@@ -1,4 +1,3 @@
-use sprs::{CsMat, TriMat};
 
 #[derive(Clone, Debug)]
 pub struct Perm {
@@ -47,6 +46,7 @@ impl ColsQueue {
     fn pop_min(&mut self) -> Option<usize> {
         let col = loop {
             if self.min_score >= self.score2head.len() {
+                println!("None branch");
                 return None;
             }
             if let Some(col) = self.score2head[self.min_score] {
@@ -100,15 +100,6 @@ pub struct BlockDiagForm {
 }
 
 
-fn mat_from_triplets(rows: usize, cols: usize, triplets: &[(usize, usize)]) -> CsMat<f64> {
-    let mut mat = TriMat::with_capacity((rows, cols), triplets.len());
-    for (r, c) in triplets {
-        mat.add_triplet(*r, *c, 1.0);
-    }
-    mat.to_csc()
-}
-
-
 pub fn order_simple<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> Perm {
     let mut cols_queue = ColsQueue::new(size);
     for c in 0..size {
@@ -118,6 +109,7 @@ pub fn order_simple<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
     let mut new2orig = Vec::with_capacity(size);
     while new2orig.len() < size {
         let min = cols_queue.pop_min();
+        println!("min: {:?}", min);
         //TODO panic happens here
         new2orig.push(min.unwrap());
     }
@@ -133,27 +125,14 @@ pub fn order_simple<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
 
 
 fn main() {
-    let mat = mat_from_triplets(
-        4,
-        6,
-        &[
-            (0, 0),
-            (0, 2),
-            (1, 0),
-            (1, 2),
-            (1, 4),
-            (2, 0),
-            (2, 1),
-            (2, 4),
-            (3, 0),
-            (3, 4),
-        ],
-    );
     order_simple(4, |c| {
-        mat.outer_view([0, 1, 2, 4][c])
-            .unwrap()
-            .into_raw_storage()
-            .0
+        match c {
+            0 => &[0, 1, 2, 3],
+            1 => &[2],
+            2 => &[0, 1],
+            3 => &[1, 2, 3],
+            _ => unreachable!(),
+        }
     });
     println!("All ok! Try running in release mode")
 }

@@ -13,6 +13,6 @@ readme = "README.md"
 keywords = ["linear-programming", "optimization"]
 categories = ["mathematics", "science"]
 
-[dependencies]
-sprs = { version = "0.11.2", default-features = false }
-log = "0.4.11"
+
+[profile.release]
+debug = true
