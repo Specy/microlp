@@ -10,7 +10,7 @@ use sprs::CompressedStorage;
 
 type CsMat = sprs::CsMatI<f64, usize>;
 
-const EPS: f64 = f64::EPSILON*10.0;
+pub const EPS: f64 = f64::EPSILON * 10.0;
 
 fn float_eq(a: f64, b: f64) -> bool {
     (a - b).abs() < EPS

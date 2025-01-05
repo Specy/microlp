@@ -1,6 +1,6 @@
 [package]
 name = "microlp"
-version = "0.2.7"
+version = "0.2.8"
 authors = [
     "Alexey Zatelepin <alex.zatelepin@gmail.com>",
     "Specy <specy.dev@gmai.com"

@@ -1,6 +1,6 @@
-use std::cmp::Ordering;
-
+use crate::solver::EPS;
 use crate::sparse::{Error, Perm, ScatteredVec, SparseMat, TriangleMat};
+use std::cmp::Ordering;
 
 #[derive(Clone)]
 pub struct LUFactors {
@@ -206,7 +206,7 @@ pub fn lu_factorize<'a>(
                 }
             }
 
-            if max_abs < 1e-8 {
+            if max_abs < EPS {
                 return Err(Error::SingularMatrix);
             }
 
