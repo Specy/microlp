@@ -10,7 +10,7 @@ use sprs::CompressedStorage;
 
 type CsMat = sprs::CsMatI<f64, usize>;
 
-const EPS: f64 = 1e-8;
+const EPS: f64 = f64::EPSILON*10.0;
 
 fn float_eq(a: f64, b: f64) -> bool {
     (a - b).abs() < EPS
@@ -1519,7 +1519,7 @@ fn choose_branch_var(cur_solution: &Solution, domain: &[VarDomain]) -> Option<Va
             continue;
         }
         let divergence = f64::abs(val - val.round());
-        if divergence > 1e-5 && divergence > max_divergence {
+        if divergence > EPS && divergence > max_divergence {
             max_divergence = divergence;
             max_var = Some(var);
         }
