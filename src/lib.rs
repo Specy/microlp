@@ -850,4 +850,27 @@ mod tests {
         );
         assert_eq!(sol.objective(), 405.0);
     }
+
+    #[test]
+    fn solve_big_m() {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+
+        let m = 1.0e9;
+
+        // Define variables with their objective coefficients
+        let x = problem.add_var(1.0, (0.0, f64::INFINITY));
+        let b = problem.add_binary_var(-1.0);
+
+        problem.add_constraint([(x, 1.0)], ComparisonOp::Ge, 5.0);
+        problem.add_constraint([(b, -m), (x, 1.0)], ComparisonOp::Le, 10.0);
+        problem.add_constraint([(b, -m), (x, 1.0)], ComparisonOp::Ge, -m + 10.0);
+
+        let sol = problem.solve().unwrap();
+
+        assert_eq!(
+            [*sol.var_value(x), *sol.var_value(b)],
+            [5.0, 0.0]
+        );
+        assert_eq!(sol.objective().round(), 5.0);
+    }
 }
