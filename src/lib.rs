@@ -832,7 +832,7 @@ mod tests {
         let x = problem.add_var(50.0, (2.0, f64::INFINITY)); // x ≥ 0
         let y = problem.add_var(40.0, (0.0, 7.0)); // y ≥ 0
         let z = problem.add_integer_var(45.0, (0, i32::MAX)); // z ≥ 0 and integer
-        // Machine time constraint: 3x + 2y + z ≤ 20
+                                                              // Machine time constraint: 3x + 2y + z ≤ 20
         problem.add_constraint(&[(x, 3.0), (y, 2.0), (z, 1.0)], ComparisonOp::Le, 20.0);
 
         // Labor time constraint: 2x + y + 3z ≤ 15

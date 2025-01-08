@@ -111,10 +111,10 @@ impl std::fmt::Debug for Solver {
 
 #[derive(Clone, Debug)]
 struct Step {
-    start_solution: Solution,
-    var: Variable,
-    start_val: i64,
-    cur_val: Option<i64>,
+    pub(crate) start_solution: Solution,
+    pub(crate) var: Variable,
+    pub(crate) start_val: i64,
+    pub(crate) cur_val: Option<i64>,
 }
 
 impl Solver {
@@ -520,7 +520,8 @@ impl Solver {
                     "starting branch&bound, current obj. value: {:.2}",
                     self.cur_obj_val
                 );
-                vec![new_step(cur_solution, var)]
+                let steps = new_steps(cur_solution, var);
+                vec![steps.0, steps.1]
             } else {
                 debug!(
                     "found optimal solution with initial relaxation! cost: {:.2}",
@@ -530,7 +531,7 @@ impl Solver {
             };
 
         for iter in 0.. {
-            //guaranteed to have at least one element
+            //guaranteed to have at an element
             let cur_step = dfs_stack.last_mut().unwrap();
 
             // Choose next value for current variable
@@ -569,7 +570,9 @@ impl Solver {
 
             if let Some(var) = choose_branch_var(&cur_solution, &self.orig_var_domains) {
                 // Search deeper
-                dfs_stack.push(new_step(cur_solution, var));
+                let steps = new_steps(cur_solution, var);
+                dfs_stack.push(steps.0);
+                dfs_stack.push(steps.1);
             } else {
                 // Found integral solution
                 if is_solution_better(direction, best_cost, obj_val) {
@@ -1527,14 +1530,23 @@ fn choose_branch_var(cur_solution: &Solution, domain: &[VarDomain]) -> Option<Va
     max_var
 }
 
-fn new_step(start_solution: Solution, var: Variable) -> Step {
-    let start_val = if start_solution[var] < 0.5 { 0 } else { 1 };
-    Step {
+fn new_steps(start_solution: Solution, var: Variable) -> (Step, Step) {
+    //TODO swap order of the branches by prioritizing the branch that improves the objective function
+    let min = start_solution[var].floor() as i64;
+    let max = start_solution[var].ceil() as i64;
+    let lower_branch = Step {
+        start_solution: start_solution.clone(),
+        var,
+        start_val: min,
+        cur_val: None,
+    };
+    let higher_branch = Step {
         start_solution,
         var,
-        start_val,
+        start_val: max,
         cur_val: None,
-    }
+    };
+    (lower_branch, higher_branch)
 }
 
 fn is_solution_better(direction: OptimizationDirection, best: f64, current: f64) -> bool {
@@ -1548,6 +1560,7 @@ fn is_solution_better(direction: OptimizationDirection, best: f64, current: f64)
 mod tests {
     use super::*;
     use crate::helpers::{assert_matrix_eq, to_sparse};
+    use crate::Problem;
 
     #[test]
     fn initialize() {
@@ -1600,6 +1613,29 @@ mod tests {
         assert_eq!(&sol.primal_edge_sq_norms, &[4.0, 8.0]);
 
         assert_eq!(sol.cur_obj_val, 0.0);
+    }
+
+    #[test]
+    fn solve_integer_singular_var() {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_integer_var(1.0, (0, 10));
+        problem.add_constraint([(x, 30.0)], ComparisonOp::Ge, 90.0);
+        assert!((problem.solve().unwrap().objective() - 3.0).abs() < EPS);
+
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_integer_var(1.0, (0, 10));
+        problem.add_constraint([(x, 30.0)], ComparisonOp::Ge, 91.0);
+        assert!((problem.solve().unwrap().objective() - 4.0).abs() < EPS);
+
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x = problem.add_integer_var(1.0, (0, 10));
+        problem.add_constraint([(x, 30.0)], ComparisonOp::Le, 90.0);
+        assert!((problem.solve().unwrap().objective() - 3.0).abs() < EPS);
+
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x = problem.add_integer_var(1.0, (0, 10));
+        problem.add_constraint([(x, 30.0)], ComparisonOp::Le, 91.0);
+        assert!((problem.solve().unwrap().objective() - 3.0).abs() < EPS);
     }
 
     #[test]
