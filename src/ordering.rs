@@ -684,6 +684,10 @@ mod tests {
     use super::*;
     use sprs::{CsMat, TriMat};
 
+    fn init() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
+
     fn mat_from_triplets(rows: usize, cols: usize, triplets: &[(usize, usize)]) -> CsMat<f64> {
         let mut mat = TriMat::with_capacity((rows, cols), triplets.len());
         for (r, c) in triplets {
@@ -694,6 +698,7 @@ mod tests {
 
     #[test]
     fn colamd() {
+        init();
         let mat = mat_from_triplets(
             4,
             5,
@@ -724,6 +729,7 @@ mod tests {
 
     #[test]
     fn colamd_singular() {
+        init();
         {
             let empty_col_mat = mat_from_triplets(3, 3, &[(0, 0), (1, 0), (1, 1), (1, 2)]);
             let res = order_colamd(3, |c| {
@@ -743,6 +749,7 @@ mod tests {
 
     #[test]
     fn diag_matching() {
+        init();
         let size = 3;
         let mat = mat_from_triplets(
             size,
@@ -757,6 +764,7 @@ mod tests {
 
     #[test]
     fn block_diag_form() {
+        init();
         let size = 3;
         let mat = mat_from_triplets(
             size,

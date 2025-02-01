@@ -353,8 +353,13 @@ impl Display for Error {
 mod tests {
     use super::*;
 
+    fn init() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
+
     #[test]
     fn mat_transpose() {
+        init();
         let mut mat = SparseMat::new(2);
         mat.push(0, 1.1);
         mat.push(1, 2.2);

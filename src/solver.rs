@@ -1562,8 +1562,13 @@ mod tests {
     use crate::helpers::{assert_matrix_eq, to_sparse};
     use crate::Problem;
 
+    fn init() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
+
     #[test]
     fn initialize() {
+        init();
         let sol = Solver::try_new(
             &[2.0, 1.0],
             &[f64::NEG_INFINITY, 5.0],
@@ -1617,6 +1622,7 @@ mod tests {
 
     #[test]
     fn solve_integer_singular_var() {
+        init();
         let mut problem = Problem::new(OptimizationDirection::Minimize);
         let x = problem.add_integer_var(1.0, (0, 10));
         problem.add_constraint([(x, 30.0)], ComparisonOp::Ge, 90.0);
@@ -1640,6 +1646,7 @@ mod tests {
 
     #[test]
     fn initial_solve() {
+        init();
         let mut sol = Solver::try_new(
             &[-3.0, -4.0],
             &[f64::NEG_INFINITY, 5.0],

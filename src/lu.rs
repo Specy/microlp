@@ -281,7 +281,7 @@ pub fn lu_factorize<'a>(
         lower_nnz,
         upper_nnz + size,
         upper_nnz,
-        lower_nnz + upper_nnz + size - mat_nnz,
+        (lower_nnz + upper_nnz + size) as isize - mat_nnz as isize,
     );
 
     let res = LUFactors {
@@ -468,6 +468,10 @@ mod tests {
     use crate::helpers::{assert_matrix_eq, to_dense, to_sparse};
     use sprs::{CsMat, CsVec, TriMat};
 
+    fn init() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
+
     fn mat_from_triplets(rows: usize, cols: usize, triplets: &[(usize, usize, f64)]) -> CsMat<f64> {
         let mut mat = TriMat::with_capacity((rows, cols), triplets.len());
         for (r, c, val) in triplets {
@@ -478,6 +482,7 @@ mod tests {
 
     #[test]
     fn lu_simple() {
+        init();
         let mat = mat_from_triplets(
             3,
             4,
@@ -553,6 +558,7 @@ mod tests {
 
     #[test]
     fn lu_singular() {
+        init();
         let size = 3;
 
         {
@@ -610,6 +616,7 @@ mod tests {
 
     #[test]
     fn lu_rand() {
+        init();
         let size = 10;
 
         let mut rng = rand_pcg::Pcg64::seed_from_u64(12345);

@@ -570,8 +570,13 @@ pub use mps::MpsFile;
 mod tests {
     use super::*;
 
+    fn init() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
+
     #[test]
     fn optimize() {
+        init();
         let mut problem = Problem::new(OptimizationDirection::Maximize);
         let v1 = problem.add_var(3.0, (12.0, f64::INFINITY));
         let v2 = problem.add_var(4.0, (5.0, f64::INFINITY));
@@ -586,6 +591,7 @@ mod tests {
 
     #[test]
     fn empty_expr_constraints() {
+        init();
         let trivial = [
             (LinearExpr::empty(), ComparisonOp::Eq, 0.0),
             (LinearExpr::empty(), ComparisonOp::Ge, -1.0),
@@ -630,6 +636,7 @@ mod tests {
 
     #[test]
     fn free_variables() {
+        init();
         let mut problem = Problem::new(OptimizationDirection::Maximize);
         let v1 = problem.add_var(1.0, (0.0, f64::INFINITY));
         let v2 = problem.add_var(2.0, (f64::NEG_INFINITY, f64::INFINITY));
@@ -645,6 +652,7 @@ mod tests {
 
     #[test]
     fn fix_unfix_var() {
+        init();
         let mut problem = Problem::new(OptimizationDirection::Maximize);
         let v1 = problem.add_var(1.0, (0.0, 3.0));
         let v2 = problem.add_var(2.0, (0.0, 3.0));
@@ -680,6 +688,7 @@ mod tests {
 
     #[test]
     fn add_constraint() {
+        init();
         let mut problem = Problem::new(OptimizationDirection::Minimize);
         let v1 = problem.add_var(2.0, (0.0, f64::INFINITY));
         let v2 = problem.add_var(1.0, (0.0, f64::INFINITY));
@@ -725,6 +734,7 @@ mod tests {
 
     #[test]
     fn gomory_cut() {
+        init();
         let mut problem = Problem::new(OptimizationDirection::Minimize);
         let v1 = problem.add_var(0.0, (0.0, f64::INFINITY));
         let v2 = problem.add_var(-1.0, (0.0, f64::INFINITY));
@@ -759,6 +769,7 @@ mod tests {
 
     #[test]
     fn knapsack_solve() {
+        init();
         let mut problem = Problem::new(OptimizationDirection::Maximize);
         let weights = [10, 60, 30, 40, 30, 20, 20, 2];
         let values = [1, 10, 15, 40, 60, 90, 100, 15];
@@ -788,6 +799,7 @@ mod tests {
 
     #[test]
     fn dominating_set_solve() {
+        init();
         let mut problem = Problem::new(OptimizationDirection::Minimize);
         let vars = [
             problem.add_binary_var(1.0),
@@ -826,6 +838,7 @@ mod tests {
 
     #[test]
     fn solve_milp() {
+        init();
         let mut problem = Problem::new(OptimizationDirection::Maximize);
 
         // Define variables with their objective coefficients
@@ -853,6 +866,7 @@ mod tests {
 
     #[test]
     fn solve_big_m() {
+        init();
         let mut problem = Problem::new(OptimizationDirection::Minimize);
 
         let m = 1.0e9;

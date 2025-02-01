@@ -88,6 +88,13 @@ jobs:
         with:
           command: test
 
+      - name: Test Rust with traces
+        uses: actions-rs/cargo@v1
+        env:
+          CARGO_LOG: "trace"
+        with:
+          command: test
+
   publish-crate:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [ conformance, test ]
