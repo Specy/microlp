@@ -91,7 +91,7 @@ jobs:
       - name: Test Rust with traces
         uses: actions-rs/cargo@v1
         env:
-          CARGO_LOG: "trace"
+          RUST_LOG: "trace"
         with:
           command: test
 
