@@ -10,6 +10,9 @@ A fast linear programming solver library.
 finding the minimum (or maximum) of a linear function of a set of variables
 subject to linear equality and inequality constraints.
 
+## Getting started
+You can use [microlp](https://crates.io/crates/microlp) on its own, but it's recommended to use it with [goodlp](https://github.com/rust-or/good_lp) or with [rooc modeling language](https://github.com/specy/rooc) as it makes it easier to create models. Look at the examples below on how to use microlp on its own.
+
 ## Features
 
 * Pure Rust implementation.
