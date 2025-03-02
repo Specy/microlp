@@ -1,6 +1,9 @@
 # microlp
 This is a fork of the archived [minilp](https://github.com/ztlpn/minilp) crate, which was made to fix some bugs, add features and allow the community to make issues and PRs.
 
+### ⚠️ Warning ⚠️
+If you were using the library prior to 0.2.11, please use the latest version of the library as there was a major bug for integer variables.
+
 [![Crates.io](https://img.shields.io/crates/v/microlp.svg)](https://crates.io/crates/microlp)
 [![Documentation](https://docs.rs/microlp/badge.svg)](https://docs.rs/microlp/)
 

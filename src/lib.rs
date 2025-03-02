@@ -236,6 +236,8 @@ pub enum VarDomain {
     Integer,
     /// The variable is real.
     Real,
+    /// The variable is boolean T/F.
+    Boolean,
 }
 
 impl Problem {
@@ -273,14 +275,16 @@ impl Problem {
 
     /// Check if the problem has any integer variables.
     pub fn has_integer_vars(&self) -> bool {
-        self.var_domains.iter().any(|v| *v == VarDomain::Integer)
+        self.var_domains
+            .iter()
+            .any(|v| *v == VarDomain::Integer || *v == VarDomain::Boolean)
     }
 
     /// Add a new binary variable to the problem.
     ///
     /// `obj_coeff` is a coefficient of the term in the objective function corresponding to this variable.
     pub fn add_binary_var(&mut self, obj_coeff: f64) -> Variable {
-        self.internal_add_var(obj_coeff, (0.0, 1.0), VarDomain::Integer)
+        self.internal_add_var(obj_coeff, (0.0, 1.0), VarDomain::Boolean)
     }
 
     pub(crate) fn internal_add_var(
@@ -431,7 +435,8 @@ impl Solution {
     /// it remove precision errors
     pub fn var_value_rounded(&self, var: Variable) -> f64 {
         let val = self.var_value(var);
-        if self.solver.orig_var_domains[var.0] == VarDomain::Integer {
+        let domain = &self.solver.orig_var_domains[var.0];
+        if *domain == VarDomain::Integer || *domain == VarDomain::Boolean {
             let rounded = val.round();
             assert!(
                 f64::abs(rounded - val) < 1e-5,
@@ -569,6 +574,7 @@ pub use mps::MpsFile;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solver::{float_eq, EPS};
 
     fn init() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -761,7 +767,11 @@ mod tests {
         vec.into_iter()
             .map(|x| {
                 let val = x.round() as i64;
-                assert!(f64::abs(x - val as f64) < 1e-5);
+                assert!(
+                    f64::abs(x - val as f64) < 1e-5,
+                    "Expected integer, got {}",
+                    x
+                );
                 val
             })
             .collect()
@@ -862,6 +872,82 @@ mod tests {
             [2.0, 6.5, 1.0]
         );
         assert_eq!(sol.objective(), 405.0);
+    }
+
+    #[test]
+    fn solve_production_planning() {
+        init();
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+
+        // Number of time periods
+        const PERIODS: usize = 4;
+
+        // Production costs per unit for each period
+        let prod_costs = [10.0, 12.0, 11.0, 14.0];
+
+        // Holding costs per unit at the end of each period
+        let holding_costs = [2.0, 2.0, 2.0, 2.0];
+
+        // Setup costs for production in each period
+        let setup_costs = [100.0, 100.0, 100.0, 100.0];
+
+        // Demand for each period
+        let demand = [50.0, 70.0, 90.0, 60.0];
+
+        // Maximum production capacity per period
+        let capacity = 120.0;
+
+        // Production variables - amount to produce in each period
+        let mut production = Vec::with_capacity(PERIODS);
+        for i in 0..PERIODS {
+            production.push(problem.add_var(prod_costs[i], (0.0, capacity)));
+        }
+
+        // Inventory variables - amount to hold at the end of each period
+        let mut inventory = Vec::with_capacity(PERIODS);
+        for i in 0..PERIODS {
+            inventory.push(problem.add_var(holding_costs[i], (0.0, f64::INFINITY)));
+        }
+
+        // Setup variables - whether there is production in a period
+        let mut setup = Vec::with_capacity(PERIODS);
+        for i in 0..PERIODS {
+            setup.push(problem.add_binary_var(setup_costs[i]));
+        }
+
+        // Initial inventory is 0
+        let mut prev_inventory = problem.add_var(0.0, (0.0, 0.0));
+
+        // Flow balance constraints and production-setup linking
+        for i in 0..PERIODS {
+            // Flow balance: prev_inventory + production[i] = demand[i] + inventory[i]
+            problem.add_constraint(
+                &[
+                    (prev_inventory, 1.0),
+                    (production[i], 1.0),
+                    (inventory[i], -1.0),
+                ],
+                ComparisonOp::Eq,
+                demand[i],
+            );
+
+            // Link production to setup: production[i] <= capacity * setup[i]
+            problem.add_constraint(
+                &[(production[i], 1.0), (setup[i], -capacity)],
+                ComparisonOp::Le,
+                0.0,
+            );
+
+            prev_inventory = inventory[i]
+        }
+
+        let sol = problem.solve().unwrap();
+
+        assert!(
+            float_eq(sol.objective(), 3440.0),
+            "Expected 3440.0, got {}",
+            sol.objective()
+        );
     }
 
     #[test]

@@ -10,12 +10,18 @@ use sprs::CompressedStorage;
 
 type CsMat = sprs::CsMatI<f64, usize>;
 
-pub const EPS: f64 = f64::EPSILON * 10.0;
+pub(crate) const MACHINE_EPS: f64 = f64::EPSILON * 10.0;
+//TODO find a good epsilon value, maybe have different values for different uses
+pub const EPS: f64 = if MACHINE_EPS > 1e-8 {
+    MACHINE_EPS
+} else {
+    1e-10
+};
 
-fn float_eq(a: f64, b: f64) -> bool {
+pub(crate) fn float_eq(a: f64, b: f64) -> bool {
     (a - b).abs() < EPS
 }
-fn float_ne(a: f64, b: f64) -> bool {
+pub(crate) fn float_ne(a: f64, b: f64) -> bool {
     !float_eq(a, b)
 }
 
@@ -27,6 +33,7 @@ pub(crate) struct Solver {
     orig_var_mins: Vec<f64>,
     orig_var_maxs: Vec<f64>,
     pub(crate) orig_var_domains: Vec<VarDomain>,
+    //pub(crate) orig_int_vars: Vec<VarDomain>,
     orig_constraints: CsMat, // excluding rhs
     orig_constraints_csc: CsMat,
     orig_rhs: Vec<f64>,
@@ -110,11 +117,18 @@ impl std::fmt::Debug for Solver {
 }
 
 #[derive(Clone, Debug)]
+enum BranchKind {
+    Floor,
+    Ceil,
+    Exact, // fixed value
+}
+
+#[derive(Clone, Debug)]
 struct Step {
     pub(crate) start_solution: Solution,
     pub(crate) var: Variable,
+    pub(crate) kind: BranchKind,
     pub(crate) start_val: i64,
-    pub(crate) cur_val: Option<i64>,
 }
 
 impl Solver {
@@ -343,6 +357,11 @@ impl Solver {
             orig_constraints_csc,
             orig_rhs,
             orig_var_domains: var_domains.to_vec(),
+            /*orig_int_vars: var_domains
+            .to_vec()
+            .into_iter()
+            .filter(|d| matches!(d, VarDomain::Integer | VarDomain::Boolean))
+            .collect(),*/
             enable_primal_steepest_edge,
             enable_dual_steepest_edge,
             is_primal_feasible,
@@ -520,8 +539,7 @@ impl Solver {
                     "starting branch&bound, current obj. value: {:.2}",
                     self.cur_obj_val
                 );
-                let steps = new_steps(cur_solution, var);
-                vec![steps.0, steps.1]
+                new_steps(cur_solution, var, &self.orig_var_domains)
             } else {
                 debug!(
                     "found optimal solution with initial relaxation! cost: {:.2}",
@@ -532,52 +550,57 @@ impl Solver {
 
         for iter in 0.. {
             //guaranteed to have at an element
-            let cur_step = dfs_stack.last_mut().unwrap();
-
-            // Choose next value for current variable
-            if let Some(ref mut val) = cur_step.cur_val {
-                if *val == cur_step.start_val {
-                    *val = 1 - *val;
-                } else {
-                    // Explored all values, backtrack
-                    dfs_stack.pop();
-                    if dfs_stack.is_empty() {
-                        break;
-                    } else {
-                        continue;
-                    }
-                }
-            } else {
-                cur_step.cur_val = Some(cur_step.start_val);
-            }
-
+            let cur_step = match dfs_stack.pop() {
+                Some(step) => step,
+                None => break,
+            };
             let mut cur_solution = cur_step.start_solution.clone();
-            if let Ok(new_solution) =
-                //guaranteed to exist as it's checked in the previous if let Some
-                cur_solution.fix_var(cur_step.var, cur_step.cur_val.unwrap() as f64)
-            {
+            let branch_direction = match cur_step.kind {
+                BranchKind::Floor => ComparisonOp::Le,
+                BranchKind::Ceil => ComparisonOp::Ge,
+                BranchKind::Exact => ComparisonOp::Eq,
+            };
+            let new_solution = match branch_direction {
+                ComparisonOp::Le | ComparisonOp::Ge => cur_solution.add_constraint(
+                    [(cur_step.var, 1.0)],
+                    branch_direction,
+                    cur_step.start_val as f64,
+                ),
+                ComparisonOp::Eq => cur_solution.fix_var(cur_step.var, cur_step.start_val as f64),
+            };
+            if let Ok(new_solution) = new_solution {
                 cur_solution = new_solution;
             } else {
                 // No feasible solution with current constraints
+                debug!(
+                    "[iter {} (search depth {})] pruned solution, infeasible",
+                    iter,
+                    dfs_stack.len()
+                );
                 continue;
             }
 
             let obj_val = cur_solution.objective();
             if !is_solution_better(direction, best_cost, obj_val) {
+                debug!(
+                    "[iter {} (search depth {})] pruned solution, cost: {:.2}",
+                    iter,
+                    dfs_stack.len(),
+                    obj_val
+                );
                 // Branch is worse than best solution
                 continue;
             }
 
             if let Some(var) = choose_branch_var(&cur_solution, &self.orig_var_domains) {
                 // Search deeper
-                let steps = new_steps(cur_solution, var);
-                dfs_stack.push(steps.0);
-                dfs_stack.push(steps.1);
+                let steps = new_steps(cur_solution, var, &self.orig_var_domains);
+                dfs_stack.extend(steps);
             } else {
                 // Found integral solution
                 if is_solution_better(direction, best_cost, obj_val) {
                     debug!(
-                        "iter {} (search depth {}): found new best solution, cost: {:.2}",
+                        "[iter {} (search depth {})] found new best solution, cost: {:.2}",
                         iter,
                         dfs_stack.len(),
                         obj_val
@@ -674,11 +697,11 @@ impl Solver {
                 ComparisonOp::Ge => 0.0 >= rhs,
             };
 
-            if is_tautological {
-                return Ok(());
+            return if is_tautological {
+                Ok(())
             } else {
-                return Err(Error::Infeasible);
-            }
+                Err(Error::Infeasible)
+            };
         }
 
         let slack_var = self.num_total_vars();
@@ -1518,7 +1541,7 @@ fn choose_branch_var(cur_solution: &Solution, domain: &[VarDomain]) -> Option<Va
     let mut max_divergence = 0.0;
     let mut max_var = None;
     for (var, &val) in cur_solution {
-        if domain[var.0] != VarDomain::Integer {
+        if domain[var.0] == VarDomain::Real {
             continue;
         }
         let divergence = f64::abs(val - val.round());
@@ -1530,23 +1553,40 @@ fn choose_branch_var(cur_solution: &Solution, domain: &[VarDomain]) -> Option<Va
     max_var
 }
 
-fn new_steps(start_solution: Solution, var: Variable) -> (Step, Step) {
+fn get_branch_min_max(var: Variable, current_solution: &Solution) -> (i64, i64) {
+    let min = current_solution[var].floor() as i64;
+    let max = current_solution[var].ceil() as i64;
+    (min, max)
+}
+
+fn new_steps(start_solution: Solution, var: Variable, var_domains: &[VarDomain]) -> Vec<Step> {
     //TODO swap order of the branches by prioritizing the branch that improves the objective function
-    let min = start_solution[var].floor() as i64;
-    let max = start_solution[var].ceil() as i64;
+    let (min, max) = get_branch_min_max(var, &start_solution);
+    if min == max {
+        return vec![];
+    }
+    let is_bool = var_domains[var.0] == VarDomain::Boolean;
     let lower_branch = Step {
         start_solution: start_solution.clone(),
         var,
+        kind: if is_bool {
+            BranchKind::Exact
+        } else {
+            BranchKind::Floor
+        },
         start_val: min,
-        cur_val: None,
     };
     let higher_branch = Step {
         start_solution,
         var,
+        kind: if is_bool {
+            BranchKind::Exact
+        } else {
+            BranchKind::Ceil
+        },
         start_val: max,
-        cur_val: None,
     };
-    (lower_branch, higher_branch)
+    vec![lower_branch, higher_branch]
 }
 
 fn is_solution_better(direction: OptimizationDirection, best: f64, current: f64) -> bool {
@@ -1642,6 +1682,28 @@ mod tests {
         let x = problem.add_integer_var(1.0, (0, 10));
         problem.add_constraint([(x, 30.0)], ComparisonOp::Le, 91.0);
         assert!((problem.solve().unwrap().objective() - 3.0).abs() < EPS);
+    }
+
+    #[test]
+    fn solve_powers_integer() {
+        init();
+        let n = 15626;
+        // return (a,b,c) such that 2^a * 3^b * 5^c >= n and is minimized given a,b,c € N
+        let logn = (n as f64).log2();
+        let log2 = 2_f64.log2();
+        let log3 = 3_f64.log2();
+        let log5 = 5_f64.log2();
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let p2 = problem.add_integer_var(log2, (0, 100));
+        let p3 = problem.add_integer_var(log3, (0, 100));
+        let p5 = problem.add_integer_var(log5, (0, 100));
+        problem.add_constraint(
+            &[(p2, log2), (p3, log3), (p5, log5)],
+            ComparisonOp::Ge,
+            logn,
+        );
+        let sol = problem.solve().unwrap();
+        assert_eq!(sol.objective().round() as i64, 14);
     }
 
     #[test]
