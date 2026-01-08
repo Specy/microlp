@@ -267,8 +267,8 @@ impl Problem {
     ///
     /// `obj_coeff` is a coefficient of the term in the objective function corresponding to this
     /// variable, `min` and `max` are the minimum and maximum (inclusive) bounds of this
-    /// variable. If one of the bounds is absent, use `f64::NEG_INFINITY` for minimum and
-    /// `f64::INFINITY` for maximum.
+    /// variable. If one of the bounds is absent, use `i32::MIN` for minimum and `i32::MAX` for
+    /// maximum.
     pub fn add_integer_var(&mut self, obj_coeff: f64, (min, max): (i32, i32)) -> Variable {
         self.internal_add_var(obj_coeff, (min as f64, max as f64), VarDomain::Integer)
     }
