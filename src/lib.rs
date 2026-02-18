@@ -61,6 +61,9 @@ mod tests;
 use solver::Solver;
 use sprs::errors::StructureError;
 
+use core::time::Duration;
+use web_time::Instant;
+
 /// An enum indicating whether to minimize or maximize objective function.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OptimizationDirection {
@@ -218,6 +221,7 @@ pub struct Problem {
     var_maxs: Vec<f64>,
     var_domains: Vec<VarDomain>,
     constraints: Vec<(CsVec, ComparisonOp, f64)>,
+    time_limit: Option<Duration>,
 }
 
 impl std::fmt::Debug for Problem {
@@ -254,7 +258,17 @@ impl Problem {
             var_maxs: vec![],
             var_domains: vec![],
             constraints: vec![],
+            time_limit: None,
         }
+    }
+
+    /// Set a time limit for the solver. If the solver exceeds this duration,
+    /// it will return [`Error::Limit`].
+    ///
+    /// The implementation uses [`web_time::Instant`] under the hood, which works
+    /// on both native and WebAssembly targets.
+    pub fn set_time_limit(&mut self, duration: Duration) {
+        self.time_limit = Some(duration);
     }
 
     /// Add a new real variable to the problem.
@@ -353,15 +367,18 @@ impl Problem {
     ///
     /// # Errors
     ///
-    /// Will return an error, if the problem is infeasible (constraints can't be satisfied)
-    /// or if the objective value is unbounded.
+    /// Will return an error, if the problem is infeasible (constraints can't be satisfied),
+    /// if the objective value is unbounded, or if a time limit was set and exceeded.
     pub fn solve(&self) -> Result<Solution, Error> {
+        let deadline = self.time_limit.map(|d| Instant::now() + d);
+
         let mut solver = Solver::try_new(
             &self.obj_coeffs,
             &self.var_mins,
             &self.var_maxs,
             &self.constraints,
             &self.var_domains,
+            deadline,
         )?;
         solver.initial_solve()?;
 
