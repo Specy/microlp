@@ -458,7 +458,7 @@ impl Solution {
     /// # Warning
     /// If you used integer variables, there might be rounding errors in the variable results
     /// for example you could see 0.999999999999 instead of 1.0.
-    pub fn iter(&self) -> SolutionIter {
+    pub fn iter(&self) -> SolutionIter<'_> {
         SolutionIter {
             solution: self,
             var_idx: 0,
