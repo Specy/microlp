@@ -764,8 +764,6 @@ impl Solver {
             }
         }
 
-        //TODO should i do this?
-        self.recalc_obj_coeffs()?;
 
         self.is_primal_feasible = false;
         self.restore_feasibility()
