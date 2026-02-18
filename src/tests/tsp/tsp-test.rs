@@ -1,4 +1,7 @@
 #[cfg(test)]
+
+//TODO add more tests
+// https://github.com/rhgrant10/tsplib95/tree/master/archives/problems
 mod tests_tsp {
     use crate::problems_solvers::tsp::{solve_tsp, TspProblem};
     use std::fs;

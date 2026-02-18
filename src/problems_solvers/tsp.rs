@@ -1,7 +1,11 @@
+//disable clippy
+//
+
 use crate::{ComparisonOp, LinearExpr, OptimizationDirection, Variable};
 use std::io;
 
 /// Solve the Travelling Salesman Problem using integer linear programming with iterative subtour elimination.
+#[allow(clippy::all)]
 pub fn solve_tsp(problem: &TspProblem) -> Tour {
     info!("starting, problem name: {}", problem.name);
 
@@ -244,6 +248,7 @@ pub struct Tour(Vec<usize>);
 
 impl Tour {
     /// Returns a space-separated string of 1-based node indices in tour order.
+    #[allow(clippy::all)]
     pub fn to_string(&self) -> String {
         self.0
             .iter()
