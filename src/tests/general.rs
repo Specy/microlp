@@ -1,8 +1,7 @@
-
 #[cfg(test)]
 mod tests_general {
-    use crate::*;
     use crate::solver::float_eq;
+    use crate::*;
 
     fn init() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -224,10 +223,7 @@ mod tests_general {
         problem.add_constraint(&entries, ComparisonOp::Le, capacity as f64);
         let sol = problem.solve().unwrap();
 
-        let values = vars
-            .iter()
-            .map(|v| sol.var_value(*v))
-            .collect::<Vec<_>>();
+        let values = vars.iter().map(|v| sol.var_value(*v)).collect::<Vec<_>>();
         assert_eq!(
             cast_result_to_integers(values),
             vec![0, 0, 1, 0, 1, 1, 1, 1]
@@ -266,10 +262,7 @@ mod tests_general {
             );
         }
         let sol = problem.solve().unwrap();
-        let values = vars
-            .iter()
-            .map(|v| sol.var_value(*v))
-            .collect::<Vec<_>>();
+        let values = vars.iter().map(|v| sol.var_value(*v)).collect::<Vec<_>>();
         assert_eq!(cast_result_to_integers(values), vec![1, 0, 1, 0, 0, 0]);
         assert_eq!(sol.objective(), 2.0);
     }
@@ -283,7 +276,7 @@ mod tests_general {
         let x = problem.add_var(50.0, (2.0, f64::INFINITY)); // x ≥ 0
         let y = problem.add_var(40.0, (0.0, 7.0)); // y ≥ 0
         let z = problem.add_integer_var(45.0, (0, i32::MAX)); // z ≥ 0 and integer
-        // Machine time constraint: 3x + 2y + z ≤ 20
+                                                              // Machine time constraint: 3x + 2y + z ≤ 20
         problem.add_constraint(&[(x, 3.0), (y, 2.0), (z, 1.0)], ComparisonOp::Le, 20.0);
 
         // Labor time constraint: 2x + y + 3z ≤ 15
@@ -292,11 +285,7 @@ mod tests_general {
         let sol = problem.solve().unwrap();
 
         assert_eq!(
-            [
-                sol.var_value(x),
-                sol.var_value(y),
-                sol.var_value(z)
-            ],
+            [sol.var_value(x), sol.var_value(y), sol.var_value(z)],
             [2.0, 6.5, 1.0]
         );
         assert_eq!(sol.objective(), 405.0);
