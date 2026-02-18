@@ -37,6 +37,7 @@ problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
 problem.add_constraint(&[(x, 2.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
 
 // Optimal value is 7, achieved at x = 1 and y = 3.
+let mut problem = problem;
 let solution = problem.solve().unwrap();
 assert_eq!(solution.objective(), 7.0);
 assert_eq!(solution[x], 1.0);
@@ -54,6 +55,8 @@ mod helpers;
 mod lu;
 mod mps;
 mod ordering;
+/// Problem solvers built on top of the microlp library.
+pub mod problems_solvers;
 mod solver;
 mod sparse;
 mod tests;
