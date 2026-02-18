@@ -8,6 +8,10 @@ use crate::{
 };
 use sprs::CompressedStorage;
 
+use web_time::Instant;
+
+pub(crate) type Deadline = Option<Instant>;
+
 type CsMat = sprs::CsMatI<f64, usize>;
 
 pub(crate) const MACHINE_EPS: f64 = f64::EPSILON * 10.0;
@@ -25,9 +29,20 @@ pub(crate) fn float_ne(a: f64, b: f64) -> bool {
     !float_eq(a, b)
 }
 
+#[inline]
+fn check_deadline(deadline: &Deadline) -> Result<(), Error> {
+    if let Some(dl) = deadline {
+        if Instant::now() >= *dl {
+            return Err(Error::Limit);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(crate) struct Solver {
     pub(crate) num_vars: usize,
+    pub(crate) deadline: Deadline,
 
     orig_obj_coeffs: Vec<f64>,
     orig_var_mins: Vec<f64>,
@@ -138,6 +153,7 @@ impl Solver {
         var_maxs: &[f64],
         constraints: &[(CsVec, ComparisonOp, f64)],
         var_domains: &[VarDomain],
+        deadline: Deadline,
     ) -> Result<Self, Error> {
         let enable_steepest_edge = true; // TODO: make user-settable.
 
@@ -356,6 +372,7 @@ impl Solver {
             orig_constraints,
             orig_constraints_csc,
             orig_rhs,
+            deadline,
             orig_var_domains: var_domains.to_vec(),
             /*orig_int_vars: var_domains
             .to_vec()
@@ -505,6 +522,8 @@ impl Solver {
     }
 
     pub(crate) fn initial_solve(&mut self) -> Result<(), Error> {
+        check_deadline(&self.deadline)?;
+
         if !self.is_primal_feasible {
             self.restore_feasibility()?;
         }
@@ -549,6 +568,10 @@ impl Solver {
             };
 
         for iter in 0.. {
+            if iter % 100 == 0 {
+                check_deadline(&self.deadline)?;
+            }
+
             //guaranteed to have at an element
             let cur_step = match dfs_stack.pop() {
                 Some(step) => step,
@@ -622,6 +645,8 @@ impl Solver {
     fn optimize(&mut self) -> Result<(), Error> {
         for iter in 0.. {
             if iter % 1000 == 0 {
+                check_deadline(&self.deadline)?;
+
                 let (num_vars, infeasibility) = self.calc_dual_infeasibility();
                 debug!(
                     "optimize iter {}: obj.: {}, non-optimal coeffs: {} ({})",
@@ -654,6 +679,8 @@ impl Solver {
 
         for iter in 0.. {
             if iter % 1000 == 0 {
+                check_deadline(&self.deadline)?;
+
                 let (num_vars, infeasibility) = self.calc_primal_infeasibility();
                 debug!(
                     "restore feasibility iter {}: {}: {}, infeas. vars: {} ({})",
@@ -763,7 +790,6 @@ impl Solver {
                     .push(self.inv_basis_row_coeffs.sq_norm());
             }
         }
-
 
         self.is_primal_feasible = false;
         self.restore_feasibility()
@@ -1621,6 +1647,7 @@ mod tests {
                 (to_sparse(&[0.0, 1.0]), ComparisonOp::Eq, 3.0),
             ],
             &[VarDomain::Real, VarDomain::Real],
+            Default::default(),
         )
         .unwrap();
 
@@ -1719,6 +1746,7 @@ mod tests {
                 (to_sparse(&[-1.0, 4.0]), ComparisonOp::Le, 20.0),
             ],
             &[VarDomain::Real, VarDomain::Real],
+            Default::default(),
         )
         .unwrap();
         sol.initial_solve().unwrap();
@@ -1742,6 +1770,7 @@ mod tests {
                 (to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 5.0),
             ],
             &[VarDomain::Real, VarDomain::Real],
+            Default::default(),
         )
         .unwrap()
         .initial_solve();

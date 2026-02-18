@@ -3,6 +3,8 @@ mod tests_general {
     use crate::solver::float_eq;
     use crate::*;
 
+    use core::time::Duration;
+
     fn init() {
         let _ = env_logger::builder().is_test(true).try_init();
     }
@@ -365,6 +367,61 @@ mod tests_general {
             "Expected 3440.0, got {}",
             sol.objective()
         );
+    }
+
+    #[test]
+    fn time_limit_zero_returns_limit_error() {
+        init();
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x = problem.add_var(1.0, (0.0, f64::INFINITY));
+        let y = problem.add_var(2.0, (0.0, 3.0));
+        problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
+        problem.add_constraint(&[(x, 2.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
+
+        // A zero duration guarantees the deadline is already passed before solving starts.
+        problem.set_time_limit(Duration::ZERO);
+        let result = problem.solve();
+        assert_eq!(result.unwrap_err(), Error::Limit);
+    }
+
+    #[test]
+    fn time_limit_generous_succeeds() {
+        init();
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x = problem.add_var(1.0, (0.0, f64::INFINITY));
+        let y = problem.add_var(2.0, (0.0, 3.0));
+        problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
+        problem.add_constraint(&[(x, 2.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
+
+        // A generous time limit should let a small problem solve without issue.
+        problem.set_time_limit(Duration::from_secs(60));
+        let sol = problem.solve().unwrap();
+        assert_eq!(sol.objective(), 7.0);
+        assert_eq!(sol[x], 1.0);
+        assert_eq!(sol[y], 3.0);
+    }
+
+    #[test]
+    fn time_limit_zero_integer_returns_limit_error() {
+        init();
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let weights = [10, 60, 30, 40, 30, 20, 20, 2];
+        let values = [1, 10, 15, 40, 60, 90, 100, 15];
+        let capacity = 102;
+        let mut vars = vec![];
+        for i in 0..weights.len() {
+            let var = problem.add_binary_var(values[i] as f64);
+            vars.push(var);
+        }
+        let entries = vars
+            .iter()
+            .map(|v| (*v, weights[v.0] as f64))
+            .collect::<Vec<_>>();
+        problem.add_constraint(&entries, ComparisonOp::Le, capacity as f64);
+
+        problem.set_time_limit(Duration::ZERO);
+        let result = problem.solve();
+        assert_eq!(result.unwrap_err(), Error::Limit);
     }
 
     #[test]
