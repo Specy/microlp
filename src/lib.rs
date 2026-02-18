@@ -452,15 +452,6 @@ impl Solution {
             *val
         }
     }
-    
-    /// Value of the variable at optimum.
-    ///
-    /// If the variable was defined as an integer or boolean, it rounds it.
-    /// it remove precision errors
-    #[deprecated(note="please use `var_value` instead")]
-    pub fn var_value_rounded(&self, var: Variable) -> f64 {
-        self.var_value(var)
-    }
 
     /// Iterate over the variable-value pairs of the solution.
     ///
