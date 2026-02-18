@@ -2,7 +2,7 @@
 #[cfg(test)]
 mod tests_general {
     use crate::*;
-    use crate::solver::{float_eq, EPS};
+    use crate::solver::float_eq;
 
     fn init() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -226,7 +226,7 @@ mod tests_general {
 
         let values = vars
             .iter()
-            .map(|v| sol.var_value_rounded(*v))
+            .map(|v| sol.var_value(*v))
             .collect::<Vec<_>>();
         assert_eq!(
             cast_result_to_integers(values),
@@ -268,7 +268,7 @@ mod tests_general {
         let sol = problem.solve().unwrap();
         let values = vars
             .iter()
-            .map(|v| sol.var_value_rounded(*v))
+            .map(|v| sol.var_value(*v))
             .collect::<Vec<_>>();
         assert_eq!(cast_result_to_integers(values), vec![1, 0, 1, 0, 0, 0]);
         assert_eq!(sol.objective(), 2.0);
@@ -293,9 +293,9 @@ mod tests_general {
 
         assert_eq!(
             [
-                sol.var_value_rounded(x),
-                sol.var_value_rounded(y),
-                sol.var_value_rounded(z)
+                sol.var_value(x),
+                sol.var_value(y),
+                sol.var_value(z)
             ],
             [2.0, 6.5, 1.0]
         );
@@ -395,7 +395,7 @@ mod tests_general {
 
         let sol = problem.solve().unwrap();
 
-        assert_eq!([*sol.var_value(x), *sol.var_value(b)], [5.0, 0.0]);
+        assert_eq!([sol.var_value(x), sol.var_value(b)], [5.0, 0.0]);
         assert_eq!(sol.objective().round(), 5.0);
     }
 }

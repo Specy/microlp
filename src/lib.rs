@@ -428,17 +428,17 @@ impl Solution {
     /// # Warning
     /// If the variable is an integer, there might be rounding errors.
     /// For example you could see 0.999999999999 instead of 1.0.
-    pub fn var_value(&self, var: Variable) -> &f64 {
+    pub fn var_value_raw(&self, var: Variable) -> &f64 {
         assert!(var.0 < self.num_vars);
         self.solver.get_value(var.0)
     }
 
     /// Value of the variable at optimum.
     ///
-    /// If the variable was defined as an integer, it rounds
-    /// it remove precision errors
-    pub fn var_value_rounded(&self, var: Variable) -> f64 {
-        let val = self.var_value(var);
+    /// If the variable was defined as an integer or boolean, it rounds it.
+    /// it removes precision errors
+    pub fn var_value(&self, var: Variable) -> f64 {
+        let val = self.var_value_raw(var);
         let domain = &self.solver.orig_var_domains[var.0];
         if *domain == VarDomain::Integer || *domain == VarDomain::Boolean {
             let rounded = val.round();
@@ -451,6 +451,15 @@ impl Solution {
         } else {
             *val
         }
+    }
+    
+    /// Value of the variable at optimum.
+    ///
+    /// If the variable was defined as an integer or boolean, it rounds it.
+    /// it remove precision errors
+    #[deprecated(note="please use `var_value` instead")]
+    pub fn var_value_rounded(&self, var: Variable) -> f64 {
+        self.var_value(var)
     }
 
     /// Iterate over the variable-value pairs of the solution.
@@ -539,7 +548,7 @@ impl std::ops::Index<Variable> for Solution {
     type Output = f64;
 
     fn index(&self, var: Variable) -> &Self::Output {
-        self.var_value(var)
+        self.var_value_raw(var)
     }
 }
 

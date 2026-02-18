@@ -279,7 +279,7 @@ mod tests_aoc {
 
         let mut problem = Problem::new(OptimizationDirection::Minimize);
         let vars: Vec<Variable> = (0..button_count)
-            .map(|_| problem.add_var(1.0, (0.0, f64::INFINITY)))
+            .map(|_| problem.add_integer_var(1.0, (0, i32::MAX)))
             .collect();
 
         let mut counter_changing_button_indices = vec![Vec::new(); counter_count];
@@ -302,7 +302,7 @@ mod tests_aoc {
         }
 
         let solution = problem.solve().expect("microlp solve failed");
-        vars.iter().map(|&var| solution[var].round() as i64).sum()
+        vars.iter().map(|&var| solution.var_value(var) as i64).sum()
     }
 
     fn part_2_microlp(input: &str) -> i64 {
