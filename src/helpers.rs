@@ -4,7 +4,7 @@ use std::ops::Deref;
 pub(crate) fn resized_view<IStorage, DStorage>(
     vec: &CsVecBase<IStorage, DStorage, f64>,
     len: usize,
-) -> CsVecView<f64>
+) -> CsVecView<'_, f64>
 where
     IStorage: Deref<Target = [usize]>,
     DStorage: Deref<Target = [f64]>,

@@ -21,7 +21,7 @@ mod broken_tests_set {
         let sol = problem.solve().unwrap();
 
         assert_eq!(
-            [*sol.var_value(x), *sol.var_value(y), *sol.var_value(z)],
+            [sol.var_value(x), sol.var_value(y), sol.var_value(z)],
             [2.0, 6.2, 1.6]
         );
         assert_eq!(sol.objective(), 420.0);

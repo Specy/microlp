@@ -1,6 +1,6 @@
 [package]
 name = "microlp"
-version = "0.2.11"
+version = "0.3.0"
 authors = [
     "Alexey Zatelepin <alex.zatelepin@gmail.com>",
     "Specy <specy.dev@gmai.com"
@@ -14,7 +14,7 @@ keywords = ["linear-programming", "optimization"]
 categories = ["mathematics", "science"]
 
 [dependencies]
-sprs = { version = "0.11.2", default-features = false }
+sprs = { version = "0.11.4", default-features = false }
 log = "0.4.11"
 
 [dev-dependencies]
