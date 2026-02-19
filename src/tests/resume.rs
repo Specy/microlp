@@ -3,7 +3,7 @@ mod tests_resume {
     fn init() {
         let _ = env_logger::builder().is_test(true).try_init();
     }
-    
+
     use crate::{solver::float_eq, *};
 
     /// Deterministic pseudo-random number generator for reproducible test data.
@@ -148,9 +148,15 @@ mod tests_resume {
             &StopReason::Finished,
             "Resumed solve should eventually finish"
         );
-        
-        println!("Unlimited solve duration: {:.3}s", elapsed_unlimited.as_secs_f64());
-        println!("Resumed solve duration: {:.3}s", elapsed_limited.as_secs_f64());
+
+        println!(
+            "Unlimited solve duration: {:.3}s",
+            elapsed_unlimited.as_secs_f64()
+        );
+        println!(
+            "Resumed solve duration: {:.3}s",
+            elapsed_limited.as_secs_f64()
+        );
 
         let values_limited: Vec<f64> = vars_limited
             .iter()
@@ -173,6 +179,143 @@ mod tests_resume {
             assert!(
                 float_eq(*a, *b),
                 "Variable {} differs: unlimited = {}, resumed = {}",
+                i,
+                a,
+                b
+            );
+        }
+
+        assert!(
+            resume_count >= 1,
+            "Expected at least 1 resume call, got {}",
+            resume_count
+        );
+    }
+
+    /// Builds a large dense LP (no integer variables) that is hard enough
+    /// to take several seconds for the simplex solver.
+    ///
+    /// Uses many variables and dense constraints with pseudo-random coefficients
+    /// so the simplex method must perform many pivots.
+    fn build_large_lp() -> (Problem, Vec<Variable>) {
+        let mut rng = SimpleRng::new(0xCAFE_BABE_1337_7331);
+
+        let num_vars = 1500;
+        let num_constraints = 1200;
+
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+
+        // Create continuous variables with pseudo-random objective coefficients
+        // and bounded ranges.
+        let mut vars = Vec::with_capacity(num_vars);
+        for _ in 0..num_vars {
+            let coeff = (rng.next_range(1, 1000) as f64) / 100.0;
+            let upper = (rng.next_range(5, 50) as f64) / 10.0;
+            vars.push(problem.add_var(coeff, (0.0, upper)));
+        }
+
+        // Add dense constraints with pseudo-random coefficients.
+        // Each constraint involves all variables (dense) to maximise pivot work.
+        // Capacity is set tight enough that the LP isn't trivial.
+        for _ in 0..num_constraints {
+            let coeffs: Vec<f64> = (0..num_vars)
+                .map(|_| (rng.next_range(0, 200) as f64) / 100.0)
+                .collect();
+            let total: f64 = coeffs.iter().sum();
+            let capacity = (total * 0.15).floor();
+
+            let entries: Vec<(Variable, f64)> = vars
+                .iter()
+                .zip(coeffs.iter())
+                .filter(|(_, c)| **c > 0.0)
+                .map(|(v, c)| (*v, *c))
+                .collect();
+            problem.add_constraint(&entries, ComparisonOp::Le, capacity);
+        }
+
+        (problem, vars)
+    }
+
+    #[test]
+    fn resume_real_variables_produces_same_result_as_unlimited() {
+        init();
+
+        // ── 1. Solve without any time limit ──────────────────────────────────
+        let (problem_unlimited, vars_unlimited) = build_large_lp();
+
+        let t0 = std::time::Instant::now();
+        let sol_unlimited = problem_unlimited.solve().unwrap();
+        let elapsed_unlimited = t0.elapsed();
+
+        assert_eq!(
+            sol_unlimited.stop_reason(),
+            &StopReason::Finished,
+            "Unlimited solve should finish"
+        );
+
+        let values_unlimited: Vec<f64> = vars_unlimited
+            .iter()
+            .map(|v| sol_unlimited.var_value(*v))
+            .collect();
+        let obj_unlimited = sol_unlimited.objective();
+
+        println!(
+            "LP unlimited solve: objective = {:.6}, time = {:.3}s",
+            obj_unlimited,
+            elapsed_unlimited.as_secs_f64()
+        );
+
+        // ── 2. Solve the same problem with repeated short time limits ────────
+        let (mut problem_limited, vars_limited) = build_large_lp();
+        problem_limited.set_time_limit(Duration::from_millis(100));
+
+        let t1 = std::time::Instant::now();
+        let mut sol_limited = problem_limited.solve().unwrap();
+
+        let mut resume_count = 0u32;
+        while *sol_limited.stop_reason() == StopReason::Limit {
+            resume_count += 1;
+            sol_limited = sol_limited
+                .resume(Some(Duration::from_millis(100)))
+                .unwrap();
+        }
+        let elapsed_limited = t1.elapsed();
+
+        assert_eq!(
+            sol_limited.stop_reason(),
+            &StopReason::Finished,
+            "Resumed LP solve should eventually finish"
+        );
+
+        let values_limited: Vec<f64> = vars_limited
+            .iter()
+            .map(|v| sol_limited.var_value(*v))
+            .collect();
+        let obj_limited = sol_limited.objective();
+
+        println!(
+            "LP resumed solve:  objective = {:.6}, time = {:.3}s, resumes = {}",
+            obj_limited,
+            elapsed_limited.as_secs_f64(),
+            resume_count
+        );
+
+        // ── 3. Compare results ───────────────────────────────────────────────
+        assert!(
+            float_eq(obj_unlimited, obj_limited),
+            "LP objectives differ! unlimited = {}, resumed = {}",
+            obj_unlimited,
+            obj_limited
+        );
+
+        for (i, (a, b)) in values_unlimited
+            .iter()
+            .zip(values_limited.iter())
+            .enumerate()
+        {
+            assert!(
+                float_eq(*a, *b),
+                "LP variable {} differs: unlimited = {}, resumed = {}",
                 i,
                 a,
                 b
