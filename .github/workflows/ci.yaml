@@ -86,7 +86,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: -- --release
+          args: --release
 
       - name: Test Rust with traces
         uses: actions-rs/cargo@v1
@@ -97,7 +97,7 @@ jobs:
 
   publish-crate:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [ conformance, test ]
+    needs: [conformance, test]
 
     name: Publish to Crates.io
     runs-on: "ubuntu-latest"
