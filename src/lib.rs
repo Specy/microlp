@@ -186,8 +186,6 @@ pub enum Error {
     Unbounded,
     /// An internal error occurred.
     InternalError(String),
-    /// Step limit reached
-    Limit,
 }
 impl From<StructureError> for Error {
     fn from(err: StructureError) -> Self {
@@ -206,7 +204,6 @@ impl std::fmt::Display for Error {
         let msg = match self {
             Error::Infeasible => "problem is infeasible",
             Error::Unbounded => "problem is unbounded",
-            Error::Limit => "reached execution limit",
             Error::InternalError(msg) => msg,
         };
         msg.fmt(f)
@@ -266,7 +263,7 @@ impl Problem {
     }
 
     /// Set a time limit for the solver. If the solver exceeds this duration,
-    /// it will return [`Error::Limit`].
+    /// the solution will have [`StopReason::Limit`] as its stop reason.
     ///
     /// The implementation uses [`web_time::Instant`] under the hood, which works
     /// on both native and WebAssembly targets.
@@ -368,10 +365,13 @@ impl Problem {
 
     /// Solve the problem, finding the optimal objective function value and variable values.
     ///
+    /// If a time limit was set and exceeded, the returned [`Solution`] will have
+    /// [`StopReason::Limit`] as its stop reason, containing the best solution found so far.
+    ///
     /// # Errors
     ///
-    /// Will return an error, if the problem is infeasible (constraints can't be satisfied),
-    /// if the objective value is unbounded, or if a time limit was set and exceeded.
+    /// Will return an error if the problem is infeasible (constraints can't be satisfied)
+    /// or if the objective value is unbounded.
     pub fn solve(&self) -> Result<Solution, Error> {
         let deadline = self.time_limit.map(|d| Instant::now() + d);
 
@@ -383,19 +383,21 @@ impl Problem {
             &self.var_domains,
             deadline,
         )?;
-        solver.initial_solve()?;
+        let mut stop_reason = solver.initial_solve()?;
 
-        if self.has_integer_vars() {
+        if stop_reason == StopReason::Finished && self.has_integer_vars() {
             let non_integer_solution = Solution {
                 num_vars: self.obj_coeffs.len(),
                 direction: self.direction,
                 solver: solver.clone(),
+                stop_reason,
             };
-            solver.solve_integer(non_integer_solution, self.direction)?;
+            stop_reason = solver.solve_integer(non_integer_solution, self.direction)?;
             let solution = Solution {
                 num_vars: self.obj_coeffs.len(),
                 direction: self.direction,
                 solver,
+                stop_reason,
             };
             Ok(solution)
         } else {
@@ -403,9 +405,19 @@ impl Problem {
                 num_vars: self.obj_coeffs.len(),
                 direction: self.direction,
                 solver,
+                stop_reason,
             })
         }
     }
+}
+
+/// The reason why the solver stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopReason {
+    /// The solver reached the time limit before finding an optimal solution.
+    Limit,
+    /// The solver finished normally.
+    Finished,
 }
 
 /// A solution of a problem: optimal objective function value and variable values.
@@ -419,6 +431,7 @@ pub struct Solution {
     direction: OptimizationDirection,
     num_vars: usize,
     solver: solver::Solver,
+    stop_reason: StopReason,
 }
 
 impl std::fmt::Debug for Solution {
@@ -434,12 +447,51 @@ impl std::fmt::Debug for Solution {
 }
 
 impl Solution {
+    /// Returns the reason why the solver stopped.
+    pub fn stop_reason(&self) -> &StopReason {
+        &self.stop_reason
+    }
+
     /// Optimal value of the objective function.
     pub fn objective(&self) -> f64 {
         match self.direction {
             OptimizationDirection::Minimize => self.solver.cur_obj_val,
             OptimizationDirection::Maximize => -self.solver.cur_obj_val,
         }
+    }
+
+    /// Resume solving after the solver stopped due to a time limit.
+    ///
+    /// If the solver previously stopped with [`StopReason::Limit`], this method continues
+    /// solving with the given `time_limit`. Pass `None` to run without a time limit.
+    ///
+    /// If the solver already finished ([`StopReason::Finished`]), this is a no-op and
+    /// returns the solution as-is.
+    ///
+    /// # Errors
+    ///
+    /// Will return an error if the problem is infeasible or unbounded.
+    pub fn resume(mut self, time_limit: Option<Duration>) -> Result<Self, Error> {
+        if self.stop_reason == StopReason::Finished {
+            return Ok(self);
+        }
+
+        self.solver.deadline = time_limit.map(|d| Instant::now() + d);
+
+        let mut stop_reason = self.solver.initial_solve()?;
+
+        if stop_reason == StopReason::Finished && self.solver.has_integer_vars() {
+            let cur_solution = Solution {
+                num_vars: self.num_vars,
+                direction: self.direction,
+                solver: self.solver.clone(),
+                stop_reason: StopReason::Finished,
+            };
+            stop_reason = self.solver.solve_integer(cur_solution, self.direction)?;
+        }
+
+        self.stop_reason = stop_reason;
+        Ok(self)
     }
 
     /// Value of the variable at optimum.
@@ -503,12 +555,13 @@ impl Solution {
         rhs: f64,
     ) -> Result<Self, Error> {
         let expr = expr.into();
-        self.solver.add_constraint(
+        let stop_reason = self.solver.add_constraint(
             CsVec::new_from_unsorted(self.num_vars, expr.vars, expr.coeffs)
                 .map_err(|v| Error::InternalError(v.2.to_string()))?,
             cmp_op,
             rhs,
         )?;
+        self.stop_reason = stop_reason;
         Ok(self)
     }
 
@@ -521,7 +574,8 @@ impl Solution {
     /// Will return an error if the problem becomes infeasible with the additional constraint.
     pub fn fix_var(mut self, var: Variable, val: f64) -> Result<Self, Error> {
         assert!(var.0 < self.num_vars);
-        self.solver.fix_var(var.0, val)?;
+        let stop_reason = self.solver.fix_var(var.0, val)?;
+        self.stop_reason = stop_reason;
         Ok(self)
     }
 
@@ -550,7 +604,8 @@ impl Solution {
     /// its bounds).
     pub fn add_gomory_cut(mut self, var: Variable) -> Result<Self, Error> {
         assert!(var.0 < self.num_vars);
-        self.solver.add_gomory_cut(var.0)?;
+        let stop_reason = self.solver.add_gomory_cut(var.0)?;
+        self.stop_reason = stop_reason;
         Ok(self)
     }
 }

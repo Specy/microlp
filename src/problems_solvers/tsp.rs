@@ -1,7 +1,8 @@
 //disable clippy
 //
 
-use crate::{ComparisonOp, LinearExpr, OptimizationDirection, Variable};
+use crate::{ComparisonOp, LinearExpr, OptimizationDirection, StopReason, Variable};
+use core::time::Duration;
 use std::io;
 
 /// Solve the Travelling Salesman Problem using integer linear programming with iterative subtour elimination.
@@ -51,8 +52,15 @@ pub fn solve_tsp(problem: &TspProblem) -> Tour {
     // need exponentially many constraints. Instead, we solve the problem, check for subtours
     // in the integer solution, add violated subtour elimination constraints, and re-solve.
     // The solver's built-in branch & bound handles integrality at each iteration.
+    lp_problem.set_time_limit(Duration::from_secs(5));
+
     loop {
-        let solution = lp_problem.solve().unwrap();
+        let mut solution = lp_problem.solve().unwrap();
+
+        if *solution.stop_reason() == StopReason::Limit {
+            info!("time limit reached, resuming without limit");
+            solution = solution.resume(None).unwrap();
+        }
 
         info!(
             "solved integer problem, obj. value: {:.2}",

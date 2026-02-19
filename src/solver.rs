@@ -4,7 +4,7 @@ use crate::{
     helpers::{resized_view, to_dense},
     lu::{lu_factorize, LUFactors, ScratchSpace},
     sparse::{ScatteredVec, SparseMat, SparseVec},
-    ComparisonOp, CsVec, Error, OptimizationDirection, Solution, VarDomain, Variable,
+    ComparisonOp, CsVec, Error, OptimizationDirection, Solution, StopReason, VarDomain, Variable,
 };
 use sprs::CompressedStorage;
 
@@ -30,13 +30,13 @@ pub(crate) fn float_ne(a: f64, b: f64) -> bool {
 }
 
 #[inline]
-fn check_deadline(deadline: &Deadline) -> Result<(), Error> {
+fn check_deadline(deadline: &Deadline) -> StopReason {
     if let Some(dl) = deadline {
         if Instant::now() >= *dl {
-            return Err(Error::Limit);
+            return StopReason::Limit;
         }
     }
-    Ok(())
+    StopReason::Finished
 }
 
 #[derive(Clone)]
@@ -428,7 +428,7 @@ impl Solver {
         }
     }
 
-    pub(crate) fn fix_var(&mut self, var: usize, val: f64) -> Result<(), Error> {
+    pub(crate) fn fix_var(&mut self, var: usize, val: f64) -> Result<StopReason, Error> {
         if val < self.orig_var_mins[var] || val > self.orig_var_maxs[var] {
             return Err(Error::Infeasible);
         }
@@ -491,7 +491,7 @@ impl Solver {
         }
     }
 
-    pub(crate) fn add_gomory_cut(&mut self, var: usize) -> Result<(), Error> {
+    pub(crate) fn add_gomory_cut(&mut self, var: usize) -> Result<StopReason, Error> {
         if let VarState::Basic(row) = self.var_states[var] {
             self.calc_row_coeffs(row);
 
@@ -517,34 +517,47 @@ impl Solver {
         self.orig_constraints.rows()
     }
 
+    pub(crate) fn has_integer_vars(&self) -> bool {
+        self.orig_var_domains
+            .iter()
+            .take(self.num_vars)
+            .any(|v| *v == VarDomain::Integer || *v == VarDomain::Boolean)
+    }
+
     fn num_total_vars(&self) -> usize {
         self.num_vars + self.num_constraints()
     }
 
-    pub(crate) fn initial_solve(&mut self) -> Result<(), Error> {
-        check_deadline(&self.deadline)?;
+    pub(crate) fn initial_solve(&mut self) -> Result<StopReason, Error> {
+        if check_deadline(&self.deadline) == StopReason::Limit {
+            return Ok(StopReason::Limit);
+        }
 
         if !self.is_primal_feasible {
-            self.restore_feasibility()?;
+            if self.restore_feasibility()? == StopReason::Limit {
+                return Ok(StopReason::Limit);
+            }
         }
 
         if !self.is_dual_feasible {
             self.recalc_obj_coeffs()?;
-            self.optimize()?;
+            if self.optimize()? == StopReason::Limit {
+                return Ok(StopReason::Limit);
+            }
         }
 
         // Disable updates of primal sq. norms, because lengthy primal simplex runs
         // are unlikely after the initial solve.
         self.enable_primal_steepest_edge = false;
 
-        Ok(())
+        Ok(StopReason::Finished)
     }
 
     pub(crate) fn solve_integer(
         &mut self,
         cur_solution: Solution,
         direction: OptimizationDirection,
-    ) -> Result<(), Error> {
+    ) -> Result<StopReason, Error> {
         let mut best_cost = if direction == OptimizationDirection::Maximize {
             f64::NEG_INFINITY
         } else {
@@ -564,12 +577,18 @@ impl Solver {
                     "found optimal solution with initial relaxation! cost: {:.2}",
                     self.cur_obj_val
                 );
-                return Ok(());
+                return Ok(StopReason::Finished);
             };
 
         for iter in 0.. {
             if iter % 100 == 0 {
-                check_deadline(&self.deadline)?;
+                if check_deadline(&self.deadline) == StopReason::Limit {
+                    if let Some(solution) = best_solution {
+                        let solution: Solution = solution;
+                        *self = solution.solver;
+                    }
+                    return Ok(StopReason::Limit);
+                }
             }
 
             //guaranteed to have at an element
@@ -636,16 +655,18 @@ impl Solver {
 
         if let Some(solution) = best_solution {
             *self = solution.solver;
-            Ok(())
+            Ok(StopReason::Finished)
         } else {
             Err(Error::Infeasible)
         }
     }
 
-    fn optimize(&mut self) -> Result<(), Error> {
+    fn optimize(&mut self) -> Result<StopReason, Error> {
         for iter in 0.. {
             if iter % 1000 == 0 {
-                check_deadline(&self.deadline)?;
+                if check_deadline(&self.deadline) == StopReason::Limit {
+                    return Ok(StopReason::Limit);
+                }
 
                 let (num_vars, infeasibility) = self.calc_dual_infeasibility();
                 debug!(
@@ -667,10 +688,10 @@ impl Solver {
         }
 
         self.is_dual_feasible = true;
-        Ok(())
+        Ok(StopReason::Finished)
     }
 
-    fn restore_feasibility(&mut self) -> Result<(), Error> {
+    fn restore_feasibility(&mut self) -> Result<StopReason, Error> {
         let obj_str = if self.is_dual_feasible {
             "obj."
         } else {
@@ -679,7 +700,9 @@ impl Solver {
 
         for iter in 0.. {
             if iter % 1000 == 0 {
-                check_deadline(&self.deadline)?;
+                if check_deadline(&self.deadline) == StopReason::Limit {
+                    return Ok(StopReason::Limit);
+                }
 
                 let (num_vars, infeasibility) = self.calc_primal_infeasibility();
                 debug!(
@@ -705,7 +728,7 @@ impl Solver {
         }
 
         self.is_primal_feasible = true;
-        Ok(())
+        Ok(StopReason::Finished)
     }
 
     pub(crate) fn add_constraint(
@@ -713,7 +736,7 @@ impl Solver {
         mut coeffs: CsVec,
         cmp_op: ComparisonOp,
         rhs: f64,
-    ) -> Result<(), Error> {
+    ) -> Result<StopReason, Error> {
         assert!(self.is_primal_feasible);
         assert!(self.is_dual_feasible);
 
@@ -725,7 +748,7 @@ impl Solver {
             };
 
             return if is_tautological {
-                Ok(())
+                Ok(StopReason::Finished)
             } else {
                 Err(Error::Infeasible)
             };
