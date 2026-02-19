@@ -1,3 +1,4 @@
+#[cfg(test)]
 mod broken_tests_set {
 
     #[allow(unused_imports)]

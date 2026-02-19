@@ -1,6 +1,6 @@
 [package]
 name = "microlp"
-version = "0.3.2"
+version = "0.4.0"
 authors = [
     "Alexey Zatelepin <alex.zatelepin@gmail.com>",
     "Specy <specy.dev@gmai.com"
@@ -22,3 +22,6 @@ web-time = "1.1.0"
 rand = "0.8.5"
 rand_pcg = "0.3.1"
 env_logger = "0.11.5"
+
+[profile.test]
+opt-level = 3
