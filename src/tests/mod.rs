@@ -5,3 +5,5 @@ mod aoc2;
 mod general;
 
 mod tsp;
+
+mod resume;

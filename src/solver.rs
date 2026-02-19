@@ -86,6 +86,17 @@ pub(crate) struct Solver {
     sq_norms_update_helper: Vec<f64>,
     inv_basis_row_coeffs: SparseVec,
     row_coeffs: ScatteredVec,
+
+    /// Persisted branch-and-bound state for resuming after a time limit.
+    pub(crate) bb_state: Option<BranchAndBoundState>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BranchAndBoundState {
+    dfs_stack: Vec<Step>,
+    best_cost: f64,
+    /// Whether `self` (the Solver) represents a valid best integer solution found so far.
+    has_best: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -407,6 +418,7 @@ impl Solver {
             sq_norms_update_helper,
             inv_basis_row_coeffs: SparseVec::new(),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
+            bb_state: None,
         };
 
         debug!(
@@ -556,34 +568,65 @@ impl Solver {
         cur_solution: Solution,
         direction: OptimizationDirection,
     ) -> Result<StopReason, Error> {
-        let mut best_cost = if direction == OptimizationDirection::Maximize {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        };
-        let mut best_solution = None;
-        debug!("{:?}", cur_solution.iter().collect::<Vec<_>>());
-        let mut dfs_stack =
-            if let Some(var) = choose_branch_var(&cur_solution, &self.orig_var_domains) {
+        // If we have persisted B&B state from a previous time-limited run, restore it.
+        let (mut dfs_stack, mut best_cost, mut best_solution) =
+            if let Some(state) = self.bb_state.take() {
                 debug!(
-                    "starting branch&bound, current obj. value: {:.2}",
-                    self.cur_obj_val
+                    "resuming branch&bound, dfs_stack size: {}, best_cost: {:.2}, has_best: {}",
+                    state.dfs_stack.len(),
+                    state.best_cost,
+                    state.has_best
                 );
-                new_steps(cur_solution, var, &self.orig_var_domains)
+                let best_solution = if state.has_best {
+                    // self was restored to the best solution's solver state before returning,
+                    // so cur_solution (built from self) represents the best solution.
+                    Some(cur_solution)
+                } else {
+                    None
+                };
+                (state.dfs_stack, state.best_cost, best_solution)
             } else {
-                debug!(
-                    "found optimal solution with initial relaxation! cost: {:.2}",
-                    self.cur_obj_val
-                );
-                return Ok(StopReason::Finished);
+                // Fresh start
+                let best_cost = if direction == OptimizationDirection::Maximize {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                };
+                let best_solution = None;
+                debug!("{:?}", cur_solution.iter().collect::<Vec<_>>());
+                let dfs_stack =
+                    if let Some(var) = choose_branch_var(&cur_solution, &self.orig_var_domains) {
+                        debug!(
+                            "starting branch&bound, current obj. value: {:.2}",
+                            self.cur_obj_val
+                        );
+                        new_steps(cur_solution, var, &self.orig_var_domains)
+                    } else {
+                        debug!(
+                            "found optimal solution with initial relaxation! cost: {:.2}",
+                            self.cur_obj_val
+                        );
+                        return Ok(StopReason::Finished);
+                    };
+                (dfs_stack, best_cost, best_solution)
             };
+
+        // Cache orig_var_domains locally so the B&B loop never depends on self's
+        // mutable state (self may be overwritten with the best solution's solver).
+        let orig_var_domains = self.orig_var_domains.clone();
 
         for iter in 0.. {
             if iter % 100 == 0 && check_deadline(&self.deadline) == StopReason::Limit {
+                let has_best = best_solution.is_some();
                 if let Some(solution) = best_solution {
                     let solution: Solution = solution;
                     *self = solution.solver;
                 }
+                self.bb_state = Some(BranchAndBoundState {
+                    dfs_stack,
+                    best_cost,
+                    has_best,
+                });
                 return Ok(StopReason::Limit);
             }
 
@@ -593,6 +636,14 @@ impl Solver {
                 None => break,
             };
             let mut cur_solution = cur_step.start_solution.clone();
+            // Propagate the current deadline to the cloned solver. The step's
+            // start_solution was captured earlier (possibly in a previous
+            // time-limited run) and its deadline may have expired. Without this,
+            // `add_constraint` / `fix_var` → `restore_feasibility()` would see
+            // the stale deadline, return `Ok(StopReason::Limit)` immediately
+            // without performing any dual-simplex pivots, and leave the solver
+            // in a primal-infeasible state with garbage variable values.
+            cur_solution.solver.deadline = self.deadline;
             let branch_direction = match cur_step.kind {
                 BranchKind::Floor => ComparisonOp::Le,
                 BranchKind::Ceil => ComparisonOp::Ge,
@@ -630,9 +681,9 @@ impl Solver {
                 continue;
             }
 
-            if let Some(var) = choose_branch_var(&cur_solution, &self.orig_var_domains) {
+            if let Some(var) = choose_branch_var(&cur_solution, &orig_var_domains) {
                 // Search deeper
-                let steps = new_steps(cur_solution, var, &self.orig_var_domains);
+                let steps = new_steps(cur_solution, var, &orig_var_domains);
                 dfs_stack.extend(steps);
             } else {
                 // Found integral solution

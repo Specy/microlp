@@ -65,7 +65,7 @@ mod tests_tsp {
         let cases = discover_tsp_cases();
 
         for (num, input_path, output_path) in &cases {
-            eprintln!("Running TSP test case {}: {}", num, input_path.display());
+            println!("Running TSP test case {}: {}", num, input_path.display());
 
             let input_file = fs::File::open(input_path)
                 .expect(&format!("failed to open {}", input_path.display()));
@@ -87,7 +87,7 @@ mod tests_tsp {
                 num, expected, actual
             );
 
-            eprintln!("TSP test case {} passed.", num);
+            println!("TSP test case {} passed.", num);
         }
     }
 }

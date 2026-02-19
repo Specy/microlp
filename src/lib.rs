@@ -478,17 +478,41 @@ impl Solution {
 
         self.solver.deadline = time_limit.map(|d| Instant::now() + d);
 
-        let mut stop_reason = self.solver.initial_solve()?;
+        let has_bb_state = self.solver.bb_state.is_some();
 
-        if stop_reason == StopReason::Finished && self.solver.has_integer_vars() {
+        let stop_reason = if has_bb_state {
+            // We are resuming a branch-and-bound search. The solver is already
+            // at the best integer solution found so far (or the LP relaxation if
+            // none was found yet). Skip initial_solve and go straight to B&B.
+            //
+            // Take bb_state out before cloning so we don't deep-clone the
+            // entire DFS stack (which contains Solution/Solver snapshots for
+            // every pending branch). solve_integer will .take() it from
+            // self.solver anyway.
+            let bb_state = self.solver.bb_state.take();
             let cur_solution = Solution {
                 num_vars: self.num_vars,
                 direction: self.direction,
                 solver: self.solver.clone(),
                 stop_reason: StopReason::Finished,
             };
-            stop_reason = self.solver.solve_integer(cur_solution, self.direction)?;
-        }
+            self.solver.bb_state = bb_state;
+            self.solver.solve_integer(cur_solution, self.direction)?
+        } else {
+            // No persisted B&B state — resume the LP solve first.
+            let mut sr = self.solver.initial_solve()?;
+
+            if sr == StopReason::Finished && self.solver.has_integer_vars() {
+                let cur_solution = Solution {
+                    num_vars: self.num_vars,
+                    direction: self.direction,
+                    solver: self.solver.clone(),
+                    stop_reason: StopReason::Finished,
+                };
+                sr = self.solver.solve_integer(cur_solution, self.direction)?;
+            }
+            sr
+        };
 
         self.stop_reason = stop_reason;
         Ok(self)
