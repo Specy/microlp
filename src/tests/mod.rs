@@ -7,3 +7,5 @@ mod general;
 mod tsp;
 
 mod resume;
+
+mod broken_tests;

@@ -50,7 +50,6 @@ assert_eq!(solution[y], 3.0);
 #[macro_use]
 extern crate log;
 
-mod broken_tests;
 mod helpers;
 mod lu;
 mod mps;
@@ -460,6 +459,9 @@ impl Solution {
         }
     }
 
+    /// WARNING: It is recommended to create a new solver with a longer time limit instead of resuming it,
+    /// as there might be subtle bugs in the stopping/resuming process that were not caught by tests.
+    /// 
     /// Resume solving after the solver stopped due to a time limit.
     ///
     /// If the solver previously stopped with [`StopReason::Limit`], this method continues

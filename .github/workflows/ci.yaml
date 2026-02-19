@@ -50,7 +50,6 @@ jobs:
         with:
           command: clippy
           args: -- --deny warnings
-
   test:
     strategy:
       matrix:
@@ -87,6 +86,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: test
+          args: -- --release
 
       - name: Test Rust with traces
         uses: actions-rs/cargo@v1
