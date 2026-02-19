@@ -533,10 +533,8 @@ impl Solver {
             return Ok(StopReason::Limit);
         }
 
-        if !self.is_primal_feasible {
-            if self.restore_feasibility()? == StopReason::Limit {
-                return Ok(StopReason::Limit);
-            }
+        if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
+            return Ok(StopReason::Limit);
         }
 
         if !self.is_dual_feasible {
@@ -581,14 +579,12 @@ impl Solver {
             };
 
         for iter in 0.. {
-            if iter % 100 == 0 {
-                if check_deadline(&self.deadline) == StopReason::Limit {
-                    if let Some(solution) = best_solution {
-                        let solution: Solution = solution;
-                        *self = solution.solver;
-                    }
-                    return Ok(StopReason::Limit);
+            if iter % 100 == 0 && check_deadline(&self.deadline) == StopReason::Limit {
+                if let Some(solution) = best_solution {
+                    let solution: Solution = solution;
+                    *self = solution.solver;
                 }
+                return Ok(StopReason::Limit);
             }
 
             //guaranteed to have at an element
