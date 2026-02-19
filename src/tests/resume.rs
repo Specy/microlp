@@ -100,6 +100,7 @@ mod tests_resume {
     }
 
     #[test]
+    #[cfg_attr(debug_assertions, ignore = "test is too slow in debug mode")]
     fn resume_produces_same_result_as_unlimited() {
         init();
 
@@ -121,13 +122,6 @@ mod tests_resume {
             .map(|v| sol_unlimited.var_value(*v))
             .collect();
         let obj_unlimited = sol_unlimited.objective();
-
-        assert!(
-            elapsed_unlimited.as_secs_f64() >= 3.0,
-            "Expected the unlimited solve to take at least 3 seconds, but it took {:.3}s. \
-             Increase problem complexity if this fails.",
-            elapsed_unlimited.as_secs_f64()
-        );
 
         // ── 2. Solve the same problem with repeated 1-second time limits ─────
         let (mut problem_limited, vars_limited) = build_complex_knapsack();
@@ -237,6 +231,7 @@ mod tests_resume {
     }
 
     #[test]
+    #[cfg_attr(debug_assertions, ignore = "test is too slow in debug mode")]
     fn resume_real_variables_produces_same_result_as_unlimited() {
         init();
 

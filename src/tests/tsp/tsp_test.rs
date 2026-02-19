@@ -1,7 +1,6 @@
-#[cfg(test)]
-
 //TODO add more tests
 // https://github.com/rhgrant10/tsplib95/tree/master/archives/problems
+#[cfg(test)]
 mod tests_tsp {
     use crate::problems_solvers::tsp::{solve_tsp, TspProblem};
     use std::fs;
@@ -59,6 +58,7 @@ mod tests_tsp {
     }
 
     #[test]
+    #[cfg_attr(debug_assertions, ignore = "test is too slow in debug mode")]
     fn solve_all_tsp_cases() {
         init();
 
