@@ -669,6 +669,29 @@ impl Solver {
                 continue;
             }
 
+            // The time limit may have been reached while (re)optimizing this
+            // branch (deadlines are also checked inside `restore_feasibility`,
+            // not just in the loop above). In that case the solver is
+            // left primal-infeasible with unreliable variable values, so we
+            // must not branch on it: doing so would push steps whose
+            // `start_solution` is primal-infeasible and later call
+            // `add_constraint` on them, tripping its
+            // `assert!(self.is_primal_feasible)`. Re-queue this step and stop,
+            // persisting B&B state so the search can be resumed.
+            if cur_solution.stop_reason == StopReason::Limit {
+                dfs_stack.push(cur_step);
+                let has_best = best_solution.is_some();
+                if let Some(solution) = best_solution {
+                    *self = solution.solver;
+                }
+                self.bb_state = Some(BranchAndBoundState {
+                    dfs_stack,
+                    best_cost,
+                    has_best,
+                });
+                return Ok(StopReason::Limit);
+            }
+
             let obj_val = cur_solution.objective();
             if !is_solution_better(direction, best_cost, obj_val) {
                 debug!(

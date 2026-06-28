@@ -99,6 +99,56 @@ mod tests_resume {
         (problem, vars)
     }
 
+    /// Regression test for https://github.com/Specy/microlp/issues/22
+    ///
+    /// Solving a MILP with a very tight time limit used to panic in
+    /// `add_constraint`. It must instead stop gracefully with
+    /// `StopReason::Limit`.
+    #[test]
+    fn time_limited_integer_variables_does_not_panic() {
+        init();
+
+        fn build_hard_knapsack() -> Problem {
+            let mut rng = SimpleRng::new(0x1234_5678_9ABC_DEF0);
+            let n = 60;
+            let mut problem = Problem::new(OptimizationDirection::Maximize);
+            let mut weight_terms = Vec::with_capacity(n);
+            let mut total_weight = 0.0;
+            for _ in 0..n {
+                let weight = rng.next_range(1, 97) as f64;
+                let value = rng.next_range(1, 89) as f64;
+                let x = problem.add_integer_var(value, (0, 1));
+                weight_terms.push((x, weight));
+                total_weight += weight;
+            }
+            problem.add_constraint(
+                weight_terms.as_slice(),
+                ComparisonOp::Le,
+                total_weight * 0.5,
+            );
+            problem
+        }
+
+        // Sanity check: the untimed solve finishes.
+        let problem = build_hard_knapsack();
+        let full = problem.solve().expect("untimed solve");
+        assert_eq!(*full.stop_reason(), StopReason::Finished);
+
+        // Run many times with a tight limit to reliably hit the deadline
+        // mid-branch-and-bound. Previously this panicked.
+        for _ in 0..50 {
+            let mut problem = build_hard_knapsack();
+            problem.set_time_limit(std::time::Duration::from_millis(1));
+            let solution = problem.solve().expect("timed solve must not error");
+            // Either it finished within the limit or it stopped at the limit;
+            // both are acceptable, neither should panic.
+            assert!(matches!(
+                solution.stop_reason(),
+                StopReason::Finished | StopReason::Limit
+            ));
+        }
+    }
+
     #[test]
     #[cfg_attr(debug_assertions, ignore = "test is too slow in debug mode")]
     fn resume_produces_same_result_as_unlimited() {
