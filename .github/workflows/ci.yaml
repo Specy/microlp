@@ -82,11 +82,28 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Test Rust
+      - name: Test Rust (unit tests)
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --release
+          args: --release --lib
+
+      - name: Doctests
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --release --doc
+
+      # Problem-based correctness suite. The default invocation runs the quick
+      # and standard tiers (~200 cases, a couple of minutes at most on CI) and
+      # deliberately excludes the `hard` tier: the long-running MILP benchmarks
+      # and the cases that pin known, still-open solver bugs. Run those locally
+      # with `cargo test --release --test suite -- --hard`.
+      - name: Correctness suite
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --release --test suite
 
       - name: Test Rust with traces
         uses: actions-rs/cargo@v1
@@ -94,6 +111,7 @@ jobs:
           RUST_LOG: "trace"
         with:
           command: test
+          args: --lib
 
   publish-crate:
     if: startsWith(github.ref, 'refs/tags/v')
