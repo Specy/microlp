@@ -56,6 +56,25 @@ assert_eq!(solution.var_value(y) as i32, 3);
 For a more involved example, see [examples/tsp](examples#tsp), a solver for the travelling
 salesman problem.
 
+## Testing
+
+Besides the unit tests, the repo ships a correctness suite of 200+ LP/MILP
+problems with independently known answers (netlib and MIPLIB 3 benchmarks,
+constructed classics, instances verified against exact DP/brute-force
+oracles, and incremental-API scenarios covering `add_constraint`, `fix_var`,
+Gomory cuts and `resume`):
+
+```bash
+cargo test --release --test suite                          # default run, ~10 s (CI runs this)
+cargo test --release --test suite -- --limit 25 --seed 42  # stable random subset
+cargo test --release --test suite -- --hard                # + long-running MILPs and known-failure cases
+```
+
+It reports per-case results and a pass percentage. The default run is always
+green; the `--hard` tier additionally contains cases that pin three known
+solver bugs (see [tests/suite/README.md](tests/suite/README.md)) and so fails
+until those are fixed.
+
 ## License
 
 This project is licensed under the [Apache License, Version 2.0](./LICENSE).
