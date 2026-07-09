@@ -18,10 +18,10 @@ jobs:
     runs-on: "ubuntu-latest"
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Cache Rust
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           key: ${{ runner.os }}-nightly-${{ hashFiles('Cargo.toml') }}
           path: |
@@ -32,24 +32,15 @@ jobs:
             target/
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          profile: minimal
-          toolchain: nightly
           components: rustfmt, clippy
-          override: true
 
       - name: Rustfmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --check
+        run: cargo fmt --check
 
       - name: Clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: -- --deny warnings
+        run: cargo clippy -- --deny warnings
   test:
     strategy:
       matrix:
@@ -62,12 +53,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Cache Rust
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
-          key: ${{ runner.os }}-${{ matrix.rust }}-${{ hashFiles('Cargo.toml') }}
+          key: ${{ runner.os }}-stable-${{ hashFiles('Cargo.toml') }}
           path: |
             ~/.cargo/bin/
             ~/.cargo/registry/index/
@@ -76,23 +67,13 @@ jobs:
             target/
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Test Rust (unit tests)
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --release --lib
+        run: cargo test --release --lib
 
       - name: Doctests
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --release --doc
+        run: cargo test --release --doc
 
       # Problem-based correctness suite. The default invocation runs the quick
       # and standard tiers (~200 cases, a couple of minutes at most on CI) and
@@ -100,18 +81,12 @@ jobs:
       # and the cases that pin known, still-open solver bugs. Run those locally
       # with `cargo test --release --test suite -- --hard`.
       - name: Correctness suite
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --release --test suite
+        run: cargo test --release --test suite
 
       - name: Test Rust with traces
-        uses: actions-rs/cargo@v1
+        run: cargo test --lib
         env:
           RUST_LOG: "trace"
-        with:
-          command: test
-          args: --lib
 
   publish-crate:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -121,14 +96,10 @@ jobs:
     runs-on: "ubuntu-latest"
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Publish
         run: cargo publish --token ${REGISTRY_TOKEN}
