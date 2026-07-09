@@ -422,6 +422,19 @@ impl<'a> KVPairs<'a> {
             });
         };
         let second_val = parse_f64(tokens.next()?, tokens.line_idx)?;
+
+        // The MPS format allows at most two key-value pairs per line.
+        // Tokens beyond the second pair indicate a malformed line.
+        if tokens.iter.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "line {}: expected at most two key-value pairs",
+                    tokens.line_idx,
+                ),
+            ));
+        }
+
         Ok(KVPairs {
             first: (first_key, first_val),
             second: Some((second_key, second_val)),
@@ -476,5 +489,30 @@ ENDATA
         assert_eq!(sol[file.variables["YTWO"]], -1.0);
         assert_eq!(sol[file.variables["ZTHREE"]], 6.0);
         assert_eq!(sol.objective(), 54.0);
+    }
+
+    /// A line with three key-value pairs must be rejected, not silently truncated.
+    #[test]
+    fn test_extra_kv_pairs_rejected() {
+        let input = "\
+NAME          TEST
+ROWS
+ N  COST
+ L  LIM1
+COLUMNS
+    XONE      COST                 1   LIM1                 1   EXTRA                1
+RHS
+    RHS1      LIM1                 5
+ENDATA
+";
+        let mut cursor = io::Cursor::new(input);
+        let err = MpsFile::parse(&mut cursor, OptimizationDirection::Minimize).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("expected at most two key-value pairs"),
+            "unexpected error message: {}",
+            err,
+        );
     }
 }
