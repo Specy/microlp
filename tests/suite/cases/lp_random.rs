@@ -136,7 +136,7 @@ fn build_random_lp(
 fn solve_obj(mut p: Problem, budget: std::time::Duration) -> Result<f64, String> {
     p.set_time_limit(budget);
     let sol = p.solve().map_err(|e| format!("solver error: {}", e))?;
-    if *sol.stop_reason() == microlp::StopReason::Limit {
+    if sol.status() != microlp::Status::Optimal {
         return Err("hit time limit".into());
     }
     Ok(sol.objective())

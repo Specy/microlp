@@ -112,8 +112,8 @@ mod tests_resume {
         let elapsed_unlimited = t0.elapsed();
 
         assert_eq!(
-            sol_unlimited.stop_reason(),
-            &StopReason::Finished,
+            sol_unlimited.status(),
+            Status::Optimal,
             "Unlimited solve should finish"
         );
 
@@ -131,15 +131,15 @@ mod tests_resume {
         let mut sol_limited = problem_limited.solve().unwrap();
 
         let mut resume_count = 0u32;
-        while *sol_limited.stop_reason() == StopReason::Limit {
+        while sol_limited.status() != Status::Optimal {
             resume_count += 1;
             sol_limited = sol_limited.resume(Some(Duration::from_secs(1))).unwrap();
         }
         let elapsed_limited = t1.elapsed();
 
         assert_eq!(
-            sol_limited.stop_reason(),
-            &StopReason::Finished,
+            sol_limited.status(),
+            Status::Optimal,
             "Resumed solve should eventually finish"
         );
 
@@ -243,8 +243,8 @@ mod tests_resume {
         let elapsed_unlimited = t0.elapsed();
 
         assert_eq!(
-            sol_unlimited.stop_reason(),
-            &StopReason::Finished,
+            sol_unlimited.status(),
+            Status::Optimal,
             "Unlimited solve should finish"
         );
 
@@ -268,7 +268,7 @@ mod tests_resume {
         let mut sol_limited = problem_limited.solve().unwrap();
 
         let mut resume_count = 0u32;
-        while *sol_limited.stop_reason() == StopReason::Limit {
+        while sol_limited.status() != Status::Optimal {
             resume_count += 1;
             sol_limited = sol_limited
                 .resume(Some(Duration::from_millis(100)))
@@ -277,8 +277,8 @@ mod tests_resume {
         let elapsed_limited = t1.elapsed();
 
         assert_eq!(
-            sol_limited.stop_reason(),
-            &StopReason::Finished,
+            sol_limited.status(),
+            Status::Optimal,
             "Resumed LP solve should eventually finish"
         );
 

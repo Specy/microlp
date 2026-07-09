@@ -255,32 +255,95 @@ pub fn register(cases: &mut Vec<Case>) {
         (b, Expected::objective(3440.0))
     });
 
-    // KNOWN FAILURE (solver bug): interrupting branch & bound via a time
-    // limit must return StopReason::Limit with the best-so-far solution, but
-    // currently panics ("assertion failed: self.is_primal_feasible",
-    // solver.rs:787). Kept in the hard tier until fixed. Uses a knapsack big
-    // enough that 30 ms cannot finish it on any machine.
+    // A mid-search time limit must return a CLEAN status — never the old
+    // is_primal_feasible panic: Optimal if 30 ms happened to suffice, Feasible
+    // with a valid incumbent, or Interrupted with none — and resume(None) must
+    // then finish at the exact DP optimum. Knapsack sized so 30 ms rarely
+    // finishes it. Promoted to the standard tier now that the panic is fixed,
+    // so the default (CI) run guards the fix.
     cases.push(Case::custom(
         "milp/time-limit-interrupt",
-        Tier::Hard,
+        Tier::Standard,
         30,
         move |_budget| {
             let mut rng = crate::rng::Rng::new(0xDEAD);
             let n = 40;
-            let mut p = microlp::Problem::new(Maximize);
-            let mut terms = vec![];
+            // Preserve the original draw order (value then weight per item) so
+            // the instance is byte-identical to the pre-flip case.
+            let mut values = vec![];
+            let mut weights = vec![];
             for _ in 0..n {
-                let v = p.add_binary_var(rng.int(1, 1000) as f64);
-                terms.push((v, rng.int(1, 1000) as f64));
+                values.push(rng.int(1, 1000));
+                weights.push(rng.int(1, 1000));
             }
-            let cap: f64 = terms.iter().map(|(_, w)| w).sum::<f64>() * 0.5;
+            let cap = weights.iter().sum::<i64>() as f64 * 0.5;
+            let best = oracles::knapsack01(&values, &weights, cap.floor() as i64) as f64;
+
+            let mut p = microlp::Problem::new(Maximize);
+            let vars: Vec<_> = values.iter().map(|&v| p.add_binary_var(v as f64)).collect();
+            let terms: Vec<_> = vars
+                .iter()
+                .zip(&weights)
+                .map(|(&v, &w)| (v, w as f64))
+                .collect();
             p.add_constraint(&terms, Le, cap);
             p.set_time_limit(std::time::Duration::from_millis(30));
-            match p.solve() {
-                // Either outcome is acceptable; the bug is the panic, which
-                // the runner reports separately if it happens.
-                Ok(_) | Err(_) => Ok(()),
+
+            let sol = p
+                .solve()
+                .map_err(|e| format!("interrupted solve errored: {}", e))?;
+            match sol.status() {
+                microlp::Status::Optimal => {
+                    if (sol.objective() - best).abs() > 1e-6 {
+                        return Err(format!(
+                            "finished within 30 ms but objective {} != DP optimum {}",
+                            sol.objective(),
+                            best
+                        ));
+                    }
+                }
+                microlp::Status::Feasible => {
+                    // The incumbent must be a feasible 0/1 knapsack point and no
+                    // better than the true optimum.
+                    let mut weight = 0.0;
+                    for (i, &v) in vars.iter().enumerate() {
+                        let x = sol.var_value_raw(v);
+                        if (x - x.round()).abs() > 1e-6 {
+                            return Err(format!("incumbent x{} = {} not integral", i, x));
+                        }
+                        weight += x.round() * weights[i] as f64;
+                    }
+                    if weight > cap + 1e-6 {
+                        return Err(format!(
+                            "incumbent weight {} exceeds capacity {}",
+                            weight, cap
+                        ));
+                    }
+                    if sol.objective() > best + 1e-6 {
+                        return Err(format!(
+                            "incumbent objective {} exceeds DP optimum {}",
+                            sol.objective(),
+                            best
+                        ));
+                    }
+                }
+                microlp::Status::Interrupted => {
+                    // No incumbent yet; value accessors would panic. Resume below.
+                }
             }
+            // Resuming to completion must reach the proven optimum.
+            let sol = sol.resume(None).map_err(|e| format!("resume: {}", e))?;
+            if sol.status() != microlp::Status::Optimal {
+                return Err("resume(None) did not reach Optimal".into());
+            }
+            if (sol.objective() - best).abs() > 1e-6 {
+                return Err(format!(
+                    "resumed objective {} != DP optimum {}",
+                    sol.objective(),
+                    best
+                ));
+            }
+            Ok(())
         },
     ));
 
@@ -330,7 +393,7 @@ pub fn register(cases: &mut Vec<Case>) {
                         let sol = p
                             .solve()
                             .map_err(|e| format!("{}({},{}): {}", gate, a, bit, e))?;
-                        if *sol.stop_reason() == microlp::StopReason::Limit {
+                        if sol.status() != microlp::Status::Optimal {
                             return Err("hit time limit".into());
                         }
                         let got = sol.objective();

@@ -381,7 +381,7 @@ mod tests_general {
         // A zero duration guarantees the deadline is already passed before solving starts.
         problem.set_time_limit(Duration::ZERO);
         let result = problem.solve().unwrap();
-        assert_eq!(result.stop_reason(), &StopReason::Limit);
+        assert_eq!(result.status(), Status::Interrupted);
     }
 
     #[test]
@@ -421,7 +421,7 @@ mod tests_general {
 
         problem.set_time_limit(Duration::ZERO);
         let result = problem.solve().unwrap();
-        assert_eq!(result.stop_reason(), &StopReason::Limit);
+        assert_eq!(result.status(), Status::Interrupted);
     }
 
     #[test]

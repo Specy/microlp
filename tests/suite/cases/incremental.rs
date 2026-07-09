@@ -17,7 +17,7 @@ use crate::oracles;
 use crate::rng::Rng;
 use microlp::ComparisonOp::{Ge, Le};
 use microlp::OptimizationDirection::{Maximize, Minimize};
-use microlp::{MpsFile, OptimizationDirection, Problem, Solution, StopReason, Variable};
+use microlp::{MpsFile, OptimizationDirection, Problem, Solution, Status, Variable};
 use std::io::BufReader;
 use std::time::Duration;
 
@@ -91,7 +91,7 @@ fn add_constraint_lp(cases: &mut Vec<Case>) {
                 inst.objective as f64,
             )?;
             for (j, &want) in inst.x_star.iter().enumerate() {
-                assert_close(&format!("x{}", j), *sol.var_value_raw(vars[j]), want as f64)?;
+                assert_close(&format!("x{}", j), sol.var_value_raw(vars[j]), want as f64)?;
             }
             Ok(())
         }));
@@ -215,7 +215,7 @@ fn fix_unfix_lp(cases: &mut Vec<Case>) {
             for (jj, &want) in inst.x_star.iter().enumerate() {
                 assert_close(
                     &format!("restored x{}", jj),
-                    *restored.var_value_raw(vars_handle[jj]),
+                    restored.var_value_raw(vars_handle[jj]),
                     want as f64,
                 )?;
             }
@@ -246,19 +246,19 @@ fn gomory(cases: &mut Vec<Case>) {
             p.set_time_limit(budget / 4);
             let sol = p.solve().map_err(|e| format!("base: {}", e))?;
             assert_close("relaxation objective", sol.objective(), -1.5)?;
-            assert_close("relaxation v2", *sol.var_value_raw(v2), 1.5)?;
+            assert_close("relaxation v2", sol.var_value_raw(v2), 1.5)?;
 
             let sol = sol
                 .add_gomory_cut(v2)
                 .map_err(|e| format!("first cut: {}", e))?;
             assert_close("after first cut", sol.objective(), -1.0)?;
-            assert_close("v2 integral", *sol.var_value_raw(v2), 1.0)?;
+            assert_close("v2 integral", sol.var_value_raw(v2), 1.0)?;
 
             let sol = sol
                 .add_gomory_cut(v1)
                 .map_err(|e| format!("second cut: {}", e))?;
             assert_close("after second cut", sol.objective(), -1.0)?;
-            assert_close("v1 integral", *sol.var_value_raw(v1), 1.0)?;
+            assert_close("v1 integral", sol.var_value_raw(v1), 1.0)?;
             Ok(())
         },
     ));
@@ -330,7 +330,7 @@ fn gomory(cases: &mut Vec<Case>) {
                 // its bounds; add_gomory_cut panics on non-basic variables).
                 let mut cut_var = None;
                 for (j, &v) in vars.iter().enumerate() {
-                    let val = *sol.var_value_raw(v);
+                    let val = sol.var_value_raw(v);
                     let fractional = (val - val.round()).abs() > 1e-6;
                     let interior =
                         val > bounds[j].0 as f64 + 1e-7 && val < bounds[j].1 as f64 - 1e-7;
@@ -381,11 +381,11 @@ fn resume(cases: &mut Vec<Case>) {
             }
             p.set_time_limit(Duration::ZERO);
             let sol = p.solve().map_err(|e| format!("limited solve: {}", e))?;
-            if *sol.stop_reason() != StopReason::Limit {
-                return Err("zero time limit did not produce StopReason::Limit".into());
+            if sol.status() == Status::Optimal {
+                return Err("zero time limit did not interrupt the solve".into());
             }
             let sol = sol.resume(None).map_err(|e| format!("resume: {}", e))?;
-            if *sol.stop_reason() != StopReason::Finished {
+            if sol.status() != Status::Optimal {
                 return Err("resume(None) did not finish".into());
             }
             assert_close("resumed objective", sol.objective(), inst.objective as f64)
@@ -414,11 +414,11 @@ fn resume(cases: &mut Vec<Case>) {
             p.add_constraint(&terms, Le, capacity as f64);
             p.set_time_limit(Duration::ZERO);
             let sol = p.solve().map_err(|e| format!("limited solve: {}", e))?;
-            if *sol.stop_reason() != StopReason::Limit {
-                return Err("zero time limit did not produce StopReason::Limit".into());
+            if sol.status() == Status::Optimal {
+                return Err("zero time limit did not interrupt the solve".into());
             }
             let sol = sol.resume(None).map_err(|e| format!("resume: {}", e))?;
-            if *sol.stop_reason() != StopReason::Finished {
+            if sol.status() != Status::Optimal {
                 return Err("resume(None) did not finish".into());
             }
             assert_close("resumed knapsack vs DP", sol.objective(), best)
@@ -445,7 +445,7 @@ fn resume(cases: &mut Vec<Case>) {
             problem.set_time_limit(Duration::from_millis(1));
             let mut sol = problem.solve().map_err(|e| format!("solve: {}", e))?;
             let mut slices = 0;
-            while *sol.stop_reason() == StopReason::Limit {
+            while sol.status() != Status::Optimal {
                 slices += 1;
                 if slices > 1000 {
                     return Err(
@@ -461,6 +461,42 @@ fn resume(cases: &mut Vec<Case>) {
                 sol.objective(),
                 -8.9664482186e5,
             )
+        },
+    ));
+
+    // A genuine mid-search B&B interrupt (not Duration::ZERO): stein27 (~0.5 s
+    // to solve) reliably overruns a 50 ms first slice, returning a clean
+    // Feasible/Interrupted status instead of the old is_primal_feasible panic
+    // (the C1 known failure). Resuming in 100 ms slices must then reach the
+    // proven optimum 18. Standard tier so the default (CI) run guards
+    // resume-after-MILP-interrupt. If a very fast machine finishes inside the
+    // first slice the status is already Optimal and the objective check still
+    // holds.
+    cases.push(Case::custom(
+        "incr/resume-midway-milp",
+        Tier::Standard,
+        120,
+        |_budget| {
+            let parsed = crate::mps_milp::parse(
+                &std::fs::read_to_string(data_path("miplib3", "stein27.mps"))
+                    .map_err(|e| format!("read stein27: {}", e))?,
+                OptimizationDirection::Minimize,
+                false,
+            )?;
+            let mut problem = parsed.problem;
+            problem.set_time_limit(Duration::from_millis(50));
+            let mut sol = problem.solve().map_err(|e| format!("solve: {}", e))?;
+            let mut slices = 0;
+            while sol.status() != Status::Optimal {
+                slices += 1;
+                if slices > 600 {
+                    return Err("MILP resume made no progress after 600 slices".into());
+                }
+                sol = sol
+                    .resume(Some(Duration::from_millis(100)))
+                    .map_err(|e| format!("resume slice {}: {}", slices, e))?;
+            }
+            assert_close("stein27 via interrupted+resumed B&B", sol.objective(), 18.0)
         },
     ));
 }
@@ -526,9 +562,9 @@ fn milp_known_failures(cases: &mut Vec<Case>) {
                 .map_err(|e| format!("fix_var(y, 1) on MILP solution: {}", e))?;
             // The documented contract implies an integer-feasible re-solve.
             let vals = [
-                *sol.var_value_raw(x),
-                *sol.var_value_raw(y),
-                *sol.var_value_raw(z),
+                sol.var_value_raw(x),
+                sol.var_value_raw(y),
+                sol.var_value_raw(z),
             ];
             for (name, v) in ["x", "y", "z"].iter().zip(vals) {
                 if (v - v.round()).abs() > 1e-5 {
@@ -712,43 +748,11 @@ fn milp_known_failures(cases: &mut Vec<Case>) {
                 .add_constraint(&[(y, 1.0)], Le, 5.0)
                 .map_err(|e| format!("adding y <= 5: {}", e))?;
             assert_close("objective with y <= 5", sol.objective(), 395.0)?;
-            let zv = *sol.var_value_raw(z);
+            let zv = sol.var_value_raw(z);
             if (zv - zv.round()).abs() > 1e-5 {
                 return Err(format!("z = {} is fractional after the edit", zv));
             }
             Ok(())
-        },
-    ));
-
-    // KNOWN FAILURE (time-limit-interrupt bug): interrupting B&B mid-search
-    // currently panics, so resuming from a genuine mid-search Limit cannot be
-    // exercised yet. numbers chosen so stein27 (~0.9 s to solve) reliably
-    // overruns a 50 ms first slice.
-    cases.push(Case::custom(
-        "incr/resume-midway-milp",
-        Tier::Hard,
-        120,
-        |_budget| {
-            let parsed = crate::mps_milp::parse(
-                &std::fs::read_to_string(data_path("miplib3", "stein27.mps"))
-                    .map_err(|e| format!("read stein27: {}", e))?,
-                OptimizationDirection::Minimize,
-                false,
-            )?;
-            let mut problem = parsed.problem;
-            problem.set_time_limit(Duration::from_millis(50));
-            let mut sol = problem.solve().map_err(|e| format!("solve: {}", e))?;
-            let mut slices = 0;
-            while *sol.stop_reason() == StopReason::Limit {
-                slices += 1;
-                if slices > 600 {
-                    return Err("MILP resume made no progress after 600 slices".into());
-                }
-                sol = sol
-                    .resume(Some(Duration::from_millis(100)))
-                    .map_err(|e| format!("resume slice {}: {}", slices, e))?;
-            }
-            assert_close("stein27 via interrupted+resumed B&B", sol.objective(), 18.0)
         },
     ));
 }
