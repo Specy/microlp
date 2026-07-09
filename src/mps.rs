@@ -145,6 +145,27 @@ impl MpsFile {
                 let mut tokens = Tokens::new(&lines);
                 let name = tokens.next()?;
 
+                // Integer variables are declared via INTORG/INTEND markers in the
+                // COLUMNS section. The free MPS format uses MARKER 'INTORG'/'INTEND'.
+                // Neither form is supported by MpsFile::parse.
+                if name == "INTORG" || name == "INTEND" {
+                    return Err(lines.err(
+                        "integer markers (INTORG/INTEND) are not supported by MpsFile::parse",
+                    ));
+                }
+                if name == "MARKER" {
+                    let second = lines.cur.split_whitespace().nth(1).unwrap_or("");
+                    if second == "INTORG"
+                        || second == "INTEND"
+                        || second == "'INTORG'"
+                        || second == "'INTEND'"
+                    {
+                        return Err(lines.err(
+                            "integer markers (INTORG/INTEND) are not supported by MpsFile::parse",
+                        ));
+                    }
+                }
+
                 if name != cur_name {
                     if var_name2idx.contains_key(name) {
                         return Err(lines.err(&format!("variable {} already declared", name)));
@@ -476,5 +497,58 @@ ENDATA
         assert_eq!(sol[file.variables["YTWO"]], -1.0);
         assert_eq!(sol[file.variables["ZTHREE"]], 6.0);
         assert_eq!(sol.objective(), 54.0);
+    }
+
+    /// Integer markers (INTORG/INTEND) are not supported and must produce a
+    /// clear error, not a confusing parse failure.
+    #[test]
+    fn test_integer_marker_rejected() {
+        // Traditional MPS format with bare INTORG/INTEND markers.
+        let input = "\
+NAME          TEST
+ROWS
+ N  COST
+ L  LIM1
+COLUMNS
+    INTORG    
+    XONE      COST                 1   LIM1                 1
+    INTEND    
+RHS
+    RHS1      LIM1                 5
+ENDATA
+";
+        let err = MpsFile::parse(&mut io::Cursor::new(input), OptimizationDirection::Minimize)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("integer markers"),
+            "unexpected error: {}",
+            err,
+        );
+
+        // Free MPS format with MARKER 'INTORG' / 'INTEND'.
+        let input2 = "\
+NAME          TEST
+ROWS
+ N  COST
+ L  LIM1
+COLUMNS
+    MARKER    'INTORG'
+    XONE      COST                 1   LIM1                 1
+    MARKER    'INTEND'
+RHS
+    RHS1      LIM1                 5
+ENDATA
+";
+        let err = MpsFile::parse(
+            &mut io::Cursor::new(input2),
+            OptimizationDirection::Minimize,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("integer markers"),
+            "unexpected error: {}",
+            err,
+        );
     }
 }
