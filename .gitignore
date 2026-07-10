@@ -3,3 +3,7 @@
 /.vscode
 **/*.rs.bk
 Cargo.lock
+
+# Local-only working documents (design sessions, agent task ledgers)
+/docs/superpowers/
+/.superpowers/

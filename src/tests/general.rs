@@ -102,7 +102,7 @@ mod tests_general {
             assert_eq!(sol[v2], 3.0);
             assert_eq!(sol.objective(), 6.5);
 
-            sol = sol.unfix_var(v1).0;
+            sol = sol.unfix_var(v1).unwrap().0;
             assert_eq!(sol[v1], 1.0);
             assert_eq!(sol[v2], 3.0);
             assert_eq!(sol.objective(), 7.0);
@@ -114,7 +114,7 @@ mod tests_general {
             assert_eq!(sol[v2], 2.5);
             assert_eq!(sol.objective(), 6.5);
 
-            sol = sol.unfix_var(v2).0;
+            sol = sol.unfix_var(v2).unwrap().0;
             assert_eq!(sol[v1], 1.0);
             assert_eq!(sol[v2], 3.0);
             assert_eq!(sol.objective(), 7.0);

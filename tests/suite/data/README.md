@@ -1,5 +1,24 @@
 # Vendored benchmark data — provenance, attribution, licensing
 
+## Layout: tier folders
+
+Instances live under `data/<tier>/<source>/` where `<tier>` is one of `easy`,
+`medium`, `hard`, `xhard`. **The folder is the tier**: file-based suite cases
+derive their tier from the folder their instance is found in (see
+`cases::locate`), so moving a file between tier folders re-tiers its cases
+with no code change. Tier flags on the runner are cumulative upper limits
+(`--hard` runs easy + medium + hard; `--xhard` runs everything).
+
+The MIPLIB instances are one file with two cases: the integer solve's tier
+follows the folder, while the LP-relaxation case always runs in the medium
+tier (every relaxation is fast and doubles as a parser check).
+
+Large instances (multi-megabyte MILPBench `.lp` files) are stored gzipped as
+`<file>.lp.gz`; case tables always use the logical `.lp` name, `cases::locate`
+resolves whichever storage form exists, and `cases::read_instance`
+decompresses in memory at run time. Gzipping (or un-gzipping) a file is a
+pure data-directory change, like moving it between tiers.
+
 ## Licensing summary
 
 Neither the netlib LP collection nor MIPLIB 3 ships a formal (SPDX-style)
@@ -21,7 +40,7 @@ stricter requirements, delete this directory — the affected `netlib/*` and
 `miplib/*` suite cases will fail with a clear "cannot read" message while all
 constructed and oracle-verified cases keep working.
 
-## netlib/ — LP benchmark instances (plain MPS)
+## {medium,hard}/netlib/ — LP benchmark instances (plain MPS)
 
 Source: the classic netlib LP collection (https://netlib.org/lp/data/),
 vendored from the uncompressed mirrors in COIN-OR's Data-Netlib repository
@@ -56,7 +75,7 @@ whitespace-tokenized readers — including microlp's `MpsFile` — cannot
 disambiguate that, so the vendored copy adds the explicit (semantically
 irrelevant) vector name `RHS` to those four lines. No numeric content changed.
 
-## miplib3/ — MILP benchmark instances (plain MPS with INTORG/INTEND markers)
+## {medium,hard}/miplib3/ — MILP benchmark instances (plain MPS with INTORG/INTEND markers)
 
 Source: MIPLIB 3.0, vendored from COIN-OR's Data-miplib3 repository
 (https://github.com/coin-or-tools/Data-miplib3). Reference: R. E. Bixby,
@@ -86,11 +105,12 @@ donator are from the same catalog's ORIGINS index:
 | bell3a   | 878430.32    | 862578.64     | W. Cook |
 
 Note: microlp's own `MpsFile` parser has no integer-marker support, so the
-suite uses its own minimal reader (`tests/suite/mps_milp.rs`) for these files.
-Integer columns that receive no BOUNDS entry default to bounds [0, 1] (the
-MPSX-era convention MIPLIB 3 files were written for); every instance's parse
-is validated by checking the LP relaxation objective against the published
-value above.
+suite reads these files independently via the external `mps` crate plus the
+semantics adapter in `tests/suite/mps_milp.rs` (which also recovers the
+INTORG/INTEND integer markers the crate drops). Integer columns that receive
+no BOUNDS entry default to bounds [0, 1] (the MPSX-era convention MIPLIB 3
+files were written for); every instance's parse is validated by checking the
+LP relaxation objective against the published value above.
 
 ## Constructed cases (no external data)
 

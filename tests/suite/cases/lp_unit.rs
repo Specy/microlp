@@ -10,8 +10,12 @@ use microlp::OptimizationDirection::{Maximize, Minimize};
 const INF: f64 = f64::INFINITY;
 const NEG_INF: f64 = f64::NEG_INFINITY;
 
-fn case(cases: &mut Vec<Case>, name: &str, build: impl Fn() -> (Builder, Expected) + 'static) {
-    cases.push(Case::solve(name, Tier::Quick, 10, move || {
+fn case(
+    cases: &mut Vec<Case>,
+    name: &str,
+    build: impl Fn() -> (Builder, Expected) + Send + Sync + 'static,
+) {
+    cases.push(Case::solve(name, Tier::Easy, 10, move || {
         let (b, expected) = build();
         Ok((b.spec, b.problem, expected))
     }));
@@ -184,7 +188,7 @@ pub fn register(cases: &mut Vec<Case>) {
     // Unique optimum: x_n = 5^n, all other x_j = 0; objective 5^n.
     for n in 3usize..=8 {
         let name = format!("lp/klee-minty-{}", n);
-        cases.push(Case::solve(name, Tier::Quick, 10, move || {
+        cases.push(Case::solve(name, Tier::Easy, 10, move || {
             let mut b = Builder::new(Maximize);
             let vars: Vec<_> = (0..n)
                 .map(|j| b.real(2f64.powi((n - 1 - j) as i32), 0.0, INF))

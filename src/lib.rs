@@ -10,6 +10,8 @@ subject to linear equality and inequality constraints.
 * Pure Rust implementation.
 * Able to solve problems with hundreds of thousands of variables and constraints.
 * Incremental: add constraints to an existing solution without solving it from scratch.
+* Interruptible: time/node limits with clean resume, warm starts from known solutions,
+  and MIP gap reporting for integer problems.
 * Problems can be defined via an API or parsed from an
   [MPS](https://en.wikipedia.org/wiki/MPS_(format)) file.
 
@@ -364,7 +366,7 @@ impl Problem {
     }
 }
 
-pub use mip::{SolveOptions, Stats, Status};
+pub use mip::{SolveOptions, Stats, Status, Tolerances};
 
 /// Internal signal for "a limit fired mid-simplex" (public API uses [`Status`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,41 +454,49 @@ enum SolutionKind {
 
 impl std::fmt::Debug for Solution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut d = f.debug_struct("Solution");
-        d.field("direction", &self.direction)
+        f.debug_struct("Solution")
+            .field("direction", &self.direction)
             .field("num_vars", &self.num_vars)
-            .field("status", &self.status);
-        if self.status != Status::Interrupted {
-            d.field("objective", &self.objective());
-        }
-        d.finish()
+            .field("status", &self.status)
+            .field("objective", &self.objective())
+            .finish()
     }
 }
 
 impl Solution {
     /// The outcome of the solve: proven optimal, feasible-but-unproven, or interrupted.
+    ///
+    /// This is the field that decides whether the value accessors mean
+    /// anything — see [`Solution::objective`].
     pub fn status(&self) -> Status {
         self.status
     }
 
-    fn assert_has_values(&self) {
-        assert!(
-            self.status != Status::Interrupted,
-            "the solver was interrupted before finding a usable solution; \
-             call resume() to continue the search"
-        );
-    }
-
-    /// Objective value of the best known solution.
+    /// Objective value of the best solution known to this `Solution`, in the
+    /// problem's original optimization direction.
     ///
-    /// # Panics
+    /// **What this number means depends on [`status()`](Self::status), and
+    /// checking it is the caller's responsibility:**
     ///
-    /// Panics if `status()` is [`Status::Interrupted`].
+    /// * [`Status::Optimal`] — the proven optimum.
+    /// * [`Status::Feasible`] — the best incumbent found so far; a valid
+    ///   feasible value, but not proven optimal ([`Solution::gap`] says how
+    ///   far the proof got).
+    /// * [`Status::Interrupted`] — no usable solution exists yet. Reading is
+    ///   still allowed and returns the search's *current working value* (the
+    ///   objective of the simplex point the solver was at when the limit
+    ///   fired). Useful for inspection and progress reporting, but it is not
+    ///   the answer to your problem — it may correspond to an infeasible or
+    ///   fractional point. [`Solution::resume`] the search to make progress.
     pub fn objective(&self) -> f64 {
-        self.assert_has_values();
         let internal = match &self.kind {
             SolutionKind::Lp(solver) => solver.cur_obj_val,
-            SolutionKind::Mip(state) => state.incumbent.as_ref().unwrap().objective,
+            SolutionKind::Mip(state) => match &state.incumbent {
+                Some(incumbent) => incumbent.objective,
+                // No incumbent yet (interrupted early): the freshest number
+                // the search has is the current node LP's objective.
+                None => state.solver.cur_obj_val,
+            },
         };
         match self.direction {
             OptimizationDirection::Minimize => internal,
@@ -494,36 +504,71 @@ impl Solution {
         }
     }
 
-    /// Raw value of the variable (no integer rounding).
+    /// The variable's value, as recorded by the solve.
+    ///
+    /// For an LP solution this is the live value read straight from the
+    /// simplex basis. For a MILP solution this is the value stored in the
+    /// accepted incumbent, where integer/boolean variables are already
+    /// rounded to an exact integer — despite the "raw" name, this is not an
+    /// unrounded branch & bound leaf value.
+    ///
+    /// On [`Status::Interrupted`] there is no incumbent yet, and this returns
+    /// the search's *current working point* instead (the value in the node LP
+    /// the solver was at when the limit fired) — possibly fractional for
+    /// integer variables and possibly infeasible. Only [`Status::Optimal`] /
+    /// [`Status::Feasible`] values answer the problem; checking
+    /// [`status()`](Self::status) is the caller's responsibility (see
+    /// [`Solution::objective`]).
     ///
     /// # Panics
     ///
-    /// Panics if `status()` is [`Status::Interrupted`].
+    /// Panics if `var` is out of range for this problem.
     pub fn var_value_raw(&self, var: Variable) -> f64 {
         assert!(var.0 < self.num_vars);
-        self.assert_has_values();
         match &self.kind {
             SolutionKind::Lp(solver) => *solver.get_value(var.0),
-            SolutionKind::Mip(state) => state.incumbent.as_ref().unwrap().values[var.0],
+            SolutionKind::Mip(state) => match &state.incumbent {
+                Some(incumbent) => incumbent.values[var.0],
+                None => *state.solver.get_value(var.0),
+            },
         }
     }
 
     /// Value of the variable, rounded to an exact integer for integer/boolean vars.
     ///
+    /// On [`Status::Interrupted`] there is no incumbent yet, and this returns
+    /// the search's current working value *unrounded* — a mid-search point may
+    /// legitimately be fractional for integer variables, and rounding it here
+    /// would fabricate an answer. Checking [`status()`](Self::status) before
+    /// treating values as the solution is the caller's responsibility (see
+    /// [`Solution::objective`]).
+    ///
     /// # Panics
     ///
-    /// Panics if `status()` is [`Status::Interrupted`], or if an integer variable's
-    /// value is further than 1e-5 from an integer (indicates a solver bug).
+    /// Panics if `var` is out of range, or if an *accepted* solution's integer
+    /// variable is further than [`Tolerances::integrality_rounding`]'s
+    /// *default* (`1e-5`) from an integer (indicates a solver bug). This
+    /// sanity check intentionally always uses the default, never the
+    /// `tolerances.integrality_rounding` configured for the solve that
+    /// produced this solution: it exists to catch a solver bug — an accepted
+    /// incumbent must already be integral-clean — not to reflect a caller's
+    /// own (possibly loosened) preference.
     pub fn var_value(&self, var: Variable) -> f64 {
         let val = self.var_value_raw(var);
+        if self.status == Status::Interrupted {
+            // Mid-search working point: fractional integer values are
+            // legitimate here, so no rounding and no integrality check.
+            return val;
+        }
         let domain = match &self.kind {
             SolutionKind::Lp(solver) => &solver.orig_var_domains[var.0],
             SolutionKind::Mip(state) => &state.solver.orig_var_domains[var.0],
         };
         if *domain == VarDomain::Integer || *domain == VarDomain::Boolean {
             let rounded = val.round();
+            let tol = Tolerances::default().integrality_rounding;
             assert!(
-                f64::abs(rounded - val) < 1e-5,
+                f64::abs(rounded - val) < tol,
                 "Variable was expected to be an integer, got {}",
                 val
             );
@@ -555,9 +600,9 @@ impl Solution {
 
     /// Iterate over variable/value pairs (raw values, like [`Solution::var_value_raw`]).
     ///
-    /// # Panics
-    ///
-    /// Panics if `status()` is [`Status::Interrupted`].
+    /// On [`Status::Interrupted`] the yielded values are the search's current
+    /// working point, not a usable solution — see [`Solution::objective`] for
+    /// the status contract.
     pub fn iter(&self) -> SolutionIter<'_> {
         SolutionIter {
             solution: self,
@@ -594,41 +639,70 @@ impl Solution {
     /// Add a constraint to the solved problem and re-solve.
     ///
     /// LP solutions re-solve incrementally from the live basis (dual simplex).
-    /// MILP solutions are re-solved on the ORIGINAL problem plus the edit
-    /// (implemented in phase 3; until then this returns an internal error).
+    /// MILP solutions are re-solved on the original problem plus all edits; the
+    /// previous incumbent is kept as a warm start when it remains feasible.
+    /// Editing a paused (`Feasible`/`Interrupted`) MILP solution is allowed — the
+    /// open search tree is discarded and the search restarts from the edited
+    /// problem.
+    ///
+    /// The MILP re-solve runs with a fresh budget taken from the original
+    /// [`SolveOptions`] (each edit gets the full `time_limit`/`node_limit` again),
+    /// whereas the LP re-solve inherits the original absolute deadline; the two may
+    /// be aligned in a later release.
     ///
     /// # Errors
     ///
     /// [`Error::Infeasible`] if the edit makes the problem infeasible.
     pub fn add_constraint(
-        mut self,
+        self,
         expr: impl Into<LinearExpr>,
         cmp_op: ComparisonOp,
         rhs: f64,
     ) -> Result<Self, Error> {
-        match &mut self.kind {
-            SolutionKind::Lp(solver) => {
-                if self.status == Status::Interrupted {
+        let Solution {
+            direction,
+            num_vars,
+            status,
+            kind,
+        } = self;
+        match kind {
+            SolutionKind::Lp(mut solver) => {
+                if status == Status::Interrupted {
                     return Err(Error::InternalError(
                         "cannot edit an interrupted solution; resume() it first".to_string(),
                     ));
                 }
                 let expr = expr.into();
                 let sr = solver.add_constraint(
-                    CsVec::new_from_unsorted(self.num_vars, expr.vars, expr.coeffs)
+                    CsVec::new_from_unsorted(num_vars, expr.vars, expr.coeffs)
                         .map_err(|v| Error::InternalError(v.2.to_string()))?,
                     cmp_op,
                     rhs,
                 )?;
-                self.status = match sr {
-                    StopReason::Finished => Status::Optimal,
-                    StopReason::Limit => Status::Interrupted,
-                };
-                Ok(self)
+                Ok(Solution {
+                    direction,
+                    num_vars,
+                    status: match sr {
+                        StopReason::Finished => Status::Optimal,
+                        StopReason::Limit => Status::Interrupted,
+                    },
+                    kind: SolutionKind::Lp(solver),
+                })
             }
-            SolutionKind::Mip(_) => Err(Error::InternalError(
-                "editing MILP solutions is implemented in phase 3 of the refactor".to_string(),
-            )),
+            SolutionKind::Mip(mut state) => {
+                // Edit-after-pause is allowed by design: any status is editable here.
+                let expr = expr.into();
+                let coeffs = CsVec::new_from_unsorted(num_vars, expr.vars, expr.coeffs)
+                    .map_err(|v| Error::InternalError(v.2.to_string()))?;
+                state.base.constraints.push((coeffs, cmp_op, rhs));
+                let run = mip::reedit_and_resolve(state)?;
+                Ok(Solution {
+                    direction,
+                    num_vars,
+                    status: mip::status_of(run.outcome, &run.state),
+                    kind: SolutionKind::Mip(Box::new(run.state)),
+                })
+            }
         }
     }
 
@@ -638,39 +712,110 @@ impl Solution {
     /// # Errors
     ///
     /// [`Error::Infeasible`] if the fix makes the problem infeasible.
-    pub fn fix_var(mut self, var: Variable, val: f64) -> Result<Self, Error> {
-        assert!(var.0 < self.num_vars);
-        match &mut self.kind {
-            SolutionKind::Lp(solver) => {
-                if self.status == Status::Interrupted {
+    pub fn fix_var(self, var: Variable, val: f64) -> Result<Self, Error> {
+        let Solution {
+            direction,
+            num_vars,
+            status,
+            kind,
+        } = self;
+        assert!(var.0 < num_vars);
+        match kind {
+            SolutionKind::Lp(mut solver) => {
+                if status == Status::Interrupted {
                     return Err(Error::InternalError(
                         "cannot edit an interrupted solution; resume() it first".to_string(),
                     ));
                 }
                 let sr = solver.fix_var(var.0, val)?;
-                self.status = match sr {
-                    StopReason::Finished => Status::Optimal,
-                    StopReason::Limit => Status::Interrupted,
-                };
-                Ok(self)
+                Ok(Solution {
+                    direction,
+                    num_vars,
+                    status: match sr {
+                        StopReason::Finished => Status::Optimal,
+                        StopReason::Limit => Status::Interrupted,
+                    },
+                    kind: SolutionKind::Lp(solver),
+                })
             }
-            SolutionKind::Mip(_) => Err(Error::InternalError(
-                "editing MILP solutions is implemented in phase 3 of the refactor".to_string(),
-            )),
+            SolutionKind::Mip(mut state) => {
+                if val < state.base.var_mins[var.0] || val > state.base.var_maxs[var.0] {
+                    return Err(Error::Infeasible);
+                }
+                state.fixed.insert(var.0, val);
+                let run = mip::reedit_and_resolve(state)?;
+                Ok(Solution {
+                    direction,
+                    num_vars,
+                    status: mip::status_of(run.outcome, &run.state),
+                    kind: SolutionKind::Mip(Box::new(run.state)),
+                })
+            }
         }
     }
 
     /// Undo a previous [`Solution::fix_var`]. The boolean reports whether the
     /// variable was actually fixed.
-    pub fn unfix_var(mut self, var: Variable) -> (Self, bool) {
-        assert!(var.0 < self.num_vars);
-        match &mut self.kind {
-            SolutionKind::Lp(solver) => {
+    ///
+    /// MILP solutions re-solve on the original problem plus the remaining edits
+    /// (see [`Solution::add_constraint`]); the previous incumbent is kept as a
+    /// warm start when it survives.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Infeasible`] if the problem without this fix is infeasible — this
+    /// is possible when a prior edit was interrupted before proving infeasibility
+    /// and the unfix re-solve completes that proof. [`Error::InternalError`] on an
+    /// internal re-solve failure. The pure-LP path never errors.
+    pub fn unfix_var(self, var: Variable) -> Result<(Self, bool), Error> {
+        let Solution {
+            direction,
+            num_vars,
+            status,
+            kind,
+        } = self;
+        assert!(var.0 < num_vars);
+        match kind {
+            SolutionKind::Lp(mut solver) => {
                 let res = solver.unfix_var(var.0);
-                (self, res)
+                Ok((
+                    Solution {
+                        direction,
+                        num_vars,
+                        status,
+                        kind: SolutionKind::Lp(solver),
+                    },
+                    res,
+                ))
             }
-            // Interim until phase 3 (Task 12): report "was not fixed".
-            SolutionKind::Mip(_) => (self, false),
+            SolutionKind::Mip(mut state) => {
+                if state.fixed.remove(&var.0).is_none() {
+                    return Ok((
+                        Solution {
+                            direction,
+                            num_vars,
+                            status,
+                            kind: SolutionKind::Mip(state),
+                        },
+                        false,
+                    ));
+                }
+                // Relaxing a fix cannot make a proven-feasible problem infeasible,
+                // but base+fixes may still be infeasible if an earlier edit was
+                // interrupted before proving it (the unfix re-solve can complete
+                // that proof), and a node LP can fail internally. Propagate both
+                // rather than converting reachable errors into panics.
+                let run = mip::reedit_and_resolve(state)?;
+                Ok((
+                    Solution {
+                        direction,
+                        num_vars,
+                        status: mip::status_of(run.outcome, &run.state),
+                        kind: SolutionKind::Mip(Box::new(run.state)),
+                    },
+                    true,
+                ))
+            }
         }
     }
 
@@ -678,12 +823,22 @@ impl Solution {
     ///
     /// # Errors
     ///
-    /// [`Error::Infeasible`] if the cut makes the problem infeasible; an internal
-    /// error on MILP solutions (the cut reads the live simplex tableau).
+    /// [`Error::Infeasible`] if the cut makes the problem infeasible;
+    /// [`Error::InternalError`] if the solution is [`Status::Interrupted`]
+    /// (`resume()` it first) or if it is a MILP solution (the cut reads the live
+    /// simplex tableau).
     pub fn add_gomory_cut(mut self, var: Variable) -> Result<Self, Error> {
         assert!(var.0 < self.num_vars);
         match &mut self.kind {
             SolutionKind::Lp(solver) => {
+                // Same guard as add_constraint/fix_var: the cut reaches solver
+                // internals that assume a completed solve, so a half-solved
+                // (interrupted) LP must be resumed before it can be edited.
+                if self.status == Status::Interrupted {
+                    return Err(Error::InternalError(
+                        "cannot edit an interrupted solution; resume() it first".to_string(),
+                    ));
+                }
                 let sr = solver.add_gomory_cut(var.0)?;
                 self.status = match sr {
                     StopReason::Finished => Status::Optimal,
@@ -701,12 +856,22 @@ impl Solution {
 impl std::ops::Index<Variable> for Solution {
     type Output = f64;
 
+    /// Raw value access, like [`Solution::var_value_raw`]: on
+    /// [`Status::Interrupted`] this is the search's current working point,
+    /// not a usable solution (see [`Solution::objective`] for the status
+    /// contract).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `var` is out of range for this problem.
     fn index(&self, var: Variable) -> &Self::Output {
         assert!(var.0 < self.num_vars);
-        self.assert_has_values();
         match &self.kind {
             SolutionKind::Lp(solver) => solver.get_value(var.0),
-            SolutionKind::Mip(state) => &state.incumbent.as_ref().unwrap().values[var.0],
+            SolutionKind::Mip(state) => match &state.incumbent {
+                Some(incumbent) => &incumbent.values[var.0],
+                None => state.solver.get_value(var.0),
+            },
         }
     }
 }

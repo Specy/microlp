@@ -94,16 +94,20 @@ jobs:
           command: test
           args: --release --doc
 
-      # Problem-based correctness suite. The default invocation runs the quick
-      # and standard tiers (~200 cases, a couple of minutes at most on CI) and
-      # deliberately excludes the `hard` tier: the long-running MILP benchmarks
-      # and the cases that pin known, still-open solver bugs. Run those locally
-      # with `cargo test --release --test suite -- --hard`.
+      # Problem-based correctness suite. Tiers are cumulative (easy < medium
+      # < hard < xhard); --hard runs everything up to and including the hard
+      # tier (long-running MILP benchmarks), with every single instance capped
+      # at 5 minutes (--max-case-seconds 300, applied on top of each case's
+      # own budget). The interrupt-tolerant hard cases pass cleanly at any
+      # budget; nothing else needs anywhere near the cap. The xhard tier
+      # (MILPBench instances beyond the solver's ceiling, 10-minute budgets)
+      # stays manual: run it locally with
+      # `cargo test --release --test suite -- --xhard`.
       - name: Correctness suite
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --release --test suite
+          args: --release --test suite -- --hard --parallel 4 --max-case-seconds 300
 
       - name: Test Rust with traces
         uses: actions-rs/cargo@v1

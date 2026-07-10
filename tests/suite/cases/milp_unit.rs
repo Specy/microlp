@@ -10,8 +10,12 @@ use microlp::OptimizationDirection::{Maximize, Minimize};
 
 const INF: f64 = f64::INFINITY;
 
-fn case(cases: &mut Vec<Case>, name: &str, build: impl Fn() -> (Builder, Expected) + 'static) {
-    case_tier(cases, name, Tier::Quick, 15, build);
+fn case(
+    cases: &mut Vec<Case>,
+    name: &str,
+    build: impl Fn() -> (Builder, Expected) + Send + Sync + 'static,
+) {
+    case_tier(cases, name, Tier::Easy, 15, build);
 }
 
 fn case_tier(
@@ -19,7 +23,7 @@ fn case_tier(
     name: &str,
     tier: Tier,
     budget: u64,
-    build: impl Fn() -> (Builder, Expected) + 'static,
+    build: impl Fn() -> (Builder, Expected) + Send + Sync + 'static,
 ) {
     cases.push(Case::solve(name, tier, budget, move || {
         let (b, expected) = build();
@@ -263,7 +267,7 @@ pub fn register(cases: &mut Vec<Case>) {
     // so the default (CI) run guards the fix.
     cases.push(Case::custom(
         "milp/time-limit-interrupt",
-        Tier::Standard,
+        Tier::Medium,
         30,
         move |_budget| {
             let mut rng = crate::rng::Rng::new(0xDEAD);
@@ -351,7 +355,7 @@ pub fn register(cases: &mut Vec<Case>) {
     // linearizations; check all four input combinations in both directions.
     for (gate, idx) in [("and", 0usize), ("or", 1), ("xor", 2)] {
         let name = format!("milp/gate-{}", gate);
-        cases.push(Case::custom(name, Tier::Quick, 15, move |budget| {
+        cases.push(Case::custom(name, Tier::Easy, 15, move |budget| {
             for a in 0..=1i32 {
                 for bit in 0..=1i32 {
                     let want = match idx {
@@ -433,7 +437,7 @@ pub fn register(cases: &mut Vec<Case>) {
                 .join("_"),
             target
         );
-        cases.push(Case::solve(name, Tier::Quick, 15, move || {
+        cases.push(Case::solve(name, Tier::Easy, 15, move || {
             let mut b = Builder::new(Minimize);
             let counts: Vec<_> = denoms
                 .iter()
@@ -457,7 +461,7 @@ pub fn register(cases: &mut Vec<Case>) {
             "milp/magic-square-center-{}",
             if maximize { "max" } else { "min" }
         );
-        case_tier(cases, &name, Tier::Standard, 60, move || {
+        case_tier(cases, &name, Tier::Medium, 60, move || {
             let dir = if maximize { Maximize } else { Minimize };
             let mut bld = Builder::new(dir);
             // b[cell][digit] = 1 iff cell holds digit+1; center cell is 4.
@@ -505,7 +509,7 @@ pub fn register(cases: &mut Vec<Case>) {
     // is exactly n.
     for n in [5usize, 6] {
         let name = format!("milp/queens-{}", n);
-        case_tier(cases, &name, Tier::Standard, 60, move || {
+        case_tier(cases, &name, Tier::Medium, 60, move || {
             let mut bld = Builder::new(Maximize);
             let mut board = vec![vec![]; n];
             for row in board.iter_mut() {

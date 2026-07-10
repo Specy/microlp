@@ -3,9 +3,14 @@
 //! validates the suite's MPS reading, in particular the integer-bound
 //! conventions) and the integer solve checked against "INT SOLN".
 //! Values from the official miplib3.cat; see data/README.md.
+//!
+//! The `/int` case's tier is derived from the folder the `.mps` file lives in
+//! (`data/<tier>/miplib3/`); the `/lp` relaxation case always runs in the
+//! medium tier — every relaxation solves in milliseconds and doubles as a
+//! parser check, so it belongs in the default run even when the integer solve
+//! is hard.
 
-use super::netlib::data_path;
-use super::{Case, Tier};
+use super::{locate, read_instance, Case, Tier};
 use crate::model::{Expected, Tol};
 use crate::mps_milp;
 use microlp::{OptimizationDirection, Status};
@@ -13,8 +18,7 @@ use microlp::{OptimizationDirection, Status};
 /// Instances whose integer solve is not guaranteed to finish inside its
 /// (generous) budget on a laptop. For these the `/int` case tolerates a clean
 /// mid-B&B interrupt (a `Feasible` incumbent or a bare `Interrupted`) instead
-/// of demanding the proven optimum — before the B&B-interrupt fix these
-/// overran their budgets and panicked. When the solve *does* finish in budget
+/// of demanding the proven optimum. When the solve *does* finish in budget
 /// the published optimum is still checked.
 const INT_MAY_INTERRUPT: &[&str] = &["mod008", "vpm1", "gt2", "bell3a"];
 
@@ -25,7 +29,6 @@ struct MipInstance {
     /// Published values are rounded (mostly 2 decimals); tolerances per case.
     lp_tol: Tol,
     int_tol: Tol,
-    int_tier: Tier,
     int_budget: u64,
 }
 
@@ -39,28 +42,19 @@ const EXACT: Tol = Tol {
 };
 
 fn instances() -> Vec<MipInstance> {
-    let mk = |name, int_opt, lp_opt, lp_tol, int_tol, int_tier, int_budget| MipInstance {
+    let mk = |name, int_opt, lp_opt, lp_tol, int_tol, int_budget| MipInstance {
         name,
         int_opt,
         lp_opt,
         lp_tol,
         int_tol,
-        int_tier,
         int_budget,
     };
     vec![
-        // Small enough for a naive branch & bound: default tier.
-        mk(
-            "flugpl",
-            1201500.0,
-            1167185.73,
-            T2DP,
-            EXACT,
-            Tier::Standard,
-            120,
-        ),
-        mk("p0033", 3089.0, 2520.57, T2DP, EXACT, Tier::Standard, 120),
-        mk("stein27", 18.0, 13.0, T2DP, EXACT, Tier::Standard, 120),
+        // Small enough for a naive branch & bound: data/medium/miplib3/.
+        mk("flugpl", 1201500.0, 1167185.73, T2DP, EXACT, 120),
+        mk("p0033", 3089.0, 2520.57, T2DP, EXACT, 120),
+        mk("stein27", 18.0, 13.0, T2DP, EXACT, 120),
         // Measured fast enough for the default tier on a laptop (~1 s / ~6 s).
         mk(
             "rgn",
@@ -74,38 +68,39 @@ fn instances() -> Vec<MipInstance> {
                 abs: 0.001,
                 rel: 1e-6,
             },
-            Tier::Standard,
             120,
         ),
-        mk("lseu", 1120.0, 834.68, T2DP, EXACT, Tier::Standard, 120),
-        mk("p0201", 7615.0, 6875.0, T2DP, EXACT, Tier::Standard, 120),
-        mk("misc03", 3360.0, 1910.0, T2DP, EXACT, Tier::Standard, 120),
-        // Heavier: opt-in via --hard. stein45 finishes in budget (~30 s).
-        mk("stein45", 30.0, 22.0, T2DP, EXACT, Tier::Hard, 600),
+        mk("lseu", 1120.0, 834.68, T2DP, EXACT, 120),
+        mk("p0201", 7615.0, 6875.0, T2DP, EXACT, 120),
+        mk("misc03", 3360.0, 1910.0, T2DP, EXACT, 120),
+        // Heavier: data/hard/miplib3/. stein45 finishes in budget (~30 s).
+        mk("stein45", 30.0, 22.0, T2DP, EXACT, 600),
         // mod008/vpm1/gt2/bell3a are listed in INT_MAY_INTERRUPT: their /int
-        // solve may not finish in budget, and a mid-B&B deadline must now yield
-        // a clean status (never the old is_primal_feasible panic). See register.
-        mk("mod008", 307.0, 290.93, T2DP, EXACT, Tier::Hard, 600),
-        // enigma does NOT finish in budget and currently surfaces a real solver
-        // bug (Error::SingularMatrix from reoptimize() at a B&B node, not caught
-        // by the slack-basis robustness valve). Left failing on purpose — this
-        // is a solver-robustness bug, separate from the interrupt fix.
-        mk("enigma", 0.0, 0.0, EXACT, EXACT, Tier::Hard, 600),
-        mk("vpm1", 20.0, 15.4167, T2DP, EXACT, Tier::Hard, 600),
-        mk("gt2", 21166.0, 13460.233074, T2DP, EXACT, Tier::Hard, 600),
-        mk("bell3a", 878430.32, 862578.64, T2DP, T2DP, Tier::Hard, 600),
+        // solve may not finish in budget, and a mid-B&B deadline must yield a
+        // clean status. See register.
+        mk("mod008", 307.0, 290.93, T2DP, EXACT, 600),
+        // enigma deterministically triggers a singular-matrix error at a B&B
+        // node re-solve; solve_node_lp retries such a node once from the
+        // all-slack basis (the singular-LU robustness valve, see
+        // src/ARCHITECTURE.md §5.3), so enigma solves to its optimum (~14 s).
+        mk("enigma", 0.0, 0.0, EXACT, EXACT, 600),
+        mk("vpm1", 20.0, 15.4167, T2DP, EXACT, 600),
+        mk("gt2", 21166.0, 13460.233074, T2DP, EXACT, 600),
+        mk("bell3a", 878430.32, 862578.64, T2DP, T2DP, 600),
     ]
 }
 
 pub fn register(cases: &mut Vec<Case>) {
     for inst in instances() {
         let name = inst.name;
+        // The integer case's tier follows the data folder.
+        let (_, int_tier) = locate("miplib3", &format!("{}.mps", name));
 
         // LP relaxation case.
         let lp_case = format!("miplib/{}/lp", name);
         let lp_tol = inst.lp_tol;
         let lp_opt = inst.lp_opt;
-        cases.push(Case::solve(lp_case, Tier::Standard, 60, move || {
+        cases.push(Case::solve(lp_case, Tier::Medium, 60, move || {
             let parsed = load(name, true)?;
             Ok((
                 parsed.spec,
@@ -126,7 +121,7 @@ pub fn register(cases: &mut Vec<Case>) {
             // optimum; a bare `Interrupted` (no incumbent) just proves no panic.
             cases.push(Case::custom(
                 int_case,
-                inst.int_tier,
+                int_tier,
                 inst.int_budget,
                 move |budget| {
                     let parsed = load(name, false)?;
@@ -135,6 +130,12 @@ pub fn register(cases: &mut Vec<Case>) {
                     let sol = problem
                         .solve()
                         .map_err(|e| format!("solve errored: {}", e))?;
+                    let has_incumbent = matches!(sol.status(), Status::Optimal | Status::Feasible);
+                    if has_incumbent {
+                        crate::LAST_SOLVE.with(|slot| {
+                            *slot.borrow_mut() = Some((sol.objective(), int_opt));
+                        });
+                    }
                     match sol.status() {
                         Status::Optimal => {
                             crate::verify::validate_incumbent(&parsed.spec, &sol)?;
@@ -167,7 +168,7 @@ pub fn register(cases: &mut Vec<Case>) {
         } else {
             cases.push(Case::solve(
                 int_case,
-                inst.int_tier,
+                int_tier,
                 inst.int_budget,
                 move || {
                     let parsed = load(name, false)?;
@@ -183,9 +184,8 @@ pub fn register(cases: &mut Vec<Case>) {
 }
 
 fn load(name: &str, relax: bool) -> Result<mps_milp::ParsedMps, String> {
-    let path = data_path("miplib3", &format!("{}.mps", name));
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    let (path, _) = locate("miplib3", &format!("{}.mps", name));
+    let text = read_instance(&path)?;
     let parsed = mps_milp::parse(&text, OptimizationDirection::Minimize, relax)?;
     if parsed.obj_offset != 0.0 {
         // None of the vendored files carries an objective constant; if one

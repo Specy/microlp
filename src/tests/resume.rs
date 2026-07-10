@@ -323,4 +323,140 @@ mod tests_resume {
             resume_count
         );
     }
+
+    /// Builds a hard bounded-knapsack MILP that genuinely benefits from general
+    /// integer variables (each item may be taken several times, not just 0/1).
+    fn build_complex_integer_knapsack() -> (Problem, Vec<Variable>) {
+        let mut rng = SimpleRng::new(0x0F1E_2D3C_4B5A_6978);
+
+        let num_items = 100;
+
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+
+        // Create integer variables with bounds well above 1 and pseudo-random
+        // objective coefficients, tracking their weights for two capacity
+        // constraints.
+        let mut vars = Vec::with_capacity(num_items);
+        let mut weight_terms = Vec::with_capacity(num_items);
+        let mut volume_terms = Vec::with_capacity(num_items);
+        let mut total_weight = 0.0;
+        let mut total_volume = 0.0;
+        for _ in 0..num_items {
+            let weight = rng.next_range(1, 97) as f64;
+            let volume = rng.next_range(1, 71) as f64;
+            let value = rng.next_range(1, 89) as f64;
+            let upper = rng.next_range(3, 9) as i32;
+            let x = problem.add_integer_var(value, (0, upper));
+            vars.push(x);
+            weight_terms.push((x, weight));
+            volume_terms.push((x, volume));
+            total_weight += weight * upper as f64;
+            total_volume += volume * upper as f64;
+        }
+
+        // Capacities are set to ~40% of the total — tight enough to force heavy
+        // branching across the integer domains.
+        problem.add_constraint(
+            weight_terms.as_slice(),
+            ComparisonOp::Le,
+            total_weight * 0.4,
+        );
+        problem.add_constraint(
+            volume_terms.as_slice(),
+            ComparisonOp::Le,
+            total_volume * 0.4,
+        );
+
+        (problem, vars)
+    }
+
+    /// Regression test for <https://github.com/Specy/microlp/issues/22>, where a
+    /// time-limited MILP solve used to panic instead of stopping gracefully.
+    /// The 1 ms slices force *many* mid-search interrupts, and the sliced
+    /// search must reach the unlimited solve's answer value-for-value.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "test is too slow in debug mode")]
+    fn resume_integer_variables_produces_same_result_as_unlimited() {
+        init();
+
+        // ── 1. Solve without any time limit ──────────────────────────────────
+        let (problem_unlimited, vars_unlimited) = build_complex_integer_knapsack();
+
+        let t0 = std::time::Instant::now();
+        let sol_unlimited = problem_unlimited.solve().unwrap();
+        let elapsed_unlimited = t0.elapsed();
+
+        assert_eq!(
+            sol_unlimited.status(),
+            Status::Optimal,
+            "Unlimited solve should finish"
+        );
+
+        let values_unlimited: Vec<f64> = vars_unlimited
+            .iter()
+            .map(|v| sol_unlimited.var_value(*v))
+            .collect();
+        let obj_unlimited = sol_unlimited.objective();
+
+        println!(
+            "MILP unlimited solve: objective = {:.6}, time = {:.3}s",
+            obj_unlimited,
+            elapsed_unlimited.as_secs_f64()
+        );
+
+        // ── 2. Solve the same problem with repeated short time limits ────────
+        let (mut problem_limited, vars_limited) = build_complex_integer_knapsack();
+        problem_limited.set_time_limit(Duration::from_millis(1));
+
+        let t1 = std::time::Instant::now();
+        let mut sol_limited = problem_limited.solve().unwrap();
+
+        let mut resume_count = 0u32;
+        while sol_limited.status() != Status::Optimal {
+            resume_count += 1;
+            sol_limited = sol_limited.resume(Some(Duration::from_millis(1))).unwrap();
+        }
+        let elapsed_limited = t1.elapsed();
+
+        let values_limited: Vec<f64> = vars_limited
+            .iter()
+            .map(|v| sol_limited.var_value(*v))
+            .collect();
+        let obj_limited = sol_limited.objective();
+
+        println!(
+            "MILP resumed solve:  objective = {:.6}, time = {:.3}s, resumes = {}",
+            obj_limited,
+            elapsed_limited.as_secs_f64(),
+            resume_count
+        );
+
+        // ── 3. Compare results ───────────────────────────────────────────────
+        assert!(
+            float_eq(obj_unlimited, obj_limited),
+            "MILP objectives differ! unlimited = {}, resumed = {}",
+            obj_unlimited,
+            obj_limited
+        );
+
+        for (i, (a, b)) in values_unlimited
+            .iter()
+            .zip(values_limited.iter())
+            .enumerate()
+        {
+            assert!(
+                float_eq(*a, *b),
+                "MILP variable {} differs: unlimited = {}, resumed = {}",
+                i,
+                a,
+                b
+            );
+        }
+
+        assert!(
+            resume_count >= 1,
+            "Expected at least 1 resume call, got {}",
+            resume_count
+        );
+    }
 }

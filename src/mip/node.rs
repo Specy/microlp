@@ -20,6 +20,11 @@ pub(crate) struct Node {
     /// Sequence number of the branching that created this node; used to detect
     /// "the solver is already at my parent's optimum" (warm dive).
     pub parent_id: u64,
+    /// Which var this node's creating branch changed, in which direction, and the
+    /// parent fractionality — feeds pseudocost updates when this node's LP solves.
+    pub branch_var: usize,
+    pub branch_up: bool,
+    pub branch_frac: f64,
 }
 
 /// Collapse a bound-change list to one entry per var (later entries win),

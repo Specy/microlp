@@ -1,21 +1,45 @@
-//! Minimal MPS reader used by the suite for the vendored benchmark files.
+//! MPS reader for the suite's vendored benchmark files, built on the external
+//! [`mps`] crate (integrated-reasoning/mps).
 //!
-//! microlp's own `MpsFile` parser has no INTORG/INTEND (integer marker)
-//! support, so the MIPLIB instances are read with this independent reader and
-//! materialized through the public `Problem` API. It doubles as an independent
-//! parse of the netlib LP files: those are additionally parsed with `MpsFile`
-//! by the netlib cases, and any disagreement shows up as a failed validation.
+//! Division of labor: the crate does the *lexical* work — sections, tokens,
+//! numbers — and returns the raw `Parser` model (rows, column entries, RHS,
+//! bounds lines, verbatim). This adapter owns the *semantics* and materializes
+//! the instance through the public `Problem` API while recording a shadow
+//! [`ModelSpec`] in lockstep:
 //!
-//! Supported: ROWS (N/L/G/E), COLUMNS with integer markers, RHS (including an
-//! entry on the objective row, which by MPS convention is the *negated*
-//! objective constant), BOUNDS (UP, LO, FX, FR, MI, PL, BV, UI, LI).
-//! Integer columns with no BOUNDS entry default to [0, 1], the MPSX-era
-//! convention MIPLIB 3 files assume; every vendored instance's parse is
-//! validated against its published LP-relaxation objective.
+//! * the first `N` row is the objective; entries on any other free/unknown row
+//!   are ignored (netlib convention);
+//! * an RHS entry on the objective row is the *negated* objective constant
+//!   (MPS convention), reported as `obj_offset`;
+//! * bound resolution, including the classic MPS quirk that a negative `UP`
+//!   bound with no explicit `LO` pushes the lower bound to -inf;
+//! * integer columns with no BOUNDS entry default to `[0, 1]` (the MPSX-era
+//!   convention MIPLIB 3 files assume);
+//! * only the first RHS vector and the first BOUNDS vector are honored.
+//!
+//! # Integer markers are pre-scanned, not taken from the crate
+//!
+//! `mps` v1.0.1 recognizes `'MARKER'` `'INTORG'`/`'INTEND'` lines in COLUMNS
+//! but *consumes them without recording anything* (its `columns` parser
+//! filters marker lines out), so integrality would be silently lost — the
+//! exact kind of misparse this suite exists to catch. [`integer_columns`]
+//! recovers the integer column set with a tiny pre-scan of the COLUMNS
+//! section using the same whitespace tokenization. Every MIPLIB case
+//! cross-validates the outcome against published LP-relaxation *and* integer
+//! optima, so a divergence between the pre-scan and the crate's tokenization
+//! would surface as a failed case, not a silent wrong answer.
+//!
+//! # Loud on everything else
+//!
+//! Constructs the suite cannot faithfully represent are rejected with an
+//! `Err`, never guessed at: RANGES, SOS, quadratic sections, indicator/lazy
+//! constraints, cones, branching priorities, semi-continuous bounds (`SC`),
+//! and an OBJSENSE that contradicts the caller's direction.
 
 use crate::model::{Builder, ModelSpec};
 use microlp::{ComparisonOp, OptimizationDirection, Problem, Variable};
-use std::collections::HashMap;
+use mps::types::{BoundType, ObjectiveSense, RowType};
+use std::collections::{HashMap, HashSet};
 
 pub struct ParsedMps {
     pub problem: Problem,
@@ -45,182 +69,150 @@ pub fn parse(
     direction: OptimizationDirection,
     relax_integers: bool,
 ) -> Result<ParsedMps, String> {
-    let mut section = String::new();
-    let mut obj_row: Option<String> = None;
-    let mut row_ops: HashMap<String, (usize, ComparisonOp)> = HashMap::new();
+    let parsed = mps::Parser::<f64>::parse(text)
+        .map_err(|e| format!("mps crate failed to parse: {}", e.input))?;
+
+    reject_unsupported_sections(&parsed, direction)?;
+
+    let integer_cols = integer_columns(text)?;
+
+    // ROWS: the first N row is the objective; L/G/E rows become constraints
+    // in file order. Additional N rows are ignored (netlib convention).
+    let mut obj_row: Option<&str> = None;
+    let mut row_ops: HashMap<&str, (usize, ComparisonOp)> = HashMap::new();
     let mut constraints: Vec<RawConstraint> = vec![];
-    let mut vars: Vec<RawVar> = vec![];
-    let mut var_idx: HashMap<String, usize> = HashMap::new();
-    let mut in_integer_block = false;
-    let mut obj_offset = 0.0f64;
-    let mut rhs_vector: Option<String> = None;
-    let mut bounds_vector: Option<String> = None;
-
-    for (lineno, raw_line) in text.lines().enumerate() {
-        let err = |msg: &str| format!("line {}: {}", lineno + 1, msg);
-        if raw_line.starts_with('*') || raw_line.trim().is_empty() {
-            continue;
-        }
-        if !raw_line.starts_with(' ') {
-            let mut it = raw_line.split_whitespace();
-            section = it.next().unwrap_or("").to_string();
-            match section.as_str() {
-                "NAME" | "ROWS" | "COLUMNS" | "RHS" | "BOUNDS" | "ENDATA" => continue,
-                "RANGES" => return Err(err("RANGES section not supported by suite reader")),
-                other => return Err(err(&format!("unsupported section {}", other))),
-            }
-        }
-
-        let tokens: Vec<&str> = raw_line.split_whitespace().collect();
-        match section.as_str() {
-            "ROWS" => {
-                if tokens.len() != 2 {
-                    return Err(err("malformed ROWS line"));
-                }
-                let (ty, name) = (tokens[0], tokens[1]);
-                match ty {
-                    "N" => {
-                        if obj_row.is_none() {
-                            obj_row = Some(name.to_string());
-                        }
-                        // Additional free rows are ignored (netlib convention).
-                    }
-                    "L" | "G" | "E" => {
-                        let op = match ty {
-                            "L" => ComparisonOp::Le,
-                            "G" => ComparisonOp::Ge,
-                            _ => ComparisonOp::Eq,
-                        };
-                        row_ops.insert(name.to_string(), (constraints.len(), op));
-                        constraints.push(RawConstraint {
-                            op,
-                            terms: vec![],
-                            rhs: 0.0,
-                        });
-                    }
-                    other => return Err(err(&format!("unknown row type {}", other))),
+    for row in &parsed.rows {
+        match row.row_type {
+            RowType::Nr => {
+                if obj_row.is_none() {
+                    obj_row = Some(row.row_name);
                 }
             }
-            "COLUMNS" => {
-                if tokens.len() >= 3 && tokens[1] == "'MARKER'" {
-                    match *tokens.last().unwrap() {
-                        "'INTORG'" => in_integer_block = true,
-                        "'INTEND'" => in_integer_block = false,
-                        other => return Err(err(&format!("unknown marker {}", other))),
-                    }
-                    continue;
-                }
-                if tokens.len() < 3 || tokens.len() % 2 == 0 {
-                    return Err(err("malformed COLUMNS line"));
-                }
-                let col = tokens[0];
-                let idx = *var_idx.entry(col.to_string()).or_insert_with(|| {
-                    vars.push(RawVar {
-                        obj: 0.0,
-                        lo: None,
-                        hi: None,
-                        integer: in_integer_block,
-                        had_bound_entry: false,
-                    });
-                    vars.len() - 1
-                });
-                for pair in tokens[1..].chunks(2) {
-                    let (row, val) = (pair[0], pair[1]);
-                    let val: f64 = val
-                        .parse()
-                        .map_err(|_| err(&format!("bad number {}", val)))?;
-                    if Some(row) == obj_row.as_deref() {
-                        vars[idx].obj = val;
-                    } else if let Some(&(ci, _)) = row_ops.get(row) {
-                        constraints[ci].terms.push((idx, val));
-                    }
-                    // Entries on other free rows are ignored.
-                }
-            }
-            "RHS" => {
-                if tokens.len() < 3 || tokens.len() % 2 == 0 {
-                    return Err(err("malformed RHS line"));
-                }
-                match &rhs_vector {
-                    None => rhs_vector = Some(tokens[0].to_string()),
-                    Some(v) if v != tokens[0] => continue, // only first RHS vector
-                    _ => {}
-                }
-                for pair in tokens[1..].chunks(2) {
-                    let (row, val) = (pair[0], pair[1]);
-                    let val: f64 = val
-                        .parse()
-                        .map_err(|_| err(&format!("bad number {}", val)))?;
-                    if Some(row) == obj_row.as_deref() {
-                        // MPS convention: RHS on the objective row negates the constant.
-                        obj_offset = -val;
-                    } else if let Some(&(ci, _)) = row_ops.get(row) {
-                        constraints[ci].rhs = val;
-                    } else {
-                        return Err(err(&format!("RHS for unknown row {}", row)));
-                    }
-                }
-            }
-            "BOUNDS" => {
-                if tokens.len() < 3 {
-                    return Err(err("malformed BOUNDS line"));
-                }
-                match &bounds_vector {
-                    None => bounds_vector = Some(tokens[1].to_string()),
-                    Some(v) if v != tokens[1] => continue, // only first BOUNDS vector
-                    _ => {}
-                }
-                let ty = tokens[0];
-                let var = tokens[2];
-                let idx = *var_idx
-                    .get(var)
-                    .ok_or_else(|| err(&format!("bound for unknown column {}", var)))?;
-                let v = &mut vars[idx];
-                v.had_bound_entry = true;
-                let num = || -> Result<f64, String> {
-                    tokens
-                        .get(3)
-                        .ok_or_else(|| err("missing bound value"))?
-                        .parse()
-                        .map_err(|_| err("bad bound value"))
+            RowType::Leq | RowType::Geq | RowType::Eq => {
+                let op = match row.row_type {
+                    RowType::Leq => ComparisonOp::Le,
+                    RowType::Geq => ComparisonOp::Ge,
+                    _ => ComparisonOp::Eq,
                 };
-                match ty {
-                    "UP" => v.hi = Some(num()?),
-                    "LO" => v.lo = Some(num()?),
-                    "FX" => {
-                        let x = num()?;
-                        v.lo = Some(x);
-                        v.hi = Some(x);
-                    }
-                    "FR" => {
-                        v.lo = Some(f64::NEG_INFINITY);
-                        v.hi = Some(f64::INFINITY);
-                    }
-                    "MI" => v.lo = Some(f64::NEG_INFINITY),
-                    "PL" => v.hi = Some(f64::INFINITY),
-                    "BV" => {
-                        v.lo = Some(0.0);
-                        v.hi = Some(1.0);
-                        v.integer = true;
-                    }
-                    "UI" => {
-                        v.hi = Some(num()?);
-                        v.integer = true;
-                    }
-                    "LI" => {
-                        v.lo = Some(num()?);
-                        v.integer = true;
-                    }
-                    other => return Err(err(&format!("unsupported bound type {}", other))),
-                }
+                row_ops.insert(row.row_name, (constraints.len(), op));
+                constraints.push(RawConstraint {
+                    op,
+                    terms: vec![],
+                    rhs: 0.0,
+                });
             }
-            "ENDATA" => {}
-            other => return Err(err(&format!("data line outside section ({})", other))),
+        }
+    }
+    let obj_row = obj_row.ok_or_else(|| "no objective (N) row found".to_string())?;
+
+    // COLUMNS: variables in first-appearance order. Entries on the objective
+    // row set the objective coefficient; entries on unknown rows (extra free
+    // rows) are ignored (netlib convention).
+    let mut vars: Vec<RawVar> = vec![];
+    let mut var_idx: HashMap<&str, usize> = HashMap::new();
+    for line in &parsed.columns {
+        let idx = *var_idx.entry(line.name).or_insert_with(|| {
+            vars.push(RawVar {
+                obj: 0.0,
+                lo: None,
+                hi: None,
+                integer: integer_cols.contains(line.name),
+                had_bound_entry: false,
+            });
+            vars.len() - 1
+        });
+        let pairs = std::iter::once(&line.first_pair).chain(line.second_pair.as_ref());
+        for pair in pairs {
+            if pair.row_name == obj_row {
+                vars[idx].obj = pair.value;
+            } else if let Some(&(ci, _)) = row_ops.get(pair.row_name) {
+                constraints[ci].terms.push((idx, pair.value));
+            }
         }
     }
 
-    if obj_row.is_none() {
-        return Err("no objective (N) row found".to_string());
+    // RHS: only the first RHS vector. An entry on the objective row is the
+    // negated objective constant (MPS convention).
+    let mut obj_offset = 0.0f64;
+    let mut rhs_vector: Option<&str> = None;
+    if let Some(rhs) = &parsed.rhs {
+        for line in rhs {
+            match rhs_vector {
+                None => rhs_vector = Some(line.name),
+                Some(v) if v != line.name => continue,
+                _ => {}
+            }
+            let pairs = std::iter::once(&line.first_pair).chain(line.second_pair.as_ref());
+            for pair in pairs {
+                if pair.row_name == obj_row {
+                    obj_offset = -pair.value;
+                } else if let Some(&(ci, _)) = row_ops.get(pair.row_name) {
+                    constraints[ci].rhs = pair.value;
+                } else {
+                    return Err(format!("RHS for unknown row {}", pair.row_name));
+                }
+            }
+        }
+    }
+
+    // BOUNDS: only the first BOUNDS vector; per-side last-wins within it.
+    let mut bounds_vector: Option<&str> = None;
+    if let Some(bounds) = &parsed.bounds {
+        for line in bounds {
+            match bounds_vector {
+                None => bounds_vector = Some(line.bound_name),
+                Some(v) if v != line.bound_name => continue,
+                _ => {}
+            }
+            let idx = *var_idx
+                .get(line.column_name)
+                .ok_or_else(|| format!("bound for unknown column {}", line.column_name))?;
+            let v = &mut vars[idx];
+            v.had_bound_entry = true;
+            let num = || -> Result<f64, String> {
+                line.value.ok_or_else(|| {
+                    format!(
+                        "missing bound value for column {} ({:?})",
+                        line.column_name, line.bound_type
+                    )
+                })
+            };
+            match line.bound_type {
+                BoundType::Up => v.hi = Some(num()?),
+                BoundType::Lo => v.lo = Some(num()?),
+                BoundType::Fx => {
+                    let x = num()?;
+                    v.lo = Some(x);
+                    v.hi = Some(x);
+                }
+                BoundType::Fr => {
+                    v.lo = Some(f64::NEG_INFINITY);
+                    v.hi = Some(f64::INFINITY);
+                }
+                BoundType::Mi => v.lo = Some(f64::NEG_INFINITY),
+                BoundType::Pl => v.hi = Some(f64::INFINITY),
+                BoundType::Bv => {
+                    v.lo = Some(0.0);
+                    v.hi = Some(1.0);
+                    v.integer = true;
+                }
+                BoundType::Ui => {
+                    v.hi = Some(num()?);
+                    v.integer = true;
+                }
+                BoundType::Li => {
+                    v.lo = Some(num()?);
+                    v.integer = true;
+                }
+                // Semi-continuous variables are not representable in microlp.
+                BoundType::Sc => {
+                    return Err(format!(
+                        "unsupported bound type SC (semi-continuous) for column {}",
+                        line.column_name
+                    ))
+                }
+            }
+        }
     }
 
     // Materialize through the public API, recording the shadow model.
@@ -241,7 +233,7 @@ pub fn parse(
         b.constraint(&terms, c.op, c.rhs);
     }
 
-    // Sanity check on the reader itself.
+    // Sanity check on the adapter itself.
     assert_eq!(b.spec.vars.len(), vars.len());
 
     Ok(ParsedMps {
@@ -249,6 +241,124 @@ pub fn parse(
         spec: b.spec,
         obj_offset,
     })
+}
+
+/// Reject every parsed section the suite cannot faithfully represent — a loud
+/// error beats a silent misparse. RANGES stays unsupported (no vendored file
+/// uses it; adding it means implementing the U_i/L_i table for real).
+fn reject_unsupported_sections(
+    parsed: &mps::Parser<'_, f64>,
+    direction: OptimizationDirection,
+) -> Result<(), String> {
+    if let Some(ranges) = &parsed.ranges {
+        if !ranges.is_empty() {
+            return Err("RANGES section not supported by suite reader".to_string());
+        }
+    }
+    if parsed
+        .special_ordered_sets
+        .as_ref()
+        .is_some_and(|s| !s.is_empty())
+    {
+        return Err("SOS section not supported by suite reader".to_string());
+    }
+    if parsed
+        .quadratic_objective
+        .as_ref()
+        .is_some_and(|q| !q.is_empty())
+        || parsed
+            .quadratic_constraints
+            .as_ref()
+            .is_some_and(|q| !q.is_empty())
+    {
+        return Err("quadratic sections not supported by suite reader".to_string());
+    }
+    if parsed.indicators.as_ref().is_some_and(|i| !i.is_empty()) {
+        return Err("INDICATORS section not supported by suite reader".to_string());
+    }
+    if parsed
+        .lazy_constraints
+        .as_ref()
+        .is_some_and(|l| !l.is_empty())
+    {
+        return Err("LAZYCONS section not supported by suite reader".to_string());
+    }
+    if parsed
+        .cone_constraints
+        .as_ref()
+        .is_some_and(|c| !c.is_empty())
+    {
+        return Err("CSECTION (cones) not supported by suite reader".to_string());
+    }
+    if parsed.user_cuts.as_ref().is_some_and(|u| !u.is_empty()) {
+        return Err("USERCUTS section not supported by suite reader".to_string());
+    }
+    if parsed
+        .branch_priorities
+        .as_ref()
+        .is_some_and(|b| !b.is_empty())
+    {
+        return Err("BRANCH section not supported by suite reader".to_string());
+    }
+    // OBJSENSE: the caller states the direction for every vendored file; a
+    // contradicting in-file sense would flip every expected value, so treat
+    // it as an error rather than trusting either side silently.
+    if let Some(sense) = parsed.objective_sense {
+        let matches = matches!(
+            (sense, direction),
+            (ObjectiveSense::Min, OptimizationDirection::Minimize)
+                | (ObjectiveSense::Max, OptimizationDirection::Maximize)
+        );
+        if !matches {
+            return Err(format!(
+                "OBJSENSE {:?} contradicts the caller's direction {:?}",
+                sense, direction
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Recover the set of integer columns from `'MARKER'` `'INTORG'`/`'INTEND'`
+/// blocks in the COLUMNS section. See the module docs for why the `mps` crate
+/// cannot provide this (v1.0.1 drops marker lines during parsing).
+fn integer_columns(text: &str) -> Result<HashSet<&str>, String> {
+    let mut set = HashSet::new();
+    let mut in_columns = false;
+    let mut in_integer_block = false;
+    for (lineno, line) in text.lines().enumerate() {
+        let err = |msg: String| format!("line {}: {}", lineno + 1, msg);
+        if line.starts_with('*') || line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            in_columns = line.split_whitespace().next() == Some("COLUMNS");
+            continue;
+        }
+        if !in_columns {
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        let first = tokens.next();
+        let second = tokens.next();
+        if second == Some("'MARKER'") {
+            match line.split_whitespace().last() {
+                Some("'INTORG'") => in_integer_block = true,
+                Some("'INTEND'") => in_integer_block = false,
+                other => return Err(err(format!("unknown marker {:?}", other))),
+            }
+            continue;
+        }
+        if in_integer_block {
+            if let Some(col) = first {
+                set.insert(col);
+            }
+        }
+    }
+    if in_integer_block {
+        return Err("INTORG block not closed by an INTEND marker".to_string());
+    }
+    Ok(set)
 }
 
 fn resolve_bounds(v: &RawVar) -> (f64, f64) {

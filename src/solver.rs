@@ -14,13 +14,40 @@ pub(crate) type Deadline = Option<Instant>;
 
 type CsMat = sprs::CsMatI<f64, usize>;
 
-pub(crate) const MACHINE_EPS: f64 = f64::EPSILON * 10.0;
-//TODO find a good epsilon value, maybe have different values for different uses
-pub const EPS: f64 = if MACHINE_EPS > 1e-8 {
-    MACHINE_EPS
-} else {
-    1e-10
-};
+/// The simplex engine's working tolerance: pivot eligibility, ratio-test
+/// steps, reduced-cost optimality checks, bound-violation candidacy, and
+/// `float_eq`.
+///
+/// Deliberately tight (upstream minilp uses `1e-8`); the whole correctness
+/// suite — including the big-M models, whose branch & bound relies on node
+/// LPs resolving basic integer values sharply onto their bounds — is
+/// calibrated against this value. Loosening it (globally or just for
+/// bound-violation candidacy) lets basic values legally sit ~1e-8 off their
+/// bounds, which 1e9-scale big-M rows amplify past the MIP layer's
+/// rounded-incumbent feasibility guard and the branch-and-bound tree
+/// explodes. The flip side of running this tight — round-off noise being
+/// promoted into phantom infeasibilities — is handled where it bites, by
+/// the refresh valve in [`Solver::restore_feasibility`].
+pub const EPS: f64 = 1e-10;
+
+/// How often (in simplex iterations) the primal/dual loops in `optimize` and
+/// `restore_feasibility` check the deadline and emit a progress `debug!` log.
+/// Checking every iteration would make the deadline check itself a
+/// significant fraction of the per-iteration cost on easy problems; checking
+/// too rarely would make a time limit overshoot by a visible amount on hard
+/// ones. 1000 keeps the check overhead negligible while still bounding the
+/// worst-case overshoot to about a thousand pivots.
+pub(crate) const DEADLINE_CHECK_INTERVAL: u64 = 1000;
+
+/// Threshold-pivoting stability coefficient passed to [`lu_factorize`] for
+/// every LU (re)factorization the simplex performs: a candidate pivot is
+/// accepted only if its magnitude is at least this fraction of the column's
+/// largest eligible entry. 0.1 is the standard textbook default for
+/// Gilbert-Peierls sparse LU (see `lu_factorize`'s doc reference) — it
+/// balances numerical stability (higher would refuse more marginal pivots,
+/// at the cost of extra fill-in) against sparsity (lower risks amplifying
+/// rounding error through a poorly-conditioned pivot).
+pub(crate) const LU_STABILITY_THRESHOLD: f64 = 0.1;
 
 pub(crate) fn float_eq(a: f64, b: f64) -> bool {
     (a - b).abs() < EPS
@@ -358,7 +385,7 @@ impl Solver {
                     .unwrap()
                     .into_raw_storage()
             },
-            0.1,
+            LU_STABILITY_THRESHOLD,
             &mut scratch,
         )?;
         let lu_factors_transp = lu_factors.transpose();
@@ -807,7 +834,7 @@ impl Solver {
     fn optimize(&mut self) -> Result<StopReason, Error> {
         for iter in 0.. {
             self.lp_iterations += 1;
-            if iter % 1000 == 0 {
+            if iter % DEADLINE_CHECK_INTERVAL == 0 {
                 if check_deadline(&self.deadline) == StopReason::Limit {
                     return Ok(StopReason::Limit);
                 }
@@ -842,9 +869,14 @@ impl Solver {
             "artificial obj."
         };
 
+        // Numerics valve, armed once per stall: before an infeasibility
+        // declaration is allowed to stand, the basis gets refactorized and
+        // the basic values recomputed from the original data. See below.
+        let mut refreshed_since_pivot = false;
+
         for iter in 0.. {
             self.lp_iterations += 1;
-            if iter % 1000 == 0 {
+            if iter % DEADLINE_CHECK_INTERVAL == 0 {
                 if check_deadline(&self.deadline) == StopReason::Limit {
                     return Ok(StopReason::Limit);
                 }
@@ -858,9 +890,36 @@ impl Solver {
 
             if let Some((row, leaving_new_val)) = self.choose_pivot_row_dual() {
                 self.calc_row_coeffs(row);
-                let pivot_info = self.choose_entering_col_dual(row, leaving_new_val)?;
+                let pivot_info = match self.choose_entering_col_dual(row, leaving_new_val) {
+                    Ok(pivot_info) => pivot_info,
+                    Err(Error::Infeasible) if !refreshed_since_pivot => {
+                        // "No eligible entering column" is a proof of primal
+                        // infeasibility only in exact arithmetic. This deep
+                        // in an eta-file chain, the leaving row can be a
+                        // *phantom* violation — basic values drifted by
+                        // accumulated round-off — whose (equally drifted)
+                        // pivot row then blocks every candidate; declaring
+                        // infeasibility here is a wrong answer (netlib/brandy
+                        // did exactly this). Rebuild the factorization and
+                        // the basic values from the original data and
+                        // re-examine: a phantom dissolves, a real
+                        // infeasibility survives the refresh and the next
+                        // declaration stands.
+                        debug!(
+                            "restore feasibility iter {}: no entering column for row {}; \
+                             refreshing basis before declaring infeasibility",
+                            iter, row,
+                        );
+                        self.recalc_basic_var_vals()?;
+                        refreshed_since_pivot = true;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 self.calc_col_coeffs(pivot_info.col);
                 self.pivot(&pivot_info)?;
+                // Any successful pivot is progress: re-arm the valve.
+                refreshed_since_pivot = false;
             } else {
                 debug!(
                     "restored feasibility in {} iterations, {}: {}",
@@ -1643,7 +1702,7 @@ impl BasisSolver {
                     .unwrap()
                     .into_raw_storage()
             },
-            0.1,
+            LU_STABILITY_THRESHOLD,
             &mut self.scratch,
         )?;
         self.lu_factors_transp = self.lu_factors.transpose();

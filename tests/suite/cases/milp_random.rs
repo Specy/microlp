@@ -50,7 +50,7 @@ fn knapsack01_cases(cases: &mut Vec<Case>) {
             n,
             i
         );
-        cases.push(Case::solve(name, Tier::Standard, 30, move || {
+        cases.push(Case::solve(name, Tier::Medium, 30, move || {
             let mut rng = Rng::new(0xA000 + seed);
             let weights: Vec<i64> = (0..n).map(|_| rng.int(1, 30)).collect();
             let values: Vec<i64> = if ties {
@@ -90,7 +90,7 @@ fn bounded_knapsack_cases(cases: &mut Vec<Case>) {
     .enumerate()
     {
         let name = format!("oracle/knap-bounded/n{:02}-s{:02}", n, i);
-        cases.push(Case::solve(name, Tier::Standard, 30, move || {
+        cases.push(Case::solve(name, Tier::Medium, 30, move || {
             let mut rng = Rng::new(0xB000 + seed);
             let weights: Vec<i64> = (0..n).map(|_| rng.int(2, 20)).collect();
             let values: Vec<i64> = (0..n).map(|_| rng.int(1, 25)).collect();
@@ -122,7 +122,7 @@ fn subset_sum_cases(cases: &mut Vec<Case>) {
         .enumerate()
     {
         let name = format!("oracle/subset-sum/n{:02}-s{:02}", n, i);
-        cases.push(Case::solve(name, Tier::Standard, 30, move || {
+        cases.push(Case::solve(name, Tier::Medium, 30, move || {
             let mut rng = Rng::new(0xC000 + seed);
             let weights: Vec<i64> = (0..n).map(|_| rng.int(3, 60)).collect();
             // Build a reachable target from a random subset (roughly half);
@@ -148,7 +148,7 @@ fn subset_sum_cases(cases: &mut Vec<Case>) {
     // Structurally unreachable targets: all-even weights, odd equality target.
     for (i, &(n, seed)) in [(10usize, 41u64), (14, 42), (18, 43)].iter().enumerate() {
         let name = format!("oracle/subset-sum-infeasible/n{:02}-s{:02}", n, i);
-        cases.push(Case::solve(name, Tier::Standard, 30, move || {
+        cases.push(Case::solve(name, Tier::Medium, 30, move || {
             let mut rng = Rng::new(0xD000 + seed);
             let weights: Vec<i64> = (0..n).map(|_| 2 * rng.int(2, 30)).collect();
             let target = 2 * rng.int(10, 40) + 1; // odd: no even subset can hit it
@@ -172,7 +172,7 @@ fn assignment_cases(cases: &mut Vec<Case>) {
         .enumerate()
     {
         let name = format!("oracle/assignment/n{}-s{:02}", n, i);
-        cases.push(Case::solve(name, Tier::Standard, 30, move || {
+        cases.push(Case::solve(name, Tier::Medium, 30, move || {
             let mut rng = Rng::new(0xE000 + seed);
             let costs: Vec<Vec<i64>> = (0..n)
                 .map(|_| (0..n).map(|_| rng.int(1, 50)).collect())
@@ -209,7 +209,7 @@ fn ilp_box_cases(cases: &mut Vec<Case>) {
     // reproduce.
     for i in 0..20u64 {
         let name = format!("oracle/ilp-box/s{:02}", i);
-        cases.push(Case::solve(name, Tier::Standard, 60, move || {
+        cases.push(Case::solve(name, Tier::Medium, 60, move || {
             let mut rng = Rng::new(0xF000 + i);
             let n = rng.usize(4, 7);
             let bounds: Vec<(i64, i64)> = (0..n)
@@ -294,7 +294,7 @@ fn mixed_cases(cases: &mut Vec<Case>) {
     // The oracle enumerates the integer box and minimizes the full objective.
     for i in 0..8u64 {
         let name = format!("oracle/mixed/s{:02}", i);
-        cases.push(Case::solve(name, Tier::Standard, 60, move || {
+        cases.push(Case::solve(name, Tier::Medium, 60, move || {
             let mut rng = Rng::new(0x1A000 + i);
             let n = rng.usize(3, 5); // integers
             let m = rng.usize(1, 3); // continuous
