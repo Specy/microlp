@@ -4,7 +4,7 @@ use crate::{
     helpers::{resized_view, to_dense},
     lu::{lu_factorize, LUFactors, ScratchSpace},
     sparse::{ScatteredVec, SparseMat, SparseVec},
-    ComparisonOp, CsVec, Error, OptimizationDirection, Solution, StopReason, VarDomain, Variable,
+    ComparisonOp, CsVec, Error, StopReason, VarDomain,
 };
 use sprs::CompressedStorage;
 
@@ -14,13 +14,40 @@ pub(crate) type Deadline = Option<Instant>;
 
 type CsMat = sprs::CsMatI<f64, usize>;
 
-pub(crate) const MACHINE_EPS: f64 = f64::EPSILON * 10.0;
-//TODO find a good epsilon value, maybe have different values for different uses
-pub const EPS: f64 = if MACHINE_EPS > 1e-8 {
-    MACHINE_EPS
-} else {
-    1e-10
-};
+/// The simplex engine's working tolerance: pivot eligibility, ratio-test
+/// steps, reduced-cost optimality checks, bound-violation candidacy, and
+/// `float_eq`.
+///
+/// Deliberately tight (upstream minilp uses `1e-8`); the whole correctness
+/// suite — including the big-M models, whose branch & bound relies on node
+/// LPs resolving basic integer values sharply onto their bounds — is
+/// calibrated against this value. Loosening it (globally or just for
+/// bound-violation candidacy) lets basic values legally sit ~1e-8 off their
+/// bounds, which 1e9-scale big-M rows amplify past the MIP layer's
+/// rounded-incumbent feasibility guard and the branch-and-bound tree
+/// explodes. The flip side of running this tight — round-off noise being
+/// promoted into phantom infeasibilities — is handled where it bites, by
+/// the refresh valve in [`Solver::restore_feasibility`].
+pub const EPS: f64 = 1e-10;
+
+/// How often (in simplex iterations) the primal/dual loops in `optimize` and
+/// `restore_feasibility` check the deadline and emit a progress `debug!` log.
+/// Checking every iteration would make the deadline check itself a
+/// significant fraction of the per-iteration cost on easy problems; checking
+/// too rarely would make a time limit overshoot by a visible amount on hard
+/// ones. 1000 keeps the check overhead negligible while still bounding the
+/// worst-case overshoot to about a thousand pivots.
+pub(crate) const DEADLINE_CHECK_INTERVAL: u64 = 1000;
+
+/// Threshold-pivoting stability coefficient passed to [`lu_factorize`] for
+/// every LU (re)factorization the simplex performs: a candidate pivot is
+/// accepted only if its magnitude is at least this fraction of the column's
+/// largest eligible entry. 0.1 is the standard textbook default for
+/// Gilbert-Peierls sparse LU (see `lu_factorize`'s doc reference) — it
+/// balances numerical stability (higher would refuse more marginal pivots,
+/// at the cost of extra fill-in) against sparsity (lower risks amplifying
+/// rounding error through a poorly-conditioned pivot).
+pub(crate) const LU_STABILITY_THRESHOLD: f64 = 0.1;
 
 pub(crate) fn float_eq(a: f64, b: f64) -> bool {
     (a - b).abs() < EPS
@@ -30,7 +57,7 @@ pub(crate) fn float_ne(a: f64, b: f64) -> bool {
 }
 
 #[inline]
-fn check_deadline(deadline: &Deadline) -> StopReason {
+pub(crate) fn check_deadline(deadline: &Deadline) -> StopReason {
     if let Some(dl) = deadline {
         if Instant::now() >= *dl {
             return StopReason::Limit;
@@ -43,12 +70,13 @@ fn check_deadline(deadline: &Deadline) -> StopReason {
 pub(crate) struct Solver {
     pub(crate) num_vars: usize,
     pub(crate) deadline: Deadline,
+    /// Total number of simplex pivots performed across all solves/reoptimizes on this instance.
+    pub(crate) lp_iterations: u64,
 
     orig_obj_coeffs: Vec<f64>,
     orig_var_mins: Vec<f64>,
     orig_var_maxs: Vec<f64>,
     pub(crate) orig_var_domains: Vec<VarDomain>,
-    //pub(crate) orig_int_vars: Vec<VarDomain>,
     orig_constraints: CsMat, // excluding rhs
     orig_constraints_csc: CsMat,
     orig_rhs: Vec<f64>,
@@ -86,17 +114,6 @@ pub(crate) struct Solver {
     sq_norms_update_helper: Vec<f64>,
     inv_basis_row_coeffs: SparseVec,
     row_coeffs: ScatteredVec,
-
-    /// Persisted branch-and-bound state for resuming after a time limit.
-    pub(crate) bb_state: Option<BranchAndBoundState>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BranchAndBoundState {
-    dfs_stack: Vec<Step>,
-    best_cost: f64,
-    /// Whether `self` (the Solver) represents a valid best integer solution found so far.
-    has_best: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +127,21 @@ struct NonBasicVarState {
     at_min: bool,
     at_max: bool,
 }
+
+/// Status of one variable in a simplex basis snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum VarStatus {
+    Basic,
+    AtLower,
+    AtUpper,
+    /// Non-basic free variable (both bounds infinite), pinned at 0.
+    Free,
+}
+
+/// A compact simplex basis: one status per total var (structural + slack).
+/// Together with the current variable bounds it fully determines a vertex.
+#[derive(Clone, Debug)]
+pub(crate) struct Basis(pub(crate) Vec<VarStatus>);
 
 impl std::fmt::Debug for Solver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -140,21 +172,6 @@ impl std::fmt::Debug for Solver {
         writeln!(f, "cur_obj_val: {:?}", self.cur_obj_val)?;
         Ok(())
     }
-}
-
-#[derive(Clone, Debug)]
-enum BranchKind {
-    Floor,
-    Ceil,
-    Exact, // fixed value
-}
-
-#[derive(Clone, Debug)]
-struct Step {
-    pub(crate) start_solution: Solution,
-    pub(crate) var: Variable,
-    pub(crate) kind: BranchKind,
-    pub(crate) start_val: i64,
 }
 
 impl Solver {
@@ -368,7 +385,7 @@ impl Solver {
                     .unwrap()
                     .into_raw_storage()
             },
-            0.1,
+            LU_STABILITY_THRESHOLD,
             &mut scratch,
         )?;
         let lu_factors_transp = lu_factors.transpose();
@@ -384,12 +401,8 @@ impl Solver {
             orig_constraints_csc,
             orig_rhs,
             deadline,
+            lp_iterations: 0,
             orig_var_domains: var_domains.to_vec(),
-            /*orig_int_vars: var_domains
-            .to_vec()
-            .into_iter()
-            .filter(|d| matches!(d, VarDomain::Integer | VarDomain::Boolean))
-            .collect(),*/
             enable_primal_steepest_edge,
             enable_dual_steepest_edge,
             is_primal_feasible,
@@ -418,7 +431,6 @@ impl Solver {
             sq_norms_update_helper,
             inv_basis_row_coeffs: SparseVec::new(),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
-            bb_state: None,
         };
 
         debug!(
@@ -438,6 +450,269 @@ impl Solver {
             VarState::Basic(idx) => &self.basic_var_vals[idx],
             VarState::NonBasic(idx) => &self.nb_var_vals[idx],
         }
+    }
+
+    /// Check `values` (one entry per structural var) against every ORIGINAL
+    /// constraint row, within the ABSOLUTE tolerance `tol`. Bounds are not
+    /// checked here. Each row's sense is encoded by its slack var's bounds
+    /// (lhs + s = rhs with s in [smin, smax]  ⇔  rhs - smax ≤ lhs ≤ rhs - smin);
+    /// slack bounds are never touched by branching, so this always reflects the
+    /// user's original rows.
+    ///
+    /// The tolerance is deliberately NOT scaled by the row magnitude: this
+    /// check exists for the big-M trap, where a violation that is tiny
+    /// RELATIVE to huge row coefficients (e.g. 5.0 on a 1e9-scale row) is
+    /// decisive in absolute terms. Any row-scale-relative tolerance would be
+    /// blind to exactly the violations this guard is for.
+    pub(crate) fn check_constraints(&self, values: &[f64], tol: f64) -> bool {
+        for (r, row) in self.orig_constraints.outer_iterator().enumerate() {
+            let rhs = self.orig_rhs[r];
+            let mut lhs = 0.0;
+            for (v, &coeff) in row.iter() {
+                if v < self.num_vars {
+                    lhs += coeff * values[v];
+                }
+            }
+            let slack = self.num_vars + r;
+            let (smin, smax) = (self.orig_var_mins[slack], self.orig_var_maxs[slack]);
+            let lo = if smax.is_finite() {
+                rhs - smax
+            } else {
+                f64::NEG_INFINITY
+            };
+            let hi = if smin.is_finite() {
+                rhs - smin
+            } else {
+                f64::INFINITY
+            };
+            if lhs < lo - tol || lhs > hi + tol {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Objective value (internal minimize space) of an explicit structural-var
+    /// value vector.
+    pub(crate) fn objective_of(&self, values: &[f64]) -> f64 {
+        values
+            .iter()
+            .enumerate()
+            .map(|(v, &x)| self.orig_obj_coeffs[v] * x)
+            .sum()
+    }
+
+    pub(crate) fn get_var_bounds(&self, var: usize) -> (f64, f64) {
+        (self.orig_var_mins[var], self.orig_var_maxs[var])
+    }
+
+    /// Change a variable's bounds in place. Records the new bounds and repairs the
+    /// invariants that depend on them; does NOT run simplex — call [`Self::reoptimize`]
+    /// afterwards. Returns `Err(Infeasible)` (state untouched) if `min > max`.
+    pub(crate) fn set_var_bounds(&mut self, var: usize, min: f64, max: f64) -> Result<(), Error> {
+        if min > max {
+            return Err(Error::Infeasible);
+        }
+        self.orig_var_mins[var] = min;
+        self.orig_var_maxs[var] = max;
+        match self.var_states[var] {
+            VarState::Basic(row) => {
+                self.basic_var_mins[row] = min;
+                self.basic_var_maxs[row] = max;
+                let val = self.basic_var_vals[row];
+                if val < min - EPS || val > max + EPS {
+                    self.is_primal_feasible = false;
+                }
+            }
+            VarState::NonBasic(col) => {
+                let cur = self.nb_var_vals[col];
+                let new_val = cur.clamp(min, max);
+                if new_val != cur {
+                    // Shift the non-basic var to the nearest bound and propagate the
+                    // delta into basic values (same mechanism as fix_var's non-basic arm).
+                    self.calc_col_coeffs(col);
+                    let diff = new_val - cur;
+                    for (r, coeff) in self.col_coeffs.iter() {
+                        self.basic_var_vals[r] -= diff * coeff;
+                    }
+                    self.cur_obj_val += diff * self.nb_var_obj_coeffs[col];
+                    self.nb_var_vals[col] = new_val;
+                    self.is_primal_feasible = false;
+                }
+                self.nb_var_states[col] = NonBasicVarState {
+                    at_min: float_eq(new_val, min),
+                    at_max: float_eq(new_val, max),
+                };
+                // A var at a loosened bound may no longer justify its reduced cost.
+                self.is_dual_feasible = self.is_dual_feasible
+                    && (self.nb_var_states[col].at_min && self.nb_var_obj_coeffs[col] > -EPS
+                        || self.nb_var_states[col].at_max && self.nb_var_obj_coeffs[col] < EPS
+                        || self.nb_var_obj_coeffs[col].abs() < EPS);
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-solve after bound changes or a basis load: dual simplex to restore primal
+    /// feasibility, then primal simplex if reduced costs became dual-infeasible
+    /// (only happens after loosening bounds or a numerically imperfect basis load).
+    pub(crate) fn reoptimize(&mut self) -> Result<StopReason, Error> {
+        if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
+            return Ok(StopReason::Limit);
+        }
+        if !self.is_dual_feasible {
+            self.recalc_obj_coeffs()?;
+            if self.optimize()? == StopReason::Limit {
+                return Ok(StopReason::Limit);
+            }
+            // Primal simplex may have moved through vertices; make sure primal holds too.
+            if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
+                return Ok(StopReason::Limit);
+            }
+        }
+        Ok(StopReason::Finished)
+    }
+
+    pub(crate) fn snapshot_basis(&self) -> Basis {
+        let mut statuses = Vec::with_capacity(self.num_total_vars());
+        for var in 0..self.num_total_vars() {
+            statuses.push(match self.var_states[var] {
+                VarState::Basic(_) => VarStatus::Basic,
+                VarState::NonBasic(col) => {
+                    let s = &self.nb_var_states[col];
+                    if s.at_min {
+                        VarStatus::AtLower
+                    } else if s.at_max {
+                        VarStatus::AtUpper
+                    } else {
+                        VarStatus::Free
+                    }
+                }
+            });
+        }
+        Basis(statuses)
+    }
+
+    /// The all-slack basis (identity basis matrix). Loading it cannot fail with a
+    /// singular factorization, so it is the universal fallback.
+    pub(crate) fn slack_basis(&self) -> Basis {
+        let mut statuses = Vec::with_capacity(self.num_total_vars());
+        for var in 0..self.num_vars {
+            let min = self.orig_var_mins[var];
+            let max = self.orig_var_maxs[var];
+            statuses.push(if min.is_finite() {
+                VarStatus::AtLower
+            } else if max.is_finite() {
+                VarStatus::AtUpper
+            } else {
+                VarStatus::Free
+            });
+        }
+        for _ in 0..self.num_constraints() {
+            statuses.push(VarStatus::Basic);
+        }
+        Basis(statuses)
+    }
+
+    /// Rebuild the solver state from a basis snapshot and the CURRENT variable bounds:
+    /// non-basic values come from statuses + bounds, basic values and reduced costs are
+    /// recomputed from scratch, and the LU factorization is rebuilt. Feasibility flags
+    /// are recomputed honestly, so half-pivoted pre-load state is fully discarded.
+    ///
+    /// Statuses are interpreted against the CURRENT bounds: a status referring to a
+    /// bound that has since moved or become infinite is remapped to the nearest finite
+    /// bound (else 0) rather than rejected — the branch & bound driver relies on this
+    /// when loading a parent basis after changing variable bounds.
+    ///
+    /// # Errors
+    ///
+    /// If this returns `Err`, the solver's internal state is unspecified and must
+    /// not be used for solving until a subsequent successful `load_basis` restores
+    /// it (the all-slack basis from [`Self::slack_basis`] always loads
+    /// successfully and is the designated recovery path).
+    pub(crate) fn load_basis(&mut self, basis: &Basis) -> Result<(), Error> {
+        let n = self.num_total_vars();
+        let m = self.num_constraints();
+        if basis.0.len() != n || basis.0.iter().filter(|s| **s == VarStatus::Basic).count() != m {
+            return Err(Error::InternalError("basis shape mismatch".to_string()));
+        }
+
+        self.basic_vars.clear();
+        self.basic_var_mins.clear();
+        self.basic_var_maxs.clear();
+        self.nb_vars.clear();
+        self.nb_var_vals.clear();
+        self.nb_var_states.clear();
+        self.nb_var_is_fixed.clear();
+
+        for var in 0..n {
+            match basis.0[var] {
+                VarStatus::Basic => {
+                    self.var_states[var] = VarState::Basic(self.basic_vars.len());
+                    self.basic_vars.push(var);
+                    self.basic_var_mins.push(self.orig_var_mins[var]);
+                    self.basic_var_maxs.push(self.orig_var_maxs[var]);
+                }
+                ref status => {
+                    let min = self.orig_var_mins[var];
+                    let max = self.orig_var_maxs[var];
+                    let val = match status {
+                        VarStatus::AtLower => {
+                            if min.is_finite() {
+                                min
+                            } else if max.is_finite() {
+                                max
+                            } else {
+                                0.0
+                            }
+                        }
+                        VarStatus::AtUpper => {
+                            if max.is_finite() {
+                                max
+                            } else if min.is_finite() {
+                                min
+                            } else {
+                                0.0
+                            }
+                        }
+                        VarStatus::Free => {
+                            if min.is_finite() {
+                                min
+                            } else if max.is_finite() {
+                                max
+                            } else {
+                                0.0
+                            }
+                        }
+                        VarStatus::Basic => unreachable!(),
+                    };
+                    self.var_states[var] = VarState::NonBasic(self.nb_vars.len());
+                    self.nb_vars.push(var);
+                    self.nb_var_vals.push(val);
+                    self.nb_var_states.push(NonBasicVarState {
+                        at_min: float_eq(val, min),
+                        at_max: float_eq(val, max),
+                    });
+                    self.nb_var_is_fixed.push(false);
+                }
+            }
+        }
+
+        self.basis_solver
+            .reset(&self.orig_constraints_csc, &self.basic_vars)?;
+
+        // Steepest-edge reference reset (standard practice after a warm-start load;
+        // only affects pivot ordering quality, not correctness).
+        if self.enable_dual_steepest_edge {
+            self.dual_edge_sq_norms = vec![1.0; self.basic_vars.len()];
+        }
+
+        self.recalc_basic_var_vals()?;
+        self.recalc_obj_coeffs()?;
+
+        self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
+        self.is_dual_feasible = self.calc_dual_infeasibility().0 == 0;
+        Ok(())
     }
 
     pub(crate) fn fix_var(&mut self, var: usize, val: f64) -> Result<StopReason, Error> {
@@ -529,13 +804,6 @@ impl Solver {
         self.orig_constraints.rows()
     }
 
-    pub(crate) fn has_integer_vars(&self) -> bool {
-        self.orig_var_domains
-            .iter()
-            .take(self.num_vars)
-            .any(|v| *v == VarDomain::Integer || *v == VarDomain::Boolean)
-    }
-
     fn num_total_vars(&self) -> usize {
         self.num_vars + self.num_constraints()
     }
@@ -563,154 +831,10 @@ impl Solver {
         Ok(StopReason::Finished)
     }
 
-    pub(crate) fn solve_integer(
-        &mut self,
-        cur_solution: Solution,
-        direction: OptimizationDirection,
-    ) -> Result<StopReason, Error> {
-        // If we have persisted B&B state from a previous time-limited run, restore it.
-        let (mut dfs_stack, mut best_cost, mut best_solution) =
-            if let Some(state) = self.bb_state.take() {
-                debug!(
-                    "resuming branch&bound, dfs_stack size: {}, best_cost: {:.2}, has_best: {}",
-                    state.dfs_stack.len(),
-                    state.best_cost,
-                    state.has_best
-                );
-                let best_solution = if state.has_best {
-                    // self was restored to the best solution's solver state before returning,
-                    // so cur_solution (built from self) represents the best solution.
-                    Some(cur_solution)
-                } else {
-                    None
-                };
-                (state.dfs_stack, state.best_cost, best_solution)
-            } else {
-                // Fresh start
-                let best_cost = if direction == OptimizationDirection::Maximize {
-                    f64::NEG_INFINITY
-                } else {
-                    f64::INFINITY
-                };
-                let best_solution = None;
-                debug!("{:?}", cur_solution.iter().collect::<Vec<_>>());
-                let dfs_stack =
-                    if let Some(var) = choose_branch_var(&cur_solution, &self.orig_var_domains) {
-                        debug!(
-                            "starting branch&bound, current obj. value: {:.2}",
-                            self.cur_obj_val
-                        );
-                        new_steps(cur_solution, var, &self.orig_var_domains)
-                    } else {
-                        debug!(
-                            "found optimal solution with initial relaxation! cost: {:.2}",
-                            self.cur_obj_val
-                        );
-                        return Ok(StopReason::Finished);
-                    };
-                (dfs_stack, best_cost, best_solution)
-            };
-
-        // Cache orig_var_domains locally so the B&B loop never depends on self's
-        // mutable state (self may be overwritten with the best solution's solver).
-        let orig_var_domains = self.orig_var_domains.clone();
-
-        for iter in 0.. {
-            if iter % 100 == 0 && check_deadline(&self.deadline) == StopReason::Limit {
-                let has_best = best_solution.is_some();
-                if let Some(solution) = best_solution {
-                    let solution: Solution = solution;
-                    *self = solution.solver;
-                }
-                self.bb_state = Some(BranchAndBoundState {
-                    dfs_stack,
-                    best_cost,
-                    has_best,
-                });
-                return Ok(StopReason::Limit);
-            }
-
-            //guaranteed to have at an element
-            let cur_step = match dfs_stack.pop() {
-                Some(step) => step,
-                None => break,
-            };
-            let mut cur_solution = cur_step.start_solution.clone();
-            // Propagate the current deadline to the cloned solver. The step's
-            // start_solution was captured earlier (possibly in a previous
-            // time-limited run) and its deadline may have expired. Without this,
-            // `add_constraint` / `fix_var` → `restore_feasibility()` would see
-            // the stale deadline, return `Ok(StopReason::Limit)` immediately
-            // without performing any dual-simplex pivots, and leave the solver
-            // in a primal-infeasible state with garbage variable values.
-            cur_solution.solver.deadline = self.deadline;
-            let branch_direction = match cur_step.kind {
-                BranchKind::Floor => ComparisonOp::Le,
-                BranchKind::Ceil => ComparisonOp::Ge,
-                BranchKind::Exact => ComparisonOp::Eq,
-            };
-            let new_solution = match branch_direction {
-                ComparisonOp::Le | ComparisonOp::Ge => cur_solution.add_constraint(
-                    [(cur_step.var, 1.0)],
-                    branch_direction,
-                    cur_step.start_val as f64,
-                ),
-                ComparisonOp::Eq => cur_solution.fix_var(cur_step.var, cur_step.start_val as f64),
-            };
-            if let Ok(new_solution) = new_solution {
-                cur_solution = new_solution;
-            } else {
-                // No feasible solution with current constraints
-                debug!(
-                    "[iter {} (search depth {})] pruned solution, infeasible",
-                    iter,
-                    dfs_stack.len()
-                );
-                continue;
-            }
-
-            let obj_val = cur_solution.objective();
-            if !is_solution_better(direction, best_cost, obj_val) {
-                debug!(
-                    "[iter {} (search depth {})] pruned solution, cost: {:.2}",
-                    iter,
-                    dfs_stack.len(),
-                    obj_val
-                );
-                // Branch is worse than best solution
-                continue;
-            }
-
-            if let Some(var) = choose_branch_var(&cur_solution, &orig_var_domains) {
-                // Search deeper
-                let steps = new_steps(cur_solution, var, &orig_var_domains);
-                dfs_stack.extend(steps);
-            } else {
-                // Found integral solution
-                if is_solution_better(direction, best_cost, obj_val) {
-                    debug!(
-                        "[iter {} (search depth {})] found new best solution, cost: {:.2}",
-                        iter,
-                        dfs_stack.len(),
-                        obj_val
-                    );
-                    best_cost = obj_val;
-                    best_solution = Some(cur_solution);
-                }
-            }
-        }
-
-        if let Some(solution) = best_solution {
-            *self = solution.solver;
-            Ok(StopReason::Finished)
-        } else {
-            Err(Error::Infeasible)
-        }
-    }
-
     fn optimize(&mut self) -> Result<StopReason, Error> {
         for iter in 0.. {
-            if iter % 1000 == 0 {
+            self.lp_iterations += 1;
+            if iter % DEADLINE_CHECK_INTERVAL == 0 {
                 if check_deadline(&self.deadline) == StopReason::Limit {
                     return Ok(StopReason::Limit);
                 }
@@ -745,8 +869,14 @@ impl Solver {
             "artificial obj."
         };
 
+        // Numerics valve, armed once per stall: before an infeasibility
+        // declaration is allowed to stand, the basis gets refactorized and
+        // the basic values recomputed from the original data. See below.
+        let mut refreshed_since_pivot = false;
+
         for iter in 0.. {
-            if iter % 1000 == 0 {
+            self.lp_iterations += 1;
+            if iter % DEADLINE_CHECK_INTERVAL == 0 {
                 if check_deadline(&self.deadline) == StopReason::Limit {
                     return Ok(StopReason::Limit);
                 }
@@ -760,9 +890,36 @@ impl Solver {
 
             if let Some((row, leaving_new_val)) = self.choose_pivot_row_dual() {
                 self.calc_row_coeffs(row);
-                let pivot_info = self.choose_entering_col_dual(row, leaving_new_val)?;
+                let pivot_info = match self.choose_entering_col_dual(row, leaving_new_val) {
+                    Ok(pivot_info) => pivot_info,
+                    Err(Error::Infeasible) if !refreshed_since_pivot => {
+                        // "No eligible entering column" is a proof of primal
+                        // infeasibility only in exact arithmetic. This deep
+                        // in an eta-file chain, the leaving row can be a
+                        // *phantom* violation — basic values drifted by
+                        // accumulated round-off — whose (equally drifted)
+                        // pivot row then blocks every candidate; declaring
+                        // infeasibility here is a wrong answer (netlib/brandy
+                        // did exactly this). Rebuild the factorization and
+                        // the basic values from the original data and
+                        // re-examine: a phantom dissolves, a real
+                        // infeasibility survives the refresh and the next
+                        // declaration stands.
+                        debug!(
+                            "restore feasibility iter {}: no entering column for row {}; \
+                             refreshing basis before declaring infeasibility",
+                            iter, row,
+                        );
+                        self.recalc_basic_var_vals()?;
+                        refreshed_since_pivot = true;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 self.calc_col_coeffs(pivot_info.col);
                 self.pivot(&pivot_info)?;
+                // Any successful pivot is progress: re-arm the valve.
+                refreshed_since_pivot = false;
             } else {
                 debug!(
                     "restored feasibility in {} iterations, {}: {}",
@@ -1418,7 +1575,6 @@ impl Solver {
         }
     }
 
-    #[allow(dead_code)]
     fn recalc_basic_var_vals(&mut self) -> Result<(), Error> {
         let mut cur_vals = self.orig_rhs.clone();
         for (i, var) in self.nb_vars.iter().enumerate() {
@@ -1546,7 +1702,7 @@ impl BasisSolver {
                     .unwrap()
                     .into_raw_storage()
             },
-            0.1,
+            LU_STABILITY_THRESHOLD,
             &mut self.scratch,
         )?;
         self.lu_factors_transp = self.lu_factors.transpose();
@@ -1634,70 +1790,11 @@ fn into_resized(vec: CsVec, len: usize) -> CsVec {
     CsVec::new(len, indices, data)
 }
 
-fn choose_branch_var(cur_solution: &Solution, domain: &[VarDomain]) -> Option<Variable> {
-    let mut max_divergence = 0.0;
-    let mut max_var = None;
-    for (var, &val) in cur_solution {
-        if domain[var.0] == VarDomain::Real {
-            continue;
-        }
-        let divergence = f64::abs(val - val.round());
-        if divergence > EPS && divergence > max_divergence {
-            max_divergence = divergence;
-            max_var = Some(var);
-        }
-    }
-    max_var
-}
-
-fn get_branch_min_max(var: Variable, current_solution: &Solution) -> (i64, i64) {
-    let min = current_solution[var].floor() as i64;
-    let max = current_solution[var].ceil() as i64;
-    (min, max)
-}
-
-fn new_steps(start_solution: Solution, var: Variable, var_domains: &[VarDomain]) -> Vec<Step> {
-    //TODO swap order of the branches by prioritizing the branch that improves the objective function
-    let (min, max) = get_branch_min_max(var, &start_solution);
-    if min == max {
-        return vec![];
-    }
-    let is_bool = var_domains[var.0] == VarDomain::Boolean;
-    let lower_branch = Step {
-        start_solution: start_solution.clone(),
-        var,
-        kind: if is_bool {
-            BranchKind::Exact
-        } else {
-            BranchKind::Floor
-        },
-        start_val: min,
-    };
-    let higher_branch = Step {
-        start_solution,
-        var,
-        kind: if is_bool {
-            BranchKind::Exact
-        } else {
-            BranchKind::Ceil
-        },
-        start_val: max,
-    };
-    vec![lower_branch, higher_branch]
-}
-
-fn is_solution_better(direction: OptimizationDirection, best: f64, current: f64) -> bool {
-    match direction {
-        OptimizationDirection::Maximize => current > best,
-        OptimizationDirection::Minimize => current < best,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::helpers::{assert_matrix_eq, to_sparse};
-    use crate::Problem;
+    use crate::{OptimizationDirection, Problem};
 
     fn init() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -1845,5 +1942,171 @@ mod tests {
         .unwrap()
         .initial_solve();
         assert_eq!(infeasible.unwrap_err(), Error::Infeasible);
+    }
+
+    #[test]
+    fn set_var_bounds_tighten_matches_fresh_solve() {
+        init();
+        // minimize 2x + 3y s.t. x + y >= 4, 0 <= x,y <= 10. Optimum: x=4, y=0, obj 8.
+        let coeffs = [2.0, 3.0];
+        let mins = [0.0, 0.0];
+        let maxs = [10.0, 10.0];
+        let cons = [(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 4.0)];
+        let domains = [VarDomain::Real, VarDomain::Real];
+
+        let mut warm = Solver::try_new(&coeffs, &mins, &maxs, &cons, &domains, None).unwrap();
+        warm.initial_solve().unwrap();
+        assert!(float_eq(warm.cur_obj_val, 8.0));
+
+        // Tighten x to [0, 2] and re-solve warm: optimum becomes x=2, y=2, obj 10.
+        warm.set_var_bounds(0, 0.0, 2.0).unwrap();
+        assert_eq!(warm.reoptimize().unwrap(), StopReason::Finished);
+        assert!(warm.is_primal_feasible && warm.is_dual_feasible);
+        assert!(float_eq(warm.cur_obj_val, 10.0));
+        assert!(float_eq(*warm.get_value(0), 2.0));
+        assert!(float_eq(*warm.get_value(1), 2.0));
+
+        // Fresh solve of the tightened problem must agree.
+        let mut fresh =
+            Solver::try_new(&coeffs, &mins, &[2.0, 10.0], &cons, &domains, None).unwrap();
+        fresh.initial_solve().unwrap();
+        assert!(float_eq(fresh.cur_obj_val, warm.cur_obj_val));
+    }
+
+    #[test]
+    fn set_var_bounds_loosen_and_retighten() {
+        init();
+        // maximize x + y (internally minimize -x - y) s.t. x + y <= 4, 0 <= x,y <= 3.
+        let mut solver = Solver::try_new(
+            &[-1.0, -1.0],
+            &[0.0, 0.0],
+            &[3.0, 3.0],
+            &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 4.0)],
+            &[VarDomain::Real, VarDomain::Real],
+            None,
+        )
+        .unwrap();
+        solver.initial_solve().unwrap();
+        assert!(float_eq(solver.cur_obj_val, -4.0));
+
+        // Tighten x to [0, 0.5]: optimum x=0.5, y=3, obj -3.5.
+        solver.set_var_bounds(0, 0.0, 0.5).unwrap();
+        assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
+        assert!(float_eq(solver.cur_obj_val, -3.5));
+
+        // Loosen x back to [0, 3]: optimum returns to -4.
+        solver.set_var_bounds(0, 0.0, 3.0).unwrap();
+        assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
+        assert!(float_eq(solver.cur_obj_val, -4.0));
+
+        assert!(solver.lp_iterations > 0);
+    }
+
+    #[test]
+    fn set_var_bounds_crossing_is_infeasible_and_leaves_state_untouched() {
+        init();
+        let mut solver = Solver::try_new(
+            &[1.0],
+            &[0.0],
+            &[10.0],
+            &[(to_sparse(&[1.0]), ComparisonOp::Ge, 1.0)],
+            &[VarDomain::Real],
+            None,
+        )
+        .unwrap();
+        solver.initial_solve().unwrap();
+        let obj_before = solver.cur_obj_val;
+        assert_eq!(
+            solver.set_var_bounds(0, 2.0, 1.0).unwrap_err(),
+            Error::Infeasible
+        );
+        assert_eq!(solver.get_var_bounds(0), (0.0, 10.0)); // untouched
+        assert!(float_eq(solver.cur_obj_val, obj_before));
+    }
+
+    #[test]
+    fn basis_snapshot_load_roundtrip() {
+        init();
+        // NOTE: deviates from the task brief's literal fixture, which used obj [2.0, 1.0]
+        // with var 0 in (-inf, 0] and var 1 in [5, inf) under x+y<=6, x+2y<=8. That LP is
+        // unbounded (fix y at its min of 5: both constraints reduce to upper bounds on x,
+        // and x has no lower bound, so x -> -inf drives 2x+y -> -inf), so
+        // `initial_solve().unwrap()` panics with `Unbounded` before any basis code runs —
+        // confirmed empirically and by hand. Swapped in the fixture from the adjacent
+        // `initial_solve` test below (proven feasible+bounded, obj -68.0 at x=12, y=8,
+        // with both structural vars basic and both slacks non-basic), so the round trip
+        // exercises a non-trivial basis that actually differs from the slack basis.
+        let mut solver = Solver::try_new(
+            &[-3.0, -4.0],
+            &[f64::NEG_INFINITY, 5.0],
+            &[20.0, f64::INFINITY],
+            &[
+                (to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 20.0),
+                (to_sparse(&[-1.0, 4.0]), ComparisonOp::Le, 20.0),
+            ],
+            &[VarDomain::Real, VarDomain::Real],
+            None,
+        )
+        .unwrap();
+        solver.initial_solve().unwrap();
+        let obj = solver.cur_obj_val;
+        let vals: Vec<f64> = (0..2).map(|v| *solver.get_value(v)).collect();
+        let basis = solver.snapshot_basis();
+
+        // Wreck the state by loading the all-slack basis…
+        let slack = solver.slack_basis();
+        solver.load_basis(&slack).unwrap();
+
+        // …then reload the optimal basis: objective and values must round-trip.
+        solver.load_basis(&basis).unwrap();
+        assert!(solver.is_primal_feasible && solver.is_dual_feasible);
+        assert!(float_eq(solver.cur_obj_val, obj));
+        for v in 0..2 {
+            assert!(float_eq(*solver.get_value(v), vals[v]));
+        }
+    }
+
+    #[test]
+    fn slack_basis_load_then_reoptimize_reaches_optimum() {
+        init();
+        // minimize 2x + 3y s.t. x + y >= 4, 0 <= x,y <= 10 → obj 8.
+        let mut solver = Solver::try_new(
+            &[2.0, 3.0],
+            &[0.0, 0.0],
+            &[10.0, 10.0],
+            &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 4.0)],
+            &[VarDomain::Real, VarDomain::Real],
+            None,
+        )
+        .unwrap();
+        solver.initial_solve().unwrap();
+        assert!(float_eq(solver.cur_obj_val, 8.0));
+
+        let slack = solver.slack_basis();
+        solver.load_basis(&slack).unwrap();
+        assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
+        assert!(float_eq(solver.cur_obj_val, 8.0));
+    }
+
+    #[test]
+    fn load_basis_rejects_wrong_shape() {
+        init();
+        let mut solver = Solver::try_new(
+            &[1.0],
+            &[0.0],
+            &[1.0],
+            &[(to_sparse(&[1.0]), ComparisonOp::Le, 1.0)],
+            &[VarDomain::Real],
+            None,
+        )
+        .unwrap();
+        solver.initial_solve().unwrap();
+        // 2 total vars (1 structural + 1 slack); a basis with zero Basic entries is invalid.
+        let bad = Basis(vec![VarStatus::AtLower, VarStatus::AtLower]);
+        assert!(solver.load_basis(&bad).is_err());
+        // Solver must still be usable via the slack-basis fallback path.
+        let slack = solver.slack_basis();
+        solver.load_basis(&slack).unwrap();
+        assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
     }
 }

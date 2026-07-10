@@ -136,7 +136,7 @@ fn build_random_lp(
 fn solve_obj(mut p: Problem, budget: std::time::Duration) -> Result<f64, String> {
     p.set_time_limit(budget);
     let sol = p.solve().map_err(|e| format!("solver error: {}", e))?;
-    if *sol.stop_reason() == microlp::StopReason::Limit {
+    if sol.status() != microlp::Status::Optimal {
         return Err("hit time limit".into());
     }
     Ok(sol.objective())
@@ -162,7 +162,7 @@ pub fn register(cases: &mut Vec<Case>) {
     .enumerate()
     {
         let name = format!("lp/certified/n{:02}-s{:02}", n, i);
-        cases.push(Case::solve(name, Tier::Quick, 10, move || {
+        cases.push(Case::solve(name, Tier::Easy, 10, move || {
             let inst = certified_instance(n, seed);
             let (bld, vars) = build_certified(&inst);
             let expected_vars: Vec<_> = vars
@@ -181,7 +181,7 @@ pub fn register(cases: &mut Vec<Case>) {
         .enumerate()
     {
         let name = format!("lp/metamorphic/n{}-s{:02}", n, i);
-        cases.push(Case::custom(name, Tier::Quick, 20, move |budget| {
+        cases.push(Case::custom(name, Tier::Easy, 20, move |budget| {
             let lp = random_feasible_lp(n, seed);
             let per = budget / 4;
             let tol = Tol {
@@ -239,7 +239,7 @@ pub fn register(cases: &mut Vec<Case>) {
     // is tight anyway with an explicit equality. Same unique optimum.
     for (i, &(n, seed)) in [(4usize, 301u64), (6, 302), (9, 303)].iter().enumerate() {
         let name = format!("lp/certified-eq/n{}-s{:02}", n, i);
-        cases.push(Case::solve(name, Tier::Quick, 10, move || {
+        cases.push(Case::solve(name, Tier::Easy, 10, move || {
             let inst = certified_instance(n, seed);
             let nvars = inst.x_star.len();
             let mut bld = Builder::new(Maximize);

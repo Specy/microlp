@@ -102,7 +102,7 @@ mod tests_general {
             assert_eq!(sol[v2], 3.0);
             assert_eq!(sol.objective(), 6.5);
 
-            sol = sol.unfix_var(v1).0;
+            sol = sol.unfix_var(v1).unwrap().0;
             assert_eq!(sol[v1], 1.0);
             assert_eq!(sol[v2], 3.0);
             assert_eq!(sol.objective(), 7.0);
@@ -114,7 +114,7 @@ mod tests_general {
             assert_eq!(sol[v2], 2.5);
             assert_eq!(sol.objective(), 6.5);
 
-            sol = sol.unfix_var(v2).0;
+            sol = sol.unfix_var(v2).unwrap().0;
             assert_eq!(sol[v1], 1.0);
             assert_eq!(sol[v2], 3.0);
             assert_eq!(sol.objective(), 7.0);
@@ -381,7 +381,7 @@ mod tests_general {
         // A zero duration guarantees the deadline is already passed before solving starts.
         problem.set_time_limit(Duration::ZERO);
         let result = problem.solve().unwrap();
-        assert_eq!(result.stop_reason(), &StopReason::Limit);
+        assert_eq!(result.status(), Status::Interrupted);
     }
 
     #[test]
@@ -421,7 +421,7 @@ mod tests_general {
 
         problem.set_time_limit(Duration::ZERO);
         let result = problem.solve().unwrap();
-        assert_eq!(result.stop_reason(), &StopReason::Limit);
+        assert_eq!(result.status(), Status::Interrupted);
     }
 
     #[test]

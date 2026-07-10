@@ -106,7 +106,12 @@ impl Tol {
     };
 
     pub fn matches(&self, got: f64, expected: f64) -> bool {
-        (got - expected).abs() <= self.abs + self.rel * expected.abs()
+        (got - expected).abs() <= self.slack(expected)
+    }
+
+    /// The absolute slack this tolerance grants around `expected`.
+    pub fn slack(&self, expected: f64) -> f64 {
+        self.abs + self.rel * expected.abs()
     }
 }
 

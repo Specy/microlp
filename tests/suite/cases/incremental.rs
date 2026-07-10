@@ -3,21 +3,21 @@
 //!
 //! On pure-LP solutions these are incremental (dual simplex) and are checked
 //! against external truths (certified optima, from-scratch solves, an ILP
-//! enumeration oracle) — this behavior is correct today. On MILP solutions the
-//! same APIs are buggy: they act on the branch & bound incumbent leaf (whose
-//! solver still carries the branch path's bound-fixings) instead of the
-//! original problem, so feasible edits report a false `Infeasible`. The
-//! `*-milp` cases assert the correct behavior and therefore fail until the bug
-//! is fixed; they are kept in the hard tier, out of the default (CI) run.
+//! enumeration oracle). On MILP solutions the same APIs re-solve the original
+//! problem plus every edit applied so far, keeping the previous incumbent as a
+//! warm start when it remains feasible (see `Solution::add_constraint`'s doc).
+//! The `*-milp` cases below assert exactly this fixed behavior against DP,
+//! brute-force, and hand-computed truths — they are regular default-tier
+//! cases, not known-failure placeholders.
 
 use super::lp_random::{certified_instance, CertifiedLp};
-use super::netlib::data_path;
+use super::{locate, read_instance};
 use super::{Case, Tier};
 use crate::oracles;
 use crate::rng::Rng;
 use microlp::ComparisonOp::{Ge, Le};
 use microlp::OptimizationDirection::{Maximize, Minimize};
-use microlp::{MpsFile, OptimizationDirection, Problem, Solution, StopReason, Variable};
+use microlp::{MpsFile, OptimizationDirection, Problem, Solution, Status, Variable};
 use std::io::BufReader;
 use std::time::Duration;
 
@@ -55,7 +55,7 @@ pub fn register(cases: &mut Vec<Case>) {
     fix_unfix_lp(cases);
     gomory(cases);
     resume(cases);
-    milp_known_failures(cases);
+    milp_edits(cases);
 }
 
 // ---------------------------------------------------------------- LP: add_constraint
@@ -69,7 +69,7 @@ fn add_constraint_lp(cases: &mut Vec<Case>) {
         .enumerate()
     {
         let name = format!("incr/add-constraint-cert/n{:02}-s{:02}", n, i);
-        cases.push(Case::custom(name, Tier::Quick, 20, move |budget| {
+        cases.push(Case::custom(name, Tier::Easy, 20, move |budget| {
             let inst = certified_instance(n, seed);
             let (mut p, vars) = boxed_certified(&inst);
             let split = n / 2;
@@ -91,7 +91,7 @@ fn add_constraint_lp(cases: &mut Vec<Case>) {
                 inst.objective as f64,
             )?;
             for (j, &want) in inst.x_star.iter().enumerate() {
-                assert_close(&format!("x{}", j), *sol.var_value_raw(vars[j]), want as f64)?;
+                assert_close(&format!("x{}", j), sol.var_value_raw(vars[j]), want as f64)?;
             }
             Ok(())
         }));
@@ -101,7 +101,7 @@ fn add_constraint_lp(cases: &mut Vec<Case>) {
     // known value; the last one makes the problem infeasible.
     cases.push(Case::custom(
         "incr/add-constraint-steps",
-        Tier::Quick,
+        Tier::Easy,
         20,
         |budget| {
             let mut p = Problem::new(Maximize);
@@ -146,7 +146,7 @@ fn fix_unfix_lp(cases: &mut Vec<Case>) {
         .enumerate()
     {
         let name = format!("incr/fix-unfix-cert/n{:02}-s{:02}", n, i);
-        cases.push(Case::custom(name, Tier::Quick, 20, move |budget| {
+        cases.push(Case::custom(name, Tier::Easy, 20, move |budget| {
             let inst = certified_instance(n, seed);
 
             // Fresh solve of the full problem (original, unboxed formulation).
@@ -207,7 +207,9 @@ fn fix_unfix_lp(cases: &mut Vec<Case>) {
 
             // Unfix restores the certified optimum; the bool reports whether
             // the variable was really fixed.
-            let (restored, was_fixed) = fixed_incr.unfix_var(vars_handle[j]);
+            let (restored, was_fixed) = fixed_incr
+                .unfix_var(vars_handle[j])
+                .map_err(|e| format!("unfix_var: {}", e))?;
             if !was_fixed {
                 return Err("unfix_var returned false for a fixed variable".into());
             }
@@ -215,11 +217,13 @@ fn fix_unfix_lp(cases: &mut Vec<Case>) {
             for (jj, &want) in inst.x_star.iter().enumerate() {
                 assert_close(
                     &format!("restored x{}", jj),
-                    *restored.var_value_raw(vars_handle[jj]),
+                    restored.var_value_raw(vars_handle[jj]),
                     want as f64,
                 )?;
             }
-            let (_, was_fixed_again) = restored.unfix_var(vars_handle[j]);
+            let (_, was_fixed_again) = restored
+                .unfix_var(vars_handle[j])
+                .map_err(|e| format!("unfix_var: {}", e))?;
             if was_fixed_again {
                 return Err("second unfix_var claimed the variable was still fixed".into());
             }
@@ -235,7 +239,7 @@ fn gomory(cases: &mut Vec<Case>) {
     // (objective -1.5 -> -1.0 across two cuts).
     cases.push(Case::custom(
         "incr/gomory-textbook",
-        Tier::Quick,
+        Tier::Easy,
         20,
         |budget| {
             let mut p = Problem::new(Minimize);
@@ -246,19 +250,19 @@ fn gomory(cases: &mut Vec<Case>) {
             p.set_time_limit(budget / 4);
             let sol = p.solve().map_err(|e| format!("base: {}", e))?;
             assert_close("relaxation objective", sol.objective(), -1.5)?;
-            assert_close("relaxation v2", *sol.var_value_raw(v2), 1.5)?;
+            assert_close("relaxation v2", sol.var_value_raw(v2), 1.5)?;
 
             let sol = sol
                 .add_gomory_cut(v2)
                 .map_err(|e| format!("first cut: {}", e))?;
             assert_close("after first cut", sol.objective(), -1.0)?;
-            assert_close("v2 integral", *sol.var_value_raw(v2), 1.0)?;
+            assert_close("v2 integral", sol.var_value_raw(v2), 1.0)?;
 
             let sol = sol
                 .add_gomory_cut(v1)
                 .map_err(|e| format!("second cut: {}", e))?;
             assert_close("after second cut", sol.objective(), -1.0)?;
-            assert_close("v1 integral", *sol.var_value_raw(v1), 1.0)?;
+            assert_close("v1 integral", sol.var_value_raw(v1), 1.0)?;
             Ok(())
         },
     ));
@@ -270,7 +274,7 @@ fn gomory(cases: &mut Vec<Case>) {
     // LP becomes integral it must equal it exactly.
     for (case_idx, seed) in (0..4u64).enumerate() {
         let name = format!("incr/gomory-oracle/s{:02}", case_idx);
-        cases.push(Case::custom(name, Tier::Quick, 30, move |budget| {
+        cases.push(Case::custom(name, Tier::Easy, 30, move |budget| {
             let mut rng = Rng::new(0x6000 + seed);
             let n = rng.usize(3, 4);
             let bounds: Vec<(i64, i64)> = (0..n).map(|_| (0, rng.int(3, 5))).collect();
@@ -330,7 +334,7 @@ fn gomory(cases: &mut Vec<Case>) {
                 // its bounds; add_gomory_cut panics on non-basic variables).
                 let mut cut_var = None;
                 for (j, &v) in vars.iter().enumerate() {
-                    let val = *sol.var_value_raw(v);
+                    let val = sol.var_value_raw(v);
                     let fractional = (val - val.round()).abs() > 1e-6;
                     let interior =
                         val > bounds[j].0 as f64 + 1e-7 && val < bounds[j].1 as f64 - 1e-7;
@@ -370,7 +374,7 @@ fn resume(cases: &mut Vec<Case>) {
     // resume entry paths deterministically for LP and MILP alike.
     cases.push(Case::custom(
         "incr/resume-zero-lp",
-        Tier::Quick,
+        Tier::Easy,
         20,
         |_budget| {
             let inst = certified_instance(8, 601);
@@ -381,11 +385,11 @@ fn resume(cases: &mut Vec<Case>) {
             }
             p.set_time_limit(Duration::ZERO);
             let sol = p.solve().map_err(|e| format!("limited solve: {}", e))?;
-            if *sol.stop_reason() != StopReason::Limit {
-                return Err("zero time limit did not produce StopReason::Limit".into());
+            if sol.status() == Status::Optimal {
+                return Err("zero time limit did not interrupt the solve".into());
             }
             let sol = sol.resume(None).map_err(|e| format!("resume: {}", e))?;
-            if *sol.stop_reason() != StopReason::Finished {
+            if sol.status() != Status::Optimal {
                 return Err("resume(None) did not finish".into());
             }
             assert_close("resumed objective", sol.objective(), inst.objective as f64)
@@ -394,7 +398,7 @@ fn resume(cases: &mut Vec<Case>) {
 
     cases.push(Case::custom(
         "incr/resume-zero-milp-knap",
-        Tier::Quick,
+        Tier::Easy,
         30,
         |_budget| {
             let mut rng = Rng::new(0x7000);
@@ -414,11 +418,11 @@ fn resume(cases: &mut Vec<Case>) {
             p.add_constraint(&terms, Le, capacity as f64);
             p.set_time_limit(Duration::ZERO);
             let sol = p.solve().map_err(|e| format!("limited solve: {}", e))?;
-            if *sol.stop_reason() != StopReason::Limit {
-                return Err("zero time limit did not produce StopReason::Limit".into());
+            if sol.status() == Status::Optimal {
+                return Err("zero time limit did not interrupt the solve".into());
             }
             let sol = sol.resume(None).map_err(|e| format!("resume: {}", e))?;
-            if *sol.stop_reason() != StopReason::Finished {
+            if sol.status() != Status::Optimal {
                 return Err("resume(None) did not finish".into());
             }
             assert_close("resumed knapsack vs DP", sol.objective(), best)
@@ -430,12 +434,11 @@ fn resume(cases: &mut Vec<Case>) {
     // case degrades to a plain optimum check — every outcome is asserted.
     cases.push(Case::custom(
         "incr/resume-slices-lp",
-        Tier::Standard,
+        Tier::Medium,
         60,
         |_budget| {
-            let path = data_path("netlib", "israel.mps");
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+            let path = locate("netlib", "israel.mps").0;
+            let text = read_instance(&path)?;
             let file = MpsFile::parse(
                 BufReader::new(text.as_bytes()),
                 OptimizationDirection::Minimize,
@@ -445,7 +448,7 @@ fn resume(cases: &mut Vec<Case>) {
             problem.set_time_limit(Duration::from_millis(1));
             let mut sol = problem.solve().map_err(|e| format!("solve: {}", e))?;
             let mut slices = 0;
-            while *sol.stop_reason() == StopReason::Limit {
+            while sol.status() != Status::Optimal {
                 slices += 1;
                 if slices > 1000 {
                     return Err(
@@ -463,24 +466,63 @@ fn resume(cases: &mut Vec<Case>) {
             )
         },
     ));
+
+    // A genuine mid-search B&B interrupt (not Duration::ZERO): stein27 (~0.5 s
+    // to solve) reliably overruns a 50 ms first slice, returning a clean
+    // Feasible/Interrupted status instead of the old is_primal_feasible panic
+    // (the C1 known failure). Resuming in 100 ms slices must then reach the
+    // proven optimum 18. Standard tier so the default (CI) run guards
+    // resume-after-MILP-interrupt. If a very fast machine finishes inside the
+    // first slice the status is already Optimal and the objective check still
+    // holds.
+    cases.push(Case::custom(
+        "incr/resume-midway-milp",
+        Tier::Medium,
+        120,
+        |_budget| {
+            let parsed = crate::mps_milp::parse(
+                &read_instance(&locate("miplib3", "stein27.mps").0)?,
+                OptimizationDirection::Minimize,
+                false,
+            )?;
+            let mut problem = parsed.problem;
+            problem.set_time_limit(Duration::from_millis(50));
+            let mut sol = problem.solve().map_err(|e| format!("solve: {}", e))?;
+            let mut slices = 0;
+            while sol.status() != Status::Optimal {
+                slices += 1;
+                if slices > 600 {
+                    return Err("MILP resume made no progress after 600 slices".into());
+                }
+                sol = sol
+                    .resume(Some(Duration::from_millis(100)))
+                    .map_err(|e| format!("resume slice {}: {}", slices, e))?;
+            }
+            assert_close("stein27 via interrupted+resumed B&B", sol.objective(), 18.0)
+        },
+    ));
 }
 
 // ------------------------------------------------- MILP incremental edits
 
-fn milp_known_failures(cases: &mut Vec<Case>) {
-    // KNOWN FAILURE (solver bug): after a MILP solve, Solution::add_constraint
-    // and Solution::fix_var act on the branch & bound incumbent leaf, whose
-    // solver still carries the branch path's bound-rows and variable fixings,
-    // instead of the original problem. Feasible edits therefore return a false
-    // Infeasible (or a wrong/fractional value). These cases assert the correct
-    // documented behavior and so fail until the bug is fixed; they live in the
-    // hard tier and are excluded from the default (CI) run. add-constraint-mixed
-    // happens to land on the right value for its particular instance but is
-    // grouped here as it exercises the same buggy path.
+fn milp_edits(cases: &mut Vec<Case>) {
+    // Solution::add_constraint and Solution::fix_var on a MILP solution
+    // re-solve the original problem plus every edit applied so far (the
+    // previous incumbent is kept as a warm start when it remains feasible).
+    // Each case below checks the edited result against an independent truth
+    // (DP, brute force, or a hand-computed optimum). add-constraint-mixed
+    // exercises the same re-solve path on a mixed continuous/integer problem;
+    // note its particular values happen to coincide with what the old
+    // incumbent-leaf bug would have produced too, so unlike the other five it
+    // would not by itself have caught that bug — it stays grouped here as a
+    // regression check on the mixed continuous/integer edit path. All six
+    // solve in low single-digit milliseconds (measured via a targeted
+    // `--hard` run), so they run in the default (Standard) tier alongside the
+    // rest of `incr/*`.
 
     cases.push(Case::custom(
         "incr/add-constraint-milp",
-        Tier::Hard,
+        Tier::Medium,
         30,
         |_budget| {
             // Knapsack, then forbid the two chosen items from coexisting via
@@ -509,7 +551,7 @@ fn milp_known_failures(cases: &mut Vec<Case>) {
 
     cases.push(Case::custom(
         "incr/fix-var-milp",
-        Tier::Hard,
+        Tier::Medium,
         30,
         |_budget| {
             // max 5x+4y+3z, 4x+3y+2z <= 6, binary. Optimum 8 at (1,0,1).
@@ -526,9 +568,9 @@ fn milp_known_failures(cases: &mut Vec<Case>) {
                 .map_err(|e| format!("fix_var(y, 1) on MILP solution: {}", e))?;
             // The documented contract implies an integer-feasible re-solve.
             let vals = [
-                *sol.var_value_raw(x),
-                *sol.var_value_raw(y),
-                *sol.var_value_raw(z),
+                sol.var_value_raw(x),
+                sol.var_value_raw(y),
+                sol.var_value_raw(z),
             ];
             for (name, v) in ["x", "y", "z"].iter().zip(vals) {
                 if (v - v.round()).abs() > 1e-5 {
@@ -544,7 +586,7 @@ fn milp_known_failures(cases: &mut Vec<Case>) {
     // This is the TSP-style iterate-and-cut usage pattern.
     cases.push(Case::custom(
         "incr/add-constraint-milp-chain",
-        Tier::Hard,
+        Tier::Medium,
         60,
         |_budget| {
             let mut rng = Rng::new(0x8000);
@@ -622,7 +664,7 @@ fn milp_known_failures(cases: &mut Vec<Case>) {
     // the unconstrained DP optimum; the unfix bool contract holds on MILP.
     cases.push(Case::custom(
         "incr/fix-unfix-milp-roundtrip",
-        Tier::Hard,
+        Tier::Medium,
         60,
         |_budget| {
             let mut rng = Rng::new(0x8100);
@@ -651,12 +693,16 @@ fn milp_known_failures(cases: &mut Vec<Case>) {
                 .map_err(|e| format!("fix_var(x0, 0): {}", e))?;
             assert_close("fixed-out vs DP", sol.objective(), without0)?;
 
-            let (sol, was_fixed) = sol.unfix_var(vars[0]);
+            let (sol, was_fixed) = sol
+                .unfix_var(vars[0])
+                .map_err(|e| format!("unfix_var: {}", e))?;
             if !was_fixed {
                 return Err("unfix_var returned false for a fixed variable".into());
             }
             assert_close("after unfix vs DP", sol.objective(), base_best)?;
-            let (_, was_fixed_again) = sol.unfix_var(vars[0]);
+            let (_, was_fixed_again) = sol
+                .unfix_var(vars[0])
+                .map_err(|e| format!("unfix_var: {}", e))?;
             if was_fixed_again {
                 return Err("second unfix_var claimed the variable was still fixed".into());
             }
@@ -668,7 +714,7 @@ fn milp_known_failures(cases: &mut Vec<Case>) {
     // solutions by definition.
     cases.push(Case::custom(
         "incr/fix-var-milp-fractional",
-        Tier::Hard,
+        Tier::Medium,
         15,
         |_budget| {
             let mut p = Problem::new(Maximize);
@@ -691,7 +737,7 @@ fn milp_known_failures(cases: &mut Vec<Case>) {
     // re-solve to the hand-computed optimum (x continuous, z integer).
     cases.push(Case::custom(
         "incr/add-constraint-mixed",
-        Tier::Hard,
+        Tier::Medium,
         30,
         |_budget| {
             // The suite's mixed-textbook case: max 50x+40y+45z, x>=2 cont.,
@@ -712,43 +758,11 @@ fn milp_known_failures(cases: &mut Vec<Case>) {
                 .add_constraint(&[(y, 1.0)], Le, 5.0)
                 .map_err(|e| format!("adding y <= 5: {}", e))?;
             assert_close("objective with y <= 5", sol.objective(), 395.0)?;
-            let zv = *sol.var_value_raw(z);
+            let zv = sol.var_value_raw(z);
             if (zv - zv.round()).abs() > 1e-5 {
                 return Err(format!("z = {} is fractional after the edit", zv));
             }
             Ok(())
-        },
-    ));
-
-    // KNOWN FAILURE (time-limit-interrupt bug): interrupting B&B mid-search
-    // currently panics, so resuming from a genuine mid-search Limit cannot be
-    // exercised yet. numbers chosen so stein27 (~0.9 s to solve) reliably
-    // overruns a 50 ms first slice.
-    cases.push(Case::custom(
-        "incr/resume-midway-milp",
-        Tier::Hard,
-        120,
-        |_budget| {
-            let parsed = crate::mps_milp::parse(
-                &std::fs::read_to_string(data_path("miplib3", "stein27.mps"))
-                    .map_err(|e| format!("read stein27: {}", e))?,
-                OptimizationDirection::Minimize,
-                false,
-            )?;
-            let mut problem = parsed.problem;
-            problem.set_time_limit(Duration::from_millis(50));
-            let mut sol = problem.solve().map_err(|e| format!("solve: {}", e))?;
-            let mut slices = 0;
-            while *sol.stop_reason() == StopReason::Limit {
-                slices += 1;
-                if slices > 600 {
-                    return Err("MILP resume made no progress after 600 slices".into());
-                }
-                sol = sol
-                    .resume(Some(Duration::from_millis(100)))
-                    .map_err(|e| format!("resume slice {}: {}", slices, e))?;
-            }
-            assert_close("stein27 via interrupted+resumed B&B", sol.objective(), 18.0)
         },
     ));
 }

@@ -6,7 +6,7 @@
 //! bounds and integrality are re-checked against the shadow `ModelSpec`.
 
 use crate::model::{Domain, Expected, ModelSpec};
-use microlp::{ComparisonOp, Error, Solution, StopReason};
+use microlp::{ComparisonOp, Error, Solution, Status};
 
 /// Feasibility slack: a constraint `lhs (op) rhs` is accepted when violated by
 /// no more than `FEAS_ABS * (1 + |rhs|)`, which scales gracefully for the
@@ -26,11 +26,14 @@ pub enum Outcome {
 pub fn check(spec: &ModelSpec, expected: &Expected, result: Result<Solution, Error>) -> Outcome {
     match result {
         Ok(sol) => {
-            if *sol.stop_reason() == StopReason::Limit {
+            // A solve that hit a limit (feasible-but-unproven or interrupted
+            // before any incumbent) is a timeout for the suite's purposes —
+            // the default tier expects every case to prove optimality.
+            if matches!(sol.status(), Status::Feasible | Status::Interrupted) {
                 return Outcome::Timeout;
             }
             // `Solution::iter` yields variables in insertion order (0..n).
-            let values: Vec<f64> = sol.iter().map(|(_, &x)| x).collect();
+            let values: Vec<f64> = sol.iter().map(|(_, x)| x).collect();
             if values.len() != spec.vars.len() {
                 return Outcome::Fail(format!(
                     "solution has {} variables, shadow model has {}",
@@ -97,6 +100,25 @@ pub fn check(spec: &ModelSpec, expected: &Expected, result: Result<Solution, Err
             }
         },
     }
+}
+
+/// Validate a returned incumbent (an `Optimal` or `Feasible` solution) against
+/// the shadow model, without comparing to any expected objective. Used by the
+/// interrupt cases, which accept a clean feasible-but-unproven incumbent but
+/// still insist it be a genuine feasible point of the model.
+///
+/// The caller must ensure `sol.status()` is not [`Status::Interrupted`] (the
+/// value accessors panic otherwise).
+pub fn validate_incumbent(spec: &ModelSpec, sol: &Solution) -> Result<(), String> {
+    let values: Vec<f64> = sol.iter().map(|(_, x)| x).collect();
+    if values.len() != spec.vars.len() {
+        return Err(format!(
+            "solution has {} variables, shadow model has {}",
+            values.len(),
+            spec.vars.len()
+        ));
+    }
+    validate_solution(spec, &values, sol.objective())
 }
 
 fn validate_solution(spec: &ModelSpec, values: &[f64], reported_obj: f64) -> Result<(), String> {
