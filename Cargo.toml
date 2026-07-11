@@ -12,7 +12,7 @@ repository = "https://github.com/Specy/microlp/"
 readme = "README.md"
 keywords = ["linear-programming", "optimization"]
 categories = ["mathematics", "science"]
-exclude = ["tests/suite/data"]
+exclude = ["tests/suite/data", "benchmark", "BENCHMARK.md"]
 
 [dependencies]
 sprs = { version = "0.11.4", default-features = false }
@@ -26,6 +26,12 @@ env_logger = "0.11.5"
 mps = { version = "1.0.1", default-features = false }
 lp_parser_rs = "4.1.0"
 flate2 = "1.1.9"
+
+# The benchmark harness lives in its own workspace member so that its solver
+# dependencies (HiGHS and friends) never enter the library's dependency graph,
+# its dev-dependencies, or plain `cargo test` builds.
+[workspace]
+members = ["benchmark"]
 
 [profile.test]
 opt-level = 3

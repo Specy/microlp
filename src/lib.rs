@@ -890,7 +890,7 @@ impl<'a> Iterator for SolutionIter<'a> {
         if self.var_idx < self.solution.num_vars {
             let var = Variable(self.var_idx);
             self.var_idx += 1;
-            Some((var, self.solution.var_value_raw(var)))
+            Some((var, self.solution.var_value(var)))
         } else {
             None
         }

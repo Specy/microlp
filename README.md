@@ -1,8 +1,4 @@
 # microlp
-This is a fork of the archived [minilp](https://github.com/ztlpn/minilp) crate, which was made to fix some bugs, add features and allow the community to make issues and PRs.
-
-### ⚠️ Warning ⚠️
-If you were using the library prior to 0.2.11, please use the latest version of the library as there was a major bug for integer variables.
 
 [![Crates.io](https://img.shields.io/crates/v/microlp.svg)](https://crates.io/crates/microlp)
 [![Documentation](https://docs.rs/microlp/badge.svg)](https://docs.rs/microlp/)
@@ -10,6 +6,12 @@ If you were using the library prior to 0.2.11, please use the latest version of 
 A linear programming solver: it finds the minimum (or maximum) of a linear
 function of a set of variables subject to linear equality and inequality
 constraints. Variables can be real, integer or boolean.
+
+This is a fork of the archived [minilp](https://github.com/ztlpn/minilp) crate, which was made to fix some bugs, add MILP solving, new features and allow the community to make issues and PRs.
+
+### Disclaimer
+
+I cannot guarantee that the solver always gives optimal solutions (nor that it is bug free), but I'm trying to expand the test suite to cover most cases and catch any bugs that come with it. If you find a bug, want to contribute new testcases or new features, consider reporting it or contributing and sending a PR.
 
 ## Getting started
 
@@ -23,11 +25,9 @@ directly.
 
 * Pure Rust, no dependencies on native code. Runs on WebAssembly.
 * Real, integer and boolean variables.
-* Time and node limits. An interrupted solve resumes where it stopped.
-* Solved problems can be changed (new constraints, fixed variables) and
-  re-solved without starting over.
+* Time limits with possibility to edit and resume the solve.
+* Edit problems after solving and resume the solve from scratch.
 * Warm starts from a known solution.
-* Reads MPS files.
 * Handles problems with hundreds of thousands of variables and constraints.
 
 Integer and boolean variables are handled with branch & bound. The library is
@@ -55,9 +55,6 @@ assert_eq!(solution.objective(), 7.0);
 assert_eq!(solution.var_value(x), 1.0);
 assert_eq!(solution.var_value(y), 3.0);
 ```
-
-For a bigger example, see [examples/tsp](examples#tsp), a travelling salesman
-solver.
 
 ## Defining a problem
 
@@ -131,7 +128,7 @@ computed from exactly the values you read:
 let value = solution.var_value(x);   // rounded to an exact integer for
                                      // integer/boolean variables
 let raw = solution.var_value_raw(x); // without the rounding
-let same = solution[x];              // indexing works too
+let same = solution[x];              // indexing works too, this is equivalent to var_value()
 
 for (var, value) in &solution {
     println!("{}: {}", var.idx(), value);
@@ -279,29 +276,9 @@ while solution.var_value(x).fract() != 0.0 {
 }
 ```
 
-## Reading MPS files
-
-`MpsFile` parses the classic [MPS](https://en.wikipedia.org/wiki/MPS_(format))
-format and gives you the parsed `Problem` plus a name→variable map:
-
-```rust
-use microlp::{MpsFile, OptimizationDirection};
-use std::{fs::File, io::BufReader};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let file = BufReader::new(File::open("model.mps")?);
-    let mps = MpsFile::parse(file, OptimizationDirection::Minimize)?;
-
-    let solution = mps.problem.solve()?;
-    let x = mps.variables["X1"];
-    println!("X1 = {}", solution.var_value(x));
-    Ok(())
-}
-```
-
 ## Testing
 
-Besides unit tests, the repository ships a correctness suite of 230+ LP/MILP
+Besides unit tests, the repository ships a correctness suite of 200+ LP/MILP
 problems with independently known answers:
 
 ```bash
@@ -312,6 +289,39 @@ cargo test --release --test suite -- --hard  # plus the long-running ones
 See [tests/suite/README.md](tests/suite/README.md) for how it works, and
 [src/ARCHITECTURE.md](src/ARCHITECTURE.md) if you want to know how the solver
 itself works.
+
+There is also a harder tier called `xhard` which microlp currently cannot solve in reasonable time. (under 10 minutes) which you can run with. This tier is being used to compare with other solvers.
+```
+cargo test --release --test suite -- --xhard
+```
+
+## Benchmarks
+
+[BENCHMARK.md](https://github.com/Specy/microlp/blob/master/BENCHMARK.md)
+compares microlp against other open-source solvers on the suite's benchmark
+instances, and tracks how close it gets on the instances it cannot yet solve
+within a time budget. Regenerate it from a clone of this repository (the
+crates.io package does not include the benchmark data) with:
+
+```bash
+cargo run -p microlp-benchmark --release
+```
+
+The rival solvers set themselves up during the build: HiGHS is compiled from
+source, SCIP is downloaded prebuilt (the first build needs internet access)
+and Clarabel is pure Rust. What must already be on the machine is a C++
+toolchain, CMake and libclang:
+
+* **Linux** (Debian/Ubuntu): `sudo apt install cmake build-essential libclang-dev`
+* **macOS**: `xcode-select --install`, then `brew install cmake`
+* **Windows**: Visual Studio Build Tools (C++ workload), [CMake](https://cmake.org)
+  and [LLVM](https://github.com/llvm/llvm-project/releases) for
+  `libclang.dll` — or `pip install libclang` and point `LIBCLANG_PATH` at
+  its `native` folder
+
+Runs are timed, so use an otherwise idle machine. A solver you cannot build
+can be left out, e.g.
+`cargo run -p microlp-benchmark --release --no-default-features --features highs,clarabel`.
 
 ## License
 
