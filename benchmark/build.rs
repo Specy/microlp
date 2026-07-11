@@ -1,9 +1,9 @@
 //! With the `scip` feature, the bundled SCIP links dynamically and its
 //! shared libraries live deep inside scip-sys's build output — the produced
-//! binary would silently fail to start without them. Copy them next to the
-//! executable (Windows searches the executable's directory) and embed an
-//! rpath on unix, so `cargo run -p microlp-benchmark` works with no manual
-//! PATH surgery.
+//! binary would silently fail to start without them. On Windows the loader
+//! searches the executable's directory, so the libraries are copied next to
+//! it; on unix an rpath is embedded instead. Either way,
+//! `cargo run -p microlp-benchmark` works with no manual PATH surgery.
 
 use std::path::{Path, PathBuf};
 
@@ -12,6 +12,7 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_SCIP").is_none() {
         return;
     }
+    let windows = std::env::var("CARGO_CFG_TARGET_FAMILY").as_deref() == Ok("windows");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
     // OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out; the executable
     // directory is three levels up.
@@ -20,22 +21,19 @@ fn main() {
         .nth(3)
         .expect("unexpected OUT_DIR layout")
         .to_path_buf();
-    let install = find_scip_install(&exe_dir.join("build")).unwrap_or_else(|| {
+    let install = find_scip_install(&exe_dir.join("build"), windows).unwrap_or_else(|| {
         panic!(
-            "the scip feature is enabled but no scip-sys-*/out/scip_install exists under {} — \
-             did the scip-sys build change its layout?",
+            "the scip feature is enabled but no scip-sys-*/out/scip_install with libraries \
+             for this platform exists under {} — did the scip-sys build change its layout?",
             exe_dir.join("build").display()
         )
     });
 
-    let bin = install.join("bin");
-    if bin.is_dir() {
+    if windows {
+        let bin = install.join("bin");
         for entry in std::fs::read_dir(&bin).into_iter().flatten().flatten() {
             let path = entry.path();
-            let is_shared_lib = path
-                .extension()
-                .is_some_and(|e| e == "dll" || e == "so" || e == "dylib");
-            if !is_shared_lib {
+            if !path.extension().is_some_and(|e| e == "dll") {
                 continue;
             }
             let dest = exe_dir.join(path.file_name().expect("file name"));
@@ -49,26 +47,36 @@ fn main() {
                 );
             }
         }
-    }
-    if std::env::var("CARGO_CFG_TARGET_FAMILY").as_deref() == Ok("unix") {
-        let lib = install.join("lib");
-        if lib.is_dir() {
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
-        }
+    } else {
+        println!(
+            "cargo:rustc-link-arg=-Wl,-rpath,{}",
+            install.join("lib").display()
+        );
+        // Emit classic DT_RPATH instead of DT_RUNPATH: RUNPATH only applies
+        // to the executable's *direct* dependencies, but SCIP's shared
+        // library has dependencies of its own living in the same directory
+        // (and, transitively, the Fortran runtime), which only RPATH lets
+        // the loader resolve from there.
+        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
     }
 }
 
 /// The scip_install directory of the most recently built scip-sys, found by
 /// scanning the profile's build directory (there is no DEP_ env var for it:
 /// scip-sys is not a direct dependency of this crate).
-fn find_scip_install(build_dir: &Path) -> Option<PathBuf> {
+///
+/// A candidate must carry the *current target's* library format: a Windows
+/// and a WSL/Linux build can share one target directory (a checkout under
+/// /mnt/c), leaving one scip_install per platform side by side, and picking
+/// by recency alone can then grab the wrong platform's libraries.
+fn find_scip_install(build_dir: &Path, windows: bool) -> Option<PathBuf> {
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(build_dir).ok()?.flatten() {
         if !entry.file_name().to_string_lossy().starts_with("scip-sys-") {
             continue;
         }
         let install = entry.path().join("out").join("scip_install");
-        if !install.is_dir() {
+        if !has_platform_libs(&install, windows) {
             continue;
         }
         let modified = entry
@@ -80,4 +88,20 @@ fn find_scip_install(build_dir: &Path) -> Option<PathBuf> {
         }
     }
     best.map(|(_, path)| path)
+}
+
+fn has_platform_libs(install: &Path, windows: bool) -> bool {
+    let (dir, matches): (PathBuf, fn(&str) -> bool) = if windows {
+        (install.join("bin"), |name| name.ends_with(".dll"))
+    } else {
+        (install.join("lib"), |name| {
+            name.starts_with("libscip.so")
+                || (name.starts_with("libscip") && name.contains(".dylib"))
+        })
+    };
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| matches(&e.file_name().to_string_lossy()))
 }
