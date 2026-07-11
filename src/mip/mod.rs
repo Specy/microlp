@@ -6,6 +6,7 @@
 pub(crate) mod branching;
 pub(crate) mod node;
 pub(crate) mod params;
+pub(crate) mod propagate;
 
 use crate::solver::{check_deadline, Deadline, Solver};
 use crate::{ComparisonOp, Error, OptimizationDirection, Problem, StopReason, VarDomain, Variable};
@@ -162,6 +163,16 @@ impl Default for Tolerances {
 pub struct Stats {
     /// Branch & bound nodes whose LP was solved (0 for pure-LP problems).
     pub nodes_solved: u64,
+    /// Nodes pruned by bound propagation before any LP work: the node's
+    /// branching decisions, propagated through the constraint activities,
+    /// proved the subproblem empty.
+    pub nodes_pruned_by_propagation: u64,
+    /// Variable bounds tightened by reduced-cost fixing: after a node LP
+    /// solves with an incumbent in hand, LP duality bounds how far each
+    /// nonbasic variable can move before the objective crosses the incumbent
+    /// cutoff — integer bounds round inward accordingly, often fixing
+    /// binaries outright.
+    pub reduced_cost_tightenings: u64,
     /// Total simplex pivots across the whole solve (including the root LP).
     pub lp_iterations: u64,
     /// Wall-clock time spent inside the solver, accumulated across resumes.
@@ -217,6 +228,15 @@ pub(crate) struct MipState {
     pub base: Problem,
     /// User-level fix_var overlay on `base` (var → fixed value).
     pub fixed: BTreeMap<usize, f64>,
+    /// Node-level bound propagation over the (presolved) rows the search
+    /// runs on. Plain data + reusable scratch; see `mip::propagate`.
+    pub propagator: propagate::Propagator,
+    /// Propagation effectiveness sample (see `params::PROP_SAMPLE_CALLS`):
+    /// calls made, calls that deduced or pruned, and the kill switch that
+    /// flips when the sampled hit rate is too low to pay for itself.
+    pub prop_calls: u32,
+    pub prop_hits: u32,
+    pub prop_disabled: bool,
 }
 
 impl std::fmt::Debug for MipState {
@@ -297,6 +317,7 @@ pub(crate) fn run(problem: &Problem, options: SolveOptions) -> Result<MipRun, Er
         &problem.var_domains,
         deadline,
     )?;
+    let propagator = propagate::Propagator::new(constraints, problem.obj_coeffs.len());
     let root_bounds = var_mins
         .iter()
         .zip(var_maxs)
@@ -320,6 +341,10 @@ pub(crate) fn run(problem: &Problem, options: SolveOptions) -> Result<MipRun, Er
         pseudocosts,
         base: problem.clone(),
         fixed: BTreeMap::new(),
+        propagator,
+        prop_calls: 0,
+        prop_hits: 0,
+        prop_disabled: false,
     };
     let outcome = resume_run_with_deadline(&mut state)?;
     Ok(MipRun { outcome, state })
@@ -541,6 +566,19 @@ fn apply_node_bounds(state: &mut MipState, node: &Node) -> bool {
     true
 }
 
+// SOS1/clique SET branching was implemented here (detection of packing rows
+// where the two smallest binary coefficients exceed the rhs, plus
+// Beale–Tomlin half-splits over the free members) and REVERTED after
+// measurement on 2026-07-11: with node propagation already delivering every
+// clique implication through the row activities (a member at 1 zeroes its
+// siblings), set branches only starved the pseudocost learning — lseu 3×
+// slower, p0201 +81%, rgn +62% vs plain variable branching (and a
+// positive-weight-only split variant was catastrophically worse: 2-minute
+// timeouts from weight reshuffling among free zero-weight siblings). See
+// docs/superpowers/specs/2026-07-11-bb-improvements-design.md §5 for the
+// full design and numbers; the set-packing correctness fixture below
+// remains in the test suite.
+
 /// Branch on `var` at the solver's current (just solved) optimum: push the two
 /// children carrying the parent's basis and objective bound.
 fn branch(state: &mut MipState, parent: &Node, var: usize) {
@@ -555,10 +593,15 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
     state.last_solved_id = Some(id);
     let basis = state.solver.snapshot_basis();
 
+    // Intersect with the CURRENT bounds: post-solve deductions (reduced-cost
+    // fixing + its propagation) may have tightened this var past the value
+    // the LP solved at, and a plain floor/floor+1 entry would LOOSEN that
+    // deduction (bound_changes is last-entry-wins). A crossing child is fine
+    // — apply_node_bounds prunes it on pop.
     let mut down_changes = parent.bound_changes.clone();
-    down_changes.push((var, lo, floor));
+    down_changes.push((var, lo, floor.min(hi)));
     let mut up_changes = parent.bound_changes.clone();
-    up_changes.push((var, floor + 1.0, hi));
+    up_changes.push((var, (floor + 1.0).max(lo), hi));
 
     let down_node = Node {
         bound_changes: down_changes,
@@ -566,9 +609,10 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
         lp_bound: z,
         depth: parent.depth + 1,
         parent_id: id,
-        branch_var: var,
+        branch_var: Some(var),
         branch_up: false,
         branch_frac: f_down,
+        fresh_changes: 1,
     };
     let up_node = Node {
         bound_changes: up_changes,
@@ -576,9 +620,10 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
         lp_bound: z,
         depth: parent.depth + 1,
         parent_id: id,
-        branch_var: var,
+        branch_var: Some(var),
         branch_up: true,
         branch_frac: 1.0 - f_down,
+        fresh_changes: 1,
     };
 
     // Estimate-ordered dive: push the child with the LARGER estimated degradation
@@ -595,6 +640,91 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
     }
     // Children were pushed: keep plunging (LIFO pop) into this subtree.
     state.diving = true;
+}
+
+/// Reduced-cost fixing under the incumbent cutoff (design doc §4): with the
+/// node LP optimal at `z` and the search only interested in points strictly
+/// below `cutoff`, LP duality bounds every point of the node's polytope from
+/// below by `z + Σ d_j·(x_j − bound_j)` over the nonbasic vars — so a var may
+/// move at most `(cutoff − z)/|d_j|` away from its bound before the whole
+/// region is provably worthless. Integer bounds round inward, often fixing
+/// binaries outright.
+///
+/// Tightenings are applied to the solver and appended to the node's
+/// `bound_changes` (children inherit them). The node's current optimum stays
+/// feasible — the bound a var SITS on never moves — so the already-computed
+/// `z`, values and branching decisions below remain valid. Sound because the
+/// incumbent only ever improves (the cutoff only tightens) and post-solve
+/// edits re-solve from the untouched base problem.
+///
+/// Returns the touched vars (propagation seeds).
+fn reduced_cost_fixing(state: &mut MipState, node: &mut Node, z: f64) -> Vec<usize> {
+    let mut touched = Vec::new();
+    let Some(inc) = &state.incumbent else {
+        return touched;
+    };
+    let cut = cutoff(inc.objective, state.options.tolerances.prune_epsilon);
+    let slack = cut - z;
+    if !slack.is_finite() || slack <= 0.0 {
+        return touched;
+    }
+    let int_tol = state.options.int_tol;
+    for v in 0..state.solver.num_vars {
+        let Some((d, at_min, at_max)) = state.solver.nb_reduced_cost(v) else {
+            continue;
+        };
+        let (lo, hi) = state.solver.get_var_bounds(v);
+        if lo == hi {
+            continue;
+        }
+        let is_int = matches!(
+            state.solver.orig_var_domains[v],
+            VarDomain::Integer | VarDomain::Boolean
+        );
+        if at_min && d > params::RC_EPS {
+            let m = slack / d;
+            let new_hi = if is_int {
+                ((lo + m) + int_tol).floor().max(lo)
+            } else {
+                lo + m
+            };
+            let apply = if is_int {
+                new_hi < hi - 0.5
+            } else {
+                hi - new_hi > 1e-9 * hi.abs().max(1.0)
+            };
+            if apply {
+                state
+                    .solver
+                    .set_var_bounds(v, lo, new_hi)
+                    .expect("new_hi >= lo by construction");
+                node.bound_changes.push((v, lo, new_hi));
+                touched.push(v);
+            }
+        } else if at_max && d < -params::RC_EPS {
+            let m = slack / -d;
+            let new_lo = if is_int {
+                ((hi - m) - int_tol).ceil().min(hi)
+            } else {
+                hi - m
+            };
+            let apply = if is_int {
+                new_lo > lo + 0.5
+            } else {
+                new_lo - lo > 1e-9 * lo.abs().max(1.0)
+            };
+            if apply {
+                state
+                    .solver
+                    .set_var_bounds(v, new_lo, hi)
+                    .expect("new_lo <= hi by construction");
+                node.bound_changes.push((v, new_lo, hi));
+                touched.push(v);
+            }
+        }
+    }
+    state.stats.reduced_cost_tightenings += touched.len() as u64;
+    touched
 }
 
 /// Outcome of solving one branch & bound node's LP relaxation.
@@ -806,11 +936,11 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
             lp_bound: state.solver.cur_obj_val,
             depth: 0,
             parent_id: 0,
-            // Placeholder: the root is never popped from `open` (it's consumed here,
-            // not pushed), so this is never fed into `pseudocosts.record`.
-            branch_var: 0,
+            branch_var: None,
             branch_up: false,
             branch_frac: 1.0,
+            // No branching created the root; presolve already ran its fixpoint.
+            fresh_changes: 0,
         };
         if branching::is_integral(&state.solver, &domains, int_tol) {
             if try_adopt_incumbent(state, true) {
@@ -881,9 +1011,62 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
 
         // Load the node into the solver: bounds first (values derive from them),
         // then the basis if the solver isn't already at this node's parent optimum.
+        let mut node = node;
         if !apply_node_bounds(state, &node) {
             state.diving = false;
             continue; // crossing bounds — pruned without touching the solver
+        }
+        // Propagate the node's branching decisions through the row activities
+        // BEFORE the LP: deduced bounds are appended to `bound_changes` (so
+        // children inherit them) and a contradiction prunes without LP work.
+        // Seeds are only the entries the CREATING branch added — everything
+        // older was already propagated at the ancestors and inherited.
+        // `state.applied` must mirror the solver on EVERY path — propagation
+        // may have applied partial tightenings before hitting a contradiction,
+        // and the next node's diff-reset logic reads `applied` to undo them.
+        let fresh = node.fresh_changes.min(node.bound_changes.len());
+        if !state.prop_disabled && fresh > 0 {
+            let start = node.bound_changes.len() - fresh;
+            let seeds: Vec<usize> = node.bound_changes[start..].iter().map(|c| c.0).collect();
+            let before = node.bound_changes.len();
+            let res = state.propagator.propagate(
+                &mut state.solver,
+                seeds.into_iter(),
+                &domains,
+                int_tol,
+                &mut node.bound_changes,
+            );
+            state.prop_calls += 1;
+            let deduced = node.bound_changes.len() > before;
+            if deduced || res.is_err() {
+                state.prop_hits += 1;
+                state.applied = effective_bounds(&node.bound_changes);
+                // Collapse to one entry per var: children clone this list at
+                // every branching, so letting deduction entries accumulate
+                // uncollapsed turns deep dives quadratic (measured as a
+                // 40-minute stall on the warm-restart knapsack cases).
+                node.bound_changes = state.applied.clone();
+                node.fresh_changes = node.bound_changes.len();
+            }
+            if state.prop_calls == params::PROP_SAMPLE_CALLS
+                && state.prop_hits * params::PROP_HIT_DIVISOR < state.prop_calls
+            {
+                debug!(
+                    "node propagation disabled: {} hits in {} calls",
+                    state.prop_hits, state.prop_calls
+                );
+                state.prop_disabled = true;
+            }
+            match res {
+                Ok(()) => {}
+                Err(Error::Infeasible) => {
+                    state.stats.nodes_pruned_by_propagation += 1;
+                    state.last_solved_id = None;
+                    state.diving = false;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         }
         let warm = state.last_solved_id == Some(node.parent_id);
         if !warm && state.solver.load_basis(&node.basis).is_err() {
@@ -925,17 +1108,50 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
 
         let z = state.solver.cur_obj_val;
         // Feed this node's actual degradation (vs. its parent's bound, the estimate
-        // used at branch time) back into the pseudocost that predicted it.
-        state.pseudocosts.record(
-            node.branch_var,
-            node.branch_up,
-            (z - node.lp_bound).max(0.0) / node.branch_frac.max(params::BRANCH_FRAC_GUARD),
-        );
+        // used at branch time) back into the pseudocost that predicted it. Set
+        // (clique) branches carry no per-var signal and record nothing.
+        if let Some(bv) = node.branch_var {
+            state.pseudocosts.record(
+                bv,
+                node.branch_up,
+                (z - node.lp_bound).max(0.0) / node.branch_frac.max(params::BRANCH_FRAC_GUARD),
+            );
+        }
         if let Some(inc) = &state.incumbent {
             if z >= cutoff(inc.objective, state.options.tolerances.prune_epsilon) {
                 state.last_solved_id = None;
                 state.diving = false;
                 continue;
+            }
+        }
+
+        // Reduced-cost fixing under the incumbent cutoff, then propagation of
+        // whatever it tightened. A propagation contradiction here means "no
+        // point of this node can beat the incumbent" — prune. The bookkeeping
+        // mirrors the pre-LP propagation block: `state.applied` must reflect
+        // the solver after any tightening, on every path.
+        let rc_touched = reduced_cost_fixing(state, &mut node, z);
+        if !rc_touched.is_empty() {
+            let res = state.propagator.propagate(
+                &mut state.solver,
+                rc_touched.into_iter(),
+                &domains,
+                int_tol,
+                &mut node.bound_changes,
+            );
+            state.applied = effective_bounds(&node.bound_changes);
+            // Collapse (see the pre-LP propagation block for the rationale).
+            node.bound_changes = state.applied.clone();
+            node.fresh_changes = node.bound_changes.len();
+            match res {
+                Ok(()) => {}
+                Err(Error::Infeasible) => {
+                    state.stats.nodes_pruned_by_propagation += 1;
+                    state.last_solved_id = None;
+                    state.diving = false;
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -949,6 +1165,8 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
                 // Below-tolerance fractionality with real infeasibility on rounding:
                 // branch anyway — the children fix the var exactly (floor/floor+1);
                 // branch() sets `diving = true`, so the dive continues into them.
+                // Deliberately a plain VARIABLE branch: the whole point of this
+                // path is pinning this specific var, which a set branch may not do.
                 branch(state, &node, var);
             } else {
                 try_adopt_incumbent(state, false);
@@ -1178,6 +1396,161 @@ mod tests {
         assert!((incumbent_obj(&r.state) + 21.0).abs() < 1e-6);
         // After a best-bound jump the pop is NOT the last-pushed node at least once
         // on this instance; correctness above is the real assertion.
+    }
+
+    #[test]
+    fn propagation_prunes_fixed_charge_children_without_lp() {
+        // Two-facility fixed charge: min 5a + 4b + x + y with x + y >= 6,
+        // x <= 4a, y <= 4b, a/b binary, x/y in [0, 4]. Demand 6 > 4 forces
+        // BOTH facilities open (optimum a = b = 1, x + y = 6, objective 15).
+        // The root LP is fractional in a; the a = 0 child is empty, and
+        // propagation proves it from the rows alone (a = 0 -> x <= 0 ->
+        // y >= 6 > 4) — that child must be pruned WITHOUT an LP solve.
+        //
+        // Presolve is deliberately OFF: its root fixpoint derives the same
+        // facts up front (x >= 2 -> a = 1 by integer rounding) and solves
+        // this at the root with zero nodes — this test isolates the NODE
+        // propagation mechanism instead.
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let a = p.add_binary_var(5.0);
+        let b = p.add_binary_var(4.0);
+        let x = p.add_var(1.0, (0.0, 4.0));
+        let y = p.add_var(1.0, (0.0, 4.0));
+        p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 6.0);
+        p.add_constraint(&[(x, 1.0), (a, -4.0)], ComparisonOp::Le, 0.0);
+        p.add_constraint(&[(y, 1.0), (b, -4.0)], ComparisonOp::Le, 0.0);
+        let options = SolveOptions {
+            presolve: false,
+            ..SolveOptions::default()
+        };
+        let run = run(&p, options).unwrap();
+        assert_eq!(run.outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&run.state) - 15.0).abs() < 1e-6);
+        assert!(
+            run.state.stats.nodes_pruned_by_propagation >= 1,
+            "the closed-facility child must be pruned by propagation, stats: {:?}",
+            run.state.stats
+        );
+    }
+
+    #[test]
+    fn propagated_bounds_are_inherited_and_do_not_leak_across_subtrees() {
+        // A deeper fixed-charge chain solved to optimality: correctness here
+        // exercises the `state.applied` bookkeeping — propagated bounds must
+        // be undone when the search jumps to another subtree (a stale leaked
+        // bound would silently cut feasible regions and change the optimum).
+        // min 3a + 3b + 2c + x + y + z, x+y+z >= 7, x <= 3a, y <= 3b, z <= 3c.
+        // Best: open all three (7 > 6 impossible with two): a=b=c=1, sum 7:
+        // objective 3+3+2+7 = 15.
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let a = p.add_binary_var(3.0);
+        let b = p.add_binary_var(3.0);
+        let c = p.add_binary_var(2.0);
+        let x = p.add_var(1.0, (0.0, 3.0));
+        let y = p.add_var(1.0, (0.0, 3.0));
+        let z = p.add_var(1.0, (0.0, 3.0));
+        p.add_constraint(&[(x, 1.0), (y, 1.0), (z, 1.0)], ComparisonOp::Ge, 7.0);
+        p.add_constraint(&[(x, 1.0), (a, -3.0)], ComparisonOp::Le, 0.0);
+        p.add_constraint(&[(y, 1.0), (b, -3.0)], ComparisonOp::Le, 0.0);
+        p.add_constraint(&[(z, 1.0), (c, -3.0)], ComparisonOp::Le, 0.0);
+        let run = run(&p, SolveOptions::default()).unwrap();
+        assert_eq!(run.outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&run.state) - 15.0).abs() < 1e-6);
+        let inc = run.state.incumbent.as_ref().unwrap();
+        for (i, want) in [1.0, 1.0, 1.0].iter().enumerate() {
+            assert!((inc.values[i] - want).abs() < 1e-6, "y{} != 1", i);
+        }
+    }
+
+    #[test]
+    fn set_packing_solves_to_optimum() {
+        // Three disjoint packing triples plus a coupling knapsack. Optimum
+        // picks the best member of each triple subject to the knapsack.
+        // maximize 5a1 + 4a2 + 3a3 (triple A, <= 1)
+        //        + 6b1 + 2b2 + 2b3 (triple B, <= 1)
+        //        + 4c1 + 4c2 + 3c3 (triple C, <= 1)
+        // s.t. weights 3a1+1a2+1a3 + 4b1+1b2+1b3 + 3c1+1c2+1c3 <= 7.
+        // Exhaustive check: a1 + b1 impossible with c1 (3+4+3=10); best is
+        // a1(3) + b1(4) = 11 weight 7 -> obj 11? vs a1 + c1 + b2: 3+3+1=7 ->
+        // 5+4+6? b2=2: 5+4+2=11? Let's assert against presolve-off too, and
+        // pin the value computed by hand below.
+        // Candidates (one per triple, weight <= 7):
+        //  a1,b1, -  : w=7 obj=11   |  a1,b2,c1: w=7 obj=11
+        //  a1,b1 alone dominates adding nothing else; a2,b1,c1: w=8 no.
+        //  a1,b2,c2: w=5 obj=11; plus nothing else possible (triples used).
+        //  a2,b1,c1: 1+4+3=8 no. a1,b1,c2: 3+4+1=8 no. a1,b1,c3: 8 no.
+        //  a2,b1,c2: 1+4+1=6 obj 4+6+4=14!  a2,b1,c1: 8 no.
+        //  a3,b1,c1: 1+4+3=8 no. a2,b1,c3: 6 obj 4+6+3=13.
+        //  a1,b1 without c: 11 < 14. Best: a2,b1,c2 = 14? check a2,b1,c2
+        //  weight 1+4+1=6 <= 7, obj 4+6+4=14. Any better? a1,b1 needs w 7,
+        //  leaves no c. a1(5) vs a2(4): a1,b1,cX impossible; a1,b2/b3+cX:
+        //  5+2+4=11. So optimum = 14.
+        let mut p = Problem::new(OptimizationDirection::Maximize);
+        let a: Vec<_> = [5.0, 4.0, 3.0]
+            .iter()
+            .map(|&c| p.add_binary_var(c))
+            .collect();
+        let b: Vec<_> = [6.0, 2.0, 2.0]
+            .iter()
+            .map(|&c| p.add_binary_var(c))
+            .collect();
+        let c: Vec<_> = [4.0, 4.0, 3.0]
+            .iter()
+            .map(|&c| p.add_binary_var(c))
+            .collect();
+        for grp in [&a, &b, &c] {
+            p.add_constraint(
+                grp.iter().map(|&v| (v, 1.0)).collect::<Vec<_>>(),
+                ComparisonOp::Le,
+                1.0,
+            );
+        }
+        let weights = [3.0, 1.0, 1.0, 4.0, 1.0, 1.0, 3.0, 1.0, 1.0];
+        let all: Vec<_> = a.iter().chain(&b).chain(&c).copied().collect();
+        p.add_constraint(
+            all.iter()
+                .zip(weights)
+                .map(|(&v, w)| (v, w))
+                .collect::<Vec<_>>(),
+            ComparisonOp::Le,
+            7.0,
+        );
+        let run_default = run(&p, SolveOptions::default()).unwrap();
+        assert_eq!(run_default.outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&run_default.state) + 14.0).abs() < 1e-6);
+        // Same answer with presolve off (isolates the branching machinery).
+        let run_raw = run(
+            &p,
+            SolveOptions {
+                presolve: false,
+                ..SolveOptions::default()
+            },
+        )
+        .unwrap();
+        assert!((incumbent_obj(&run_raw.state) + 14.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reduced_cost_fixing_fires_under_warm_incumbent() {
+        // binary_knapsack with its optimum handed in as a warm start: the
+        // incumbent exists before the first branching, so every node solves
+        // under a tight cutoff and reduced-cost fixing can bite. Optimum must
+        // be unchanged and at least one tightening must have fired.
+        let mut options = SolveOptions::default();
+        options.warm_start = Some(vec![
+            (Variable(0), 0.0),
+            (Variable(1), 1.0),
+            (Variable(2), 1.0),
+            (Variable(3), 1.0),
+        ]);
+        let run = run(&binary_knapsack(), options).unwrap();
+        assert_eq!(run.outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&run.state) + 21.0).abs() < 1e-6);
+        assert!(
+            run.state.stats.reduced_cost_tightenings > 0,
+            "reduced-cost fixing must fire on a warm-started knapsack, stats: {:?}",
+            run.state.stats
+        );
     }
 
     #[test]

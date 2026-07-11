@@ -59,7 +59,9 @@ pub(crate) enum Mode {
 /// `Tolerances::feasibility` (see `check_constraints` for the absolute-vs-
 /// relative rationale): a false "infeasible" is a wrong answer, so the test
 /// is generous — real detections exceed it by orders of magnitude.
-const FEAS_TOL: f64 = 1e-7;
+/// Shared with the B&B node propagation (`mip::propagate`), which runs the
+/// same activity math on the same rows at every node.
+pub(crate) const FEAS_TOL: f64 = 1e-7;
 
 /// Minimum relative improvement for a working continuous bound tightening,
 /// and the amount the computed bound is relaxed OUTWARD before being stored.
@@ -67,7 +69,7 @@ const FEAS_TOL: f64 = 1e-7;
 /// implied one, so recording it stays feasible-set-exact under rounding
 /// noise; using the same value for both keeps passes idempotent (a
 /// re-derived bound never re-applies).
-const IMPROVE_REL: f64 = 1e-9;
+pub(crate) const IMPROVE_REL: f64 = 1e-9;
 
 /// Margin required to drop a row as redundant. Keeping a truly redundant row
 /// costs nothing but speed, so this errs toward keeping.
@@ -81,7 +83,7 @@ const REDUNDANT_MARGIN: f64 = 1e-9;
 /// rows are exactly where the amplified noise matters: 1e9-scale terms make
 /// `NOISE_REL * scale` ≈ 1e-3, which correctly disables aggressive integer
 /// rounding there instead of cutting a true optimum.
-const NOISE_REL: f64 = 1e-12;
+pub(crate) const NOISE_REL: f64 = 1e-12;
 
 /// Minimum RELATIVE improvement for a binary coefficient tightening: the
 /// coefficient must shrink by at least this fraction of its own magnitude.
@@ -123,6 +125,10 @@ pub(crate) struct Presolved {
     pub var_mins: Vec<f64>,
     pub var_maxs: Vec<f64>,
     pub constraints: Vec<(CsVec, ComparisonOp, f64)>,
+    /// Reduction counters; consumed by the unit tests and the debug log
+    /// (the lib itself logs from the working copy before this is built,
+    /// hence the dead-code allowance).
+    #[allow(dead_code)]
     pub stats: PresolveStats,
 }
 
@@ -532,12 +538,12 @@ impl Work<'_> {
                 let (v, a) = (row.vars[i], row.coeffs[i]);
                 let (cmin, cmax) = term_range(a, self.wlo[v], self.whi[v]);
                 let rest_l = if cmin.is_finite() {
-                    (wact.ninf_l == 0).then(|| wact.l - cmin)
+                    (wact.ninf_l == 0).then_some(wact.l - cmin)
                 } else {
                     (wact.ninf_l == 1).then_some(wact.l)
                 };
                 let rest_u = if cmax.is_finite() {
-                    (wact.ninf_u == 0).then(|| wact.u - cmax)
+                    (wact.ninf_u == 0).then_some(wact.u - cmax)
                 } else {
                     (wact.ninf_u == 1).then_some(wact.u)
                 };

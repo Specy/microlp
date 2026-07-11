@@ -506,6 +506,22 @@ impl Solver {
         (self.orig_var_mins[var], self.orig_var_maxs[var])
     }
 
+    /// Reduced cost and bound-side status of a NONBASIC var, `None` for basic
+    /// vars (their reduced cost is zero by definition). Only meaningful right
+    /// after a completed solve: the maintained `nb_var_obj_coeffs` are true
+    /// reduced costs exactly when the solver is dual-feasible on the real
+    /// objective, which `reoptimize`/`initial_solve` guarantee on `Finished`.
+    pub(crate) fn nb_reduced_cost(&self, var: usize) -> Option<(f64, bool, bool)> {
+        match self.var_states[var] {
+            VarState::Basic(_) => None,
+            VarState::NonBasic(col) => Some((
+                self.nb_var_obj_coeffs[col],
+                self.nb_var_states[col].at_min,
+                self.nb_var_states[col].at_max,
+            )),
+        }
+    }
+
     /// Change a variable's bounds in place. Records the new bounds and repairs the
     /// invariants that depend on them; does NOT run simplex — call [`Self::reoptimize`]
     /// afterwards. Returns `Err(Infeasible)` (state untouched) if `min > max`.

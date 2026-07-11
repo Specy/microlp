@@ -51,3 +51,20 @@ pub(crate) const GAP_DENOM_GUARD: f64 = 1e-10;
 /// this constant only forgives noise in the hint value itself, never a real
 /// out-of-bounds input.
 pub(crate) const HINT_BOUNDS_SLACK: f64 = 1e-9;
+
+/// Node propagation self-throttle: after this many propagation calls the
+/// driver checks the hit rate (calls that pruned the node or deduced at
+/// least one bound) and disables propagation for the rest of the search
+/// when it falls below `1 / PROP_HIT_DIVISOR`. On structures propagation
+/// cannot deduce from (covering rows, loose dense rows) it is pure per-node
+/// overhead — measured 2× on BIP_easy before this throttle existed — while
+/// effective instances (fixed-charge, bounded general integers) hit far
+/// above the bar from the very first nodes.
+pub(crate) const PROP_SAMPLE_CALLS: u32 = 64;
+pub(crate) const PROP_HIT_DIVISOR: u32 = 8;
+
+/// Reduced costs below this magnitude are treated as zero by the
+/// reduced-cost fixing pass: dividing the cutoff slack by a noise-level
+/// reduced cost would produce a garbage (astronomical) movement bound, and
+/// a genuinely-zero reduced cost carries no fixing information at all.
+pub(crate) const RC_EPS: f64 = 1e-9;
