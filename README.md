@@ -312,16 +312,19 @@ source, SCIP is downloaded prebuilt (the first build needs internet access)
 and Clarabel is pure Rust. What must already be on the machine is a C++
 toolchain, CMake and libclang:
 
-* **Linux** (Debian/Ubuntu): `sudo apt install cmake build-essential libclang-dev`
+* **Linux** (Debian/Ubuntu): `sudo apt install cmake build-essential libclang-dev libgfortran5`
 * **macOS**: `xcode-select --install`, then `brew install cmake`
 * **Windows**: Visual Studio Build Tools (C++ workload), [CMake](https://cmake.org)
   and [LLVM](https://github.com/llvm/llvm-project/releases) for
   `libclang.dll` — or `pip install libclang` and point `LIBCLANG_PATH` at
   its `native` folder
 
-Runs are timed, so use an otherwise idle machine. A solver you cannot build
+Runs are timed, so use an otherwise idle machine.
+A solver you cannot build
 can be left out, e.g.
-`cargo run -p microlp-benchmark --release --no-default-features --features highs,clarabel`.
+```bash
+cargo run -p microlp-benchmark --release --no-default-features --features highs,clarabel
+```
 
 ## License
 
