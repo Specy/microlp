@@ -56,6 +56,14 @@ pub struct SolveOptions {
     /// Optional (partial) starting assignment used to seed the incumbent.
     /// Advisory: an infeasible or incomplete hint is ignored. Default `None`.
     pub warm_start: Option<Vec<(Variable, f64)>>,
+    /// Enable presolve: reductions applied to the problem before the search
+    /// starts (bound tightening, redundant-row elimination, variable fixing;
+    /// for integer problems also coefficient tightening and dual fixing).
+    /// The problem you observe through [`crate::Solution`] is unchanged —
+    /// reductions never remove variables and preserve at least one optimum.
+    /// Disable only to compare raw solver behavior or to rule presolve out
+    /// while investigating a suspected numerical issue. Default `true`.
+    pub presolve: bool,
     /// Expert-level numeric tolerances (see [`Tolerances`]). Most callers
     /// should leave this at [`Tolerances::default`]; override an individual
     /// field only once you understand the correctness/permissiveness
@@ -71,6 +79,7 @@ impl Default for SolveOptions {
             mip_gap: 0.0,
             int_tol: 1e-6,
             warm_start: None,
+            presolve: true,
             tolerances: Tolerances::default(),
         }
     }
@@ -253,18 +262,44 @@ pub(crate) fn status_of(outcome: MipOutcome, state: &MipState) -> Status {
 /// Build the search state for `problem` and run it under `options`.
 pub(crate) fn run(problem: &Problem, options: SolveOptions) -> Result<MipRun, Error> {
     let deadline = options.time_limit.map(|d| Instant::now() + d);
+    // Presolve the search problem. `state.base` below stays the user's
+    // untouched problem, so post-solve edits keep composing against it; the
+    // presolved bounds become the ROOT bounds (branching resets to them).
+    // Dual fixing is optimum-preserving but not feasible-point-preserving,
+    // so it is disabled when a warm-start hint must be honored.
+    let pre = if options.presolve {
+        Some(crate::presolve::presolve(
+            &problem.obj_coeffs,
+            &problem.var_mins,
+            &problem.var_maxs,
+            &problem.constraints,
+            &problem.var_domains,
+            crate::presolve::Mode::Mip,
+            options.int_tol,
+            options.warm_start.is_none(),
+        )?)
+    } else {
+        None
+    };
+    let (var_mins, var_maxs, constraints) = match &pre {
+        Some(p) => (&p.var_mins[..], &p.var_maxs[..], &p.constraints[..]),
+        None => (
+            &problem.var_mins[..],
+            &problem.var_maxs[..],
+            &problem.constraints[..],
+        ),
+    };
     let solver = Solver::try_new(
         &problem.obj_coeffs,
-        &problem.var_mins,
-        &problem.var_maxs,
-        &problem.constraints,
+        var_mins,
+        var_maxs,
+        constraints,
         &problem.var_domains,
         deadline,
     )?;
-    let root_bounds = problem
-        .var_mins
+    let root_bounds = var_mins
         .iter()
-        .zip(&problem.var_maxs)
+        .zip(var_maxs)
         .map(|(&lo, &hi)| (lo, hi))
         .collect();
     let pseudocosts = branching::PseudoCosts::new(&problem.obj_coeffs, problem.obj_coeffs.len());

@@ -56,6 +56,7 @@ mod lu;
 mod mip;
 mod mps;
 mod ordering;
+mod presolve;
 /// Problem solvers built on top of the microlp library.
 pub mod problems_solvers;
 mod solver;
@@ -411,14 +412,37 @@ impl Problem {
             })
         } else {
             let deadline = options.time_limit.map(|d| Instant::now() + d);
-            let mut solver = Solver::try_new(
-                &self.obj_coeffs,
-                &self.var_mins,
-                &self.var_maxs,
-                &self.constraints,
-                &self.var_domains,
-                deadline,
-            )?;
+            let mut solver = if options.presolve {
+                // Lp mode applies only feasible-set-exact reductions, so the
+                // live solver stays sound under every later Solution edit.
+                let pre = presolve::presolve(
+                    &self.obj_coeffs,
+                    &self.var_mins,
+                    &self.var_maxs,
+                    &self.constraints,
+                    &self.var_domains,
+                    presolve::Mode::Lp,
+                    options.int_tol,
+                    false,
+                )?;
+                Solver::try_new(
+                    &self.obj_coeffs,
+                    &pre.var_mins,
+                    &pre.var_maxs,
+                    &pre.constraints,
+                    &self.var_domains,
+                    deadline,
+                )?
+            } else {
+                Solver::try_new(
+                    &self.obj_coeffs,
+                    &self.var_mins,
+                    &self.var_maxs,
+                    &self.constraints,
+                    &self.var_domains,
+                    deadline,
+                )?
+            };
             let status = match solver.initial_solve()? {
                 StopReason::Finished => Status::Optimal,
                 StopReason::Limit => Status::Interrupted,
