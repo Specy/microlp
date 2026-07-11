@@ -3,7 +3,7 @@ name = "microlp"
 version = "0.4.0"
 authors = [
     "Alexey Zatelepin <alex.zatelepin@gmail.com>",
-    "Specy <specy.dev@gmai.com"
+    "Specy <specy.dev@gmail.com>"
 ]
 edition = "2021"
 license = "Apache-2.0"
@@ -23,10 +23,6 @@ web-time = "1.1.0"
 rand = "0.8.5"
 rand_pcg = "0.3.1"
 env_logger = "0.11.5"
-# Correctness-suite-only: benchmark-file parsers (mps, lp_parser_rs) and
-# in-memory decompression of the gzipped vendored instances (flate2).
-# Dev-dependencies are never resolved for downstream users of the library,
-# so these stay out of the published package's dependency graph.
 mps = { version = "1.0.1", default-features = false }
 lp_parser_rs = "4.1.0"
 flate2 = "1.1.9"
