@@ -1153,6 +1153,36 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
                 }
                 Err(e) => return Err(e),
             }
+            // The bounds changed AFTER the LP solved: refresh it so the
+            // integrality check and the branching decision below read values
+            // consistent with the node's final bounds (a propagated fixing
+            // of a basic var otherwise leaves a stale fractional value that
+            // nothing can branch on). Same outcome handling as the first
+            // solve; the refresh does not count as a new node.
+            match solve_node_lp(state)? {
+                NodeLp::Solved => {
+                    let z = state.solver.cur_obj_val;
+                    if let Some(inc) = &state.incumbent {
+                        if z >= cutoff(inc.objective, state.options.tolerances.prune_epsilon) {
+                            state.last_solved_id = None;
+                            state.diving = false;
+                            continue;
+                        }
+                    }
+                }
+                NodeLp::Infeasible => {
+                    state.stats.nodes_pruned_by_propagation += 1;
+                    state.last_solved_id = None;
+                    state.diving = false;
+                    continue;
+                }
+                NodeLp::Limit => {
+                    state.open.push(node);
+                    state.last_solved_id = None;
+                    state.diving = false;
+                    return Ok(MipOutcome::Interrupted);
+                }
+            }
         }
 
         if branching::is_integral(&state.solver, &domains, int_tol) {
@@ -1167,6 +1197,10 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
                 // branch() sets `diving = true`, so the dive continues into them.
                 // Deliberately a plain VARIABLE branch: the whole point of this
                 // path is pinning this specific var, which a set branch may not do.
+                // choose_branch_var skips FIXED vars (their LP value can carry
+                // sub-EPS basic noise that reads as "fractional" at tol 0, and
+                // branching them reproduces the parent node forever — the
+                // family/bigm-exact m1e7 infinite loop).
                 branch(state, &node, var);
             } else {
                 try_adopt_incumbent(state, false);

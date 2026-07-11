@@ -91,6 +91,16 @@ pub(crate) fn choose_branch_var(
         if !is_int_domain(d) {
             continue;
         }
+        // A fixed var (lo == hi; integral bounds make hi - lo < 0.5 the
+        // robust test) cannot move: branching on it reproduces the parent
+        // node verbatim and loops forever. Its LP value can still carry
+        // sub-EPS basic noise (e.g. -5e-16 on a var fixed to 0), which is
+        // exactly how it used to sneak past the fractionality test below
+        // when called with int_tol = 0.
+        let (lo, hi) = solver.get_var_bounds(v);
+        if hi - lo < 0.5 {
+            continue;
+        }
         let val = *solver.get_value(v);
         if fractionality(val) <= int_tol {
             continue;
