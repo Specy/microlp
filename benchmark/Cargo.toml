@@ -1,0 +1,36 @@
+[package]
+name = "microlp-benchmark"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Reproducible performance comparison of microlp against other open-source solvers; writes BENCHMARK.md."
+
+[[bin]]
+name = "benchmark"
+path = "src/main.rs"
+
+[dependencies]
+microlp = { path = ".." }
+# The same instance readers the correctness suite uses — the adapter modules
+# under tests/suite are mounted into this crate via #[path], so both harnesses
+# share one set of parsing semantics.
+mps = { version = "1.0.1", default-features = false }
+lp_parser_rs = "4.1.0"
+flate2 = "1.1.9"
+# Rival solvers. HiGHS compiles its C++ sources at build time (needs cmake and
+# a C++ toolchain); the good_lp-backed extras are opt-in features.
+highs = { version = "1", optional = true }
+good_lp = { version = "1", default-features = false, optional = true }
+
+[features]
+default = ["highs", "scip", "clarabel"]
+highs = ["dep:highs"]
+# clarabel and scip are driven through the good_lp modeling layer. scip uses
+# the bundled precompiled SCIP library (build-time download); it links
+# dynamically, so build.rs copies its shared libraries next to the produced
+# executable (and embeds an rpath on unix) — `cargo run` works as is.
+# CBC is deliberately absent: linking it requires a system CBC install that
+# cannot even be type-checked without one; if you have CBC, a contender is a
+# ~20-line copy of the SCIP arm in src/contenders.rs (good_lp/coin_cbc).
+clarabel = ["dep:good_lp", "good_lp/clarabel"]
+scip = ["dep:good_lp", "good_lp/scip", "good_lp/scip_bundled"]
