@@ -68,3 +68,26 @@ pub(crate) const PROP_HIT_DIVISOR: u32 = 8;
 /// reduced cost would produce a garbage (astronomical) movement bound, and
 /// a genuinely-zero reduced cost carries no fixing information at all.
 pub(crate) const RC_EPS: f64 = 1e-9;
+
+/// Step cap for the root diving heuristic: each step fixes one integer var
+/// and re-solves the LP, so this bounds the dive's LP work regardless of
+/// problem size. The dive is advisory (its only product is a possible first
+/// incumbent), so abandoning at the cap is always sound.
+pub(crate) const DIVE_MAX_STEPS: usize = 256;
+
+/// Simplex-pivot budget for the whole dive, as a multiple of what the ROOT
+/// LP itself took (with an absolute floor for trivial roots). Keeps the
+/// dive's LP work a bounded fraction of the solve regardless of size.
+pub(crate) const DIVE_PIVOT_FACTOR: u64 = 2;
+pub(crate) const DIVE_PIVOT_MIN: u64 = 500;
+
+/// The dive fires only after this many nodes have been solved in a run with
+/// NO incumbent found. Instances that find incumbents naturally never dive
+/// (a root-time dive measurably perturbed their search trajectory: gt2 went
+/// 75 ms → 315 ms from a weaker-cutoff tree, not from dive cost); the dive
+/// exists purely as a rescue for searches that would otherwise run their
+/// whole budget empty-handed. 512 was tuned on the corpus: at 128 the dive
+/// still fired inside BIP_easy's natural incumbent-discovery window and its
+/// weaker cutoff cost ~25%; at 512 BIP never dives while mod008 (incumbent-
+/// less past 512 nodes) keeps a ~30% win from the rescue.
+pub(crate) const DIVE_TRIGGER_NODES: u64 = 512;

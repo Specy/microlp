@@ -173,6 +173,9 @@ pub struct Stats {
     /// cutoff — integer bounds round inward accordingly, often fixing
     /// binaries outright.
     pub reduced_cost_tightenings: u64,
+    /// Incumbents produced by the root diving heuristic (0 or 1 per solve:
+    /// it runs once, before the tree search starts).
+    pub incumbents_from_dive: u64,
     /// Total simplex pivots across the whole solve (including the root LP).
     pub lp_iterations: u64,
     /// Wall-clock time spent inside the solver, accumulated across resumes.
@@ -237,6 +240,9 @@ pub(crate) struct MipState {
     pub prop_calls: u32,
     pub prop_hits: u32,
     pub prop_disabled: bool,
+    /// Whether the incumbent-rescue dive has been attempted in this search
+    /// (it fires at most once; see `params::DIVE_TRIGGER_NODES`).
+    pub dive_done: bool,
 }
 
 impl std::fmt::Debug for MipState {
@@ -345,6 +351,7 @@ pub(crate) fn run(problem: &Problem, options: SolveOptions) -> Result<MipRun, Er
         prop_calls: 0,
         prop_hits: 0,
         prop_disabled: false,
+        dive_done: false,
     };
     let outcome = resume_run_with_deadline(&mut state)?;
     Ok(MipRun { outcome, state })
@@ -909,6 +916,113 @@ fn try_warm_start(
     Ok(None)
 }
 
+/// LP-guided diving heuristic for a FIRST incumbent, fired mid-search after
+/// [`params::DIVE_TRIGGER_NODES`] nodes have solved with no incumbent (a
+/// search on track to run its whole budget empty-handed): from the current
+/// node's optimum, repeatedly round the most-integral fractional integer
+/// var to its nearest feasible integer, fix it, and re-solve; if the dive
+/// bottoms out on an integer-feasible point, adopt it. Any point found this
+/// way is globally valid — the dive only ever TIGHTENS bounds inside the
+/// current subproblem, and adoption re-validates against root bounds and
+/// rows. Advisory by design: every failure path (LP infeasible even after
+/// trying the opposite rounding, deadline, step or pivot cap) just abandons.
+///
+/// Restore is bounds-only: touched vars go back to the values recorded in
+/// `state.applied` (the current node's bounds). The solver's basis is NOT
+/// restored — the caller invalidates `last_solved_id`, so the next popped
+/// node reloads its own basis exactly as after any non-warm jump.
+fn dive_for_incumbent(state: &mut MipState, domains: &[VarDomain]) -> Result<(), Error> {
+    let int_tol = state.options.int_tol;
+    let mut touched: Vec<usize> = Vec::new();
+    // Budget the dive's LP work relative to the search's per-node effort so
+    // it stays a bounded fraction of the solve at every problem size.
+    let pivots_start = state.solver.lp_iterations;
+    let per_node = pivots_start / state.stats.nodes_solved.max(1);
+    let pivot_budget = (per_node * params::DIVE_PIVOT_FACTOR).max(params::DIVE_PIVOT_MIN);
+
+    'dive: for _ in 0..params::DIVE_MAX_STEPS {
+        if state.solver.lp_iterations - pivots_start > pivot_budget {
+            break;
+        }
+        if branching::is_integral(&state.solver, domains, int_tol) {
+            if try_adopt_incumbent(state, true) {
+                state.stats.incumbents_from_dive += 1;
+                debug!("dive found an incumbent after {} fixes", touched.len());
+            }
+            break;
+        }
+        // Most-integral fractional int var: the cheapest rounding gamble.
+        let mut best: Option<(usize, f64, f64)> = None;
+        for (v, d) in domains.iter().enumerate() {
+            if !matches!(d, VarDomain::Integer | VarDomain::Boolean) {
+                continue;
+            }
+            let (lo, hi) = state.solver.get_var_bounds(v);
+            if hi - lo < 0.5 {
+                continue; // fixed (possibly with sub-EPS value noise)
+            }
+            let val = *state.solver.get_value(v);
+            let dist = (val - val.round()).abs();
+            if dist <= int_tol {
+                continue;
+            }
+            if best.is_none_or(|(_, _, d)| dist < d) {
+                best = Some((v, val, dist));
+            }
+        }
+        let Some((v, val, _)) = best else {
+            // Nothing fractional beyond tolerance yet !is_integral: the same
+            // guard-noise corner the search loop handles; not dive material.
+            break;
+        };
+        let (lo, hi) = state.solver.get_var_bounds(v);
+        let first = val.round().clamp(lo, hi);
+        // Nearest side first, opposite side as the one retry.
+        let second = if first > val {
+            first - 1.0
+        } else {
+            first + 1.0
+        };
+        for (attempt, target) in [first, second.clamp(lo, hi)].into_iter().enumerate() {
+            if attempt == 1 && target == first {
+                break 'dive; // clamp collapsed both sides onto one value
+            }
+            state
+                .solver
+                .set_var_bounds(v, target, target)
+                .expect("rounded target is inside the var's bounds");
+            if attempt == 0 {
+                touched.push(v);
+            }
+            match state.solver.reoptimize() {
+                Ok(StopReason::Finished) => continue 'dive,
+                Ok(StopReason::Limit) => break 'dive,
+                Err(Error::Infeasible) => continue, // try the opposite side
+                // Internal LP error mid-dive: the heuristic is not worth a
+                // hard failure — abandon and restore.
+                Err(_) => break 'dive,
+            }
+        }
+        break; // both roundings infeasible: the dive is stuck
+    }
+
+    // Bounds-only restore: back to the current node's bounds (`applied`),
+    // falling back to root bounds for vars the node never touched. The next
+    // popped node reloads its own basis (the caller clears the warm-dive
+    // marker), which discards whatever LP state the dive left behind.
+    for v in touched {
+        let (lo, hi) = match state.applied.binary_search_by_key(&v, |t| t.0) {
+            Ok(i) => (state.applied[i].1, state.applied[i].2),
+            Err(_) => state.root_bounds[v],
+        };
+        state
+            .solver
+            .set_var_bounds(v, lo, hi)
+            .expect("node bounds cannot cross");
+    }
+    Ok(())
+}
+
 fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
     let domains = state.solver.orig_var_domains.clone();
     let int_tol = state.options.int_tol;
@@ -994,6 +1108,23 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
             if nodes_this_run >= nl {
                 return Ok(MipOutcome::Interrupted);
             }
+        }
+
+        // Incumbent-rescue dive: this search has solved a whole trigger's
+        // worth of nodes without finding ANY feasible point — spend a bounded
+        // LP effort trying to round one out of the current relaxation, so the
+        // cutoff machinery (pruning, reduced-cost fixing) finally arms. Fired
+        // at most once; searches that find incumbents naturally never pay it.
+        if !state.dive_done
+            && state.incumbent.is_none()
+            && nodes_this_run >= params::DIVE_TRIGGER_NODES
+        {
+            state.dive_done = true;
+            dive_for_incumbent(state, &domains)?;
+            // The dive left the solver off the last node's optimum: the next
+            // pop must reload its basis rather than assume a warm dive.
+            state.last_solved_id = None;
+            state.diving = false;
         }
 
         let node = match pop_node(state) {
@@ -1562,6 +1693,45 @@ mod tests {
         )
         .unwrap();
         assert!((incumbent_obj(&run_raw.state) + 14.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dive_rounds_out_an_incumbent_from_the_root_relaxation() {
+        // Unit-test the dive mechanism directly (the in-search trigger fires
+        // only after DIVE_TRIGGER_NODES incumbent-less nodes, which small
+        // fixtures never reach): stop a knapsack run before any node, then
+        // dive from the root relaxation. Rounding down fractional knapsack
+        // items is always feasible for a <= row, so the dive must adopt an
+        // incumbent, and the state must remain consistent enough to resume
+        // the search to the true optimum afterwards.
+        let mut options = SolveOptions::default();
+        options.node_limit = Some(0);
+        let mut r = run(&binary_knapsack(), options).unwrap();
+        assert_eq!(r.outcome, MipOutcome::Interrupted);
+        assert!(r.state.incumbent.is_none());
+
+        let domains = r.state.solver.orig_var_domains.clone();
+        dive_for_incumbent(&mut r.state, &domains).unwrap();
+        r.state.last_solved_id = None;
+        r.state.diving = false;
+        assert_eq!(
+            r.state.stats.incumbents_from_dive, 1,
+            "the dive must adopt an incumbent on a knapsack root, stats: {:?}",
+            r.state.stats
+        );
+        let dive_obj = incumbent_obj(&r.state);
+        assert!(
+            dive_obj <= -12.0,
+            "internal obj {} not a real point",
+            dive_obj
+        );
+
+        // The search must still finish cleanly from the post-dive state
+        // (drop the node budget: it is per-call, and 0 permits no work).
+        r.state.options.node_limit = None;
+        let outcome = resume_run(&mut r.state, None).unwrap();
+        assert_eq!(outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&r.state) + 21.0).abs() < 1e-6);
     }
 
     #[test]

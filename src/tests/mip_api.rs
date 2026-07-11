@@ -165,9 +165,11 @@ mod tests_mip_api {
 
     #[test]
     fn warm_start_liveness_hint_seeds_incumbent_before_any_node() {
-        // node_limit = 0: the search loop exits before solving a single node, so
-        // the ONLY way to have an incumbent is the warm-start hint. This test
-        // fails if the hint wiring is ever disconnected.
+        // node_limit = 0: the search loop exits before solving a single node,
+        // so the ONLY way to have an incumbent is the warm-start hint (the
+        // incumbent-rescue dive fires only after DIVE_TRIGGER_NODES solved
+        // nodes, far beyond 0). This test fails if the hint wiring is ever
+        // disconnected.
         let (p, a, b) = int_2var_problem();
         let mut options = SolveOptions::default();
         options.node_limit = Some(0);
