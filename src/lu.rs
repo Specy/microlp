@@ -625,8 +625,8 @@ mod tests {
         let mut mat = TriMat::new((size, size));
         for r in 0..size {
             for c in 0..size {
-                if rng.gen_range(0..2) == 0 {
-                    mat.add_triplet(r, c, rng.gen_range(0.0..1.0));
+                if rng.random_range(0..2) == 0 {
+                    mat.add_triplet(r, c, rng.random_range(0.0..1.0));
                 }
             }
         }
@@ -668,8 +668,8 @@ mod tests {
         let sparse_rhs = {
             let mut res = CsVec::empty(size);
             for i in 0..size {
-                if rng.gen_range(0..3) == 0 {
-                    res.append(i, rng.gen_range(0.0..1.0));
+                if rng.random_range(0..3) == 0 {
+                    res.append(i, rng.random_range(0.0..1.0));
                 }
             }
             res
