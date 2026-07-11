@@ -19,8 +19,9 @@ lp_parser_rs = "4.1.0"
 flate2 = "1.1.9"
 # Rival solvers. HiGHS compiles its C++ sources at build time (needs cmake and
 # a C++ toolchain); the good_lp-backed extras are opt-in features.
-highs = { version = "1", optional = true }
-good_lp = { version = "1", default-features = false, optional = true }
+highs = { version = "2.4.0", optional = true }
+good_lp = { version = "1.15.2", default-features = false, optional = true }
+scip-sys = { version = "0.1.28", optional = true }
 
 [features]
 default = ["highs", "scip", "clarabel"]
@@ -33,4 +34,4 @@ highs = ["dep:highs"]
 # cannot even be type-checked without one; if you have CBC, a contender is a
 # ~20-line copy of the SCIP arm in src/contenders.rs (good_lp/coin_cbc).
 clarabel = ["dep:good_lp", "good_lp/clarabel"]
-scip = ["dep:good_lp", "good_lp/scip", "good_lp/scip_bundled"]
+scip = ["dep:good_lp", "good_lp/scip", "good_lp/scip_bundled", "dep:scip-sys"]

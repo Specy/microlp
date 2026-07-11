@@ -1,0 +1,70 @@
+name: Benchmark
+
+# Manual-only: solves the vendored benchmark instances with microlp and the
+# rival solvers (HiGHS, SCIP, Clarabel), then uploads BENCHMARK.md as an
+# artifact and renders it in the job summary. Hosted runners are shared
+# machines, so absolute times are noisier than a quiet desktop — the
+# solver-to-solver comparisons are the durable signal.
+on:
+  workflow_dispatch:
+    inputs:
+      time_limit:
+        description: "Per-(instance, solver) budget in seconds"
+        required: false
+        default: "300"
+      mip_gap:
+        description: "Relative MIP gap all solvers stop at (0 = exact; 0.0001 = 0.01%)"
+        required: false
+        default: "0.0001"
+
+concurrency:
+  group: benchmark
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: Run benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # cmake + a C++ toolchain compile HiGHS from source, libclang feeds its
+      # bindgen, and the prebuilt SCIP links against the Fortran runtime.
+      - name: Install prerequisites
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential libclang-dev libgfortran5
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          key: ${{ runner.os }}-benchmark-${{ hashFiles('Cargo.toml', 'benchmark/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-benchmark-
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+
+      - name: Build
+        run: cargo build -p microlp-benchmark --release
+
+      - name: Run benchmark
+        run: |
+          set -o pipefail
+          cargo run -p microlp-benchmark --release -- \
+            --time-limit "${{ inputs.time_limit }}" \
+            --mip-gap "${{ inputs.mip_gap }}" \
+            --out BENCHMARK.md 2>&1 | tee benchmark-progress.log
+
+      - name: Publish report to the job summary
+        run: cat BENCHMARK.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: |
+            BENCHMARK.md
+            benchmark-progress.log
+          if-no-files-found: error

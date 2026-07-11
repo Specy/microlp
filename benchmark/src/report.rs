@@ -79,6 +79,8 @@ pub struct RunData {
     pub references: Vec<ReferenceResult>,
     pub solvers: Vec<String>,
     pub time_limit_secs: f64,
+    /// Relative MIP gap every solver ran with (0 = exact proofs required).
+    pub mip_gap: f64,
     pub min_ms: f64,
     /// True when --filter/--solvers restricted the run; the report then
     /// carries a partial-run warning.
@@ -120,6 +122,7 @@ pub fn render(data: &RunData) -> String {
         }
         unsolved(&mut md, data, &kept);
     }
+    best_incumbents(&mut md, data, &kept);
     trivial_section(&mut md, data, &trivial);
     full_results(&mut md, data, &kept);
     md
@@ -140,26 +143,38 @@ fn header(md: &mut String, data: &RunData, kept: usize, trivial: usize) {
          ```bash\ncargo run -p microlp-benchmark --release\n```\n\n",
         kept + trivial,
     ));
+    let gap_clause = if data.mip_gap == 0.0 {
+        "with relative MIP gap 0, i.e. every solver (microlp included) must \
+         prove exact optimality"
+            .to_string()
+    } else {
+        format!(
+            "and every solver (microlp included) may stop once its solution is \
+             proven within a relative MIP gap of {} — \"proved optimum\" then \
+             means proven within that tolerance",
+            data.mip_gap
+        )
+    };
     md.push_str("**Method.** ");
     md.push_str(&format!(
         "Each (instance, solver) pair runs in a fresh process with a {} s budget. \
          The measured time covers building the solver's native model from the parsed \
          instance plus solving it; file parsing is excluded. Solves finishing under \
          200 ms are repeated (up to 5 times) and the fastest run is kept. Rival \
-         solvers run single-threaded with relative MIP gap 0, i.e. they must prove \
-         exact optimality just like microlp's default. Every returned solution is \
-         independently re-checked against the instance (bounds, integrality, \
-         constraints, objective); a check failure counts as a failed solve. \
-         Instances that every solver finishes in under {} ms are excluded as \
-         trivial ({} excluded, listed at the end). When no solver proves an \
-         optimum inside the shared budget on an instance microlp left \
-         unfinished, the primary rival gets one longer certification solve \
-         (untimed, all threads, still exact); its value feeds only the \
-         correction-gap column.\n\n",
-        data.time_limit_secs, data.min_ms, trivial,
+         solvers run single-threaded, {}. A solver that times out reports the \
+         incumbent it was holding, so timed-out instances still compare solution \
+         quality. Every returned solution or incumbent is independently re-checked \
+         against the instance (bounds, integrality, constraints, objective); a \
+         check failure counts as a failed solve. Instances that every solver \
+         finishes in under {} ms are excluded as trivial ({} excluded, listed at \
+         the end). When no solver proves an optimum inside the shared budget on \
+         an instance microlp left unfinished, the primary rival gets one longer \
+         certification solve (untimed, all threads, always exact); its value \
+         feeds only the correction-gap column.\n\n",
+        data.time_limit_secs, gap_clause, data.min_ms, trivial,
     ));
     md.push_str(&format!(
-        "| | |\n| --- | --- |\n| Date | {} |\n| Machine | {} ({} threads available) |\n| OS | {} {} |\n| microlp | {} |\n| Budget | {} s per (instance, solver) |\n\n",
+        "| | |\n| --- | --- |\n| Date | {} |\n| Machine | {} ({} threads available) |\n| OS | {} {} |\n| microlp | {} |\n| Budget | {} s per (instance, solver) |\n| MIP gap | {} |\n\n",
         today_utc(),
         cpu_description(),
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
@@ -167,6 +182,11 @@ fn header(md: &mut String, data: &RunData, kept: usize, trivial: usize) {
         std::env::consts::ARCH,
         git_describe(),
         data.time_limit_secs,
+        if data.mip_gap == 0.0 {
+            "0 (exact)".to_string()
+        } else {
+            format!("{} (proofs within this tolerance count as optimal)", data.mip_gap)
+        },
     ));
 }
 
@@ -332,6 +352,66 @@ fn unsolved(md: &mut String, data: &RunData, kept: &[&Row]) {
     );
 }
 
+/// Instances nobody proved anything about: compare the incumbents each
+/// solver was holding when time ran out — without this table those rows
+/// carry no comparative signal at all.
+fn best_incumbents(md: &mut String, data: &RunData, kept: &[&Row]) {
+    let rows: Vec<&&Row> = kept
+        .iter()
+        .filter(|row| !row.1.iter().any(|r| r.conclusive()))
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    md.push_str("## Best solution found where nothing was proved\n\n");
+    md.push_str(
+        "No solver proved these instances within the budget, so the incumbents \
+         they were holding when time ran out compare solution quality instead. \
+         Every value shown passed the independent feasibility check; **bold** \
+         marks the best incumbent, percentages are the distance behind it, and \
+         \"—\" means the solver found no feasible solution at all.\n\n",
+    );
+    md.push_str("| instance | class |");
+    for s in &data.solvers {
+        md.push_str(&format!(" {} |", s));
+    }
+    md.push('\n');
+    md.push_str("| --- | --- |");
+    for _ in &data.solvers {
+        md.push_str(" ---: |");
+    }
+    md.push('\n');
+    for row in rows {
+        let best = row
+            .1
+            .iter()
+            .filter(|r| r.budget_limited())
+            .filter_map(|r| r.objective)
+            .reduce(|a, b| if row.0.maximize { a.max(b) } else { a.min(b) });
+        md.push_str(&format!("| {} | {} |", row.0.name, row.0.class()));
+        for s in &data.solvers {
+            let cell = match result_of(row, s) {
+                Some(r) if r.not_applicable() => "n/a".into(),
+                Some(r) => match (r.objective, best) {
+                    (Some(obj), Some(best)) => {
+                        let behind = correction_gap(row.0.maximize, obj, best);
+                        if behind <= 1e-9 {
+                            format!("**{}**", fmt_obj(obj))
+                        } else {
+                            format!("{} (+{})", fmt_obj(obj), fmt_pct(behind))
+                        }
+                    }
+                    _ => "—".into(),
+                },
+                None => "—".into(),
+            };
+            md.push_str(&format!(" {} |", cell));
+        }
+        md.push('\n');
+    }
+    md.push('\n');
+}
+
 fn correction_gap(maximize: bool, incumbent: f64, reference: f64) -> f64 {
     let shortfall = if maximize {
         reference - incumbent
@@ -481,7 +561,7 @@ fn result_cell(r: &CaseResult) -> String {
                 .map(|g| format!(", gap {}", fmt_pct(g)))
                 .unwrap_or_default()
         ),
-        "interrupted" => "no solution in budget".into(),
+        "interrupted" => "timed out, no solution".into(),
         "infeasible" | "unbounded" => format!(
             "{} ({})",
             r.status,

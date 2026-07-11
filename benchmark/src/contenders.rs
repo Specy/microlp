@@ -3,9 +3,12 @@
 //! and solves it there, so every solver is measured over the same work:
 //! instance data in memory → answer. File parsing is excluded for everyone.
 //!
-//! Fairness settings applied to every rival: one thread, relative MIP gap 0
-//! (prove exact optimality, like microlp's default), everything else at the
-//! solver's own defaults.
+//! Fairness settings applied to every rival: one thread, the same relative
+//! MIP gap as microlp (0 by default — prove exact optimality), everything
+//! else at the solver's own defaults. Solvers that time out report the
+//! incumbent they were holding, so timed-out instances still compare
+//! solution quality; every reported incumbent is independently re-validated
+//! by the caller.
 
 use crate::corpus::Instance;
 use crate::model::{Domain, ModelSpec};
@@ -62,17 +65,26 @@ impl RunOutcome {
     }
 }
 
+/// One solve request: the shared time budget plus the run-mode knobs.
+pub struct SolveTask {
+    pub budget: Duration,
+    /// Untimed certification solve (used only to obtain a proven optimum for
+    /// the report's correction-gap column): the solver may use every thread
+    /// it wants, but must prove *exact* optimality — the caller forces
+    /// `mip_gap` to 0 on reference solves.
+    pub reference: bool,
+    /// Relative MIP gap at which a solver may stop and report the optimum
+    /// (0 = exact). Applied to every solver that supports it, so "proved
+    /// optimum" keeps meaning the same thing for everyone.
+    pub mip_gap: f64,
+}
+
 pub trait Contender {
     fn name(&self) -> &'static str;
     fn supports_mip(&self) -> bool;
     /// Build the solver's native model from `inst.spec` and solve it within
-    /// `budget`. The caller times this whole call.
-    ///
-    /// `reference` marks an untimed certification solve (used only to obtain
-    /// a proven optimum for the report's correction-gap column): the solver
-    /// may then use every thread it wants, but must still prove exact
-    /// optimality.
-    fn run(&self, inst: &Instance, budget: Duration, reference: bool) -> RunOutcome;
+    /// `task.budget`. The caller times this whole call.
+    fn run(&self, inst: &Instance, task: &SolveTask) -> RunOutcome;
 }
 
 /// All compiled-in contenders, microlp first.
@@ -140,7 +152,7 @@ impl Contender for Microlp {
         true
     }
 
-    fn run(&self, inst: &Instance, budget: Duration, _reference: bool) -> RunOutcome {
+    fn run(&self, inst: &Instance, task: &SolveTask) -> RunOutcome {
         let mut problem = microlp::Problem::new(inst.direction);
         let vars: Vec<microlp::Variable> = inst
             .spec
@@ -158,7 +170,8 @@ impl Contender for Microlp {
         }
 
         let mut options = microlp::SolveOptions::default();
-        options.time_limit = Some(budget);
+        options.time_limit = Some(task.budget);
+        options.mip_gap = task.mip_gap;
         let solution = match problem.solve_with(options) {
             Ok(s) => s,
             Err(microlp::Error::Infeasible) => return RunOutcome::bare(RunStatus::Infeasible),
@@ -203,12 +216,12 @@ mod highs_solver {
             true
         }
 
-        fn run(&self, inst: &Instance, budget: Duration, reference: bool) -> RunOutcome {
-            run_highs(inst, budget, reference)
+        fn run(&self, inst: &Instance, task: &SolveTask) -> RunOutcome {
+            run_highs(inst, task)
         }
     }
 
-    fn run_highs(inst: &Instance, budget: Duration, reference: bool) -> RunOutcome {
+    fn run_highs(inst: &Instance, task: &SolveTask) -> RunOutcome {
         let mut pb = highs::RowProblem::default();
         let cols: Vec<highs::Col> = inst
             .spec
@@ -233,8 +246,8 @@ mod highs_solver {
             microlp::OptimizationDirection::Maximize => highs::Sense::Maximise,
         };
         let mut model = pb.optimise(sense);
-        model.set_option("time_limit", budget.as_secs_f64());
-        if reference {
+        model.set_option("time_limit", task.budget.as_secs_f64());
+        if task.reference {
             // Certification solve: throw every core at it.
             model.set_option("parallel", "on");
             let threads = std::thread::available_parallelism()
@@ -246,7 +259,7 @@ mod highs_solver {
             model.set_option("parallel", "off");
         }
         model.set_option("output_flag", false);
-        model.set_option("mip_rel_gap", 0.0);
+        model.set_option("mip_rel_gap", task.mip_gap);
         model.set_option("mip_abs_gap", 0.0);
 
         let solved = model.solve();
@@ -270,7 +283,28 @@ mod highs_solver {
             S::UnboundedOrInfeasible => RunOutcome::bare(RunStatus::Error(
                 "unbounded-or-infeasible (HiGHS did not separate the two)".into(),
             )),
-            S::ReachedTimeLimit => RunOutcome::bare(RunStatus::Interrupted),
+            S::ReachedTimeLimit => {
+                // A finite mip_gap means HiGHS holds an integer-feasible
+                // incumbent (it reports its infinity constant otherwise);
+                // return it so timed-out instances still compare solution
+                // quality. The caller re-validates the values.
+                let gap = solved.mip_gap();
+                if inst.is_mip && gap.is_finite() && gap < 1e29 {
+                    let values = solved.get_solution().columns().to_vec();
+                    let objective = objective_of(&inst.spec, &values);
+                    RunOutcome {
+                        status: RunStatus::Feasible,
+                        objective: Some(objective),
+                        values: Some(values),
+                        bound: None,
+                        gap: Some(gap),
+                        nodes: None,
+                        simplex_iters: None,
+                    }
+                } else {
+                    RunOutcome::bare(RunStatus::Interrupted)
+                }
+            }
             other => RunOutcome::bare(RunStatus::Error(format!("HiGHS status {:?}", other))),
         }
     }
@@ -319,7 +353,7 @@ mod good_lp_solver {
             }
         }
 
-        fn run(&self, inst: &Instance, budget: Duration, _reference: bool) -> RunOutcome {
+        fn run(&self, inst: &Instance, task: &SolveTask) -> RunOutcome {
             let spec = &inst.spec;
             let mut vars = variables!();
             let handles: Vec<good_lp::Variable> = spec
@@ -346,7 +380,7 @@ mod good_lp_solver {
                 Backend::Clarabel => {
                     // Clarabel has no time-limit API in good_lp; the
                     // orchestrator's hard process deadline nets a runaway.
-                    let _ = budget;
+                    let _ = task;
                     let mut model = unsolved.using(good_lp::solvers::clarabel::clarabel);
                     for c in &spec.constraints {
                         model = model.with(to_constraint(c, &handles));
@@ -355,10 +389,21 @@ mod good_lp_solver {
                 }
                 #[cfg(feature = "scip")]
                 Backend::Scip => {
-                    use good_lp::solvers::WithTimeLimit as _;
+                    use good_lp::solvers::{WithMipGap as _, WithTimeLimit as _};
                     let mut model = unsolved
                         .using(good_lp::solvers::scip::scip)
-                        .with_time_limit(budget.as_secs_f64());
+                        .with_time_limit(task.budget.as_secs_f64());
+                    if task.mip_gap > 0.0 {
+                        model = match model.with_mip_gap(task.mip_gap as f32) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                return RunOutcome::bare(RunStatus::Error(format!(
+                                    "cannot set the SCIP mip gap: {}",
+                                    e
+                                )))
+                            }
+                        };
+                    }
                     for c in &spec.constraints {
                         model = model.with(to_constraint(c, &handles));
                     }
@@ -389,8 +434,10 @@ mod good_lp_solver {
         handles: &[good_lp::Variable],
     ) -> RunOutcome {
         match res {
+            // GapLimit means "proved within the configured mip gap", which
+            // is exactly what the other solvers report as Optimal then.
             Ok(sol) => match sol.status() {
-                SolutionStatus::Optimal => {
+                SolutionStatus::Optimal | SolutionStatus::GapLimit => {
                     let values: Vec<f64> = handles.iter().map(|&h| sol.value(h)).collect();
                     let objective = objective_of(&inst.spec, &values);
                     RunOutcome {
@@ -403,10 +450,31 @@ mod good_lp_solver {
                         simplex_iters: None,
                     }
                 }
-                // A limit ended the search; like any rival timeout, the
-                // incumbent is not needed by the report.
-                SolutionStatus::TimeLimit | SolutionStatus::GapLimit => {
-                    RunOutcome::bare(RunStatus::Interrupted)
+                SolutionStatus::TimeLimit => {
+                    // Report the incumbent held at the limit so timed-out
+                    // instances still compare solution quality. good_lp's
+                    // SCIP wrapper has no "is there a solution?" accessor —
+                    // `value()` panicking is its only signal that the solver
+                    // held nothing — so a caught panic here means a clean
+                    // "timed out with no incumbent", not a bug.
+                    let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handles.iter().map(|&h| sol.value(h)).collect::<Vec<f64>>()
+                    }));
+                    match extracted {
+                        Ok(values) => {
+                            let objective = objective_of(&inst.spec, &values);
+                            RunOutcome {
+                                status: RunStatus::Feasible,
+                                objective: Some(objective),
+                                values: Some(values),
+                                bound: None,
+                                gap: None,
+                                nodes: None,
+                                simplex_iters: None,
+                            }
+                        }
+                        Err(_) => RunOutcome::bare(RunStatus::Interrupted),
+                    }
                 }
             },
             Err(ResolutionError::Infeasible) => RunOutcome::bare(RunStatus::Infeasible),

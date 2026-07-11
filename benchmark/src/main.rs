@@ -34,7 +34,7 @@ mod contenders;
 mod corpus;
 mod report;
 
-use contenders::{RunOutcome, RunStatus};
+use contenders::{RunOutcome, RunStatus, SolveTask};
 use corpus::{Instance, InstanceMeta};
 use microlp::ComparisonOp;
 use report::{CaseResult, InstanceInfo, RunData};
@@ -54,6 +54,10 @@ USAGE:
 
 OPTIONS:
   --time-limit <secs>   per-solver budget for every instance (default 300)
+  --mip-gap <fraction>  relative MIP gap at which every solver may stop and
+                        report the optimum (default 0 = exact; e.g. 0.01
+                        accepts anything proven within 1%). Reference solves
+                        stay exact regardless.
   --solvers <a,b,...>   run only these solvers (default: all compiled in)
   --filter <substr>     run only instances whose name contains this
                         (repeatable; matches are OR-ed)
@@ -79,6 +83,7 @@ fn main() {
 
 struct Config {
     time_limit: f64,
+    mip_gap: f64,
     min_ms: f64,
     filters: Vec<String>,
     solvers: Vec<String>,
@@ -90,6 +95,7 @@ impl Config {
     fn parse(args: &[String]) -> Config {
         let mut cfg = Config {
             time_limit: DEFAULT_TIME_LIMIT_SECS,
+            mip_gap: 0.0,
             min_ms: DEFAULT_MIN_MS,
             filters: vec![],
             solvers: contenders::all()
@@ -111,6 +117,11 @@ impl Config {
                     cfg.time_limit = value("--time-limit")
                         .parse()
                         .unwrap_or_else(|_| die("--time-limit expects seconds"));
+                }
+                "--mip-gap" => {
+                    cfg.mip_gap = value("--mip-gap")
+                        .parse()
+                        .unwrap_or_else(|_| die("--mip-gap expects a fraction, e.g. 0.01"));
                 }
                 "--min-ms" => {
                     cfg.min_ms = value("--min-ms")
@@ -139,6 +150,9 @@ impl Config {
         }
         if !(cfg.time_limit.is_finite() && cfg.time_limit > 0.0) {
             die("--time-limit must be positive");
+        }
+        if !(0.0..1.0).contains(&cfg.mip_gap) {
+            die("--mip-gap must be in [0, 1)");
         }
         cfg
     }
@@ -203,6 +217,7 @@ fn orchestrate(cfg: Config) {
         references: vec![],
         solvers: cfg.solvers.clone(),
         time_limit_secs: cfg.time_limit,
+        mip_gap: cfg.mip_gap,
         min_ms: cfg.min_ms,
         partial: !cfg.filters.is_empty() || cfg.solvers != available,
     };
@@ -225,7 +240,7 @@ fn orchestrate(cfg: Config) {
                 fmt_span(started.elapsed().as_secs_f64()),
                 fmt_span((total - done + 1) as f64 * cfg.time_limit),
             );
-            let (s, res) = run_child(&exe, meta, solver, cfg.time_limit, false);
+            let (s, res) = run_child(&exe, meta, solver, cfg.time_limit, cfg.mip_gap, false);
             if sizes.is_none() {
                 sizes = s;
             }
@@ -311,7 +326,9 @@ fn reference_pass(cfg: &Config, exe: &Path, metas: &[InstanceMeta], data: &mut R
             meta.name,
             fmt_span(ref_budget),
         );
-        let (_, res) = run_child(exe, meta, &rival, ref_budget, true);
+        // References must stay exact whatever --mip-gap says: correction
+        // gaps are measured against them.
+        let (_, res) = run_child(exe, meta, &rival, ref_budget, 0.0, true);
         eprintln!(
             "[ref {:>2}/{}] {:<45} {}",
             i + 1,
@@ -369,6 +386,7 @@ fn run_child(
     meta: &InstanceMeta,
     solver: &str,
     limit: f64,
+    mip_gap: f64,
     reference: bool,
 ) -> (Option<Sizes>, CaseResult) {
     let mut args = vec![
@@ -379,6 +397,8 @@ fn run_child(
         solver.to_string(),
         "--time-limit".to_string(),
         limit.to_string(),
+        "--mip-gap".to_string(),
+        mip_gap.to_string(),
     ];
     if reference {
         args.push("--reference".to_string());
@@ -522,6 +542,7 @@ fn run_one(args: &[String]) {
     let mut instance = None;
     let mut solver = None;
     let mut limit = DEFAULT_TIME_LIMIT_SECS;
+    let mut mip_gap = 0.0;
     let mut reference = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -534,8 +555,9 @@ fn run_one(args: &[String]) {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(DEFAULT_TIME_LIMIT_SECS)
             }
+            "--mip-gap" => mip_gap = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
             "--reference" => reference = true,
-            _ => die("run-one expects --instance, --solver, --time-limit, --reference"),
+            _ => die("run-one expects --instance, --solver, --time-limit, --mip-gap, --reference"),
         }
     }
     let (Some(instance), Some(solver)) = (instance, solver) else {
@@ -590,12 +612,18 @@ fn run_one(args: &[String]) {
         return;
     }
 
-    let budget = Duration::from_secs_f64(limit);
+    let task = SolveTask {
+        budget: Duration::from_secs_f64(limit),
+        reference,
+        // Correction gaps are measured against reference optima, so those
+        // stay exact whatever gap the timed run uses.
+        mip_gap: if reference { 0.0 } else { mip_gap },
+    };
     let mut best: Option<(f64, RunOutcome)> = None;
     let loop_started = Instant::now();
     for run in 0.. {
         let t0 = Instant::now();
-        let out = contender.run(&inst, budget, reference);
+        let out = contender.run(&inst, &task);
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         if best.as_ref().is_none_or(|(b, _)| ms < *b) {
             best = Some((ms, out));
