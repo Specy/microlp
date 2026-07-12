@@ -1587,32 +1587,23 @@ impl Solver {
             }
         }
 
-        if self.basis_solver.eta_matrices.len() > 0 {
-            self.basis_solver
-                .reset(&self.orig_constraints_csc, &self.basic_vars)?;
-        }
-
-        self.basis_solver
-            .lu_factors
-            .solve_dense(&mut cur_vals, &mut self.basis_solver.scratch);
+        // Etas are applied to the dense solve directly — a pending eta file
+        // is NOT a reason to refactorize (it used to be, and on node-heavy
+        // MILP solves that meant a full refactorization every recalc).
+        self.basis_solver.solve_dense_with_etas(&mut cur_vals);
         self.basic_var_vals = cur_vals;
         Ok(())
     }
 
     fn recalc_obj_coeffs(&mut self) -> Result<(), Error> {
-        if self.basis_solver.eta_matrices.len() > 0 {
-            self.basis_solver
-                .reset(&self.orig_constraints_csc, &self.basic_vars)?;
-        }
-
+        // Same as recalc_basic_var_vals: pending etas participate in the
+        // (transposed) dense solve instead of forcing a refactorization.
         let multipliers = {
             let mut rhs = vec![0.0; self.num_constraints()];
             for (c, &var) in self.basic_vars.iter().enumerate() {
                 rhs[c] = self.orig_obj_coeffs[var];
             }
-            self.basis_solver
-                .lu_factors_transp
-                .solve_dense(&mut rhs, &mut self.basis_solver.scratch);
+            self.basis_solver.solve_transp_dense_with_etas(&mut rhs);
             rhs
         };
 
@@ -1723,6 +1714,34 @@ impl BasisSolver {
         }
 
         &mut self.rhs
+    }
+
+    /// Dense counterpart of [`Self::solve`]: LU solve plus the forward eta
+    /// application, so callers with dense right-hand sides (the recalcs) no
+    /// longer need a full refactorization just because etas are pending.
+    fn solve_dense_with_etas(&mut self, rhs: &mut [f64]) {
+        self.lu_factors.solve_dense(rhs, &mut self.scratch);
+        for idx in 0..self.eta_matrices.len() {
+            let coeff = rhs[self.eta_matrices.leaving_rows[idx]];
+            if coeff != 0.0 {
+                for (r, &val) in self.eta_matrices.coeff_cols.col_iter(idx) {
+                    rhs[r] -= coeff * val;
+                }
+            }
+        }
+    }
+
+    /// Dense counterpart of [`Self::solve_transp`]: the reverse eta
+    /// application, then the transposed LU solve.
+    fn solve_transp_dense_with_etas(&mut self, rhs: &mut [f64]) {
+        for idx in (0..self.eta_matrices.len()).rev() {
+            let mut coeff = 0.0;
+            for (i, &val) in self.eta_matrices.coeff_cols.col_iter(idx) {
+                coeff += val * rhs[i];
+            }
+            rhs[self.eta_matrices.leaving_rows[idx]] -= coeff;
+        }
+        self.lu_factors_transp.solve_dense(rhs, &mut self.scratch);
     }
 
     /// Pass right-hand side via self.rhs
@@ -1853,6 +1872,81 @@ mod tests {
         assert_eq!(&sol.primal_edge_sq_norms, &[4.0, 8.0]);
 
         assert_eq!(sol.cur_obj_val, 0.0);
+    }
+
+    /// The recalcs apply pending etas to their dense solves instead of
+    /// refactorizing (they used to reset the whole factorization). The
+    /// eta-aware results must match what a FRESH factorization of the same
+    /// basis computes; values are compared per-VAR because a reload
+    /// re-orders basis positions.
+    #[test]
+    fn recalcs_with_pending_etas_match_a_fresh_factorization() {
+        init();
+        // minimize x + y + z, pairwise sums >= 2, boxes [0, 10]: optimum
+        // x = y = z = 1. A bound tightening then forces dual pivots, which
+        // push etas.
+        let mut solver = Solver::try_new(
+            &[1.0, 1.0, 1.0],
+            &[0.0, 0.0, 0.0],
+            &[10.0, 10.0, 10.0],
+            &[
+                (to_sparse(&[1.0, 1.0, 0.0]), ComparisonOp::Ge, 2.0),
+                (to_sparse(&[0.0, 1.0, 1.0]), ComparisonOp::Ge, 2.0),
+                (to_sparse(&[1.0, 0.0, 1.0]), ComparisonOp::Ge, 2.0),
+            ],
+            &[VarDomain::Real, VarDomain::Real, VarDomain::Real],
+            None,
+        )
+        .unwrap();
+        assert_eq!(solver.initial_solve().unwrap(), StopReason::Finished);
+        solver.set_var_bounds(2, 0.0, 0.25).unwrap();
+        assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
+        assert!(
+            solver.basis_solver.eta_matrices.len() > 0,
+            "fixture must leave etas pending to exercise the new path"
+        );
+
+        // Recalculate through the eta-aware dense solves.
+        solver.recalc_basic_var_vals().unwrap();
+        solver.recalc_obj_coeffs().unwrap();
+        let by_var = |s: &Solver| -> Vec<(usize, f64)> {
+            let mut v: Vec<(usize, f64)> = s
+                .basic_vars
+                .iter()
+                .zip(&s.basic_var_vals)
+                .map(|(&var, &val)| (var, val))
+                .collect();
+            v.sort_by_key(|&(var, _)| var);
+            v
+        };
+        let rc_by_var = |s: &Solver| -> Vec<(usize, f64)> {
+            let mut v: Vec<(usize, f64)> = s
+                .nb_vars
+                .iter()
+                .zip(&s.nb_var_obj_coeffs)
+                .map(|(&var, &rc)| (var, rc))
+                .collect();
+            v.sort_by_key(|&(var, _)| var);
+            v
+        };
+        let eta_vals = by_var(&solver);
+        let eta_rcs = rc_by_var(&solver);
+        let eta_obj = solver.cur_obj_val;
+
+        // Reloading the solver's own snapshot refactorizes from scratch and
+        // reruns the recalcs eta-free — the ground truth.
+        let basis = solver.snapshot_basis();
+        solver.load_basis(&basis).unwrap();
+        assert_eq!(solver.basis_solver.eta_matrices.len(), 0);
+        for ((va, a), (vb, b)) in eta_vals.iter().zip(by_var(&solver).iter()) {
+            assert_eq!(va, vb);
+            assert!((a - b).abs() < 1e-9, "basic val of var {va}: {a} vs {b}");
+        }
+        for ((va, a), (vb, b)) in eta_rcs.iter().zip(rc_by_var(&solver).iter()) {
+            assert_eq!(va, vb);
+            assert!((a - b).abs() < 1e-9, "reduced cost of var {va}: {a} vs {b}");
+        }
+        assert!((eta_obj - solver.cur_obj_val).abs() < 1e-9);
     }
 
     #[test]
