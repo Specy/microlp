@@ -96,11 +96,143 @@ mod tests_mip_api {
     }
 
     #[test]
+    fn invalid_integrality_tolerances_are_rejected() {
+        // Negative/NaN tolerances make exact integers look fractional; a
+        // tolerance of 0.5 or more can classify every real value as integral
+        // and makes the rounding-based branch split skip part of the domain.
+        // Keep a node limit on each reproducer so the pre-fix behavior cannot
+        // generate unchanged branches indefinitely.
+        for int_tol in [-1.0, f64::NAN, 0.5, f64::INFINITY] {
+            let mut p = Problem::new(OptimizationDirection::Minimize);
+            p.add_integer_var(1.0, (0, 1));
+            let mut options = SolveOptions::default();
+            options.int_tol = int_tol;
+            options.node_limit = Some(1);
+
+            let err = p.solve_with(options).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidOptions(message) if message.contains("int_tol")),
+                "unexpected error for int_tol={int_tol}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_gap_and_expert_tolerances_are_rejected() {
+        fn assert_invalid(field: &str, options: SolveOptions) {
+            let mut p = Problem::new(OptimizationDirection::Minimize);
+            p.add_integer_var(1.0, (0, 1));
+            let err = p.solve_with(options).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidOptions(message) if message.contains(field)),
+                "unexpected error for {field}: {err}"
+            );
+        }
+
+        for value in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut options = SolveOptions::default();
+            options.mip_gap = value;
+            assert_invalid("mip_gap", options);
+        }
+        for value in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut options = SolveOptions::default();
+            options.tolerances.feasibility = value;
+            assert_invalid("tolerances.feasibility", options);
+        }
+        for value in [-1.0, f64::NAN, 0.5, f64::INFINITY] {
+            let mut options = SolveOptions::default();
+            options.tolerances.integrality_rounding = value;
+            assert_invalid("tolerances.integrality_rounding", options);
+        }
+        for value in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut options = SolveOptions::default();
+            options.tolerances.prune_epsilon = value;
+            assert_invalid("tolerances.prune_epsilon", options);
+        }
+    }
+
+    #[test]
+    fn rounded_root_candidate_does_not_bypass_optimality_proof() {
+        // The root LP is b=5e-7, y=1, z=0 with objective -3. The default
+        // integrality tolerance considers b integral and rounding it to zero
+        // yields the feasible point (0, 1, 0), but that point has objective -1.
+        // The true integer optimum is (0, 0, 1), objective -2.
+        //
+        // Feasibility of the rounded point therefore cannot justify returning
+        // Optimal: because rounding changed the objective away from the LP
+        // bound, branch-and-bound still has proof work to do.
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let b = p.add_binary_var(-4_000_000.0);
+        let y = p.add_binary_var(-1.0);
+        let z = p.add_binary_var(-2.0);
+        p.add_constraint(&[(b, 1.0)], ComparisonOp::Le, 5e-7);
+        p.add_constraint(&[(b, 2_000_000.0), (z, 1.0)], ComparisonOp::Le, 1.0);
+        p.add_constraint(&[(y, 1.0), (z, 1.0)], ComparisonOp::Le, 1.0);
+
+        let sol = p.solve().unwrap();
+        assert_eq!(sol.status(), Status::Optimal);
+        assert!((sol.objective() - -2.0).abs() < 1e-9);
+        assert_eq!(sol.var_value(b), 0.0);
+        assert_eq!(sol.var_value(y), 0.0);
+        assert_eq!(sol.var_value(z), 1.0);
+    }
+
+    #[test]
+    fn rounded_node_candidate_does_not_bypass_its_subtree_proof() {
+        // a >= 0.5 forces an ordinary root branch. In the feasible a=1
+        // child, the remaining relaxation is the near-integral trap from the
+        // root regression above. The child must branch on b rather than treat
+        // the feasible rounded point as proof that its whole subtree is done.
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let a = p.add_binary_var(0.0);
+        let b = p.add_binary_var(-4_000_000.0);
+        let y = p.add_binary_var(-1.0);
+        let z = p.add_binary_var(-2.0);
+        p.add_constraint(&[(a, 1.0)], ComparisonOp::Ge, 0.5);
+        p.add_constraint(&[(b, 1.0)], ComparisonOp::Le, 5e-7);
+        p.add_constraint(&[(b, 2_000_000.0), (z, 1.0)], ComparisonOp::Le, 1.0);
+        p.add_constraint(&[(y, 1.0), (z, 1.0)], ComparisonOp::Le, 1.0);
+
+        let sol = p.solve().unwrap();
+        assert_eq!(sol.status(), Status::Optimal);
+        assert!((sol.objective() - -2.0).abs() < 1e-9);
+        assert_eq!(sol.var_value(a), 1.0);
+        assert_eq!(sol.var_value(b), 0.0);
+        assert_eq!(sol.var_value(y), 0.0);
+        assert_eq!(sol.var_value(z), 1.0);
+    }
+
+    #[test]
     fn milp_infeasible_is_an_error() {
         let mut p = Problem::new(OptimizationDirection::Minimize);
         let x = p.add_integer_var(1.0, (0, 10));
         p.add_constraint(&[(x, 2.0)], ComparisonOp::Eq, 1.0);
         assert_eq!(p.solve().unwrap_err(), Error::Infeasible);
+    }
+
+    #[test]
+    fn unbounded_relaxation_does_not_mask_integer_infeasibility() {
+        // The relaxation is unbounded through y, but x is forced to 0.5 and
+        // has an integer domain, so the actual MILP has no feasible point.
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let x = p.add_integer_var(0.0, (0, 1));
+        let _y = p.add_var(-1.0, (0.0, f64::INFINITY));
+        p.add_constraint(&[(x, 1.0)], ComparisonOp::Eq, 0.5);
+        assert_eq!(p.solve().unwrap_err(), Error::Infeasible);
+    }
+
+    #[test]
+    fn unbounded_relaxation_classification_resumes_after_root_interrupt() {
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let x = p.add_integer_var(0.0, (0, 1));
+        let _y = p.add_var(-1.0, (0.0, f64::INFINITY));
+        p.add_constraint(&[(x, 1.0)], ComparisonOp::Eq, 0.5);
+        let mut options = SolveOptions::default();
+        options.time_limit = Some(Duration::ZERO);
+
+        let interrupted = p.solve_with(options).unwrap();
+        assert_eq!(interrupted.status(), Status::Interrupted);
+        assert_eq!(interrupted.resume(None).unwrap_err(), Error::Infeasible);
     }
 
     #[test]
@@ -118,6 +250,16 @@ mod tests_mip_api {
             .unwrap();
         assert!((sol.objective() - 7.0).abs() < 1e-6);
         assert!((sol[x] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn optimal_lp_stats_report_bound_and_zero_gap() {
+        let mut p = Problem::new(OptimizationDirection::Maximize);
+        let _x = p.add_var(2.0, (0.0, 3.0));
+        let sol = p.solve().unwrap();
+        let stats = sol.stats();
+        assert_eq!(stats.best_bound, Some(6.0));
+        assert_eq!(stats.gap, Some(0.0));
     }
 
     #[test]
@@ -149,6 +291,18 @@ mod tests_mip_api {
         let sol = p.solve_with(options).unwrap();
         assert_eq!(sol.status(), Status::Optimal);
         assert!((sol.objective() - 11.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn warm_start_non_finite_hint_is_ignored() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let (p, a, _) = int_2var_problem();
+            let mut options = SolveOptions::default();
+            options.warm_start = Some(vec![(a, invalid)]);
+            let sol = p.solve_with(options).unwrap();
+            assert_eq!(sol.status(), Status::Optimal);
+            assert!((sol.objective() - 11.0).abs() < 1e-6);
+        }
     }
 
     #[test]
@@ -254,6 +408,18 @@ mod tests_mip_api {
     }
 
     #[test]
+    fn milp_fix_var_non_finite_is_infeasible_error() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let (p, a, _) = int_2var_problem();
+            let sol = p.solve().unwrap();
+            assert!(
+                matches!(sol.fix_var(a, invalid), Err(Error::Infeasible)),
+                "non-finite fix {invalid} was not rejected"
+            );
+        }
+    }
+
+    #[test]
     fn milp_edit_after_pause_completes_correctly() {
         let (p, a, b) = int_2var_problem();
         let mut options = SolveOptions::default();
@@ -283,12 +449,12 @@ mod tests_mip_api {
     }
 
     #[test]
-    fn milp_gomory_cut_is_rejected_with_internal_error() {
+    fn milp_gomory_cut_is_rejected_with_invalid_operation() {
         let (p, a, _) = int_2var_problem();
         let sol = p.solve().unwrap();
         assert!(matches!(
             sol.add_gomory_cut(a),
-            Err(Error::InternalError(_))
+            Err(Error::InvalidOperation(_))
         ));
     }
 
@@ -297,7 +463,7 @@ mod tests_mip_api {
         // Pure-LP problem (continuous vars). A zero-duration budget interrupts the
         // solve before it completes, so the solution is Status::Interrupted. Before
         // the guard, add_gomory_cut reached solver internals that assume a finished
-        // solve and panicked; it must now return an InternalError, matching the
+        // solve and panicked; it must now return an InvalidOperation, matching the
         // guard already on add_constraint/fix_var.
         let mut p = Problem::new(OptimizationDirection::Minimize);
         let x = p.add_var(1.0, (0.0, 10.0));
@@ -309,7 +475,7 @@ mod tests_mip_api {
         assert_eq!(sol.status(), Status::Interrupted);
         assert!(matches!(
             sol.add_gomory_cut(x),
-            Err(Error::InternalError(_))
+            Err(Error::InvalidOperation(_))
         ));
     }
 }

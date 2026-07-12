@@ -91,11 +91,13 @@ problem.add_constraint(lhs, ComparisonOp::Eq, 0.0);
 
 ## Solving and reading the solution
 
-`solve()` returns `Err` only when the problem itself has no answer:
-`Error::Infeasible` (the constraints contradict each other) or
-`Error::Unbounded` (the objective can grow forever). Anything else — including
-running out of time — is an `Ok(Solution)`, and `status()` tells you what you
-got:
+`solve()` returns `Error::Infeasible` when the constraints contradict each
+other and `Error::Unbounded` when the objective can grow forever. Invalid
+numeric options return `Error::InvalidOptions`, a call that is illegal for the
+solution's state (e.g. editing an interrupted solution before `resume()`)
+returns `Error::InvalidOperation`, and unrecoverable numerical failures return
+`Error::InternalError`. Running out of time is not an error: it returns an
+`Ok(Solution)`, and `status()` tells you what you got:
 
 * `Status::Optimal` — the proven optimum.
 * `Status::Feasible` — a limit was hit first; this is the best solution found
@@ -196,8 +198,10 @@ let solution = problem.solve_with(options)?;
   advisory: if it isn't usable it is ignored, and it does not carry over any
   proof — to continue an earlier search, use `resume` instead.
 * `int_tol`, `tolerances` — numeric tolerances. The defaults are the safe
-  choice; see the [documentation](https://docs.rs/microlp/) before changing
-  them.
+  choice; values must be finite and non-negative, and the two integrality
+  tolerances must be below `0.5`. Invalid settings are rejected instead of
+  being allowed to corrupt branching or pruning. See the
+  [documentation](https://docs.rs/microlp/) before changing them.
 
 ## Changing a solved problem
 

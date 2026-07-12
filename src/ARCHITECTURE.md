@@ -193,13 +193,17 @@ keeps the live solver (that is what makes LP incremental editing cheap).
 flowchart TD
     A[run: build Solver from Problem] --> B[initial_solve: root LP relaxation]
     B -->|Limit| I1((return Interrupted<br/>resume re-enters here))
-    B -->|Infeasible / Unbounded| E1((Err — honest))
+    B -->|Infeasible| E1((Err Infeasible))
+    B -->|Unbounded| UF[zero-objective integer-feasibility search]
+    UF -->|integer point found| EU((Err Unbounded))
+    UF -->|tree exhausted| E1
+    UF -->|Limit| I1
     B --> WS{warm_start hint?}
     WS -->|yes| H[try_warm_start §5.7<br/>fix hinted vars → LP-complete →<br/>guarded adopt → restore root exactly]
     WS -->|no| C
     H --> C{root integral<br/>within int_tol?}
-    C -->|yes + guard passes| OPT((Optimal))
-    C -->|guard fails| BR0[branch on the offending var]
+    C -->|yes + guard passes + LP point exact| OPT((Optimal))
+    C -->|rounded or guard fails| BR0[adopt if feasible;<br/>branch below-tolerance var]
     C -->|no| BR0[branch root: two children pushed]
     BR0 --> L{{search loop}}
     L --> L0{open empty?}
@@ -220,8 +224,11 @@ flowchart TD
     PR2 -->|prune| L0
     PR2 --> INT{integral within int_tol?}
     INT -->|yes| GUARD{rounded values feasible? §5.4}
-    GUARD -->|yes| ADOPT[adopt incumbent] --> L0
-    GUARD -->|no| BTOL[branch the below-tolerance var<br/>children fix it exactly] --> L0
+    GUARD -->|yes| ADOPT[adopt incumbent]
+    ADOPT --> EXACT{LP point exactly integral?}
+    EXACT -->|yes| L0
+    EXACT -->|no| BTOL[branch the below-tolerance var<br/>children fix it exactly] --> L0
+    GUARD -->|no| BTOL
     INT -->|no| BRANCH[pseudocost-choose var,<br/>push 2 children, cheaper side on top] --> L0
 ```
 
@@ -284,12 +291,16 @@ rounding it to `1` moves that row by `5.0` — a real violation hiding inside th
 tolerance. The guard makes this impossible to adopt:
 
 - Guard **passes** → adopt: store the ROUNDED values with `objective = c·x_rounded`, so what
-  the user reads is exactly self-consistent.
+  the user reads is exactly self-consistent. If rounding changed any integer value, adoption
+  does **not** close the node: the relaxation bound can still be strictly better than the
+  rounded objective, so the driver branches on that below-tolerance fractionality to finish
+  the proof.
 - Guard **fails** → do not adopt; **branch on the offending below-tolerance variable**
   (children `⌊v⌋` / `⌊v⌋+1` fix it exactly, and the dive resolves the truth).
 - Degenerate fallback: if every integer variable is *exactly* integral yet the check failed,
-  the failure is float noise in the re-evaluated dot products (possible on big-M rows), not
-  in the solution — force-accept.
+  retry once from the all-slack basis. This removes eta-chain drift on big-M rows; if the
+  independently checked point is still invalid, return an internal error rather than
+  force-accepting a potentially infeasible answer.
 
 The tolerance is deliberately **absolute**, never scaled by row magnitude: a relative
 tolerance (`1e-7·|rhs|`) evaluates to ~100 on a 1e9-scale row and would swallow exactly the
@@ -453,7 +464,7 @@ Two homes, by audience:
 
 | Knob | Default | Gates |
 |---|---|---|
-| `int_tol` | `1e-6` | "is this LP value integral?" — branching stops when all integer vars are within this of an integer. Loosening it does NOT loosen final feasibility (the guard still applies) — it mainly shifts work into exact-fixing branches. |
+| `int_tol` | `1e-6` | "is this LP value integral?" — a rounded feasible point may be adopted, but branching continues until its LP point is exact. Must be finite and in `[0, 0.5)`. |
 | `mip_gap` | `0.0` | early-stop proof quality (relative gap) |
 | `tolerances.feasibility` | `1e-7` **absolute** | the rounded-incumbent guard and the post-edit incumbent pre-filter (§5.4 explains why absolute) |
 | `tolerances.integrality_rounding` | `1e-5` | integrality check in the edit pre-filter; `var_value`'s sanity assert pins the *default* deliberately |
@@ -477,9 +488,10 @@ conflations.
 
 | Situation | Behavior |
 |---|---|
+| Root LP unbounded on a MILP | run a resumable zero-objective integer-feasibility search; any integer point proves `Unbounded`, exhaustion proves `Infeasible` |
 | Node LP infeasible | prune (correct) |
 | Node LP unbounded | impossible when the node is bounded → `InternalError` |
-| Singular LU during a node re-solve | retry once from the slack basis; then propagate |
+| Singular LU or an exactly-integral candidate with guard-breaking drift | retry once from the slack basis; then propagate |
 | `load_basis` failure on a jump | load the slack basis (infallible) and solve the node from scratch |
 | Phase-1 stall (“no entering column”) | refresh the basis (fresh LU + recomputed values) and retry once per stall; declare `Infeasible` only if it survives the refresh |
 | Deadline mid-LP | requeue the node unsolved; return `Interrupted` |

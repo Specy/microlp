@@ -185,6 +185,16 @@ pub enum Error {
     Infeasible,
     /// The objective function is unbounded.
     Unbounded,
+    /// A [`SolveOptions`] value is out of range: a non-finite or negative gap or
+    /// tolerance, or an integrality tolerance not in `[0, 0.5)`. The message
+    /// names the offending field. This is a caller error — fix the option value
+    /// and re-solve.
+    InvalidOptions(String),
+    /// An operation is not valid for the solution's current state: editing an
+    /// [`Status::Interrupted`] solution before [`Solution::resume`], or asking
+    /// for a Gomory cut on a MILP solution. The message says which. Not a solver
+    /// failure — the call itself is the problem.
+    InvalidOperation(String),
     /// An internal error occurred.
     InternalError(String),
 }
@@ -205,7 +215,9 @@ impl std::fmt::Display for Error {
         let msg = match self {
             Error::Infeasible => "problem is infeasible",
             Error::Unbounded => "problem is unbounded",
-            Error::InternalError(msg) => msg,
+            Error::InvalidOptions(msg)
+            | Error::InvalidOperation(msg)
+            | Error::InternalError(msg) => msg,
         };
         msg.fmt(f)
     }
@@ -398,8 +410,10 @@ impl Problem {
     ///
     /// # Errors
     ///
-    /// See [`Problem::solve`].
+    /// See [`Problem::solve`]. Returns [`Error::InvalidOptions`] when a
+    /// numeric solve option is non-finite or outside its documented range.
     pub fn solve_with(&self, options: SolveOptions) -> Result<Solution, Error> {
+        options.validate()?;
         let num_vars = self.obj_coeffs.len();
         if self.has_integer_vars() {
             let run = mip::run(self, options)?;
@@ -592,6 +606,8 @@ impl Solution {
         match &self.kind {
             SolutionKind::Lp(solver) => Stats {
                 lp_iterations: solver.lp_iterations,
+                best_bound: (self.status == Status::Optimal).then(|| self.objective()),
+                gap: (self.status == Status::Optimal).then_some(0.0),
                 ..Stats::default()
             },
             SolutionKind::Mip(state) => state.stats,
@@ -668,7 +684,7 @@ impl Solution {
         match kind {
             SolutionKind::Lp(mut solver) => {
                 if status == Status::Interrupted {
-                    return Err(Error::InternalError(
+                    return Err(Error::InvalidOperation(
                         "cannot edit an interrupted solution; resume() it first".to_string(),
                     ));
                 }
@@ -711,7 +727,8 @@ impl Solution {
     ///
     /// # Errors
     ///
-    /// [`Error::Infeasible`] if the fix makes the problem infeasible.
+    /// [`Error::Infeasible`] if the fix makes the problem infeasible or
+    /// `val` is not finite.
     pub fn fix_var(self, var: Variable, val: f64) -> Result<Self, Error> {
         let Solution {
             direction,
@@ -720,10 +737,13 @@ impl Solution {
             kind,
         } = self;
         assert!(var.0 < num_vars);
+        if !val.is_finite() {
+            return Err(Error::Infeasible);
+        }
         match kind {
             SolutionKind::Lp(mut solver) => {
                 if status == Status::Interrupted {
-                    return Err(Error::InternalError(
+                    return Err(Error::InvalidOperation(
                         "cannot edit an interrupted solution; resume() it first".to_string(),
                     ));
                 }
@@ -838,7 +858,7 @@ impl Solution {
     /// # Errors
     ///
     /// [`Error::Infeasible`] if the cut makes the problem infeasible;
-    /// [`Error::InternalError`] if the solution is [`Status::Interrupted`]
+    /// [`Error::InvalidOperation`] if the solution is [`Status::Interrupted`]
     /// (`resume()` it first) or if it is a MILP solution (the cut reads the live
     /// simplex tableau).
     pub fn add_gomory_cut(mut self, var: Variable) -> Result<Self, Error> {
@@ -849,7 +869,7 @@ impl Solution {
                 // internals that assume a completed solve, so a half-solved
                 // (interrupted) LP must be resumed before it can be edited.
                 if self.status == Status::Interrupted {
-                    return Err(Error::InternalError(
+                    return Err(Error::InvalidOperation(
                         "cannot edit an interrupted solution; resume() it first".to_string(),
                     ));
                 }
@@ -860,7 +880,7 @@ impl Solution {
                 };
                 Ok(self)
             }
-            SolutionKind::Mip(_) => Err(Error::InternalError(
+            SolutionKind::Mip(_) => Err(Error::InvalidOperation(
                 "Gomory cuts require a pure-LP solution".to_string(),
             )),
         }

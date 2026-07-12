@@ -214,6 +214,17 @@ fn main() {
     // solver's presolve/simplex diagnostics through the suite runner.
     let _ = env_logger::try_init();
     let opts = parse_args();
+    let data_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("suite")
+        .join("data");
+    if !data_root.is_dir() {
+        println!(
+            "microlp correctness suite skipped: benchmark corpus is not included in \
+             the published crate (run it from the source repository)"
+        );
+        return;
+    }
     let debug_build = cfg!(debug_assertions);
 
     let mut all = cases::all();
