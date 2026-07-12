@@ -2,13 +2,21 @@
 //!
 //! Owns exactly one [`Solver`] per search. Branching changes variable bounds in
 //! place (never adds constraint rows), so the LP never grows during the search.
+//! The one sanctioned exception is the root cut loop (`run_root_cuts`), which
+//! appends valid-inequality rows BEFORE the root node snapshots the first
+//! basis — every basis in the search is sized for the final, cut-extended row
+//! set, so the invariant above holds for the whole tree.
 
 pub(crate) mod branching;
+pub(crate) mod cuts;
 pub(crate) mod node;
 pub(crate) mod params;
+pub(crate) mod propagate;
 
 use crate::solver::{check_deadline, Deadline, Solver};
-use crate::{ComparisonOp, Error, OptimizationDirection, Problem, StopReason, VarDomain, Variable};
+use crate::{
+    ComparisonOp, CsVec, Error, OptimizationDirection, Problem, StopReason, VarDomain, Variable,
+};
 use core::time::Duration;
 use node::{effective_bounds, Node};
 use std::collections::BTreeMap;
@@ -56,6 +64,22 @@ pub struct SolveOptions {
     /// Optional (partial) starting assignment used to seed the incumbent.
     /// Advisory: an infeasible or incomplete hint is ignored. Default `None`.
     pub warm_start: Option<Vec<(Variable, f64)>>,
+    /// Enable presolve: reductions applied to the problem before the search
+    /// starts (bound tightening, redundant-row elimination, variable fixing;
+    /// for integer problems also coefficient tightening and dual fixing).
+    /// The problem you observe through [`crate::Solution`] is unchanged —
+    /// reductions never remove variables and preserve at least one optimum.
+    /// Disable only to compare raw solver behavior or to rule presolve out
+    /// while investigating a suspected numerical issue. Default `true`.
+    pub presolve: bool,
+    /// Enable root cutting planes: valid inequalities separated at the root
+    /// relaxation (currently knapsack cover cuts) that tighten the LP bound
+    /// without excluding any integer-feasible point. Rows are added only
+    /// before the tree search starts; solutions and the problem you observe
+    /// through [`crate::Solution`] are unchanged. Ignored for pure-LP
+    /// problems. Disable to compare raw search behavior or to rule cuts out
+    /// while investigating a suspected numerical issue. Default `true`.
+    pub root_cuts: bool,
     /// Expert-level numeric tolerances (see [`Tolerances`]). Most callers
     /// should leave this at [`Tolerances::default`]; override an individual
     /// field only once you understand the correctness/permissiveness
@@ -71,6 +95,8 @@ impl Default for SolveOptions {
             mip_gap: 0.0,
             int_tol: 1e-6,
             warm_start: None,
+            presolve: true,
+            root_cuts: true,
             tolerances: Tolerances::default(),
         }
     }
@@ -153,6 +179,21 @@ impl Default for Tolerances {
 pub struct Stats {
     /// Branch & bound nodes whose LP was solved (0 for pure-LP problems).
     pub nodes_solved: u64,
+    /// Nodes pruned by bound propagation before any LP work: the node's
+    /// branching decisions, propagated through the constraint activities,
+    /// proved the subproblem empty.
+    pub nodes_pruned_by_propagation: u64,
+    /// Variable bounds tightened by reduced-cost fixing: after a node LP
+    /// solves with an incumbent in hand, LP duality bounds how far each
+    /// nonbasic variable can move before the objective crosses the incumbent
+    /// cutoff — integer bounds round inward accordingly, often fixing
+    /// binaries outright.
+    pub reduced_cost_tightenings: u64,
+    /// Incumbents produced by the root diving heuristic (0 or 1 per solve:
+    /// it runs once, before the tree search starts).
+    pub incumbents_from_dive: u64,
+    /// Knapsack cover cuts added to the LP by the root cut loop.
+    pub cover_cuts: u64,
     /// Total simplex pivots across the whole solve (including the root LP).
     pub lp_iterations: u64,
     /// Wall-clock time spent inside the solver, accumulated across resumes.
@@ -208,6 +249,22 @@ pub(crate) struct MipState {
     pub base: Problem,
     /// User-level fix_var overlay on `base` (var → fixed value).
     pub fixed: BTreeMap<usize, f64>,
+    /// Node-level bound propagation over the (presolved) rows the search
+    /// runs on. Plain data + reusable scratch; see `mip::propagate`.
+    pub propagator: propagate::Propagator,
+    /// Propagation effectiveness sample (see `params::PROP_SAMPLE_CALLS`):
+    /// calls made, calls that deduced or pruned, and the kill switch that
+    /// flips when the sampled hit rate is too low to pay for itself.
+    pub prop_calls: u32,
+    pub prop_hits: u32,
+    pub prop_disabled: bool,
+    /// Whether the incumbent-rescue dive has been attempted in this search
+    /// (it fires at most once; see `params::DIVE_TRIGGER_NODES`).
+    pub dive_done: bool,
+    /// Root cut-loop rounds consumed so far. Persisted here (not loop-local)
+    /// so a deadline that strikes mid-loop resumes the round budget instead
+    /// of restarting it.
+    pub cut_rounds_done: u32,
 }
 
 impl std::fmt::Debug for MipState {
@@ -253,18 +310,45 @@ pub(crate) fn status_of(outcome: MipOutcome, state: &MipState) -> Status {
 /// Build the search state for `problem` and run it under `options`.
 pub(crate) fn run(problem: &Problem, options: SolveOptions) -> Result<MipRun, Error> {
     let deadline = options.time_limit.map(|d| Instant::now() + d);
+    // Presolve the search problem. `state.base` below stays the user's
+    // untouched problem, so post-solve edits keep composing against it; the
+    // presolved bounds become the ROOT bounds (branching resets to them).
+    // Dual fixing is optimum-preserving but not feasible-point-preserving,
+    // so it is disabled when a warm-start hint must be honored.
+    let pre = if options.presolve {
+        Some(crate::presolve::presolve(
+            &problem.obj_coeffs,
+            &problem.var_mins,
+            &problem.var_maxs,
+            &problem.constraints,
+            &problem.var_domains,
+            crate::presolve::Mode::Mip,
+            options.int_tol,
+            options.warm_start.is_none(),
+        )?)
+    } else {
+        None
+    };
+    let (var_mins, var_maxs, constraints) = match &pre {
+        Some(p) => (&p.var_mins[..], &p.var_maxs[..], &p.constraints[..]),
+        None => (
+            &problem.var_mins[..],
+            &problem.var_maxs[..],
+            &problem.constraints[..],
+        ),
+    };
     let solver = Solver::try_new(
         &problem.obj_coeffs,
-        &problem.var_mins,
-        &problem.var_maxs,
-        &problem.constraints,
+        var_mins,
+        var_maxs,
+        constraints,
         &problem.var_domains,
         deadline,
     )?;
-    let root_bounds = problem
-        .var_mins
+    let propagator = propagate::Propagator::new(constraints, problem.obj_coeffs.len());
+    let root_bounds = var_mins
         .iter()
-        .zip(&problem.var_maxs)
+        .zip(var_maxs)
         .map(|(&lo, &hi)| (lo, hi))
         .collect();
     let pseudocosts = branching::PseudoCosts::new(&problem.obj_coeffs, problem.obj_coeffs.len());
@@ -285,6 +369,12 @@ pub(crate) fn run(problem: &Problem, options: SolveOptions) -> Result<MipRun, Er
         pseudocosts,
         base: problem.clone(),
         fixed: BTreeMap::new(),
+        propagator,
+        prop_calls: 0,
+        prop_hits: 0,
+        prop_disabled: false,
+        dive_done: false,
+        cut_rounds_done: 0,
     };
     let outcome = resume_run_with_deadline(&mut state)?;
     Ok(MipRun { outcome, state })
@@ -506,6 +596,19 @@ fn apply_node_bounds(state: &mut MipState, node: &Node) -> bool {
     true
 }
 
+// SOS1/clique SET branching was implemented here (detection of packing rows
+// where the two smallest binary coefficients exceed the rhs, plus
+// Beale–Tomlin half-splits over the free members) and REVERTED after
+// measurement on 2026-07-11: with node propagation already delivering every
+// clique implication through the row activities (a member at 1 zeroes its
+// siblings), set branches only starved the pseudocost learning — lseu 3×
+// slower, p0201 +81%, rgn +62% vs plain variable branching (and a
+// positive-weight-only split variant was catastrophically worse: 2-minute
+// timeouts from weight reshuffling among free zero-weight siblings). See
+// docs/superpowers/specs/2026-07-11-bb-improvements-design.md §5 for the
+// full design and numbers; the set-packing correctness fixture below
+// remains in the test suite.
+
 /// Branch on `var` at the solver's current (just solved) optimum: push the two
 /// children carrying the parent's basis and objective bound.
 fn branch(state: &mut MipState, parent: &Node, var: usize) {
@@ -514,13 +617,13 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
     let (lo, hi) = state.solver.get_var_bounds(var);
     // The split point k (children: x ≤ k and x ≥ k + 1) must be
     // noise-robust: a raw `val.floor()` of a within-tolerance-integral value
-    // is catastrophic — floor(−8e-16) = −1 makes the up child
-    // (max(0, lo), hi) reproduce the parent VERBATIM and the search
-    // descends forever. Reachable through the rounding-rejected re-branch
-    // path (`choose_branch_var` at int_tol = 0) whenever LP noise puts an
-    // integer var a hair below an integer. Snap near-integral values to
-    // their integer first, then clamp k into [lo, hi − 1] so BOTH children
-    // strictly tighten the parent's [lo, hi] whenever hi − lo ≥ 1
+    // is catastrophic — floor(−8e-16) = −1 makes the up child (max(0, lo),
+    // hi) reproduce the parent VERBATIM and the search descends forever
+    // (found via the rounding-rejected re-branch path on set-packing roots,
+    // where LP noise puts a binary at −8e-16; the bigm-exact m1e7 loop was
+    // the fixed-var variant of the same disease). Snap near-integral values
+    // to their integer first, then clamp k into [lo, hi − 1] so BOTH
+    // children strictly tighten the parent's [lo, hi] whenever hi − lo ≥ 1
     // (integral bounds — guaranteed for branchable vars).
     let floor = {
         let near = val.round();
@@ -538,10 +641,15 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
     state.last_solved_id = Some(id);
     let basis = state.solver.snapshot_basis();
 
+    // Intersect with the CURRENT bounds: post-solve deductions (reduced-cost
+    // fixing + its propagation) may have tightened this var past the value
+    // the LP solved at, and a plain floor/floor+1 entry would LOOSEN that
+    // deduction (bound_changes is last-entry-wins). A crossing child is fine
+    // — apply_node_bounds prunes it on pop.
     let mut down_changes = parent.bound_changes.clone();
-    down_changes.push((var, lo, floor));
+    down_changes.push((var, lo, floor.min(hi)));
     let mut up_changes = parent.bound_changes.clone();
-    up_changes.push((var, floor + 1.0, hi));
+    up_changes.push((var, (floor + 1.0).max(lo), hi));
 
     let down_node = Node {
         bound_changes: down_changes,
@@ -549,9 +657,10 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
         lp_bound: z,
         depth: parent.depth + 1,
         parent_id: id,
-        branch_var: var,
+        branch_var: Some(var),
         branch_up: false,
         branch_frac: f_down,
+        fresh_changes: 1,
     };
     let up_node = Node {
         bound_changes: up_changes,
@@ -559,9 +668,10 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
         lp_bound: z,
         depth: parent.depth + 1,
         parent_id: id,
-        branch_var: var,
+        branch_var: Some(var),
         branch_up: true,
         branch_frac: 1.0 - f_down,
+        fresh_changes: 1,
     };
 
     // Estimate-ordered dive: push the child with the LARGER estimated degradation
@@ -578,6 +688,91 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
     }
     // Children were pushed: keep plunging (LIFO pop) into this subtree.
     state.diving = true;
+}
+
+/// Reduced-cost fixing under the incumbent cutoff (design doc §4): with the
+/// node LP optimal at `z` and the search only interested in points strictly
+/// below `cutoff`, LP duality bounds every point of the node's polytope from
+/// below by `z + Σ d_j·(x_j − bound_j)` over the nonbasic vars — so a var may
+/// move at most `(cutoff − z)/|d_j|` away from its bound before the whole
+/// region is provably worthless. Integer bounds round inward, often fixing
+/// binaries outright.
+///
+/// Tightenings are applied to the solver and appended to the node's
+/// `bound_changes` (children inherit them). The node's current optimum stays
+/// feasible — the bound a var SITS on never moves — so the already-computed
+/// `z`, values and branching decisions below remain valid. Sound because the
+/// incumbent only ever improves (the cutoff only tightens) and post-solve
+/// edits re-solve from the untouched base problem.
+///
+/// Returns the touched vars (propagation seeds).
+fn reduced_cost_fixing(state: &mut MipState, node: &mut Node, z: f64) -> Vec<usize> {
+    let mut touched = Vec::new();
+    let Some(inc) = &state.incumbent else {
+        return touched;
+    };
+    let cut = cutoff(inc.objective, state.options.tolerances.prune_epsilon);
+    let slack = cut - z;
+    if !slack.is_finite() || slack <= 0.0 {
+        return touched;
+    }
+    let int_tol = state.options.int_tol;
+    for v in 0..state.solver.num_vars {
+        let Some((d, at_min, at_max)) = state.solver.nb_reduced_cost(v) else {
+            continue;
+        };
+        let (lo, hi) = state.solver.get_var_bounds(v);
+        if lo == hi {
+            continue;
+        }
+        let is_int = matches!(
+            state.solver.orig_var_domains[v],
+            VarDomain::Integer | VarDomain::Boolean
+        );
+        if at_min && d > params::RC_EPS {
+            let m = slack / d;
+            let new_hi = if is_int {
+                ((lo + m) + int_tol).floor().max(lo)
+            } else {
+                lo + m
+            };
+            let apply = if is_int {
+                new_hi < hi - 0.5
+            } else {
+                hi - new_hi > 1e-9 * hi.abs().max(1.0)
+            };
+            if apply {
+                state
+                    .solver
+                    .set_var_bounds(v, lo, new_hi)
+                    .expect("new_hi >= lo by construction");
+                node.bound_changes.push((v, lo, new_hi));
+                touched.push(v);
+            }
+        } else if at_max && d < -params::RC_EPS {
+            let m = slack / -d;
+            let new_lo = if is_int {
+                ((hi - m) - int_tol).ceil().min(hi)
+            } else {
+                hi - m
+            };
+            let apply = if is_int {
+                new_lo > lo + 0.5
+            } else {
+                new_lo - lo > 1e-9 * lo.abs().max(1.0)
+            };
+            if apply {
+                state
+                    .solver
+                    .set_var_bounds(v, new_lo, hi)
+                    .expect("new_lo <= hi by construction");
+                node.bound_changes.push((v, new_lo, hi));
+                touched.push(v);
+            }
+        }
+    }
+    state.stats.reduced_cost_tightenings += touched.len() as u64;
+    touched
 }
 
 /// Outcome of solving one branch & bound node's LP relaxation.
@@ -762,6 +957,236 @@ fn try_warm_start(
     Ok(None)
 }
 
+/// LP-guided diving heuristic for a FIRST incumbent, fired mid-search after
+/// [`params::DIVE_TRIGGER_NODES`] nodes have solved with no incumbent (a
+/// search on track to run its whole budget empty-handed): from the current
+/// node's optimum, repeatedly round the most-integral fractional integer
+/// var to its nearest feasible integer, fix it, and re-solve; if the dive
+/// bottoms out on an integer-feasible point, adopt it. Any point found this
+/// way is globally valid — the dive only ever TIGHTENS bounds inside the
+/// current subproblem, and adoption re-validates against root bounds and
+/// rows. Advisory by design: every failure path (LP infeasible even after
+/// trying the opposite rounding, deadline, step or pivot cap) just abandons.
+///
+/// Restore is bounds-only: touched vars go back to the values recorded in
+/// `state.applied` (the current node's bounds). The solver's basis is NOT
+/// restored — the caller invalidates `last_solved_id`, so the next popped
+/// node reloads its own basis exactly as after any non-warm jump.
+fn dive_for_incumbent(state: &mut MipState, domains: &[VarDomain]) -> Result<(), Error> {
+    let int_tol = state.options.int_tol;
+    let mut touched: Vec<usize> = Vec::new();
+    // Budget the dive's LP work relative to the search's per-node effort so
+    // it stays a bounded fraction of the solve at every problem size.
+    let pivots_start = state.solver.lp_iterations;
+    let per_node = pivots_start / state.stats.nodes_solved.max(1);
+    let pivot_budget = (per_node * params::DIVE_PIVOT_FACTOR).max(params::DIVE_PIVOT_MIN);
+
+    'dive: for _ in 0..params::DIVE_MAX_STEPS {
+        if state.solver.lp_iterations - pivots_start > pivot_budget {
+            break;
+        }
+        if branching::is_integral(&state.solver, domains, int_tol) {
+            if try_adopt_incumbent(state, true) {
+                state.stats.incumbents_from_dive += 1;
+                debug!("dive found an incumbent after {} fixes", touched.len());
+            }
+            break;
+        }
+        // Most-integral fractional int var: the cheapest rounding gamble.
+        let mut best: Option<(usize, f64, f64)> = None;
+        for (v, d) in domains.iter().enumerate() {
+            if !matches!(d, VarDomain::Integer | VarDomain::Boolean) {
+                continue;
+            }
+            let (lo, hi) = state.solver.get_var_bounds(v);
+            if hi - lo < 0.5 {
+                continue; // fixed (possibly with sub-EPS value noise)
+            }
+            let val = *state.solver.get_value(v);
+            let dist = (val - val.round()).abs();
+            if dist <= int_tol {
+                continue;
+            }
+            if best.is_none_or(|(_, _, d)| dist < d) {
+                best = Some((v, val, dist));
+            }
+        }
+        let Some((v, val, _)) = best else {
+            // Nothing fractional beyond tolerance yet !is_integral: the same
+            // guard-noise corner the search loop handles; not dive material.
+            break;
+        };
+        let (lo, hi) = state.solver.get_var_bounds(v);
+        let first = val.round().clamp(lo, hi);
+        // Nearest side first, opposite side as the one retry.
+        let second = if first > val {
+            first - 1.0
+        } else {
+            first + 1.0
+        };
+        for (attempt, target) in [first, second.clamp(lo, hi)].into_iter().enumerate() {
+            if attempt == 1 && target == first {
+                break 'dive; // clamp collapsed both sides onto one value
+            }
+            state
+                .solver
+                .set_var_bounds(v, target, target)
+                .expect("rounded target is inside the var's bounds");
+            if attempt == 0 {
+                touched.push(v);
+            }
+            match state.solver.reoptimize() {
+                Ok(StopReason::Finished) => continue 'dive,
+                Ok(StopReason::Limit) => break 'dive,
+                Err(Error::Infeasible) => continue, // try the opposite side
+                // Internal LP error mid-dive: the heuristic is not worth a
+                // hard failure — abandon and restore.
+                Err(_) => break 'dive,
+            }
+        }
+        break; // both roundings infeasible: the dive is stuck
+    }
+
+    // Bounds-only restore: back to the current node's bounds (`applied`),
+    // falling back to root bounds for vars the node never touched. The next
+    // popped node reloads its own basis (the caller clears the warm-dive
+    // marker), which discards whatever LP state the dive left behind.
+    for v in touched {
+        let (lo, hi) = match state.applied.binary_search_by_key(&v, |t| t.0) {
+            Ok(i) => (state.applied[i].1, state.applied[i].2),
+            Err(_) => state.root_bounds[v],
+        };
+        state
+            .solver
+            .set_var_bounds(v, lo, hi)
+            .expect("node bounds cannot cross");
+    }
+    Ok(())
+}
+
+/// Root cut loop: separate valid inequalities at the solved root relaxation
+/// and add them to the LP, which re-solves after each row (warm dual simplex
+/// from the current basis). Runs only before the root node exists — the one
+/// point where rows may grow (see the module doc). Returns `Limit` when the
+/// deadline strikes mid-loop; the caller un-sets `root_solved` so a resume
+/// re-enters here, with `state.cut_rounds_done` carrying the round budget
+/// across the interruption.
+///
+/// Every cut preserves every integer-feasible point, so `Err(Infeasible)`
+/// out of `add_constraint` is a genuine proof that the MIP is infeasible and
+/// propagates as such via `?`. (An INVALID cut faking that proof is the bug
+/// class the enumeration tests in `cuts` exist to catch.)
+fn run_root_cuts(state: &mut MipState, domains: &[VarDomain]) -> Result<StopReason, Error> {
+    let num_vars = domains.len();
+    let mut dedup = cuts::CutDedup::new();
+    // Cuts must EARN their rows: if the whole loop ends with no bound gain,
+    // the pre-loop solver state is restored and every cut row vanishes.
+    // Measured motivation: on BIP_easy the root bound already equals the
+    // optimum, and 32 zero-gain cover cuts perturbed the incumbent-discovery
+    // trajectory for +32% solve time — the same lesson as the dive's trigger:
+    // machinery that cannot help must leave the search untouched. The clone
+    // is transient root-only memory, dropped when this function returns.
+    let snapshot = state.solver.clone();
+    let start_bound = state.solver.cur_obj_val;
+    // Rows destined for the propagator, appended once in the epilogue.
+    // Later rounds deliberately do NOT separate from cut rows: a cover of a
+    // ±1-coefficient row is dominated by that row and never violated.
+    let mut added: Vec<(Vec<usize>, Vec<f64>, f64)> = Vec::new();
+    let mut values: Vec<f64> = Vec::new();
+    let mut bounds: Vec<(f64, f64)> = Vec::new();
+    let result = loop {
+        if state.cut_rounds_done >= params::CUT_MAX_ROUNDS {
+            break StopReason::Finished;
+        }
+        if check_deadline(&state.deadline) == StopReason::Limit {
+            break StopReason::Limit;
+        }
+        let bound_before = state.solver.cur_obj_val;
+        values.clear();
+        values.extend((0..num_vars).map(|v| *state.solver.get_value(v)));
+        bounds.clear();
+        bounds.extend((0..num_vars).map(|v| state.solver.get_var_bounds(v)));
+        let found = cuts::separate_cover_cuts(
+            state.propagator.rows(),
+            &bounds,
+            domains,
+            &values,
+            params::CUTS_PER_ROUND,
+            &mut dedup,
+        );
+        // Cover cuts only. Gomory mixed-integer rounds were implemented,
+        // measured, and REVERTED here (2026-07-12): the generator was
+        // correct (validated by a hand-derived fixture + a brute-force
+        // mixed-feasibility oracle) and on gt2 the cuts closed 92% of the
+        // integrality gap — yet the corpus lost at every budget tried
+        // (uncapped: gt2 2.4×, lseu 2.8×; row-capped at 25%: gt2 +38%, lseu
+        // still 2× its covers-only time, rgn +24% — against bell3a −8% and
+        // mod008 −13%). Dense float cut rows are paid for at EVERY node LP
+        // of the search, and this solver's node cost scales with rows faster
+        // than the tree shrinks. The generator was later deleted with the
+        // Forrest–Tomlin work (both measured negatives); a re-attempt needs
+        // cut-row sparsification or an in-tree add/drop pool, not just
+        // cheaper factorizations.
+        if found.is_empty() {
+            break StopReason::Finished;
+        }
+        let batch: Vec<(CsVec, ComparisonOp, f64)> = found
+            .iter()
+            .map(|cut| {
+                (
+                    CsVec::new(num_vars, cut.vars.clone(), cut.coeffs.clone()),
+                    ComparisonOp::Le,
+                    cut.rhs,
+                )
+            })
+            .collect();
+        state.cut_rounds_done += 1;
+        // The whole round lands as ONE batch: one refactorization + one
+        // dual-simplex restore, not one per row.
+        let sr = state.solver.add_constraints(batch)?;
+        for cut in &found {
+            added.push((cut.vars.clone(), cut.coeffs.clone(), cut.rhs));
+        }
+        if sr == StopReason::Limit {
+            break StopReason::Limit;
+        }
+        // Tailing off: the whole round barely moved the (internal, minimized)
+        // root bound — the residual gap belongs to the tree, not more cuts.
+        let gain = state.solver.cur_obj_val - bound_before;
+        if gain <= params::CUT_TAILOFF_REL * (1.0 + bound_before.abs()) {
+            break StopReason::Finished;
+        }
+    };
+    // Keep-or-rollback, decided on completed loops only: an interrupted loop
+    // keeps its rows (they are already part of the LP the resume continues
+    // from) and the resumed call re-evaluates the residual gain when it
+    // finishes. `Err` paths never reach here — Infeasible is a proof.
+    if result == StopReason::Finished && !added.is_empty() {
+        let gain = state.solver.cur_obj_val - start_bound;
+        if gain <= params::CUT_KEEP_MIN_GAIN_REL * (1.0 + start_bound.abs()) {
+            debug!(
+                "root cuts: rolled back {} cover cuts ({} rounds): no bound gain",
+                added.len(),
+                state.cut_rounds_done,
+            );
+            state.solver = snapshot;
+            added.clear();
+        }
+    }
+    if !added.is_empty() {
+        debug!(
+            "root cuts: {} cover cuts over {} rounds, root bound {} -> {}",
+            added.len(),
+            state.cut_rounds_done,
+            start_bound,
+            state.solver.cur_obj_val,
+        );
+        state.stats.cover_cuts += added.len() as u64;
+        state.propagator.add_le_rows(&added, num_vars);
+    }
+    Ok(result)
+}
+
 fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
     let domains = state.solver.orig_var_domains.clone();
     let int_tol = state.options.int_tol;
@@ -783,17 +1208,32 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
                 return Ok(outcome);
             }
         }
+        // Root cutting planes: tighten the relaxation with valid inequalities
+        // while rows may still grow (no node basis has been snapshotted yet —
+        // the root node below is sized for the cut-extended LP). An integral
+        // root cannot violate a valid inequality, so separation is skipped
+        // outright there.
+        if state.options.root_cuts && !branching::is_integral(&state.solver, &domains, int_tol) {
+            debug_assert!(state.open.is_empty());
+            if run_root_cuts(state, &domains)? == StopReason::Limit {
+                // Same resume contract as an interrupted warm start: re-enter
+                // the root block on the next call; `state.cut_rounds_done`
+                // carries the consumed round budget across the interruption.
+                state.root_solved = false;
+                return Ok(MipOutcome::Interrupted);
+            }
+        }
         let root = Node {
             bound_changes: Vec::new(),
             basis: state.solver.snapshot_basis(),
             lp_bound: state.solver.cur_obj_val,
             depth: 0,
             parent_id: 0,
-            // Placeholder: the root is never popped from `open` (it's consumed here,
-            // not pushed), so this is never fed into `pseudocosts.record`.
-            branch_var: 0,
+            branch_var: None,
             branch_up: false,
             branch_frac: 1.0,
+            // No branching created the root; presolve already ran its fixpoint.
+            fresh_changes: 0,
         };
         if branching::is_integral(&state.solver, &domains, int_tol) {
             if try_adopt_incumbent(state, true) {
@@ -814,10 +1254,10 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
                 Some(var) => branch(state, &root, var),
                 // Non-integral relaxation with NO branchable var: every
                 // fractional int var is FIXED (lo == hi at a fractional
-                // value — e.g. a post-solve fix_var edit), and a fixed
-                // fractional integer admits no integer point at all. That is
-                // an infeasibility verdict, not a panic (branching on the
-                // fixed var would reproduce the node forever).
+                // value — e.g. a post-solve fix_var edit with presolve off;
+                // presolve intercepts this shape when enabled), and a fixed
+                // fractional integer admits no integer point at all. An
+                // infeasibility verdict, not a panic.
                 None => return Err(Error::Infeasible),
             }
         }
@@ -856,6 +1296,23 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
             }
         }
 
+        // Incumbent-rescue dive: this search has solved a whole trigger's
+        // worth of nodes without finding ANY feasible point — spend a bounded
+        // LP effort trying to round one out of the current relaxation, so the
+        // cutoff machinery (pruning, reduced-cost fixing) finally arms. Fired
+        // at most once; searches that find incumbents naturally never pay it.
+        if !state.dive_done
+            && state.incumbent.is_none()
+            && nodes_this_run >= params::DIVE_TRIGGER_NODES
+        {
+            state.dive_done = true;
+            dive_for_incumbent(state, &domains)?;
+            // The dive left the solver off the last node's optimum: the next
+            // pop must reload its basis rather than assume a warm dive.
+            state.last_solved_id = None;
+            state.diving = false;
+        }
+
         let node = match pop_node(state) {
             Some(n) => n,
             None => break,
@@ -871,9 +1328,62 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
 
         // Load the node into the solver: bounds first (values derive from them),
         // then the basis if the solver isn't already at this node's parent optimum.
+        let mut node = node;
         if !apply_node_bounds(state, &node) {
             state.diving = false;
             continue; // crossing bounds — pruned without touching the solver
+        }
+        // Propagate the node's branching decisions through the row activities
+        // BEFORE the LP: deduced bounds are appended to `bound_changes` (so
+        // children inherit them) and a contradiction prunes without LP work.
+        // Seeds are only the entries the CREATING branch added — everything
+        // older was already propagated at the ancestors and inherited.
+        // `state.applied` must mirror the solver on EVERY path — propagation
+        // may have applied partial tightenings before hitting a contradiction,
+        // and the next node's diff-reset logic reads `applied` to undo them.
+        let fresh = node.fresh_changes.min(node.bound_changes.len());
+        if !state.prop_disabled && fresh > 0 {
+            let start = node.bound_changes.len() - fresh;
+            let seeds: Vec<usize> = node.bound_changes[start..].iter().map(|c| c.0).collect();
+            let before = node.bound_changes.len();
+            let res = state.propagator.propagate(
+                &mut state.solver,
+                seeds.into_iter(),
+                &domains,
+                int_tol,
+                &mut node.bound_changes,
+            );
+            state.prop_calls += 1;
+            let deduced = node.bound_changes.len() > before;
+            if deduced || res.is_err() {
+                state.prop_hits += 1;
+                state.applied = effective_bounds(&node.bound_changes);
+                // Collapse to one entry per var: children clone this list at
+                // every branching, so letting deduction entries accumulate
+                // uncollapsed turns deep dives quadratic (measured as a
+                // 40-minute stall on the warm-restart knapsack cases).
+                node.bound_changes = state.applied.clone();
+                node.fresh_changes = node.bound_changes.len();
+            }
+            if state.prop_calls == params::PROP_SAMPLE_CALLS
+                && state.prop_hits * params::PROP_HIT_DIVISOR < state.prop_calls
+            {
+                debug!(
+                    "node propagation disabled: {} hits in {} calls",
+                    state.prop_hits, state.prop_calls
+                );
+                state.prop_disabled = true;
+            }
+            match res {
+                Ok(()) => {}
+                Err(Error::Infeasible) => {
+                    state.stats.nodes_pruned_by_propagation += 1;
+                    state.last_solved_id = None;
+                    state.diving = false;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         }
         let warm = state.last_solved_id == Some(node.parent_id);
         if !warm && state.solver.load_basis(&node.basis).is_err() {
@@ -915,17 +1425,80 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
 
         let z = state.solver.cur_obj_val;
         // Feed this node's actual degradation (vs. its parent's bound, the estimate
-        // used at branch time) back into the pseudocost that predicted it.
-        state.pseudocosts.record(
-            node.branch_var,
-            node.branch_up,
-            (z - node.lp_bound).max(0.0) / node.branch_frac.max(params::BRANCH_FRAC_GUARD),
-        );
+        // used at branch time) back into the pseudocost that predicted it. Set
+        // (clique) branches carry no per-var signal and record nothing.
+        if let Some(bv) = node.branch_var {
+            state.pseudocosts.record(
+                bv,
+                node.branch_up,
+                (z - node.lp_bound).max(0.0) / node.branch_frac.max(params::BRANCH_FRAC_GUARD),
+            );
+        }
         if let Some(inc) = &state.incumbent {
             if z >= cutoff(inc.objective, state.options.tolerances.prune_epsilon) {
                 state.last_solved_id = None;
                 state.diving = false;
                 continue;
+            }
+        }
+
+        // Reduced-cost fixing under the incumbent cutoff, then propagation of
+        // whatever it tightened. A propagation contradiction here means "no
+        // point of this node can beat the incumbent" — prune. The bookkeeping
+        // mirrors the pre-LP propagation block: `state.applied` must reflect
+        // the solver after any tightening, on every path.
+        let rc_touched = reduced_cost_fixing(state, &mut node, z);
+        if !rc_touched.is_empty() {
+            let res = state.propagator.propagate(
+                &mut state.solver,
+                rc_touched.into_iter(),
+                &domains,
+                int_tol,
+                &mut node.bound_changes,
+            );
+            state.applied = effective_bounds(&node.bound_changes);
+            // Collapse (see the pre-LP propagation block for the rationale).
+            node.bound_changes = state.applied.clone();
+            node.fresh_changes = node.bound_changes.len();
+            match res {
+                Ok(()) => {}
+                Err(Error::Infeasible) => {
+                    state.stats.nodes_pruned_by_propagation += 1;
+                    state.last_solved_id = None;
+                    state.diving = false;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+            // The bounds changed AFTER the LP solved: refresh it so the
+            // integrality check and the branching decision below read values
+            // consistent with the node's final bounds (a propagated fixing
+            // of a basic var otherwise leaves a stale fractional value that
+            // nothing can branch on). Same outcome handling as the first
+            // solve; the refresh does not count as a new node.
+            match solve_node_lp(state)? {
+                NodeLp::Solved => {
+                    let z = state.solver.cur_obj_val;
+                    if let Some(inc) = &state.incumbent {
+                        if z >= cutoff(inc.objective, state.options.tolerances.prune_epsilon) {
+                            state.last_solved_id = None;
+                            state.diving = false;
+                            continue;
+                        }
+                    }
+                }
+                NodeLp::Infeasible => {
+                    state.stats.nodes_pruned_by_propagation += 1;
+                    state.last_solved_id = None;
+                    state.diving = false;
+                    continue;
+                }
+                NodeLp::Limit => {
+                    state.open.push(node);
+                    state.last_solved_id = None;
+                    state.diving = false;
+                    return Ok(MipOutcome::Interrupted);
+                }
             }
         }
 
@@ -939,6 +1512,12 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
                 // Below-tolerance fractionality with real infeasibility on rounding:
                 // branch anyway — the children fix the var exactly (floor/floor+1);
                 // branch() sets `diving = true`, so the dive continues into them.
+                // Deliberately a plain VARIABLE branch: the whole point of this
+                // path is pinning this specific var, which a set branch may not do.
+                // choose_branch_var skips FIXED vars (their LP value can carry
+                // sub-EPS basic noise that reads as "fractional" at tol 0, and
+                // branching them reproduces the parent node forever — the
+                // family/bigm-exact m1e7 infinite loop).
                 branch(state, &node, var);
             } else {
                 try_adopt_incumbent(state, false);
@@ -1174,6 +1753,322 @@ mod tests {
         assert!((incumbent_obj(&r.state) + 21.0).abs() < 1e-6);
         // After a best-bound jump the pop is NOT the last-pushed node at least once
         // on this instance; correctness above is the real assertion.
+    }
+
+    #[test]
+    fn propagation_prunes_fixed_charge_children_without_lp() {
+        // Two-facility fixed charge: min 5a + 4b + x + y with x + y >= 6,
+        // x <= 4a, y <= 4b, a/b binary, x/y in [0, 4]. Demand 6 > 4 forces
+        // BOTH facilities open (optimum a = b = 1, x + y = 6, objective 15).
+        // The root LP is fractional in a; the a = 0 child is empty, and
+        // propagation proves it from the rows alone (a = 0 -> x <= 0 ->
+        // y >= 6 > 4) — that child must be pruned WITHOUT an LP solve.
+        //
+        // Presolve is deliberately OFF: its root fixpoint derives the same
+        // facts up front (x >= 2 -> a = 1 by integer rounding) and solves
+        // this at the root with zero nodes — this test isolates the NODE
+        // propagation mechanism instead.
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let a = p.add_binary_var(5.0);
+        let b = p.add_binary_var(4.0);
+        let x = p.add_var(1.0, (0.0, 4.0));
+        let y = p.add_var(1.0, (0.0, 4.0));
+        p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 6.0);
+        p.add_constraint(&[(x, 1.0), (a, -4.0)], ComparisonOp::Le, 0.0);
+        p.add_constraint(&[(y, 1.0), (b, -4.0)], ComparisonOp::Le, 0.0);
+        let options = SolveOptions {
+            presolve: false,
+            ..SolveOptions::default()
+        };
+        let run = run(&p, options).unwrap();
+        assert_eq!(run.outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&run.state) - 15.0).abs() < 1e-6);
+        assert!(
+            run.state.stats.nodes_pruned_by_propagation >= 1,
+            "the closed-facility child must be pruned by propagation, stats: {:?}",
+            run.state.stats
+        );
+    }
+
+    #[test]
+    fn propagated_bounds_are_inherited_and_do_not_leak_across_subtrees() {
+        // A deeper fixed-charge chain solved to optimality: correctness here
+        // exercises the `state.applied` bookkeeping — propagated bounds must
+        // be undone when the search jumps to another subtree (a stale leaked
+        // bound would silently cut feasible regions and change the optimum).
+        // min 3a + 3b + 2c + x + y + z, x+y+z >= 7, x <= 3a, y <= 3b, z <= 3c.
+        // Best: open all three (7 > 6 impossible with two): a=b=c=1, sum 7:
+        // objective 3+3+2+7 = 15.
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let a = p.add_binary_var(3.0);
+        let b = p.add_binary_var(3.0);
+        let c = p.add_binary_var(2.0);
+        let x = p.add_var(1.0, (0.0, 3.0));
+        let y = p.add_var(1.0, (0.0, 3.0));
+        let z = p.add_var(1.0, (0.0, 3.0));
+        p.add_constraint(&[(x, 1.0), (y, 1.0), (z, 1.0)], ComparisonOp::Ge, 7.0);
+        p.add_constraint(&[(x, 1.0), (a, -3.0)], ComparisonOp::Le, 0.0);
+        p.add_constraint(&[(y, 1.0), (b, -3.0)], ComparisonOp::Le, 0.0);
+        p.add_constraint(&[(z, 1.0), (c, -3.0)], ComparisonOp::Le, 0.0);
+        let run = run(&p, SolveOptions::default()).unwrap();
+        assert_eq!(run.outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&run.state) - 15.0).abs() < 1e-6);
+        let inc = run.state.incumbent.as_ref().unwrap();
+        for (i, want) in [1.0, 1.0, 1.0].iter().enumerate() {
+            assert!((inc.values[i] - want).abs() < 1e-6, "y{} != 1", i);
+        }
+    }
+
+    #[test]
+    fn set_packing_solves_to_optimum() {
+        // Three disjoint packing triples plus a coupling knapsack. Optimum
+        // picks the best member of each triple subject to the knapsack.
+        // maximize 5a1 + 4a2 + 3a3 (triple A, <= 1)
+        //        + 6b1 + 2b2 + 2b3 (triple B, <= 1)
+        //        + 4c1 + 4c2 + 3c3 (triple C, <= 1)
+        // s.t. weights 3a1+1a2+1a3 + 4b1+1b2+1b3 + 3c1+1c2+1c3 <= 7.
+        // Exhaustive check: a1 + b1 impossible with c1 (3+4+3=10); best is
+        // a1(3) + b1(4) = 11 weight 7 -> obj 11? vs a1 + c1 + b2: 3+3+1=7 ->
+        // 5+4+6? b2=2: 5+4+2=11? Let's assert against presolve-off too, and
+        // pin the value computed by hand below.
+        // Candidates (one per triple, weight <= 7):
+        //  a1,b1, -  : w=7 obj=11   |  a1,b2,c1: w=7 obj=11
+        //  a1,b1 alone dominates adding nothing else; a2,b1,c1: w=8 no.
+        //  a1,b2,c2: w=5 obj=11; plus nothing else possible (triples used).
+        //  a2,b1,c1: 1+4+3=8 no. a1,b1,c2: 3+4+1=8 no. a1,b1,c3: 8 no.
+        //  a2,b1,c2: 1+4+1=6 obj 4+6+4=14!  a2,b1,c1: 8 no.
+        //  a3,b1,c1: 1+4+3=8 no. a2,b1,c3: 6 obj 4+6+3=13.
+        //  a1,b1 without c: 11 < 14. Best: a2,b1,c2 = 14? check a2,b1,c2
+        //  weight 1+4+1=6 <= 7, obj 4+6+4=14. Any better? a1,b1 needs w 7,
+        //  leaves no c. a1(5) vs a2(4): a1,b1,cX impossible; a1,b2/b3+cX:
+        //  5+2+4=11. So optimum = 14.
+        let mut p = Problem::new(OptimizationDirection::Maximize);
+        let a: Vec<_> = [5.0, 4.0, 3.0]
+            .iter()
+            .map(|&c| p.add_binary_var(c))
+            .collect();
+        let b: Vec<_> = [6.0, 2.0, 2.0]
+            .iter()
+            .map(|&c| p.add_binary_var(c))
+            .collect();
+        let c: Vec<_> = [4.0, 4.0, 3.0]
+            .iter()
+            .map(|&c| p.add_binary_var(c))
+            .collect();
+        for grp in [&a, &b, &c] {
+            p.add_constraint(
+                grp.iter().map(|&v| (v, 1.0)).collect::<Vec<_>>(),
+                ComparisonOp::Le,
+                1.0,
+            );
+        }
+        let weights = [3.0, 1.0, 1.0, 4.0, 1.0, 1.0, 3.0, 1.0, 1.0];
+        let all: Vec<_> = a.iter().chain(&b).chain(&c).copied().collect();
+        p.add_constraint(
+            all.iter()
+                .zip(weights)
+                .map(|(&v, w)| (v, w))
+                .collect::<Vec<_>>(),
+            ComparisonOp::Le,
+            7.0,
+        );
+        let run_default = run(&p, SolveOptions::default()).unwrap();
+        assert_eq!(run_default.outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&run_default.state) + 14.0).abs() < 1e-6);
+        // Same answer with presolve off (isolates the branching machinery).
+        let run_raw = run(
+            &p,
+            SolveOptions {
+                presolve: false,
+                ..SolveOptions::default()
+            },
+        )
+        .unwrap();
+        assert!((incumbent_obj(&run_raw.state) + 14.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dive_rounds_out_an_incumbent_from_the_root_relaxation() {
+        // Unit-test the dive mechanism directly (the in-search trigger fires
+        // only after DIVE_TRIGGER_NODES incumbent-less nodes, which small
+        // fixtures never reach): stop a knapsack run before any node, then
+        // dive from the root relaxation. Rounding down fractional knapsack
+        // items is always feasible for a <= row, so the dive must adopt an
+        // incumbent, and the state must remain consistent enough to resume
+        // the search to the true optimum afterwards.
+        //
+        // Root cuts are deliberately OFF: two cover cuts make this fixture's
+        // root INTEGRAL (adopted as optimal with zero nodes), leaving the
+        // dive nothing to rescue — this test isolates the dive mechanism.
+        let mut options = SolveOptions::default();
+        options.node_limit = Some(0);
+        options.root_cuts = false;
+        let mut r = run(&binary_knapsack(), options).unwrap();
+        assert_eq!(r.outcome, MipOutcome::Interrupted);
+        assert!(r.state.incumbent.is_none());
+
+        let domains = r.state.solver.orig_var_domains.clone();
+        dive_for_incumbent(&mut r.state, &domains).unwrap();
+        r.state.last_solved_id = None;
+        r.state.diving = false;
+        assert_eq!(
+            r.state.stats.incumbents_from_dive, 1,
+            "the dive must adopt an incumbent on a knapsack root, stats: {:?}",
+            r.state.stats
+        );
+        let dive_obj = incumbent_obj(&r.state);
+        assert!(
+            dive_obj <= -12.0,
+            "internal obj {} not a real point",
+            dive_obj
+        );
+
+        // The search must still finish cleanly from the post-dive state
+        // (drop the node budget: it is per-call, and 0 permits no work).
+        r.state.options.node_limit = None;
+        let outcome = resume_run(&mut r.state, None).unwrap();
+        assert_eq!(outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&r.state) + 21.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reduced_cost_fixing_fires_under_warm_incumbent() {
+        // binary_knapsack with its optimum handed in as a warm start: the
+        // incumbent exists before the first branching, so every node solves
+        // under a tight cutoff and reduced-cost fixing can bite. Optimum must
+        // be unchanged and at least one tightening must have fired.
+        //
+        // Root cuts are deliberately OFF: they close this fixture's root gap
+        // to zero (no nodes ever solve), leaving reduced-cost fixing nothing
+        // to fire on — this test isolates the RC-fixing mechanism.
+        let mut options = SolveOptions::default();
+        options.root_cuts = false;
+        options.warm_start = Some(vec![
+            (Variable(0), 0.0),
+            (Variable(1), 1.0),
+            (Variable(2), 1.0),
+            (Variable(3), 1.0),
+        ]);
+        let run = run(&binary_knapsack(), options).unwrap();
+        assert_eq!(run.outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&run.state) + 21.0).abs() < 1e-6);
+        assert!(
+            run.state.stats.reduced_cost_tightenings > 0,
+            "reduced-cost fixing must fire on a warm-started knapsack, stats: {:?}",
+            run.state.stats
+        );
+    }
+
+    #[test]
+    fn cover_cuts_fire_on_a_fractional_knapsack_root_and_preserve_the_optimum() {
+        // binary_knapsack's root LP is x* = (1, 1, 0.5, 0), obj 22 (int
+        // optimum 21): the cover {x, y, z} (5+7+4 = 16 > 14) is violated by
+        // 0.5, so the root cut loop must fire. The optimum must be untouched
+        // and the tree must not grow versus the cut-free search.
+        let no_cuts = {
+            let mut o = SolveOptions::default();
+            o.root_cuts = false;
+            run(&binary_knapsack(), o).unwrap()
+        };
+        assert_eq!(no_cuts.state.stats.cover_cuts, 0);
+        assert!((incumbent_obj(&no_cuts.state) + 21.0).abs() < 1e-6);
+
+        let with_cuts = run(&binary_knapsack(), SolveOptions::default()).unwrap();
+        assert_eq!(with_cuts.outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&with_cuts.state) + 21.0).abs() < 1e-6);
+        assert!(
+            with_cuts.state.stats.cover_cuts >= 1,
+            "a violated cover exists at the root; stats: {:?}",
+            with_cuts.state.stats
+        );
+        assert!(
+            with_cuts.state.stats.nodes_solved <= no_cuts.state.stats.nodes_solved,
+            "cuts must not grow the tree: {} vs {} nodes",
+            with_cuts.state.stats.nodes_solved,
+            no_cuts.state.stats.nodes_solved
+        );
+    }
+
+    #[test]
+    fn zero_gain_cuts_are_rolled_back() {
+        // Two-partition fixture with a coupling knapsack and an objective
+        // that is CONSTANT on the feasible set (x1+x2 = 1 and x3+x4 = 1 pin
+        // x1+x2+x3+x4 to exactly 2): the root bound can never move, so any
+        // cover separated off a fractional root vertex is zero-gain by
+        // construction and the loop must roll it back — cover_cuts stays 0
+        // whether the simplex lands on a fractional vertex (cut fired, then
+        // rolled back — the path BIP_easy exercises at suite scale) or an
+        // integral one (separation finds nothing). Presolve off keeps the
+        // fixture's rows raw so the root LP actually sees them.
+        let mut p = Problem::new(OptimizationDirection::Maximize);
+        let x1 = p.add_binary_var(1.0);
+        let x2 = p.add_binary_var(1.0);
+        let x3 = p.add_binary_var(1.0);
+        let x4 = p.add_binary_var(1.0);
+        p.add_constraint(&[(x1, 1.0), (x2, 1.0)], ComparisonOp::Eq, 1.0);
+        p.add_constraint(&[(x3, 1.0), (x4, 1.0)], ComparisonOp::Eq, 1.0);
+        p.add_constraint(&[(x1, 3.0), (x3, 3.0)], ComparisonOp::Le, 5.0);
+        let options = SolveOptions {
+            presolve: false,
+            ..SolveOptions::default()
+        };
+        let run = run(&p, options).unwrap();
+        assert_eq!(run.outcome, MipOutcome::Optimal);
+        // Internal space negates Maximize: optimum 2 is -2 internally.
+        assert!((incumbent_obj(&run.state) + 2.0).abs() < 1e-6);
+        assert_eq!(
+            run.state.stats.cover_cuts, 0,
+            "zero-gain cuts must be rolled back, stats: {:?}",
+            run.state.stats
+        );
+    }
+
+    #[test]
+    fn general_integer_rows_yield_no_cover_cuts() {
+        // int_2var_problem has general integers in [0, 10]: cover
+        // separation skips every row by construction, so the cut loop must
+        // exit empty-handed and the plain branch-and-bound must still reach
+        // the optimum. (A GMI fallback for exactly this shape was measured
+        // and reverted — see the comment in `run_root_cuts`.)
+        let run = run(&int_2var_problem(), SolveOptions::default()).unwrap();
+        assert_eq!(run.outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&run.state) - 11.0).abs() < 1e-6);
+        assert_eq!(run.state.stats.cover_cuts, 0);
+    }
+
+    #[test]
+    fn integral_root_separates_no_cuts() {
+        // Root LP already integral: separation is skipped outright (a valid
+        // inequality cannot be violated by an integral LP optimum anyway).
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let a = p.add_binary_var(1.0);
+        let b = p.add_binary_var(1.0);
+        p.add_constraint(&[(a, 1.0)], ComparisonOp::Ge, 1.0);
+        p.add_constraint(&[(b, 1.0)], ComparisonOp::Ge, 1.0);
+        let run = run(&p, SolveOptions::default()).unwrap();
+        assert_eq!(run.outcome, MipOutcome::Optimal);
+        assert_eq!(run.state.stats.cover_cuts, 0);
+    }
+
+    #[test]
+    fn interrupted_before_root_resumes_through_the_cut_loop() {
+        // A zero time budget interrupts before the root LP even solves;
+        // the resume must re-enter the root block, run the cut loop, and
+        // finish to the true optimum — exercising the cuts-after-resume path.
+        let mut options = SolveOptions::default();
+        options.time_limit = Some(Duration::ZERO);
+        let mut r = run(&binary_knapsack(), options).unwrap();
+        assert_eq!(r.outcome, MipOutcome::Interrupted);
+        assert!(!r.state.root_solved);
+
+        let outcome = resume_run(&mut r.state, None).unwrap();
+        assert_eq!(outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&r.state) + 21.0).abs() < 1e-6);
+        assert!(
+            r.state.stats.cover_cuts >= 1,
+            "the resumed root must still separate its cover, stats: {:?}",
+            r.state.stats
+        );
     }
 
     #[test]

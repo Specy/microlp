@@ -280,7 +280,13 @@ fn main() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|info| {
         LAST_PANIC.with(|slot| {
-            *slot.borrow_mut() = Some(info.to_string());
+            let mut msg = info.to_string();
+            // Backtraces obey RUST_BACKTRACE (disabled unless requested).
+            let bt = std::backtrace::Backtrace::capture();
+            if matches!(bt.status(), std::backtrace::BacktraceStatus::Captured) {
+                msg = format!("{msg}\n{bt}");
+            }
+            *slot.borrow_mut() = Some(msg);
         });
     }));
 

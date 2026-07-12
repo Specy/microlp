@@ -165,9 +165,11 @@ mod tests_mip_api {
 
     #[test]
     fn warm_start_liveness_hint_seeds_incumbent_before_any_node() {
-        // node_limit = 0: the search loop exits before solving a single node, so
-        // the ONLY way to have an incumbent is the warm-start hint. This test
-        // fails if the hint wiring is ever disconnected.
+        // node_limit = 0: the search loop exits before solving a single node,
+        // so the ONLY way to have an incumbent is the warm-start hint (the
+        // incumbent-rescue dive fires only after DIVE_TRIGGER_NODES solved
+        // nodes, far beyond 0). This test fails if the hint wiring is ever
+        // disconnected.
         let (p, a, b) = int_2var_problem();
         let mut options = SolveOptions::default();
         options.node_limit = Some(0);
@@ -195,6 +197,27 @@ mod tests_mip_api {
         // Correctness identical; the hinted run must not explore MORE nodes.
         assert!(with_hint.stats().nodes_solved <= without.stats().nodes_solved);
         assert_eq!(with_hint.objective(), without.objective());
+    }
+
+    #[test]
+    fn fix_var_fractional_int_without_presolve_is_infeasible_not_a_panic() {
+        // With presolve off (it intercepts this shape when enabled), the
+        // SEARCH itself must turn "an integer var fixed at a fractional
+        // value" into a clean Infeasible: choose_branch_var rightly refuses
+        // to branch on fixed vars, and a non-integral relaxation with no
+        // branchable var is an infeasibility verdict — this used to die on
+        // an expect().
+        let (p, a, _) = int_2var_problem();
+        let options = SolveOptions {
+            presolve: false,
+            root_cuts: false,
+            ..SolveOptions::default()
+        };
+        let sol = p.solve_with(options).unwrap();
+        match sol.fix_var(a, 2.5) {
+            Err(Error::Infeasible) => {}
+            other => panic!("expected Infeasible, got {:?}", other.map(|_| ())),
+        }
     }
 
     #[test]

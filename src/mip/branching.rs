@@ -96,8 +96,7 @@ pub(crate) fn choose_branch_var(
         // node verbatim and loops forever. Its LP value can still carry
         // sub-EPS basic noise (e.g. -5e-16 on a var fixed to 0), which is
         // exactly how it used to sneak past the fractionality test below
-        // when called with int_tol = 0 (the rounding-rejected re-branch
-        // path).
+        // when called with int_tol = 0.
         let (lo, hi) = solver.get_var_bounds(v);
         if hi - lo < 0.5 {
             continue;

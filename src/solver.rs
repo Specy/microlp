@@ -506,6 +506,22 @@ impl Solver {
         (self.orig_var_mins[var], self.orig_var_maxs[var])
     }
 
+    /// Reduced cost and bound-side status of a NONBASIC var, `None` for basic
+    /// vars (their reduced cost is zero by definition). Only meaningful right
+    /// after a completed solve: the maintained `nb_var_obj_coeffs` are true
+    /// reduced costs exactly when the solver is dual-feasible on the real
+    /// objective, which `reoptimize`/`initial_solve` guarantee on `Finished`.
+    pub(crate) fn nb_reduced_cost(&self, var: usize) -> Option<(f64, bool, bool)> {
+        match self.var_states[var] {
+            VarState::Basic(_) => None,
+            VarState::NonBasic(col) => Some((
+                self.nb_var_obj_coeffs[col],
+                self.nb_var_states[col].at_min,
+                self.nb_var_states[col].at_max,
+            )),
+        }
+    }
+
     /// Change a variable's bounds in place. Records the new bounds and repairs the
     /// invariants that depend on them; does NOT run simplex — call [`Self::reoptimize`]
     /// afterwards. Returns `Err(Infeasible)` (state untouched) if `min > max`.
@@ -637,6 +653,19 @@ impl Solver {
             return Err(Error::InternalError("basis shape mismatch".to_string()));
         }
 
+        // NOTE (measured 2026-07-12): morphing the current factorization
+        // into the target basis via eta updates — one FTRAN + eta per
+        // differing column instead of this full refactorization — was
+        // implemented, measured, and reverted. Under the product-form eta
+        // scheme every morph eta is paid for by EVERY subsequent
+        // FTRAN/BTRAN until the next refactorization, and the chains also
+        // hit the eta-overflow limit sooner: on stein27, morphing all 4.7k
+        // node-basis loads doubled the overflow refactorizations and cost
+        // +42% total. A load-reset buys a CLEAN factorization; deferring it
+        // into the chain loses whenever many solves follow, which is the
+        // node-solve pattern. Basis morphing only pays on top of an
+        // in-place LU update scheme (Forrest–Tomlin), where it needs no
+        // persistent chain.
         self.basic_vars.clear();
         self.basic_var_mins.clear();
         self.basic_var_maxs.clear();
@@ -654,44 +683,13 @@ impl Solver {
                     self.basic_var_maxs.push(self.orig_var_maxs[var]);
                 }
                 ref status => {
-                    let min = self.orig_var_mins[var];
-                    let max = self.orig_var_maxs[var];
-                    let val = match status {
-                        VarStatus::AtLower => {
-                            if min.is_finite() {
-                                min
-                            } else if max.is_finite() {
-                                max
-                            } else {
-                                0.0
-                            }
-                        }
-                        VarStatus::AtUpper => {
-                            if max.is_finite() {
-                                max
-                            } else if min.is_finite() {
-                                min
-                            } else {
-                                0.0
-                            }
-                        }
-                        VarStatus::Free => {
-                            if min.is_finite() {
-                                min
-                            } else if max.is_finite() {
-                                max
-                            } else {
-                                0.0
-                            }
-                        }
-                        VarStatus::Basic => unreachable!(),
-                    };
+                    let val = self.nonbasic_load_value(var, status);
                     self.var_states[var] = VarState::NonBasic(self.nb_vars.len());
                     self.nb_vars.push(var);
                     self.nb_var_vals.push(val);
                     self.nb_var_states.push(NonBasicVarState {
-                        at_min: float_eq(val, min),
-                        at_max: float_eq(val, max),
+                        at_min: float_eq(val, self.orig_var_mins[var]),
+                        at_max: float_eq(val, self.orig_var_maxs[var]),
                     });
                     self.nb_var_is_fixed.push(false);
                 }
@@ -702,7 +700,12 @@ impl Solver {
             .reset(&self.orig_constraints_csc, &self.basic_vars)?;
 
         // Steepest-edge reference reset (standard practice after a warm-start load;
-        // only affects pivot ordering quality, not correctness).
+        // only affects pivot ordering quality, not correctness). Measured
+        // 2026-07-12: carrying the previous basis's norms per-var instead
+        // (1.0 only for newly basic vars) is sharply WORSE — gt2 3.9×,
+        // BIP +65%, lseu +45% — stale exact norms misrank rows badly enough
+        // that the flat reference framework beats them. DSE norms are
+        // exact-or-worthless; don't retry without exact update tracking.
         if self.enable_dual_steepest_edge {
             self.dual_edge_sq_norms = vec![1.0; self.basic_vars.len()];
         }
@@ -713,6 +716,36 @@ impl Solver {
         self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
         self.is_dual_feasible = self.calc_dual_infeasibility().0 == 0;
         Ok(())
+    }
+
+    /// The value a nonbasic variable takes when a basis is loaded with the
+    /// given status: the recorded bound, remapped to the nearest finite
+    /// bound (else 0) when the recorded one has since moved or become
+    /// infinite — see [`Self::load_basis`]'s doc.
+    fn nonbasic_load_value(&self, var: usize, status: &VarStatus) -> f64 {
+        let min = self.orig_var_mins[var];
+        let max = self.orig_var_maxs[var];
+        match status {
+            VarStatus::AtLower | VarStatus::Free => {
+                if min.is_finite() {
+                    min
+                } else if max.is_finite() {
+                    max
+                } else {
+                    0.0
+                }
+            }
+            VarStatus::AtUpper => {
+                if max.is_finite() {
+                    max
+                } else if min.is_finite() {
+                    min
+                } else {
+                    0.0
+                }
+            }
+            VarStatus::Basic => unreachable!(),
+        }
     }
 
     pub(crate) fn fix_var(&mut self, var: usize, val: f64) -> Result<StopReason, Error> {
@@ -812,6 +845,18 @@ impl Solver {
         if check_deadline(&self.deadline) == StopReason::Limit {
             return Ok(StopReason::Limit);
         }
+
+        // NOTE (measured 2026-07-12): a triangular structural crash start
+        // for large problems — replacing the all-slack basis before the
+        // first pivot — was implemented, measured, and reverted. Its basis
+        // is nonsingular by construction, but at CAT/SC scale (20k–40k
+        // rows, 0/1 data) the Gilbert–Peierls factorization rejected it or,
+        // worse, the crash-started walk later reached bases whose mid-solve
+        // refactorization failed as numerically singular (an unguarded
+        // error path: `reset()` failures propagate as solve errors). A
+        // crash start needs a factorization layer with singularity
+        // recovery first — recorded as a requirement of the Forrest–Tomlin
+        // phase alongside the update scheme itself.
 
         if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
             return Ok(StopReason::Limit);
@@ -937,63 +982,93 @@ impl Solver {
 
     pub(crate) fn add_constraint(
         &mut self,
-        mut coeffs: CsVec,
+        coeffs: CsVec,
         cmp_op: ComparisonOp,
         rhs: f64,
+    ) -> Result<StopReason, Error> {
+        self.add_constraints(vec![(coeffs, cmp_op, rhs)])
+    }
+
+    /// Add a batch of rows to a solved LP and dual-simplex back to
+    /// optimality. The whole batch costs ONE matrix rebuild, ONE basis
+    /// refactorization and ONE feasibility restore — the per-row versions of
+    /// those dominated `add_constraint` loops (the root cut loop adds tens
+    /// of rows per round; measured on BIP_easy, 32 per-row refactorizations
+    /// of a 2900-row basis were most of the loop's cost). Rows may reference
+    /// any variable that exists BEFORE the batch, never another batch row's
+    /// slack.
+    pub(crate) fn add_constraints(
+        &mut self,
+        new_rows: Vec<(CsVec, ComparisonOp, f64)>,
     ) -> Result<StopReason, Error> {
         assert!(self.is_primal_feasible);
         assert!(self.is_dual_feasible);
 
-        if coeffs.indices().is_empty() {
-            let is_tautological = match cmp_op {
-                ComparisonOp::Eq => float_eq(rhs, 0.0),
-                ComparisonOp::Le => 0.0 <= rhs,
-                ComparisonOp::Ge => 0.0 >= rhs,
-            };
-
-            return if is_tautological {
-                Ok(StopReason::Finished)
-            } else {
-                Err(Error::Infeasible)
-            };
+        let mut rows = Vec::with_capacity(new_rows.len());
+        for (coeffs, cmp_op, rhs) in new_rows {
+            if coeffs.indices().is_empty() {
+                let is_tautological = match cmp_op {
+                    ComparisonOp::Eq => float_eq(rhs, 0.0),
+                    ComparisonOp::Le => 0.0 <= rhs,
+                    ComparisonOp::Ge => 0.0 >= rhs,
+                };
+                if is_tautological {
+                    continue;
+                }
+                return Err(Error::Infeasible);
+            }
+            rows.push((coeffs, cmp_op, rhs));
+        }
+        if rows.is_empty() {
+            return Ok(StopReason::Finished);
         }
 
-        let slack_var = self.num_total_vars();
-        let (slack_var_min, slack_var_max) = match cmp_op {
-            ComparisonOp::Le => (0.0, f64::INFINITY),
-            ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
-            ComparisonOp::Eq => (0.0, 0.0),
-        };
-
-        self.orig_obj_coeffs.push(0.0);
-        self.orig_var_mins.push(slack_var_min);
-        self.orig_var_maxs.push(slack_var_max);
-        self.var_states.push(VarState::Basic(self.basic_vars.len()));
-        self.basic_vars.push(slack_var);
-        self.basic_var_mins.push(slack_var_min);
-        self.basic_var_maxs.push(slack_var_max);
-
-        let mut lhs_val = 0.0;
-        for (var, &coeff) in coeffs.iter() {
-            let val = match self.var_states[var] {
-                VarState::Basic(idx) => self.basic_var_vals[idx],
-                VarState::NonBasic(idx) => self.nb_var_vals[idx],
+        // Every new row's slack enters the basis at the row's current
+        // activity slack; the basis matrix stays square and gains a
+        // block-triangular slack border, so existing tableau rows are
+        // unchanged (relied on by the steepest-edge update below).
+        let first_slack = self.num_total_vars();
+        let new_num_total_vars = first_slack + rows.len();
+        for (i, (coeffs, cmp_op, rhs)) in rows.iter().enumerate() {
+            let (slack_var_min, slack_var_max) = match cmp_op {
+                ComparisonOp::Le => (0.0, f64::INFINITY),
+                ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
+                ComparisonOp::Eq => (0.0, 0.0),
             };
-            lhs_val += val * coeff;
-        }
-        self.basic_var_vals.push(rhs - lhs_val);
+            self.orig_obj_coeffs.push(0.0);
+            self.orig_var_mins.push(slack_var_min);
+            self.orig_var_maxs.push(slack_var_max);
+            self.var_states.push(VarState::Basic(self.basic_vars.len()));
+            self.basic_vars.push(first_slack + i);
+            self.basic_var_mins.push(slack_var_min);
+            self.basic_var_maxs.push(slack_var_max);
 
-        let new_num_total_vars = self.num_total_vars() + 1;
+            let mut lhs_val = 0.0;
+            for (var, &coeff) in coeffs.iter() {
+                debug_assert!(
+                    var < first_slack,
+                    "batch rows must not reference batch slacks"
+                );
+                let val = match self.var_states[var] {
+                    VarState::Basic(idx) => self.basic_var_vals[idx],
+                    VarState::NonBasic(idx) => self.nb_var_vals[idx],
+                };
+                lhs_val += val * coeff;
+            }
+            self.basic_var_vals.push(rhs - lhs_val);
+            self.orig_rhs.push(*rhs);
+        }
+
         let mut new_orig_constraints = CsMat::empty(CompressedStorage::CSR, new_num_total_vars);
         for row in self.orig_constraints.outer_iterator() {
             new_orig_constraints =
                 new_orig_constraints.append_outer_csvec(resized_view(&row, new_num_total_vars));
         }
-        coeffs = into_resized(coeffs, new_num_total_vars);
-        coeffs.append(slack_var, 1.0);
-        new_orig_constraints = new_orig_constraints.append_outer_csvec(coeffs.view());
-
-        self.orig_rhs.push(rhs);
+        for (i, (coeffs, _, _)) in rows.into_iter().enumerate() {
+            let mut coeffs = into_resized(coeffs, new_num_total_vars);
+            coeffs.append(first_slack + i, 1.0);
+            new_orig_constraints = new_orig_constraints.append_outer_csvec(coeffs.view());
+        }
 
         self.orig_constraints = new_orig_constraints;
         self.orig_constraints_csc = self.orig_constraints.to_csc();
@@ -1002,19 +1077,23 @@ impl Solver {
             .reset(&self.orig_constraints_csc, &self.basic_vars)?;
 
         if self.enable_primal_steepest_edge || self.enable_dual_steepest_edge {
-            // existing tableau rows didn't change, so we calc the last row
-            // and add its contribution to the sq. norms.
-            self.calc_row_coeffs(self.num_constraints() - 1);
+            // Existing tableau rows didn't change (slack border), so only
+            // the new rows contribute to the sq. norms.
+            for r in (self.num_constraints() - (new_num_total_vars - first_slack))
+                ..self.num_constraints()
+            {
+                self.calc_row_coeffs(r);
 
-            if self.enable_primal_steepest_edge {
-                for (c, &coeff) in self.row_coeffs.iter() {
-                    self.primal_edge_sq_norms[c] += coeff * coeff;
+                if self.enable_primal_steepest_edge {
+                    for (c, &coeff) in self.row_coeffs.iter() {
+                        self.primal_edge_sq_norms[c] += coeff * coeff;
+                    }
                 }
-            }
 
-            if self.enable_dual_steepest_edge {
-                self.dual_edge_sq_norms
-                    .push(self.inv_basis_row_coeffs.sq_norm());
+                if self.enable_dual_steepest_edge {
+                    self.dual_edge_sq_norms
+                        .push(self.inv_basis_row_coeffs.sq_norm());
+                }
             }
         }
 
@@ -1492,6 +1571,16 @@ impl Solver {
         // A simple heuristic to choose when to recompute LU factorization.
         // Note: a possible failure mode is that the LU factorization accidentally
         // generates a lot of fill-in and doesn't get recomputed for a long time.
+        //
+        // The `< 1 ×` threshold was re-measured 2026-07-12 against 2× and 4×:
+        // on small bases (stein45 331 rows, lseu) larger multipliers are
+        // monotonically WORSE — the eta chain taxes every solve more than
+        // the cheap refactorization costs — while the one large basis in the
+        // corpus (BIP, 2900 rows) preferred 2× (4.7 → 3.7 s), because
+        // factorization cost grows with m faster than chain drag does. The
+        // m-dependence is real, but one instance is no basis for a formula;
+        // in-place LU updating (Forrest–Tomlin) removes the trade-off
+        // entirely and is the recorded successor to this heuristic.
         let eta_matrices_nnz = self.basis_solver.eta_matrices.coeff_cols.nnz();
         if eta_matrices_nnz < self.basis_solver.lu_factors.nnz() {
             self.basis_solver
@@ -1587,32 +1676,23 @@ impl Solver {
             }
         }
 
-        if self.basis_solver.eta_matrices.len() > 0 {
-            self.basis_solver
-                .reset(&self.orig_constraints_csc, &self.basic_vars)?;
-        }
-
-        self.basis_solver
-            .lu_factors
-            .solve_dense(&mut cur_vals, &mut self.basis_solver.scratch);
+        // Etas are applied to the dense solve directly — a pending eta file
+        // is NOT a reason to refactorize (it used to be, and on bell3a that
+        // was 7.8k full refactorizations per solve).
+        self.basis_solver.solve_dense_with_etas(&mut cur_vals);
         self.basic_var_vals = cur_vals;
         Ok(())
     }
 
     fn recalc_obj_coeffs(&mut self) -> Result<(), Error> {
-        if self.basis_solver.eta_matrices.len() > 0 {
-            self.basis_solver
-                .reset(&self.orig_constraints_csc, &self.basic_vars)?;
-        }
-
+        // Same as recalc_basic_var_vals: pending etas participate in the
+        // (transposed) dense solve instead of forcing a refactorization.
         let multipliers = {
             let mut rhs = vec![0.0; self.num_constraints()];
             for (c, &var) in self.basic_vars.iter().enumerate() {
                 rhs[c] = self.orig_obj_coeffs[var];
             }
-            self.basis_solver
-                .lu_factors_transp
-                .solve_dense(&mut rhs, &mut self.basis_solver.scratch);
+            self.basis_solver.solve_transp_dense_with_etas(&mut rhs);
             rhs
         };
 
@@ -1723,6 +1803,34 @@ impl BasisSolver {
         }
 
         &mut self.rhs
+    }
+
+    /// Dense counterpart of [`Self::solve`]: LU solve plus the forward eta
+    /// application, so callers with dense right-hand sides (the recalcs) no
+    /// longer need a full refactorization just because etas are pending.
+    fn solve_dense_with_etas(&mut self, rhs: &mut [f64]) {
+        self.lu_factors.solve_dense(rhs, &mut self.scratch);
+        for idx in 0..self.eta_matrices.len() {
+            let coeff = rhs[self.eta_matrices.leaving_rows[idx]];
+            if coeff != 0.0 {
+                for (r, &val) in self.eta_matrices.coeff_cols.col_iter(idx) {
+                    rhs[r] -= coeff * val;
+                }
+            }
+        }
+    }
+
+    /// Dense counterpart of [`Self::solve_transp`]: the reverse eta
+    /// application, then the transposed LU solve.
+    fn solve_transp_dense_with_etas(&mut self, rhs: &mut [f64]) {
+        for idx in (0..self.eta_matrices.len()).rev() {
+            let mut coeff = 0.0;
+            for (i, &val) in self.eta_matrices.coeff_cols.col_iter(idx) {
+                coeff += val * rhs[i];
+            }
+            rhs[self.eta_matrices.leaving_rows[idx]] -= coeff;
+        }
+        self.lu_factors_transp.solve_dense(rhs, &mut self.scratch);
     }
 
     /// Pass right-hand side via self.rhs
@@ -1853,6 +1961,81 @@ mod tests {
         assert_eq!(&sol.primal_edge_sq_norms, &[4.0, 8.0]);
 
         assert_eq!(sol.cur_obj_val, 0.0);
+    }
+
+    /// The recalcs apply pending etas to their dense solves instead of
+    /// refactorizing (they used to reset the whole factorization). The
+    /// eta-aware results must match what a FRESH factorization of the same
+    /// basis computes; values are compared per-VAR because a reload
+    /// re-orders basis positions.
+    #[test]
+    fn recalcs_with_pending_etas_match_a_fresh_factorization() {
+        init();
+        // minimize x + y + z, pairwise sums >= 2, boxes [0, 10]: optimum
+        // x = y = z = 1. A bound tightening then forces dual pivots, which
+        // push etas.
+        let mut solver = Solver::try_new(
+            &[1.0, 1.0, 1.0],
+            &[0.0, 0.0, 0.0],
+            &[10.0, 10.0, 10.0],
+            &[
+                (to_sparse(&[1.0, 1.0, 0.0]), ComparisonOp::Ge, 2.0),
+                (to_sparse(&[0.0, 1.0, 1.0]), ComparisonOp::Ge, 2.0),
+                (to_sparse(&[1.0, 0.0, 1.0]), ComparisonOp::Ge, 2.0),
+            ],
+            &[VarDomain::Real, VarDomain::Real, VarDomain::Real],
+            None,
+        )
+        .unwrap();
+        assert_eq!(solver.initial_solve().unwrap(), StopReason::Finished);
+        solver.set_var_bounds(2, 0.0, 0.25).unwrap();
+        assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
+        assert!(
+            solver.basis_solver.eta_matrices.len() > 0,
+            "fixture must leave etas pending to exercise the new path"
+        );
+
+        // Recalculate through the eta-aware dense solves.
+        solver.recalc_basic_var_vals().unwrap();
+        solver.recalc_obj_coeffs().unwrap();
+        let by_var = |s: &Solver| -> Vec<(usize, f64)> {
+            let mut v: Vec<(usize, f64)> = s
+                .basic_vars
+                .iter()
+                .zip(&s.basic_var_vals)
+                .map(|(&var, &val)| (var, val))
+                .collect();
+            v.sort_by_key(|&(var, _)| var);
+            v
+        };
+        let rc_by_var = |s: &Solver| -> Vec<(usize, f64)> {
+            let mut v: Vec<(usize, f64)> = s
+                .nb_vars
+                .iter()
+                .zip(&s.nb_var_obj_coeffs)
+                .map(|(&var, &rc)| (var, rc))
+                .collect();
+            v.sort_by_key(|&(var, _)| var);
+            v
+        };
+        let eta_vals = by_var(&solver);
+        let eta_rcs = rc_by_var(&solver);
+        let eta_obj = solver.cur_obj_val;
+
+        // Reloading the solver's own snapshot refactorizes from scratch and
+        // reruns the recalcs eta-free — the ground truth.
+        let basis = solver.snapshot_basis();
+        solver.load_basis(&basis).unwrap();
+        assert_eq!(solver.basis_solver.eta_matrices.len(), 0);
+        for ((va, a), (vb, b)) in eta_vals.iter().zip(by_var(&solver).iter()) {
+            assert_eq!(va, vb);
+            assert!((a - b).abs() < 1e-9, "basic val of var {va}: {a} vs {b}");
+        }
+        for ((va, a), (vb, b)) in eta_rcs.iter().zip(rc_by_var(&solver).iter()) {
+            assert_eq!(va, vb);
+            assert!((a - b).abs() < 1e-9, "reduced cost of var {va}: {a} vs {b}");
+        }
+        assert!((eta_obj - solver.cur_obj_val).abs() < 1e-9);
     }
 
     #[test]
