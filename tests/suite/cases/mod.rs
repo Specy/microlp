@@ -7,6 +7,7 @@ use std::time::Duration;
 mod incremental;
 mod lp_random;
 mod lp_unit;
+mod milp_families;
 mod milp_random;
 mod milp_unit;
 mod milpbench;
@@ -151,6 +152,7 @@ pub fn all() -> Vec<Case> {
     lp_random::register(&mut cases);
     milp_unit::register(&mut cases);
     milp_random::register(&mut cases);
+    milp_families::register(&mut cases);
     incremental::register(&mut cases);
     netlib::register(&mut cases);
     miplib::register(&mut cases);

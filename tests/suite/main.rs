@@ -210,6 +210,9 @@ enum Status {
 }
 
 fn main() {
+    // Silent unless RUST_LOG is set; lets `RUST_LOG=microlp=debug` expose the
+    // solver's presolve/simplex diagnostics through the suite runner.
+    let _ = env_logger::try_init();
     let opts = parse_args();
     let debug_build = cfg!(debug_assertions);
 

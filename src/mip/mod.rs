@@ -512,8 +512,26 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
     let z = state.solver.cur_obj_val;
     let val = *state.solver.get_value(var);
     let (lo, hi) = state.solver.get_var_bounds(var);
-    let floor = val.floor();
-    let f_down = val - floor;
+    // The split point k (children: x ≤ k and x ≥ k + 1) must be
+    // noise-robust: a raw `val.floor()` of a within-tolerance-integral value
+    // is catastrophic — floor(−8e-16) = −1 makes the up child
+    // (max(0, lo), hi) reproduce the parent VERBATIM and the search
+    // descends forever. Reachable through the rounding-rejected re-branch
+    // path (`choose_branch_var` at int_tol = 0) whenever LP noise puts an
+    // integer var a hair below an integer. Snap near-integral values to
+    // their integer first, then clamp k into [lo, hi − 1] so BOTH children
+    // strictly tighten the parent's [lo, hi] whenever hi − lo ≥ 1
+    // (integral bounds — guaranteed for branchable vars).
+    let floor = {
+        let near = val.round();
+        let k = if (val - near).abs() <= state.options.int_tol {
+            near
+        } else {
+            val.floor()
+        };
+        k.clamp(lo, (hi - 1.0).max(lo))
+    };
+    let f_down = (val - floor).clamp(0.0, 1.0);
 
     state.node_seq += 1;
     let id = state.node_seq;
@@ -791,10 +809,17 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
                 }
             }
         } else {
-            let var =
-                branching::choose_branch_var(&state.solver, &domains, int_tol, &state.pseudocosts)
-                    .expect("non-integral relaxation must have a fractional int var");
-            branch(state, &root, var);
+            match branching::choose_branch_var(&state.solver, &domains, int_tol, &state.pseudocosts)
+            {
+                Some(var) => branch(state, &root, var),
+                // Non-integral relaxation with NO branchable var: every
+                // fractional int var is FIXED (lo == hi at a fractional
+                // value — e.g. a post-solve fix_var edit), and a fixed
+                // fractional integer admits no integer point at all. That is
+                // an infeasibility verdict, not a panic (branching on the
+                // fixed var would reproduce the node forever).
+                None => return Err(Error::Infeasible),
+            }
         }
     }
 
@@ -923,10 +948,16 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
             continue;
         }
 
-        let var =
-            branching::choose_branch_var(&state.solver, &domains, int_tol, &state.pseudocosts)
-                .expect("non-integral node must have a fractional int var");
-        branch(state, &node, var);
+        match branching::choose_branch_var(&state.solver, &domains, int_tol, &state.pseudocosts) {
+            Some(var) => branch(state, &node, var),
+            // Same verdict as the root case above: non-integral with no
+            // branchable var means a fixed-at-fractional integer var — the
+            // node's subproblem contains no integer point. Prune it.
+            None => {
+                state.last_solved_id = None;
+                state.diving = false;
+            }
+        }
     }
 
     if state.incumbent.is_some() {

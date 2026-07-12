@@ -821,6 +821,20 @@ impl Solution {
 
     /// Add a Gomory cut for `var`. Only available on pure-LP solutions.
     ///
+    /// # Validity preconditions (caller's responsibility)
+    ///
+    /// This generates the classic **pure-integer Gomory fractional cut**
+    /// from `var`'s simplex tableau row. Its validity — "no integer-feasible
+    /// point is cut off" — rests on textbook assumptions this method does
+    /// NOT check: every variable with a nonzero coefficient in that tableau
+    /// row (including slacks, i.e. the touched rows' data) must be
+    /// integer-valued at every integer-feasible point, and every nonbasic
+    /// variable in the row must sit at a lower bound of exactly zero.
+    /// Calling it on rows with continuous variables, shifted or upper
+    /// bounds, or fractional row data can add an **invalid cut that silently
+    /// excludes optimal solutions**. Intended for hand-rolled cutting-plane
+    /// loops over pure-integer models in standard form; anything else, don't.
+    ///
     /// # Errors
     ///
     /// [`Error::Infeasible`] if the cut makes the problem infeasible;
