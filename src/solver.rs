@@ -719,7 +719,12 @@ impl Solver {
             .reset(&self.orig_constraints_csc, &self.basic_vars)?;
 
         // Steepest-edge reference reset (standard practice after a warm-start load;
-        // only affects pivot ordering quality, not correctness).
+        // only affects pivot ordering quality, not correctness). Measured
+        // 2026-07-12: carrying the previous basis's norms per-var instead
+        // (1.0 only for newly basic vars) is sharply WORSE — gt2 3.9×,
+        // BIP +65%, lseu +45% — stale exact norms misrank rows badly enough
+        // that the flat reference framework beats them. DSE norms are
+        // exact-or-worthless; don't retry without exact update tracking.
         if self.enable_dual_steepest_edge {
             self.dual_edge_sq_norms = vec![1.0; self.basic_vars.len()];
         }
@@ -1027,6 +1032,18 @@ impl Solver {
         if check_deadline(&self.deadline) == StopReason::Limit {
             return Ok(StopReason::Limit);
         }
+
+        // NOTE (measured 2026-07-12): a triangular structural crash start
+        // for large problems — replacing the all-slack basis before the
+        // first pivot — was implemented, measured, and reverted. Its basis
+        // is nonsingular by construction, but at CAT/SC scale (20k–40k
+        // rows, 0/1 data) the Gilbert–Peierls factorization rejected it or,
+        // worse, the crash-started walk later reached bases whose mid-solve
+        // refactorization failed as numerically singular (an unguarded
+        // error path: `reset()` failures propagate as solve errors). A
+        // crash start needs a factorization layer with singularity
+        // recovery first — recorded as a requirement of the Forrest–Tomlin
+        // phase alongside the update scheme itself.
 
         if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
             return Ok(StopReason::Limit);
@@ -1741,6 +1758,16 @@ impl Solver {
         // A simple heuristic to choose when to recompute LU factorization.
         // Note: a possible failure mode is that the LU factorization accidentally
         // generates a lot of fill-in and doesn't get recomputed for a long time.
+        //
+        // The `< 1 ×` threshold was re-measured 2026-07-12 against 2× and 4×:
+        // on small bases (stein45 331 rows, lseu) larger multipliers are
+        // monotonically WORSE — the eta chain taxes every solve more than
+        // the cheap refactorization costs — while the one large basis in the
+        // corpus (BIP, 2900 rows) preferred 2× (4.7 → 3.7 s), because
+        // factorization cost grows with m faster than chain drag does. The
+        // m-dependence is real, but one instance is no basis for a formula;
+        // in-place LU updating (Forrest–Tomlin) removes the trade-off
+        // entirely and is the recorded successor to this heuristic.
         let eta_matrices_nnz = self.basis_solver.eta_matrices.coeff_cols.nnz();
         if eta_matrices_nnz < self.basis_solver.lu_factors.nnz() {
             self.basis_solver
