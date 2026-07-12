@@ -2,14 +2,21 @@
 //!
 //! Owns exactly one [`Solver`] per search. Branching changes variable bounds in
 //! place (never adds constraint rows), so the LP never grows during the search.
+//! The one sanctioned exception is the root cut loop (`run_root_cuts`), which
+//! appends valid-inequality rows BEFORE the root node snapshots the first
+//! basis — every basis in the search is sized for the final, cut-extended row
+//! set, so the invariant above holds for the whole tree.
 
 pub(crate) mod branching;
+pub(crate) mod cuts;
 pub(crate) mod node;
 pub(crate) mod params;
 pub(crate) mod propagate;
 
 use crate::solver::{check_deadline, Deadline, Solver};
-use crate::{ComparisonOp, Error, OptimizationDirection, Problem, StopReason, VarDomain, Variable};
+use crate::{
+    ComparisonOp, CsVec, Error, OptimizationDirection, Problem, StopReason, VarDomain, Variable,
+};
 use core::time::Duration;
 use node::{effective_bounds, Node};
 use std::collections::BTreeMap;
@@ -65,6 +72,14 @@ pub struct SolveOptions {
     /// Disable only to compare raw solver behavior or to rule presolve out
     /// while investigating a suspected numerical issue. Default `true`.
     pub presolve: bool,
+    /// Enable root cutting planes: valid inequalities separated at the root
+    /// relaxation (currently knapsack cover cuts) that tighten the LP bound
+    /// without excluding any integer-feasible point. Rows are added only
+    /// before the tree search starts; solutions and the problem you observe
+    /// through [`crate::Solution`] are unchanged. Ignored for pure-LP
+    /// problems. Disable to compare raw search behavior or to rule cuts out
+    /// while investigating a suspected numerical issue. Default `true`.
+    pub root_cuts: bool,
     /// Expert-level numeric tolerances (see [`Tolerances`]). Most callers
     /// should leave this at [`Tolerances::default`]; override an individual
     /// field only once you understand the correctness/permissiveness
@@ -81,6 +96,7 @@ impl Default for SolveOptions {
             int_tol: 1e-6,
             warm_start: None,
             presolve: true,
+            root_cuts: true,
             tolerances: Tolerances::default(),
         }
     }
@@ -176,6 +192,8 @@ pub struct Stats {
     /// Incumbents produced by the root diving heuristic (0 or 1 per solve:
     /// it runs once, before the tree search starts).
     pub incumbents_from_dive: u64,
+    /// Knapsack cover cuts added to the LP by the root cut loop.
+    pub cover_cuts: u64,
     /// Total simplex pivots across the whole solve (including the root LP).
     pub lp_iterations: u64,
     /// Wall-clock time spent inside the solver, accumulated across resumes.
@@ -243,6 +261,10 @@ pub(crate) struct MipState {
     /// Whether the incumbent-rescue dive has been attempted in this search
     /// (it fires at most once; see `params::DIVE_TRIGGER_NODES`).
     pub dive_done: bool,
+    /// Root cut-loop rounds consumed so far. Persisted here (not loop-local)
+    /// so a deadline that strikes mid-loop resumes the round budget instead
+    /// of restarting it.
+    pub cut_rounds_done: u32,
 }
 
 impl std::fmt::Debug for MipState {
@@ -352,6 +374,7 @@ pub(crate) fn run(problem: &Problem, options: SolveOptions) -> Result<MipRun, Er
         prop_hits: 0,
         prop_disabled: false,
         dive_done: false,
+        cut_rounds_done: 0,
     };
     let outcome = resume_run_with_deadline(&mut state)?;
     Ok(MipRun { outcome, state })
@@ -1023,6 +1046,116 @@ fn dive_for_incumbent(state: &mut MipState, domains: &[VarDomain]) -> Result<(),
     Ok(())
 }
 
+/// Root cut loop: separate valid inequalities at the solved root relaxation
+/// and add them to the LP, which re-solves after each row (warm dual simplex
+/// from the current basis). Runs only before the root node exists — the one
+/// point where rows may grow (see the module doc). Returns `Limit` when the
+/// deadline strikes mid-loop; the caller un-sets `root_solved` so a resume
+/// re-enters here, with `state.cut_rounds_done` carrying the round budget
+/// across the interruption.
+///
+/// Every cut preserves every integer-feasible point, so `Err(Infeasible)`
+/// out of `add_constraint` is a genuine proof that the MIP is infeasible and
+/// propagates as such via `?`. (An INVALID cut faking that proof is the bug
+/// class the enumeration tests in `cuts` exist to catch.)
+fn run_root_cuts(state: &mut MipState, domains: &[VarDomain]) -> Result<StopReason, Error> {
+    let num_vars = domains.len();
+    let mut dedup = cuts::CutDedup::new();
+    // Cuts must EARN their rows: if the whole loop ends with no bound gain,
+    // the pre-loop solver state is restored and every cut row vanishes.
+    // Measured motivation: on BIP_easy the root bound already equals the
+    // optimum, and 32 zero-gain cover cuts perturbed the incumbent-discovery
+    // trajectory for +32% solve time — the same lesson as the dive's trigger:
+    // machinery that cannot help must leave the search untouched. The clone
+    // is transient root-only memory, dropped when this function returns.
+    let snapshot = state.solver.clone();
+    let start_bound = state.solver.cur_obj_val;
+    // Rows destined for the propagator, appended once in the epilogue.
+    // Later rounds deliberately do NOT separate from cut rows: a cover of a
+    // ±1-coefficient row is dominated by that row and never violated.
+    let mut added: Vec<(Vec<usize>, Vec<f64>, f64)> = Vec::new();
+    let mut values: Vec<f64> = Vec::new();
+    let mut bounds: Vec<(f64, f64)> = Vec::new();
+    let result = loop {
+        if state.cut_rounds_done >= params::CUT_MAX_ROUNDS {
+            break StopReason::Finished;
+        }
+        if check_deadline(&state.deadline) == StopReason::Limit {
+            break StopReason::Limit;
+        }
+        let bound_before = state.solver.cur_obj_val;
+        values.clear();
+        values.extend((0..num_vars).map(|v| *state.solver.get_value(v)));
+        bounds.clear();
+        bounds.extend((0..num_vars).map(|v| state.solver.get_var_bounds(v)));
+        let found = cuts::separate_cover_cuts(
+            state.propagator.rows(),
+            &bounds,
+            domains,
+            &values,
+            params::CUTS_PER_ROUND,
+            &mut dedup,
+        );
+        if found.is_empty() {
+            break StopReason::Finished;
+        }
+        state.cut_rounds_done += 1;
+        // The whole round lands as ONE batch: one refactorization + one
+        // dual-simplex restore, not one per row.
+        let batch: Vec<(CsVec, ComparisonOp, f64)> = found
+            .iter()
+            .map(|cut| {
+                (
+                    CsVec::new(num_vars, cut.vars.clone(), cut.coeffs.clone()),
+                    ComparisonOp::Le,
+                    cut.rhs,
+                )
+            })
+            .collect();
+        let sr = state.solver.add_constraints(batch)?;
+        for cut in &found {
+            added.push((cut.vars.clone(), cut.coeffs.clone(), cut.rhs));
+        }
+        if sr == StopReason::Limit {
+            break StopReason::Limit;
+        }
+        // Tailing off: the whole round barely moved the (internal, minimized)
+        // root bound — the residual gap belongs to the tree, not more cuts.
+        let gain = state.solver.cur_obj_val - bound_before;
+        if gain <= params::CUT_TAILOFF_REL * (1.0 + bound_before.abs()) {
+            break StopReason::Finished;
+        }
+    };
+    // Keep-or-rollback, decided on completed loops only: an interrupted loop
+    // keeps its rows (they are already part of the LP the resume continues
+    // from) and the resumed call re-evaluates the residual gain when it
+    // finishes. `Err` paths never reach here — Infeasible is a proof.
+    if result == StopReason::Finished && !added.is_empty() {
+        let gain = state.solver.cur_obj_val - start_bound;
+        if gain <= params::CUT_KEEP_MIN_GAIN_REL * (1.0 + start_bound.abs()) {
+            debug!(
+                "root cuts: rolled back {} cover cuts ({} rounds): no bound gain",
+                added.len(),
+                state.cut_rounds_done,
+            );
+            state.solver = snapshot;
+            added.clear();
+        }
+    }
+    if !added.is_empty() {
+        debug!(
+            "root cuts: {} cover cuts over {} rounds, root bound {} -> {}",
+            added.len(),
+            state.cut_rounds_done,
+            start_bound,
+            state.solver.cur_obj_val,
+        );
+        state.stats.cover_cuts += added.len() as u64;
+        state.propagator.add_le_rows(&added, num_vars);
+    }
+    Ok(result)
+}
+
 fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
     let domains = state.solver.orig_var_domains.clone();
     let int_tol = state.options.int_tol;
@@ -1042,6 +1175,21 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
             // rather than build the root node from a half-solved bound.
             if let Some(outcome) = try_warm_start(state, &hints)? {
                 return Ok(outcome);
+            }
+        }
+        // Root cutting planes: tighten the relaxation with valid inequalities
+        // while rows may still grow (no node basis has been snapshotted yet —
+        // the root node below is sized for the cut-extended LP). An integral
+        // root cannot violate a valid inequality, so separation is skipped
+        // outright there.
+        if state.options.root_cuts && !branching::is_integral(&state.solver, &domains, int_tol) {
+            debug_assert!(state.open.is_empty());
+            if run_root_cuts(state, &domains)? == StopReason::Limit {
+                // Same resume contract as an interrupted warm start: re-enter
+                // the root block on the next call; `state.cut_rounds_done`
+                // carries the consumed round budget across the interruption.
+                state.root_solved = false;
+                return Ok(MipOutcome::Interrupted);
             }
         }
         let root = Node {
@@ -1704,8 +1852,13 @@ mod tests {
         // items is always feasible for a <= row, so the dive must adopt an
         // incumbent, and the state must remain consistent enough to resume
         // the search to the true optimum afterwards.
+        //
+        // Root cuts are deliberately OFF: two cover cuts make this fixture's
+        // root INTEGRAL (adopted as optimal with zero nodes), leaving the
+        // dive nothing to rescue — this test isolates the dive mechanism.
         let mut options = SolveOptions::default();
         options.node_limit = Some(0);
+        options.root_cuts = false;
         let mut r = run(&binary_knapsack(), options).unwrap();
         assert_eq!(r.outcome, MipOutcome::Interrupted);
         assert!(r.state.incumbent.is_none());
@@ -1740,7 +1893,12 @@ mod tests {
         // incumbent exists before the first branching, so every node solves
         // under a tight cutoff and reduced-cost fixing can bite. Optimum must
         // be unchanged and at least one tightening must have fired.
+        //
+        // Root cuts are deliberately OFF: they close this fixture's root gap
+        // to zero (no nodes ever solve), leaving reduced-cost fixing nothing
+        // to fire on — this test isolates the RC-fixing mechanism.
         let mut options = SolveOptions::default();
+        options.root_cuts = false;
         options.warm_start = Some(vec![
             (Variable(0), 0.0),
             (Variable(1), 1.0),
@@ -1754,6 +1912,105 @@ mod tests {
             run.state.stats.reduced_cost_tightenings > 0,
             "reduced-cost fixing must fire on a warm-started knapsack, stats: {:?}",
             run.state.stats
+        );
+    }
+
+    #[test]
+    fn cover_cuts_fire_on_a_fractional_knapsack_root_and_preserve_the_optimum() {
+        // binary_knapsack's root LP is x* = (1, 1, 0.5, 0), obj 22 (int
+        // optimum 21): the cover {x, y, z} (5+7+4 = 16 > 14) is violated by
+        // 0.5, so the root cut loop must fire. The optimum must be untouched
+        // and the tree must not grow versus the cut-free search.
+        let no_cuts = {
+            let mut o = SolveOptions::default();
+            o.root_cuts = false;
+            run(&binary_knapsack(), o).unwrap()
+        };
+        assert_eq!(no_cuts.state.stats.cover_cuts, 0);
+        assert!((incumbent_obj(&no_cuts.state) + 21.0).abs() < 1e-6);
+
+        let with_cuts = run(&binary_knapsack(), SolveOptions::default()).unwrap();
+        assert_eq!(with_cuts.outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&with_cuts.state) + 21.0).abs() < 1e-6);
+        assert!(
+            with_cuts.state.stats.cover_cuts >= 1,
+            "a violated cover exists at the root; stats: {:?}",
+            with_cuts.state.stats
+        );
+        assert!(
+            with_cuts.state.stats.nodes_solved <= no_cuts.state.stats.nodes_solved,
+            "cuts must not grow the tree: {} vs {} nodes",
+            with_cuts.state.stats.nodes_solved,
+            no_cuts.state.stats.nodes_solved
+        );
+    }
+
+    #[test]
+    fn zero_gain_cuts_are_rolled_back() {
+        // Two-partition fixture with a coupling knapsack and an objective
+        // that is CONSTANT on the feasible set (x1+x2 = 1 and x3+x4 = 1 pin
+        // x1+x2+x3+x4 to exactly 2): the root bound can never move, so any
+        // cover separated off a fractional root vertex is zero-gain by
+        // construction and the loop must roll it back — cover_cuts stays 0
+        // whether the simplex lands on a fractional vertex (cut fired, then
+        // rolled back — the path BIP_easy exercises at suite scale) or an
+        // integral one (separation finds nothing). Presolve off keeps the
+        // fixture's rows raw so the root LP actually sees them.
+        let mut p = Problem::new(OptimizationDirection::Maximize);
+        let x1 = p.add_binary_var(1.0);
+        let x2 = p.add_binary_var(1.0);
+        let x3 = p.add_binary_var(1.0);
+        let x4 = p.add_binary_var(1.0);
+        p.add_constraint(&[(x1, 1.0), (x2, 1.0)], ComparisonOp::Eq, 1.0);
+        p.add_constraint(&[(x3, 1.0), (x4, 1.0)], ComparisonOp::Eq, 1.0);
+        p.add_constraint(&[(x1, 3.0), (x3, 3.0)], ComparisonOp::Le, 5.0);
+        let options = SolveOptions {
+            presolve: false,
+            ..SolveOptions::default()
+        };
+        let run = run(&p, options).unwrap();
+        assert_eq!(run.outcome, MipOutcome::Optimal);
+        // Internal space negates Maximize: optimum 2 is -2 internally.
+        assert!((incumbent_obj(&run.state) + 2.0).abs() < 1e-6);
+        assert_eq!(
+            run.state.stats.cover_cuts, 0,
+            "zero-gain cuts must be rolled back, stats: {:?}",
+            run.state.stats
+        );
+    }
+
+    #[test]
+    fn integral_root_separates_no_cuts() {
+        // Root LP already integral: separation is skipped outright (a valid
+        // inequality cannot be violated by an integral LP optimum anyway).
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let a = p.add_binary_var(1.0);
+        let b = p.add_binary_var(1.0);
+        p.add_constraint(&[(a, 1.0)], ComparisonOp::Ge, 1.0);
+        p.add_constraint(&[(b, 1.0)], ComparisonOp::Ge, 1.0);
+        let run = run(&p, SolveOptions::default()).unwrap();
+        assert_eq!(run.outcome, MipOutcome::Optimal);
+        assert_eq!(run.state.stats.cover_cuts, 0);
+    }
+
+    #[test]
+    fn interrupted_before_root_resumes_through_the_cut_loop() {
+        // A zero time budget interrupts before the root LP even solves;
+        // the resume must re-enter the root block, run the cut loop, and
+        // finish to the true optimum — exercising the cuts-after-resume path.
+        let mut options = SolveOptions::default();
+        options.time_limit = Some(Duration::ZERO);
+        let mut r = run(&binary_knapsack(), options).unwrap();
+        assert_eq!(r.outcome, MipOutcome::Interrupted);
+        assert!(!r.state.root_solved);
+
+        let outcome = resume_run(&mut r.state, None).unwrap();
+        assert_eq!(outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&r.state) + 21.0).abs() < 1e-6);
+        assert!(
+            r.state.stats.cover_cuts >= 1,
+            "the resumed root must still separate its cover, stats: {:?}",
+            r.state.stats
         );
     }
 

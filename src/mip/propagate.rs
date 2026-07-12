@@ -79,8 +79,23 @@ impl Propagator {
                 hi,
             });
         }
+        let mut prop = Propagator {
+            rows,
+            adj_start: Vec::new(),
+            adj_rows: Vec::new(),
+            dirty: Vec::new(),
+            queue: Vec::new(),
+            next: Vec::new(),
+        };
+        prop.rebuild_adj(num_vars);
+        prop
+    }
+
+    /// (Re)build the var → rows adjacency and the dirty scratch from
+    /// `self.rows`.
+    fn rebuild_adj(&mut self, num_vars: usize) {
         let mut adj_start = vec![0u32; num_vars + 1];
-        for row in &rows {
+        for row in &self.rows {
             for &v in &row.vars {
                 adj_start[v + 1] += 1;
             }
@@ -90,21 +105,40 @@ impl Propagator {
         }
         let mut adj_rows = vec![0u32; adj_start[num_vars] as usize];
         let mut fill = adj_start.clone();
-        for (r, row) in rows.iter().enumerate() {
+        for (r, row) in self.rows.iter().enumerate() {
             for &v in &row.vars {
                 adj_rows[fill[v] as usize] = r as u32;
                 fill[v] += 1;
             }
         }
-        let n_rows = rows.len();
-        Propagator {
-            rows,
-            adj_start,
-            adj_rows,
-            dirty: vec![false; n_rows],
-            queue: Vec::new(),
-            next: Vec::new(),
+        self.adj_start = adj_start;
+        self.adj_rows = adj_rows;
+        self.dirty = vec![false; self.rows.len()];
+    }
+
+    /// Read-only view of the rows (activity form `lo ≤ Σ coeffs·x ≤ hi`),
+    /// consumed by the root cut separator.
+    pub(crate) fn rows(&self) -> impl Iterator<Item = (&[usize], &[f64], f64, f64)> {
+        self.rows
+            .iter()
+            .map(|r| (r.vars.as_slice(), r.coeffs.as_slice(), r.lo, r.hi))
+    }
+
+    /// Append `Σ coeffs·x ≤ rhs` rows (root cuts) and rebuild the adjacency
+    /// so node propagation deduces from them like any other row. Root-only:
+    /// the search-time invariant that rows never change once nodes exist is
+    /// the caller's to hold (`run_root_cuts` runs before the root node is
+    /// built).
+    pub(crate) fn add_le_rows(&mut self, cuts: &[(Vec<usize>, Vec<f64>, f64)], num_vars: usize) {
+        for (vars, coeffs, rhs) in cuts {
+            self.rows.push(PropRow {
+                vars: vars.clone(),
+                coeffs: coeffs.clone(),
+                lo: f64::NEG_INFINITY,
+                hi: *rhs,
+            });
         }
+        self.rebuild_adj(num_vars);
     }
 
     fn mark_var(&mut self, v: usize) {

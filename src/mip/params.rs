@@ -91,3 +91,45 @@ pub(crate) const DIVE_PIVOT_MIN: u64 = 500;
 /// weaker cutoff cost ~25%; at 512 BIP never dives while mod008 (incumbent-
 /// less past 512 nodes) keeps a ~30% win from the rescue.
 pub(crate) const DIVE_TRIGGER_NODES: u64 = 512;
+
+/// Cap on root cut-loop rounds (each round separates on the re-solved
+/// optimum and adds a batch of cuts). The loop usually exits earlier on the
+/// tailing-off test below; the cap bounds root work on instances where
+/// separation keeps finding shallow cuts that barely move the bound.
+pub(crate) const CUT_MAX_ROUNDS: u32 = 8;
+
+/// Most-violated cuts admitted per round. Each added row costs a basis
+/// refactorization plus a short dual-simplex re-solve, so unbounded batches
+/// would let one cut-rich round dominate the root; the next round separates
+/// against the re-solved point anyway, which supersedes anything dropped.
+pub(crate) const CUTS_PER_ROUND: usize = 64;
+
+/// Minimum violation (LHS − rhs at the separation point) for a cut to be
+/// admitted. Cover cuts have ±1 coefficients, so this is on a unit scale:
+/// below it a cut barely touches the current optimum and mostly adds rows.
+pub(crate) const CUT_MIN_VIOLATION: f64 = 1e-4;
+
+/// Tailing-off exit for the root cut loop: a round that improves the root
+/// bound by less than this (relative to `1 + |bound|`) ends the loop — the
+/// remaining gap belongs to the tree search, not to more shallow cuts.
+pub(crate) const CUT_TAILOFF_REL: f64 = 1e-6;
+
+/// A candidate cover is only trusted when its weight exceeds the knapsack
+/// capacity by this margin, relative to `max(1, |capacity|)`. The emitted
+/// inequality's validity rests on "all cover members at 1 violates the
+/// row", which must hold beyond float round-off AND beyond the feasibility
+/// tolerance the LP enforces rows at (1e-7): a cover that overshoots by
+/// less than the row's enforcement slack proves nothing.
+pub(crate) const COVER_MARGIN_REL: f64 = 1e-6;
+
+/// Keep-or-rollback threshold for the WHOLE root cut loop: if the final
+/// bound gain over the pre-loop bound (relative to `1 + |bound|`) does not
+/// clear this, the pre-loop solver snapshot is restored and every cut row
+/// vanishes. Cuts exist to move the bound; zero-gain cuts still perturb the
+/// search trajectory through a different optimal vertex — measured +32% on
+/// BIP_easy, whose root bound already equals its optimum (its search time
+/// is incumbent DISCOVERY, which extra rows and a reshuffled vertex only
+/// disturb). Trajectory effects can also land lucky (enigma measured −39%
+/// from zero-gain cuts), but a coin-flip is not a mechanism; the rollback
+/// keeps only what provably paid.
+pub(crate) const CUT_KEEP_MIN_GAIN_REL: f64 = 1e-6;

@@ -953,63 +953,93 @@ impl Solver {
 
     pub(crate) fn add_constraint(
         &mut self,
-        mut coeffs: CsVec,
+        coeffs: CsVec,
         cmp_op: ComparisonOp,
         rhs: f64,
+    ) -> Result<StopReason, Error> {
+        self.add_constraints(vec![(coeffs, cmp_op, rhs)])
+    }
+
+    /// Add a batch of rows to a solved LP and dual-simplex back to
+    /// optimality. The whole batch costs ONE matrix rebuild, ONE basis
+    /// refactorization and ONE feasibility restore — the per-row versions of
+    /// those dominated `add_constraint` loops (the root cut loop adds tens
+    /// of rows per round; measured on BIP_easy, 32 per-row refactorizations
+    /// of a 2900-row basis were most of the loop's cost). Rows may reference
+    /// any variable that exists BEFORE the batch, never another batch row's
+    /// slack.
+    pub(crate) fn add_constraints(
+        &mut self,
+        new_rows: Vec<(CsVec, ComparisonOp, f64)>,
     ) -> Result<StopReason, Error> {
         assert!(self.is_primal_feasible);
         assert!(self.is_dual_feasible);
 
-        if coeffs.indices().is_empty() {
-            let is_tautological = match cmp_op {
-                ComparisonOp::Eq => float_eq(rhs, 0.0),
-                ComparisonOp::Le => 0.0 <= rhs,
-                ComparisonOp::Ge => 0.0 >= rhs,
-            };
-
-            return if is_tautological {
-                Ok(StopReason::Finished)
-            } else {
-                Err(Error::Infeasible)
-            };
+        let mut rows = Vec::with_capacity(new_rows.len());
+        for (coeffs, cmp_op, rhs) in new_rows {
+            if coeffs.indices().is_empty() {
+                let is_tautological = match cmp_op {
+                    ComparisonOp::Eq => float_eq(rhs, 0.0),
+                    ComparisonOp::Le => 0.0 <= rhs,
+                    ComparisonOp::Ge => 0.0 >= rhs,
+                };
+                if is_tautological {
+                    continue;
+                }
+                return Err(Error::Infeasible);
+            }
+            rows.push((coeffs, cmp_op, rhs));
+        }
+        if rows.is_empty() {
+            return Ok(StopReason::Finished);
         }
 
-        let slack_var = self.num_total_vars();
-        let (slack_var_min, slack_var_max) = match cmp_op {
-            ComparisonOp::Le => (0.0, f64::INFINITY),
-            ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
-            ComparisonOp::Eq => (0.0, 0.0),
-        };
-
-        self.orig_obj_coeffs.push(0.0);
-        self.orig_var_mins.push(slack_var_min);
-        self.orig_var_maxs.push(slack_var_max);
-        self.var_states.push(VarState::Basic(self.basic_vars.len()));
-        self.basic_vars.push(slack_var);
-        self.basic_var_mins.push(slack_var_min);
-        self.basic_var_maxs.push(slack_var_max);
-
-        let mut lhs_val = 0.0;
-        for (var, &coeff) in coeffs.iter() {
-            let val = match self.var_states[var] {
-                VarState::Basic(idx) => self.basic_var_vals[idx],
-                VarState::NonBasic(idx) => self.nb_var_vals[idx],
+        // Every new row's slack enters the basis at the row's current
+        // activity slack; the basis matrix stays square and gains a
+        // block-triangular slack border, so existing tableau rows are
+        // unchanged (relied on by the steepest-edge update below).
+        let first_slack = self.num_total_vars();
+        let new_num_total_vars = first_slack + rows.len();
+        for (i, (coeffs, cmp_op, rhs)) in rows.iter().enumerate() {
+            let (slack_var_min, slack_var_max) = match cmp_op {
+                ComparisonOp::Le => (0.0, f64::INFINITY),
+                ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
+                ComparisonOp::Eq => (0.0, 0.0),
             };
-            lhs_val += val * coeff;
-        }
-        self.basic_var_vals.push(rhs - lhs_val);
+            self.orig_obj_coeffs.push(0.0);
+            self.orig_var_mins.push(slack_var_min);
+            self.orig_var_maxs.push(slack_var_max);
+            self.var_states.push(VarState::Basic(self.basic_vars.len()));
+            self.basic_vars.push(first_slack + i);
+            self.basic_var_mins.push(slack_var_min);
+            self.basic_var_maxs.push(slack_var_max);
 
-        let new_num_total_vars = self.num_total_vars() + 1;
+            let mut lhs_val = 0.0;
+            for (var, &coeff) in coeffs.iter() {
+                debug_assert!(
+                    var < first_slack,
+                    "batch rows must not reference batch slacks"
+                );
+                let val = match self.var_states[var] {
+                    VarState::Basic(idx) => self.basic_var_vals[idx],
+                    VarState::NonBasic(idx) => self.nb_var_vals[idx],
+                };
+                lhs_val += val * coeff;
+            }
+            self.basic_var_vals.push(rhs - lhs_val);
+            self.orig_rhs.push(*rhs);
+        }
+
         let mut new_orig_constraints = CsMat::empty(CompressedStorage::CSR, new_num_total_vars);
         for row in self.orig_constraints.outer_iterator() {
             new_orig_constraints =
                 new_orig_constraints.append_outer_csvec(resized_view(&row, new_num_total_vars));
         }
-        coeffs = into_resized(coeffs, new_num_total_vars);
-        coeffs.append(slack_var, 1.0);
-        new_orig_constraints = new_orig_constraints.append_outer_csvec(coeffs.view());
-
-        self.orig_rhs.push(rhs);
+        for (i, (coeffs, _, _)) in rows.into_iter().enumerate() {
+            let mut coeffs = into_resized(coeffs, new_num_total_vars);
+            coeffs.append(first_slack + i, 1.0);
+            new_orig_constraints = new_orig_constraints.append_outer_csvec(coeffs.view());
+        }
 
         self.orig_constraints = new_orig_constraints;
         self.orig_constraints_csc = self.orig_constraints.to_csc();
@@ -1018,19 +1048,23 @@ impl Solver {
             .reset(&self.orig_constraints_csc, &self.basic_vars)?;
 
         if self.enable_primal_steepest_edge || self.enable_dual_steepest_edge {
-            // existing tableau rows didn't change, so we calc the last row
-            // and add its contribution to the sq. norms.
-            self.calc_row_coeffs(self.num_constraints() - 1);
+            // Existing tableau rows didn't change (slack border), so only
+            // the new rows contribute to the sq. norms.
+            for r in (self.num_constraints() - (new_num_total_vars - first_slack))
+                ..self.num_constraints()
+            {
+                self.calc_row_coeffs(r);
 
-            if self.enable_primal_steepest_edge {
-                for (c, &coeff) in self.row_coeffs.iter() {
-                    self.primal_edge_sq_norms[c] += coeff * coeff;
+                if self.enable_primal_steepest_edge {
+                    for (c, &coeff) in self.row_coeffs.iter() {
+                        self.primal_edge_sq_norms[c] += coeff * coeff;
+                    }
                 }
-            }
 
-            if self.enable_dual_steepest_edge {
-                self.dual_edge_sq_norms
-                    .push(self.inv_basis_row_coeffs.sq_norm());
+                if self.enable_dual_steepest_edge {
+                    self.dual_edge_sq_norms
+                        .push(self.inv_basis_row_coeffs.sq_norm());
+                }
             }
         }
 
