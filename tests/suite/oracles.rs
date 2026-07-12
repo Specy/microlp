@@ -95,6 +95,51 @@ pub fn coin_change_min(denoms: &[i64], target: i64) -> Option<i64> {
     (best[t] != i64::MAX).then_some(best[t])
 }
 
+/// Fixed-charge network (single demand row): minimize
+/// `sum(open_cost[i] * y_i + unit_cost[i] * x_i)` subject to
+/// `sum(x_i) >= demand`, `0 <= x_i <= cap[i] * y_i`, `y_i` binary.
+/// Exact by enumerating every open-set and greedily filling the cheapest
+/// open facilities first (optimal for a single demand row); all-integer
+/// arithmetic. Returns `None` when even opening everything cannot meet the
+/// demand.
+pub fn fixed_charge_min(
+    open_cost: &[i64],
+    unit_cost: &[i64],
+    cap: &[i64],
+    demand: i64,
+) -> Option<i64> {
+    let n = open_cost.len();
+    assert!(n <= 16, "open-set enumeration limited to n <= 16");
+    let mut best: Option<i64> = None;
+    for mask in 0u32..(1 << n) {
+        let total_cap: i64 = (0..n)
+            .filter(|&i| mask & (1 << i) != 0)
+            .map(|i| cap[i])
+            .sum();
+        if total_cap < demand {
+            continue;
+        }
+        // Fill cheapest-unit-cost open facilities first.
+        let mut open: Vec<usize> = (0..n).filter(|&i| mask & (1 << i) != 0).collect();
+        open.sort_by_key(|&i| unit_cost[i]);
+        let mut left = demand;
+        let mut cost: i64 = open.iter().map(|&i| open_cost[i]).sum();
+        for &i in &open {
+            let take = left.min(cap[i]);
+            cost += take * unit_cost[i];
+            left -= take;
+            if left == 0 {
+                break;
+            }
+        }
+        best = Some(match best {
+            None => cost,
+            Some(b) => b.min(cost),
+        });
+    }
+    best
+}
+
 /// A tiny pure-integer linear program, solved exactly by enumerating the whole
 /// bounded box. All data is integer so evaluation is exact in i64.
 pub struct TinyIlp {

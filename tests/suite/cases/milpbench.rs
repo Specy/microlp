@@ -19,10 +19,9 @@
 //! ships no certified optima for these families, so the case asserts
 //! **solver-proven** optimality — proven-optimal status, a zero gap, and an
 //! independent shadow-model validation of the returned point (feasibility,
-//! bounds, integrality, objective consistency). It additionally pins the
-//! objective to the value microlp proves, as a *regression guard* (not an
-//! external reference); see the `optimum` field for why that value is in fact a
-//! true optimum for these particular instances.
+//! bounds, integrality, objective consistency). The pinned objective is
+//! externally certified by a HiGHS zero-gap proof (see the `optimum` field for
+//! the certification details and the structural argument that backs it).
 //!
 //! Only the CFL family cleared this bar: its easy instances are *wide* (~800
 //! constraints over ~160 400 variables) with an integral LP relaxation.
@@ -233,15 +232,21 @@ struct BenchInstance {
     file: &'static str,
     /// Per-instance time budget (seconds). Generous: these solve in ~0.6 s.
     budget_secs: u64,
-    /// The optimum microlp proves for this instance.
+    /// The certified optimum for this instance.
     ///
-    /// This value is NOT an externally certified reference — MILPBench ships no
-    /// optima for these families. It is asserted as a **regression guard**. For
-    /// these CFL instances the certification is unusually strong regardless: the
-    /// LP relaxation is integral, so the simplex-*proven* LP optimum is itself an
-    /// integer-feasible point and therefore the true MILP optimum (any integer
-    /// solution is LP-feasible, so it cannot beat the LP bound). The optimal
-    /// value is unique, so it is stable across platforms within `tol`.
+    /// MILPBench ships no reference optima for these families, so each value
+    /// carries two independent certifications:
+    ///
+    /// 1. **HiGHS v1.15 zero-gap proof** (2026-07-11, benchmark harness run
+    ///    `--solvers microlp,highs --filter CFL`): HiGHS proved optimality
+    ///    with `mip_gap = 0` and its optimum matched this value within the
+    ///    harness's cross-check tolerance — no conflicting-claims alert. The
+    ///    harness independently re-validated both solvers' solutions against
+    ///    the instance (bounds, integrality, constraints, objective).
+    /// 2. **Structure**: the LP relaxation is integral, so the simplex-proven
+    ///    LP optimum is itself an integer-feasible point and therefore the
+    ///    true MILP optimum (any integer solution is LP-feasible, so it
+    ///    cannot beat the LP bound).
     optimum: f64,
     tol: Tol,
 }

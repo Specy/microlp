@@ -122,6 +122,19 @@ mod tests_general {
     }
 
     #[test]
+    fn fix_var_rejects_non_finite_values() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut problem = Problem::new(OptimizationDirection::Minimize);
+            let x = problem.add_var(1.0, (0.0, 10.0));
+            let solution = problem.solve().unwrap();
+            assert!(
+                matches!(solution.fix_var(x, invalid), Err(Error::Infeasible)),
+                "non-finite fix {invalid} was not rejected"
+            );
+        }
+    }
+
+    #[test]
     fn add_constraint() {
         init();
         let mut problem = Problem::new(OptimizationDirection::Minimize);
