@@ -235,7 +235,16 @@ mod tests_presolve_api {
         p.add_constraint(&[(s1, 1.0), (o1, -1000.0)], ComparisonOp::Le, 0.0);
         p.add_constraint(&[(s2, 1.0), (o2, -1000.0)], ComparisonOp::Le, 0.0);
         let sol = assert_same_objective(&p);
-        assert_eq!(sol.objective(), 120.0);
+        // Approximate: the objective includes CONTINUOUS supply vars whose
+        // LP values carry path-dependent float dust (any change to the root
+        // arithmetic path — e.g. a cut row — shifts it by ~1e-12);
+        // bit-exactness was never the MILP objective contract. Integer var
+        // values stay exact (rounded).
+        assert!(
+            (sol.objective() - 120.0).abs() < 1e-6,
+            "{}",
+            sol.objective()
+        );
         assert_eq!(sol.var_value(o1), 1.0);
         assert_eq!(sol.var_value(o2), 0.0);
     }

@@ -39,6 +39,25 @@ pub const EPS: f64 = 1e-10;
 /// worst-case overshoot to about a thousand pivots.
 pub(crate) const DEADLINE_CHECK_INTERVAL: u64 = 1000;
 
+/// A basic integer variable only seeds a Gomory mixed-integer cut when its
+/// fractional part is at least this far from BOTH 0 and 1. Near-integral
+/// values are dominated by tableau round-off — the cut's `f0/(1−f0)` ratios
+/// would amplify that noise into garbage coefficients — and cutting a
+/// hair's width off the relaxation is worthless anyway.
+const GMI_FRAC_MIN: f64 = 0.01;
+
+/// GMI cut coefficients below this magnitude are relaxed into the rhs using
+/// the variable's bound (never dropped: dropping a term from a `Ge` row
+/// strengthens it, i.e. makes the cut invalid). Values this small are
+/// tableau round-off, not information.
+const GMI_COEF_EPS: f64 = 1e-11;
+
+/// A GMI cut whose coefficient magnitudes span more than this ratio is
+/// discarded outright: such rows make the basis ill-conditioned, and the
+/// extreme coefficients usually trace back to amplified round-off in the
+/// tableau row rather than real structure.
+const GMI_DYNAMISM_CAP: f64 = 1e7;
+
 /// Threshold-pivoting stability coefficient passed to [`lu_factorize`] for
 /// every LU (re)factorization the simplex performs: a candidate pivot is
 /// accepted only if its magnitude is at least this fraction of the column's
@@ -814,6 +833,174 @@ impl Solver {
         } else {
             panic!("var {:?} is not basic!", var);
         }
+    }
+
+    /// Generate (without adding) a Gomory MIXED-integer cut from `var`'s
+    /// tableau row, as a `Ge` inequality `(coeffs, rhs)` over TOTAL variable
+    /// space (structural + slacks — slacks are ordinary bounded variables to
+    /// `add_constraints`, which spares the error-prone substitution back
+    /// into structural space). `None` when any soundness or numerics guard
+    /// rejects. Unlike the legacy [`Self::add_gomory_cut`] above (the
+    /// PURE-integer fractional cut, valid only when every nonbasic in the
+    /// row is integer and sits at a zero lower bound — preconditions the
+    /// caller of that public API owns), this handles the bounded mixed case:
+    /// nonbasics are shifted to their active bound (`t = x − l` at lower,
+    /// `t = u − x` at upper), integer coefficient treatment is applied only
+    /// where integrality is PROVEN, and everything else conservatively uses
+    /// the continuous formula, which is valid for integer variables too —
+    /// just weaker.
+    ///
+    /// The caller must ensure the LP is solved to optimality (fresh
+    /// factorization, real values) and that `var` is basic with a fractional
+    /// value; `domains` is the STRUCTURAL domain slice.
+    ///
+    /// Not wired into the search: the root-cut driver hookup was measured
+    /// and reverted (see `mip::run_root_cuts` — on this solver's node-LP
+    /// economics dense GMI rows cost more per node than their bound gain
+    /// saves in tree size, even at 92% gap closure on gt2). Kept, with its
+    /// validity tests, for when node LPs get cheaper; generation is correct.
+    #[allow(dead_code)]
+    pub(crate) fn gmi_cut(&mut self, var: usize, domains: &[VarDomain]) -> Option<(CsVec, f64)> {
+        // Numeric slack for "this data value is an integer" checks on
+        // bounds and row coefficients (data, not LP values).
+        const DATA_INT_EPS: f64 = 1e-9;
+        let is_data_int = |x: f64| (x - x.round()).abs() <= DATA_INT_EPS;
+
+        let row = match self.var_states[var] {
+            VarState::Basic(row) => row,
+            VarState::NonBasic(_) => return None,
+        };
+        let x_star = self.basic_var_vals[row];
+        let f0 = x_star - x_star.floor();
+        if !(GMI_FRAC_MIN..=1.0 - GMI_FRAC_MIN).contains(&f0) {
+            return None;
+        }
+
+        // The mutable tableau read happens before the immutable-borrowing
+        // closure below (it only fills the row_coeffs scratch).
+        self.calc_row_coeffs(row);
+
+        // Is total var `v`'s value provably integral whenever every integer
+        // variable is integral? Structural: its domain. Slack of row k:
+        // integer row data over integer-domained vars only.
+        let slack_is_int = |k: usize| -> bool {
+            if !is_data_int(self.orig_rhs[k]) {
+                return false;
+            }
+            for (v, &c) in self.orig_constraints.outer_view(k).unwrap().iter() {
+                if v >= self.num_vars {
+                    continue; // the row's own slack, coefficient 1
+                }
+                if c == 0.0 {
+                    continue;
+                }
+                if !is_data_int(c)
+                    || !matches!(
+                        self.orig_var_domains[v],
+                        crate::VarDomain::Integer | crate::VarDomain::Boolean
+                    )
+                {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let mut terms: Vec<(usize, f64)> = Vec::new();
+        let mut rhs = f0;
+        for (col, &a_bar) in self.row_coeffs.iter() {
+            if a_bar == 0.0 {
+                continue;
+            }
+            let v = self.nb_vars[col];
+            let state = &self.nb_var_states[col];
+            if state.at_min && state.at_max {
+                continue; // fixed: t ≡ 0, the term is exactly zero
+            }
+            if !state.at_min && !state.at_max {
+                return None; // free nonbasic: t ≥ 0 does not hold, no valid shift
+            }
+            let at_lower = state.at_min;
+            let bound = self.nb_var_vals[col];
+            // Row in t-space: x_i + Σ ã_j t_j = x_i*, t_j ≥ 0.
+            let a_tilde = if at_lower { a_bar } else { -a_bar };
+
+            let t_is_int = if v < self.num_vars {
+                matches!(
+                    domains[v],
+                    crate::VarDomain::Integer | crate::VarDomain::Boolean
+                ) && is_data_int(bound)
+            } else {
+                slack_is_int(v - self.num_vars) && is_data_int(bound)
+            };
+
+            // GMI coefficient on t_j (always ≥ 0 by construction).
+            let g = if t_is_int {
+                let f_j = a_tilde - a_tilde.floor();
+                if f_j <= f0 {
+                    f_j
+                } else {
+                    f0 * (1.0 - f_j) / (1.0 - f0)
+                }
+            } else if a_tilde >= 0.0 {
+                a_tilde
+            } else {
+                -f0 * a_tilde / (1.0 - f0)
+            };
+            if g == 0.0 {
+                continue; // integer coefficient: the term drops exactly
+            }
+
+            // Back to x-space: t = x − l keeps +g and shifts the rhs up by
+            // g·l; t = u − x flips to −g and shifts the rhs down by g·u.
+            if at_lower {
+                terms.push((v, g));
+                rhs += g * bound;
+            } else {
+                terms.push((v, -g));
+                rhs -= g * bound;
+            }
+        }
+
+        // Numerics gate: relax near-zero coefficients away using the var's
+        // bound (dropping a term from a Ge row STRENGTHENS it — invalid);
+        // an infinite bound there, any non-finite value, or excessive
+        // dynamism discards the whole cut.
+        let mut kept: Vec<(usize, f64)> = Vec::with_capacity(terms.len());
+        for (v, c) in terms {
+            if !c.is_finite() {
+                return None;
+            }
+            if c.abs() >= GMI_COEF_EPS {
+                kept.push((v, c));
+                continue;
+            }
+            let relax_bound = if c > 0.0 {
+                self.orig_var_maxs[v]
+            } else {
+                self.orig_var_mins[v]
+            };
+            if !relax_bound.is_finite() {
+                return None;
+            }
+            rhs -= c * relax_bound;
+        }
+        if kept.is_empty() || !rhs.is_finite() {
+            return None;
+        }
+        let (mut lo_mag, mut hi_mag) = (f64::INFINITY, 0.0f64);
+        for &(_, c) in &kept {
+            lo_mag = lo_mag.min(c.abs());
+            hi_mag = hi_mag.max(c.abs());
+        }
+        if hi_mag / lo_mag > GMI_DYNAMISM_CAP {
+            return None;
+        }
+
+        kept.sort_by_key(|&(v, _)| v);
+        let n = self.num_total_vars();
+        let (indices, data): (Vec<usize>, Vec<f64>) = kept.into_iter().unzip();
+        Some((CsVec::new(n, indices, data), rhs))
     }
 
     pub(crate) fn num_constraints(&self) -> usize {
@@ -1903,6 +2090,232 @@ mod tests {
         assert_eq!(&sol.primal_edge_sq_norms, &[4.0, 8.0]);
 
         assert_eq!(sol.cur_obj_val, 0.0);
+    }
+
+    /// Hand-derived GMI fixture. minimize −3x − 2y (i.e. max 3x + 2y),
+    /// 4x + 3y ≤ 10, x,y integer in [0,2]: the LP vertex is x = 2 (nonbasic
+    /// at upper), y = 2/3 (basic, f0 = 2/3), slack s = 0 (nonbasic at
+    /// lower). Tableau row: y − (4/3)t_x + (1/3)t_s = 2/3 with t_x = 2 − x.
+    /// Integer formulas (x's bound and the row's data are integral):
+    /// f_x = frac(−4/3) = 2/3 ≤ f0 → g_x = 2/3; f_s = 1/3 ≤ f0 → g_s = 1/3.
+    /// Cut (2/3)t_x + (1/3)t_s ≥ 2/3, in x-space −(2/3)x + (1/3)s ≥ −2/3 —
+    /// equivalent to 2x + y ≤ 4, which every integer point satisfies while
+    /// the vertex (2, 2/3) violates it by exactly f0.
+    #[test]
+    fn gmi_cut_matches_hand_derivation() {
+        init();
+        let domains = [VarDomain::Integer, VarDomain::Integer];
+        let mut solver = Solver::try_new(
+            &[-3.0, -2.0],
+            &[0.0, 0.0],
+            &[2.0, 2.0],
+            &[(to_sparse(&[4.0, 3.0]), ComparisonOp::Le, 10.0)],
+            &domains,
+            None,
+        )
+        .unwrap();
+        assert_eq!(solver.initial_solve().unwrap(), StopReason::Finished);
+        assert!((*solver.get_value(0) - 2.0).abs() < 1e-9);
+        assert!((*solver.get_value(1) - 2.0 / 3.0).abs() < 1e-9);
+
+        let (coeffs, rhs) = solver.gmi_cut(1, &domains).expect("y is basic fractional");
+        let terms: Vec<(usize, f64)> = coeffs.iter().map(|(v, &c)| (v, c)).collect();
+        assert_eq!(terms.len(), 2, "terms: {:?}", terms);
+        assert_eq!(terms[0].0, 0); // x
+        assert!((terms[0].1 + 2.0 / 3.0).abs() < 1e-9, "{:?}", terms);
+        assert_eq!(terms[1].0, 2); // the row's slack
+        assert!((terms[1].1 - 1.0 / 3.0).abs() < 1e-9, "{:?}", terms);
+        assert!((rhs + 2.0 / 3.0).abs() < 1e-9, "rhs {}", rhs);
+
+        // Adding it and re-solving must land the bound exactly on the
+        // integer optimum: with 2x + y ≤ 4 the LP vertex moves to (1, 2),
+        // which is integral with objective 7 — one cut closes this fixture's
+        // whole integrality gap.
+        assert_eq!(
+            solver
+                .add_constraint(coeffs, ComparisonOp::Ge, rhs)
+                .unwrap(),
+            StopReason::Finished
+        );
+        assert!(
+            (solver.cur_obj_val + 7.0).abs() < 1e-6,
+            "bound after cut: {}",
+            solver.cur_obj_val
+        );
+    }
+
+    /// The killer test for GMI soundness, mirroring the cover-cut
+    /// enumeration test: on seeded random MIXED instances, every generated
+    /// cut must hold at every mixed-feasible point. Integer assignments are
+    /// enumerated outright; for each one the cut's minimum over the
+    /// continuous completions is computed with a fresh LP (the simplex core
+    /// is the trusted, suite-validated oracle here — the code under test is
+    /// only the cut generation). Slack variables in the cut are substituted
+    /// via their definition s_k = rhs_k − Σ a_k·x, turning the check into a
+    /// pure-structural LP.
+    #[test]
+    fn gmi_cuts_never_cut_mixed_feasible_points() {
+        init();
+        let mut rng_state: u64 = 0x51ce_b00c_5eed;
+        let mut rng = move || {
+            rng_state = rng_state.wrapping_add(0x9e3779b97f4a7c15);
+            let mut z = rng_state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            z ^ (z >> 31)
+        };
+        let mut cuts_checked = 0usize;
+        for _trial in 0..240 {
+            let n_int = 2 + (rng() % 2) as usize; // 2..=3
+            let n_cont = (rng() % 3) as usize; // 0..=2
+            let n = n_int + n_cont;
+            let int_hi = 1 + (rng() % 2) as u64; // boxes [0,1] or [0,2]
+            let mins = vec![0.0; n];
+            let mut maxs = Vec::new();
+            let mut domains = Vec::new();
+            for v in 0..n {
+                if v < n_int {
+                    maxs.push(int_hi as f64);
+                    domains.push(VarDomain::Integer);
+                } else {
+                    maxs.push(3.0);
+                    domains.push(VarDomain::Real);
+                }
+            }
+            // Anchor point (kept feasible by rhs construction below).
+            let anchor: Vec<f64> = (0..n)
+                .map(|v| {
+                    if v < n_int {
+                        (rng() % (int_hi + 1)) as f64
+                    } else {
+                        (rng() % 4) as f64 * 0.75
+                    }
+                })
+                .collect();
+            let m = 2 + (rng() % 2) as usize;
+            let mut rows = Vec::new();
+            for _ in 0..m {
+                let coeffs: Vec<f64> = (0..n)
+                    .map(|_| {
+                        if rng() % 5 == 0 {
+                            0.0
+                        } else {
+                            ((rng() % 9) as i64 - 4) as f64
+                        }
+                    })
+                    .collect();
+                if coeffs.iter().all(|&c| c == 0.0) {
+                    continue;
+                }
+                let at_anchor: f64 = coeffs.iter().zip(&anchor).map(|(c, a)| c * a).sum();
+                let (op, rhs) = if rng() % 2 == 0 {
+                    (ComparisonOp::Le, at_anchor + (rng() % 4) as f64)
+                } else {
+                    (ComparisonOp::Ge, at_anchor - (rng() % 4) as f64)
+                };
+                rows.push((to_sparse(&coeffs), op, rhs));
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            let obj: Vec<f64> = (0..n).map(|_| ((rng() % 7) as i64 - 3) as f64).collect();
+
+            let mut solver = match Solver::try_new(&obj, &mins, &maxs, &rows, &domains, None) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if !matches!(solver.initial_solve(), Ok(StopReason::Finished)) {
+                continue;
+            }
+
+            // Generate a cut from every eligible basic integer var.
+            let mut generated: Vec<(Vec<(usize, f64)>, f64)> = Vec::new();
+            for v in 0..n_int {
+                let val = *solver.get_value(v);
+                let frac = val - val.floor();
+                if !(0.01..=0.99).contains(&frac) {
+                    continue;
+                }
+                if let Some((coeffs, rhs)) = solver.gmi_cut(v, &domains) {
+                    generated.push((coeffs.iter().map(|(i, &c)| (i, c)).collect(), rhs));
+                }
+            }
+            if generated.is_empty() {
+                continue;
+            }
+
+            // Substitute slacks out of each cut: s_k = rhs_k − Σ a_k·x.
+            let structural_cuts: Vec<(Vec<f64>, f64)> = generated
+                .iter()
+                .map(|(terms, rhs_ge)| {
+                    let mut c_struct = vec![0.0; n];
+                    let mut constant = 0.0;
+                    for &(tv, c) in terms {
+                        if tv < n {
+                            c_struct[tv] += c;
+                        } else {
+                            let k = tv - n;
+                            let (row, _, row_rhs) = &rows[k];
+                            constant += c * row_rhs;
+                            for (sv, &a) in row.iter() {
+                                c_struct[sv] -= c * a;
+                            }
+                        }
+                    }
+                    // Σ c_struct·x + constant ≥ rhs_ge must hold mixed-wide.
+                    (c_struct, rhs_ge - constant)
+                })
+                .collect();
+            cuts_checked += structural_cuts.len();
+
+            // Enumerate integer assignments; LP-minimize each cut over the
+            // continuous completions.
+            let assignments = (int_hi + 1).pow(n_int as u32);
+            for code in 0..assignments {
+                let mut c = code;
+                let mut fixed_mins = mins.clone();
+                let mut fixed_maxs = maxs.clone();
+                for fm in fixed_mins.iter_mut().take(n_int).zip(fixed_maxs.iter_mut()) {
+                    let val = (c % (int_hi + 1)) as f64;
+                    c /= int_hi + 1;
+                    *fm.0 = val;
+                    *fm.1 = val;
+                }
+                for (c_struct, rhs_ge) in &structural_cuts {
+                    let mut oracle = match Solver::try_new(
+                        c_struct,
+                        &fixed_mins,
+                        &fixed_maxs,
+                        &rows,
+                        &domains,
+                        None,
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => continue, // infeasible assignment: vacuous
+                    };
+                    match oracle.initial_solve() {
+                        Ok(StopReason::Finished) => {}
+                        _ => continue,
+                    }
+                    // Infeasible assignments error out of initial_solve and
+                    // were skipped above; a finite minimum below the cut's
+                    // rhs is a feasible mixed point the cut wrongly excludes.
+                    assert!(
+                        oracle.cur_obj_val >= rhs_ge - 1e-7,
+                        "GMI cut cuts a feasible completion: min {} < rhs {}\n\
+                         rows {:?}\nassignment code {}",
+                        oracle.cur_obj_val,
+                        rhs_ge,
+                        rows,
+                        code,
+                    );
+                }
+            }
+        }
+        assert!(
+            cuts_checked > 30,
+            "only {cuts_checked} GMI cuts generated across all trials"
+        );
     }
 
     #[test]

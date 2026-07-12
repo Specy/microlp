@@ -615,8 +615,26 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
     let z = state.solver.cur_obj_val;
     let val = *state.solver.get_value(var);
     let (lo, hi) = state.solver.get_var_bounds(var);
-    let floor = val.floor();
-    let f_down = val - floor;
+    // The split point k (children: x ≤ k and x ≥ k + 1) must be
+    // noise-robust: a raw `val.floor()` of a within-tolerance-integral value
+    // is catastrophic — floor(−8e-16) = −1 makes the up child (max(0, lo),
+    // hi) reproduce the parent VERBATIM and the search descends forever
+    // (found via the rounding-rejected re-branch path on set-packing roots,
+    // where LP noise puts a binary at −8e-16; the bigm-exact m1e7 loop was
+    // the fixed-var variant of the same disease). Snap near-integral values
+    // to their integer first, then clamp k into [lo, hi − 1] so BOTH
+    // children strictly tighten the parent's [lo, hi] whenever hi − lo ≥ 1
+    // (integral bounds — guaranteed for branchable vars).
+    let floor = {
+        let near = val.round();
+        let k = if (val - near).abs() <= state.options.int_tol {
+            near
+        } else {
+            val.floor()
+        };
+        k.clamp(lo, (hi - 1.0).max(lo))
+    };
+    let f_down = (val - floor).clamp(0.0, 1.0);
 
     state.node_seq += 1;
     let id = state.node_seq;
@@ -1096,12 +1114,20 @@ fn run_root_cuts(state: &mut MipState, domains: &[VarDomain]) -> Result<StopReas
             params::CUTS_PER_ROUND,
             &mut dedup,
         );
+        // Cover cuts only. Gomory mixed-integer rounds were implemented,
+        // measured, and REVERTED here (2026-07-12): generation is correct
+        // (`Solver::gmi_cut` and its brute-force validity oracle remain),
+        // and on gt2 the cuts closed 92% of the integrality gap — yet the
+        // corpus lost at every budget tried (uncapped: gt2 2.4×, lseu 2.8×;
+        // row-capped at 25%: gt2 +38%, lseu still 2× its covers-only time,
+        // rgn +24% — against bell3a −8% and mod008 −13%). Dense float cut
+        // rows are paid for at EVERY node LP of the search, and this
+        // solver's node cost scales with rows faster than the tree shrinks.
+        // Re-add the fallback when node LPs get cheaper (bounded LU updates
+        // instead of full refactorizations), not before.
         if found.is_empty() {
             break StopReason::Finished;
         }
-        state.cut_rounds_done += 1;
-        // The whole round lands as ONE batch: one refactorization + one
-        // dual-simplex restore, not one per row.
         let batch: Vec<(CsVec, ComparisonOp, f64)> = found
             .iter()
             .map(|cut| {
@@ -1112,6 +1138,9 @@ fn run_root_cuts(state: &mut MipState, domains: &[VarDomain]) -> Result<StopReas
                 )
             })
             .collect();
+        state.cut_rounds_done += 1;
+        // The whole round lands as ONE batch: one refactorization + one
+        // dual-simplex restore, not one per row.
         let sr = state.solver.add_constraints(batch)?;
         for cut in &found {
             added.push((cut.vars.clone(), cut.coeffs.clone(), cut.rhs));
@@ -1977,6 +2006,19 @@ mod tests {
             "zero-gain cuts must be rolled back, stats: {:?}",
             run.state.stats
         );
+    }
+
+    #[test]
+    fn general_integer_rows_yield_no_cover_cuts() {
+        // int_2var_problem has general integers in [0, 10]: cover
+        // separation skips every row by construction, so the cut loop must
+        // exit empty-handed and the plain branch-and-bound must still reach
+        // the optimum. (A GMI fallback for exactly this shape was measured
+        // and reverted — see the comment in `run_root_cuts`.)
+        let run = run(&int_2var_problem(), SolveOptions::default()).unwrap();
+        assert_eq!(run.outcome, MipOutcome::Optimal);
+        assert!((incumbent_obj(&run.state) - 11.0).abs() < 1e-6);
+        assert_eq!(run.state.stats.cover_cuts, 0);
     }
 
     #[test]
