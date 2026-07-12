@@ -200,6 +200,27 @@ mod tests_mip_api {
     }
 
     #[test]
+    fn fix_var_fractional_int_without_presolve_is_infeasible_not_a_panic() {
+        // With presolve off (it intercepts this shape when enabled), the
+        // SEARCH itself must turn "an integer var fixed at a fractional
+        // value" into a clean Infeasible: choose_branch_var rightly refuses
+        // to branch on fixed vars, and a non-integral relaxation with no
+        // branchable var is an infeasibility verdict — this used to die on
+        // an expect().
+        let (p, a, _) = int_2var_problem();
+        let options = SolveOptions {
+            presolve: false,
+            root_cuts: false,
+            ..SolveOptions::default()
+        };
+        let sol = p.solve_with(options).unwrap();
+        match sol.fix_var(a, 2.5) {
+            Err(Error::Infeasible) => {}
+            other => panic!("expected Infeasible, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
     fn milp_add_constraint_resolves_on_base_problem() {
         let (p, a, b) = int_2var_problem();
         let sol = p.solve().unwrap();

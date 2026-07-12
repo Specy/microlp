@@ -1247,10 +1247,17 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
                 }
             }
         } else {
-            let var =
-                branching::choose_branch_var(&state.solver, &domains, int_tol, &state.pseudocosts)
-                    .expect("non-integral relaxation must have a fractional int var");
-            branch(state, &root, var);
+            match branching::choose_branch_var(&state.solver, &domains, int_tol, &state.pseudocosts)
+            {
+                Some(var) => branch(state, &root, var),
+                // Non-integral relaxation with NO branchable var: every
+                // fractional int var is FIXED (lo == hi at a fractional
+                // value — e.g. a post-solve fix_var edit with presolve off;
+                // presolve intercepts this shape when enabled), and a fixed
+                // fractional integer admits no integer point at all. An
+                // infeasibility verdict, not a panic.
+                None => return Err(Error::Infeasible),
+            }
         }
     }
 
@@ -1518,10 +1525,16 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
             continue;
         }
 
-        let var =
-            branching::choose_branch_var(&state.solver, &domains, int_tol, &state.pseudocosts)
-                .expect("non-integral node must have a fractional int var");
-        branch(state, &node, var);
+        match branching::choose_branch_var(&state.solver, &domains, int_tol, &state.pseudocosts) {
+            Some(var) => branch(state, &node, var),
+            // Same verdict as the root case above: non-integral with no
+            // branchable var means a fixed-at-fractional integer var — the
+            // node's subproblem contains no integer point. Prune it.
+            None => {
+                state.last_solved_id = None;
+                state.diving = false;
+            }
+        }
     }
 
     if state.incumbent.is_some() {
