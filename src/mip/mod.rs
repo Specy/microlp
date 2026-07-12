@@ -1115,16 +1115,18 @@ fn run_root_cuts(state: &mut MipState, domains: &[VarDomain]) -> Result<StopReas
             &mut dedup,
         );
         // Cover cuts only. Gomory mixed-integer rounds were implemented,
-        // measured, and REVERTED here (2026-07-12): generation is correct
-        // (`Solver::gmi_cut` and its brute-force validity oracle remain),
-        // and on gt2 the cuts closed 92% of the integrality gap — yet the
-        // corpus lost at every budget tried (uncapped: gt2 2.4×, lseu 2.8×;
-        // row-capped at 25%: gt2 +38%, lseu still 2× its covers-only time,
-        // rgn +24% — against bell3a −8% and mod008 −13%). Dense float cut
-        // rows are paid for at EVERY node LP of the search, and this
-        // solver's node cost scales with rows faster than the tree shrinks.
-        // Re-add the fallback when node LPs get cheaper (bounded LU updates
-        // instead of full refactorizations), not before.
+        // measured, and REVERTED here (2026-07-12): the generator was
+        // correct (validated by a hand-derived fixture + a brute-force
+        // mixed-feasibility oracle) and on gt2 the cuts closed 92% of the
+        // integrality gap — yet the corpus lost at every budget tried
+        // (uncapped: gt2 2.4×, lseu 2.8×; row-capped at 25%: gt2 +38%, lseu
+        // still 2× its covers-only time, rgn +24% — against bell3a −8% and
+        // mod008 −13%). Dense float cut rows are paid for at EVERY node LP
+        // of the search, and this solver's node cost scales with rows faster
+        // than the tree shrinks. The generator was later deleted with the
+        // Forrest–Tomlin work (both measured negatives); a re-attempt needs
+        // cut-row sparsification or an in-tree add/drop pool, not just
+        // cheaper factorizations.
         if found.is_empty() {
             break StopReason::Finished;
         }
