@@ -90,8 +90,8 @@ Two normalizations happen at the boundary and hold everywhere inside:
   `1e-6` and `1e6` scales from producing structurally necessary tableau coefficients below
   the absolute pivot threshold. `Solver::check_constraints` multiplies the caller's absolute
   feasibility tolerance by the same per-row factor, so the user-space acceptance contract is
-  unchanged. Pure-LP rows are left untouched because `add_gomory_cut` exposes their tableau
-  and relies on the original integer-slack representation.
+  unchanged. Pure-LP rows are left unscaled to preserve their well-tested numerics; extending
+  equilibration to them is a possible future change.
 
 ---
 
@@ -459,8 +459,7 @@ match sol.status() {
 Reading values: `var_value` rounds integer variables (and asserts the stored value was
 already integral-clean — a failed assert means a solver bug, not user error);
 `var_value_raw`/`iter`/indexing return the stored values — for MILP those are the
-incumbent's already-rounded values, for LP the live basis values. `add_gomory_cut` remains
-an LP-only tool (it reads live tableau rows).
+incumbent's already-rounded values, for LP the live basis values.
 
 ---
 
@@ -574,10 +573,10 @@ error, but proving optimality there needs the phase-4 items below.
 
 ## 11. Extension points (rough order of payoff)
 
-- **Cutting planes inside the tree.** Gomory cuts exist as a user API but are not used
-  during B&B. Root-node cut rounds (cut-and-branch) are the classic next multiplier on the
-  graph-structured instances above. The architecture supports it: cuts are rows added to the
-  base problem before the tree starts (NOT during — node bounds assume a fixed row set).
+- **Cutting planes.** microlp generates no cutting planes today. Root-node cut rounds
+  (cut-and-branch) are the classic next multiplier on the graph-structured instances above.
+  The architecture supports it: cuts are rows added to the base problem before the tree
+  starts (NOT during — node bounds assume a fixed row set).
 - **Primal heuristics.** Rounding + diving heuristics produce early incumbents → earlier
   pruning. `try_adopt_incumbent(state, true)` is the safe funnel for any candidate a
   heuristic produces.

@@ -269,18 +269,6 @@ fn main() -> Result<(), Error> {
 An edit that makes the problem unsolvable returns `Err(Error::Infeasible)`
 from the edit call itself.
 
-On pure-LP solutions there is one more operation, `add_gomory_cut(var)`,
-which adds a cutting plane that pushes the given variable's fractional value
-toward an integer — a building block for experimenting with cutting-plane
-methods:
-
-```rust
-let mut solution = lp_problem.solve()?;
-while solution.var_value(x).fract() != 0.0 {
-    solution = solution.add_gomory_cut(x)?;
-}
-```
-
 ## Testing
 
 Besides unit tests, the repository ships a correctness suite of 200+ LP/MILP

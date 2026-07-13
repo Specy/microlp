@@ -449,37 +449,6 @@ mod tests_mip_api {
     }
 
     #[test]
-    fn milp_gomory_cut_is_rejected_with_invalid_operation() {
-        let (p, a, _) = int_2var_problem();
-        let sol = p.solve().unwrap();
-        assert!(matches!(
-            sol.add_gomory_cut(a),
-            Err(Error::InvalidOperation(_))
-        ));
-    }
-
-    #[test]
-    fn lp_interrupted_add_gomory_cut_errors_not_panics() {
-        // Pure-LP problem (continuous vars). A zero-duration budget interrupts the
-        // solve before it completes, so the solution is Status::Interrupted. Before
-        // the guard, add_gomory_cut reached solver internals that assume a finished
-        // solve and panicked; it must now return an InvalidOperation, matching the
-        // guard already on add_constraint/fix_var.
-        let mut p = Problem::new(OptimizationDirection::Minimize);
-        let x = p.add_var(1.0, (0.0, 10.0));
-        let y = p.add_var(1.0, (0.0, 10.0));
-        p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 3.0);
-        let mut options = SolveOptions::default();
-        options.time_limit = Some(Duration::ZERO);
-        let sol = p.solve_with(options).unwrap();
-        assert_eq!(sol.status(), Status::Interrupted);
-        assert!(matches!(
-            sol.add_gomory_cut(x),
-            Err(Error::InvalidOperation(_))
-        ));
-    }
-
-    #[test]
     fn lp_stats_report_nonzero_elapsed_time() {
         let mut p = Problem::new(OptimizationDirection::Minimize);
         let x = p.add_var(1.0, (0.0, 10.0));

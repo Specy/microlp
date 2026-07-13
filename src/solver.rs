@@ -1,4 +1,4 @@
-use core::{panic, time::Duration};
+use core::time::Duration;
 
 use crate::{
     helpers::{resized_view, to_dense},
@@ -214,10 +214,11 @@ impl Solver {
         var_domains: &[VarDomain],
         deadline: Deadline,
     ) -> Result<Self, Error> {
-        // Gomory cuts expose the pure-LP tableau and rely on integer-valued
-        // slacks, so keep that path byte-for-byte compatible. MIP branch and
-        // bound does not expose its tableau and benefits critically from row
-        // equilibration when equivalent rows arrive at very different scales.
+        // Only MIP branch and bound is equilibrated: it does not expose its
+        // tableau and is where equivalent rows at very different scales produce
+        // structurally necessary tableau coefficients below the pivot threshold.
+        // The pure-LP path is left unscaled to preserve its well-tested numerics
+        // (equilibrating it too is now unblocked, but is a separate change).
         let equilibrate_rows = var_domains
             .iter()
             .any(|domain| matches!(domain, VarDomain::Integer | VarDomain::Boolean));
@@ -829,28 +830,6 @@ impl Solver {
             Ok((true, stop))
         } else {
             Ok((false, StopReason::Finished))
-        }
-    }
-
-    pub(crate) fn add_gomory_cut(&mut self, var: usize) -> Result<StopReason, Error> {
-        if let VarState::Basic(row) = self.var_states[var] {
-            self.calc_row_coeffs(row);
-
-            let mut cut_coeffs = SparseVec::new();
-            for (col, &coeff) in self.row_coeffs.iter() {
-                let var = self.nb_vars[col];
-                cut_coeffs.push(var, coeff.floor() - coeff);
-            }
-
-            let cut_bound = self.basic_var_vals[row].floor() - self.basic_var_vals[row];
-            let num_total_vars = self.num_total_vars();
-            self.add_constraint(
-                cut_coeffs.into_csvec(num_total_vars),
-                ComparisonOp::Le,
-                cut_bound,
-            )
-        } else {
-            panic!("var {:?} is not basic!", var);
         }
     }
 

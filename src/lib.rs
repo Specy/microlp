@@ -190,10 +190,10 @@ pub enum Error {
     /// names the offending field. This is a caller error — fix the option value
     /// and re-solve.
     InvalidOptions(String),
-    /// An operation is not valid for the solution's current state: editing an
-    /// [`Status::Interrupted`] solution before [`Solution::resume`], or asking
-    /// for a Gomory cut on a MILP solution. The message says which. Not a solver
-    /// failure — the call itself is the problem.
+    /// An operation is not valid for the solution's current state: for example,
+    /// editing an [`Status::Interrupted`] solution before [`Solution::resume`].
+    /// The message says which. Not a solver failure — the call itself is the
+    /// problem.
     InvalidOperation(String),
     /// An internal error occurred.
     InternalError(String),
@@ -864,57 +864,6 @@ impl Solution {
                     true,
                 ))
             }
-        }
-    }
-
-    /// Add a Gomory cut for `var`. Only available on pure-LP solutions.
-    ///
-    /// # Validity preconditions (caller's responsibility)
-    ///
-    /// This generates the classic **pure-integer Gomory fractional cut**
-    /// from `var`'s simplex tableau row. Its validity — "no integer-feasible
-    /// point is cut off" — rests on textbook assumptions this method does
-    /// NOT check: every variable with a nonzero coefficient in that tableau
-    /// row (including slacks, i.e. the touched rows' data) must be
-    /// integer-valued at every integer-feasible point, and every nonbasic
-    /// variable in the row must sit at a lower bound of exactly zero.
-    /// Calling it on rows with continuous variables, shifted or upper
-    /// bounds, or fractional row data can add an **invalid cut that silently
-    /// excludes optimal solutions**. Intended for hand-rolled cutting-plane
-    /// loops over pure-integer models in standard form; anything else, don't.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Infeasible`] if the cut makes the problem infeasible;
-    /// [`Error::InvalidOperation`] if the solution is [`Status::Interrupted`]
-    /// (`resume()` it first) or if it is a MILP solution (the cut reads the live
-    /// simplex tableau).
-    pub fn add_gomory_cut(mut self, var: Variable) -> Result<Self, Error> {
-        assert!(var.0 < self.num_vars);
-        match &mut self.kind {
-            SolutionKind::Lp(solver) => {
-                // Same guard as add_constraint/fix_var: the cut reaches solver
-                // internals that assume a completed solve, so a half-solved
-                // (interrupted) LP must be resumed before it can be edited.
-                if self.status == Status::Interrupted {
-                    return Err(Error::InvalidOperation(
-                        "cannot edit an interrupted solution; resume() it first".to_string(),
-                    ));
-                }
-                let started = Instant::now();
-                solver.deadline = solver.operation_time_limit.map(|d| started + d);
-                let solve_result = solver.add_gomory_cut(var.0);
-                solver.elapsed += started.elapsed();
-                let sr = solve_result?;
-                self.status = match sr {
-                    StopReason::Finished => Status::Optimal,
-                    StopReason::Limit => Status::Interrupted,
-                };
-                Ok(self)
-            }
-            SolutionKind::Mip(_) => Err(Error::InvalidOperation(
-                "Gomory cuts require a pure-LP solution".to_string(),
-            )),
         }
     }
 }
