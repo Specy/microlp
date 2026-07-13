@@ -107,7 +107,7 @@ pub(crate) struct Solver {
     orig_constraints: CsMat, // excluding rhs
     orig_constraints_csc: CsMat,
     orig_rhs: Vec<f64>,
-    /// Positive per-row equilibration factors. MIP rows are multiplied by
+    /// Positive per-row equilibration factors. Every row is multiplied by
     /// these internally; validation multiplies its absolute user tolerance by
     /// the same factor so the public feasibility contract stays unscaled.
     row_scales: Vec<f64>,
@@ -214,14 +214,6 @@ impl Solver {
         var_domains: &[VarDomain],
         deadline: Deadline,
     ) -> Result<Self, Error> {
-        // Only MIP branch and bound is equilibrated: it does not expose its
-        // tableau and is where equivalent rows at very different scales produce
-        // structurally necessary tableau coefficients below the pivot threshold.
-        // The pure-LP path is left unscaled to preserve its well-tested numerics
-        // (equilibrating it too is now unblocked, but is a separate change).
-        let equilibrate_rows = var_domains
-            .iter()
-            .any(|domain| matches!(domain, VarDomain::Integer | VarDomain::Boolean));
         let enable_steepest_edge = true; // TODO: make user-settable.
 
         let num_vars = obj_coeffs.len();
@@ -310,11 +302,11 @@ impl Solver {
 
         for (coeffs, cmp_op, rhs) in constraints {
             let mut coeffs = coeffs.clone();
-            let row_scale = if equilibrate_rows {
-                equilibration_scale(&coeffs, *rhs)
-            } else {
-                1.0
-            };
+            // Equilibrate every row (LP and MIP alike): scaling each row by an
+            // exact power of two keeps equivalent rows at very different scales
+            // from producing tableau coefficients below the pivot threshold,
+            // which would otherwise mis-declare a feasible model infeasible.
+            let row_scale = equilibration_scale(&coeffs, *rhs);
             if row_scale != 1.0 {
                 coeffs.map_inplace(|coeff| coeff * row_scale);
             }
@@ -512,7 +504,7 @@ impl Solver {
     /// slack bounds are never touched by branching, so this always reflects the
     /// user's original rows.
     ///
-    /// MIP rows may carry an internal power-of-two equilibration factor; the
+    /// Rows carry an internal power-of-two equilibration factor; the
     /// tolerance is multiplied by that same factor, which is algebraically
     /// equivalent to applying `tol` to the unscaled user row. It is deliberately
     /// NOT scaled by the row's magnitude: this check exists for the big-M trap,
@@ -993,15 +985,7 @@ impl Solver {
             };
         }
 
-        let row_scale = if self
-            .orig_var_domains
-            .iter()
-            .any(|domain| matches!(domain, VarDomain::Integer | VarDomain::Boolean))
-        {
-            equilibration_scale(&coeffs, rhs)
-        } else {
-            1.0
-        };
+        let row_scale = equilibration_scale(&coeffs, rhs);
         if row_scale != 1.0 {
             coeffs.map_inplace(|coeff| coeff * row_scale);
         }
@@ -1902,24 +1886,27 @@ mod tests {
             &[0.0, f64::INFINITY, f64::INFINITY, f64::INFINITY, 0.0, 0.0]
         );
 
+        // Equilibration scales the second constraint (max structural
+        // coefficient 2) and its rhs by 1/2; the slack column stays 1. The
+        // unit-coefficient rows are unchanged.
         let orig_constraints_ref = vec![
             vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
-            vec![1.0, 2.0, 0.0, 1.0, 0.0, 0.0],
+            vec![0.5, 1.0, 0.0, 1.0, 0.0, 0.0],
             vec![1.0, 1.0, 0.0, 0.0, 1.0, 0.0],
             vec![0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         ];
         assert_matrix_eq(&sol.orig_constraints, &orig_constraints_ref);
 
-        assert_eq!(&sol.orig_rhs, &[6.0, 8.0, 2.0, 3.0]);
+        assert_eq!(&sol.orig_rhs, &[6.0, 4.0, 2.0, 3.0]);
 
         assert_eq!(&sol.basic_vars, &[2, 3, 4, 5]);
-        assert_eq!(&sol.basic_var_vals, &[1.0, -2.0, -3.0, -2.0]);
+        assert_eq!(&sol.basic_var_vals, &[1.0, -1.0, -3.0, -2.0]);
         assert_eq!(&sol.dual_edge_sq_norms, &[1.0, 1.0, 1.0, 1.0]);
 
         assert_eq!(&sol.nb_vars, &[0, 1]);
         assert_eq!(&sol.nb_var_obj_coeffs, &[-1.0, 1.0]);
         assert_eq!(&sol.nb_var_vals, &[0.0, 5.0]);
-        assert_eq!(&sol.primal_edge_sq_norms, &[4.0, 8.0]);
+        assert_eq!(&sol.primal_edge_sq_norms, &[3.25, 5.0]);
 
         assert_eq!(sol.cur_obj_val, 0.0);
     }
@@ -2069,7 +2056,11 @@ mod tests {
         assert_eq!(&sol.basic_var_vals, &[12.0, 8.0]);
         assert_eq!(&sol.nb_vars, &[2, 3]);
         assert_eq!(&sol.nb_var_vals, &[0.0, 0.0]);
-        assert_eq!(&sol.nb_var_obj_coeffs, &[3.2, 0.2]);
+        // The optimum (x=12, y=8, obj -68) is unchanged by equilibration; only
+        // the second constraint's slack reduced cost is scaled: that row
+        // (-x+4y<=20, max coeff 4) is equilibrated by 1/4, so its dual scales
+        // up 4x, 0.2 -> 0.8.
+        assert_eq!(&sol.nb_var_obj_coeffs, &[3.2, 0.8]);
         assert_eq!(sol.cur_obj_val, -68.0);
 
         let infeasible = Solver::try_new(

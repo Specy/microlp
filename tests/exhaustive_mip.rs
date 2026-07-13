@@ -529,6 +529,32 @@ fn mixed_scale_active_rows_do_not_hide_a_feasible_integer_point() {
 }
 
 #[test]
+fn mixed_scale_pure_lp_is_not_misclassified_infeasible() {
+    // The pure-LP twin of `mixed_scale_active_rows_...`: identical rows at 1e6
+    // and 1e-6 scale, but continuous variables. The infeasible-when-feasible
+    // misclassification lives in the simplex, so a pure LP is exposed to it too
+    // unless its rows are equilibrated. The unique LP optimum is x=2, y=2 (the
+    // second row binds y >= 2 and x pins at its upper bound), objective 8.
+    let mut p = Problem::new(OptimizationDirection::Minimize);
+    let x = p.add_var(-2.0, (1.0, 2.0));
+    let y = p.add_var(6.0, (-2.0, 3.0));
+    p.add_constraint([(x, 4.0e6), (y, 5.0e6)], ComparisonOp::Ge, 13.0e6);
+    p.add_constraint([(x, 7.0e-6), (y, 6.0e-6)], ComparisonOp::Ge, 26.0e-6);
+
+    let sol = p
+        .solve()
+        .expect("a feasible pure LP must not be classified as infeasible");
+    assert_eq!(sol.status(), Status::Optimal);
+    assert!(
+        (sol.objective() - 8.0).abs() < 1e-7,
+        "objective {}",
+        sol.objective()
+    );
+    assert!((sol.var_value(x) - 2.0).abs() < 1e-7);
+    assert!((sol.var_value(y) - 2.0).abs() < 1e-7);
+}
+
+#[test]
 fn mixed_scale_branching_does_not_prune_the_true_optimum() {
     // The LP relaxation starts at (0.9, -2.25). Branching x <= 0 must retain
     // (0, -3), but the unscaled warm reoptimization used to report a worse LP
