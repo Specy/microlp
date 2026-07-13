@@ -84,6 +84,14 @@ Two normalizations happen at the boundary and hold everywhere inside:
   ("total vars"), and every constraint is an equality against the basis matrix. A row's
   original sense is recoverable from its slack's bounds — `Solver::check_constraints`
   exploits exactly this.
+- **MIP rows are equilibrated by powers of two.** Before the simplex engine sees a model
+  with integer variables, each non-empty row is multiplied by an exact power-of-two factor
+  that brings its largest structural coefficient near one. This prevents equivalent rows at
+  `1e-6` and `1e6` scales from producing structurally necessary tableau coefficients below
+  the absolute pivot threshold. `Solver::check_constraints` multiplies the caller's absolute
+  feasibility tolerance by the same per-row factor, so the user-space acceptance contract is
+  unchanged. Pure-LP rows are left untouched because `add_gomory_cut` exposes their tableau
+  and relies on the original integer-slack representation.
 
 ---
 

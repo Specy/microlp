@@ -388,8 +388,9 @@ fn nodelimit_step_cases(cases: &mut Vec<Case>) {
 mod mwis {
     use super::Rng;
     use bit_set::BitSet;
-    use microlp::{ComparisonOp::Le, OptimizationDirection::Maximize, Problem, SolveOptions,
-        Status, Variable};
+    use microlp::{
+        ComparisonOp::Le, OptimizationDirection::Maximize, Problem, SolveOptions, Status, Variable,
+    };
 
     pub type Node = usize;
     pub type Edge = (Node, Node);
@@ -498,9 +499,7 @@ mod mwis {
                 ))
             }
         }
-        let selected: BitSet = (0..graph.size())
-            .filter(|&v| sol[vars[v]] > 0.5)
-            .collect();
+        let selected: BitSet = (0..graph.size()).filter(|&v| sol[vars[v]] > 0.5).collect();
         Ok((selected, sol.objective()))
     }
 
@@ -540,10 +539,10 @@ fn mwis_warm_start_cases(cases: &mut Vec<Case>) {
     //   4. Assert cold and warm agree on the optimal objective value.
     //   5. Cross-validate against HiGHS when built with --features highs.
     for (seed, n, edge_pct, tier, budget) in [
-        (0xABCD_u64, 100_usize,  5_u32, Tier::Medium, 30_u64),
+        (0xABCD_u64, 100_usize, 5_u32, Tier::Medium, 30_u64),
         (0x1234_u64, 100_usize, 15_u32, Tier::Medium, 30_u64),
-        (0xDEAD_u64, 100_usize, 25_u32, Tier::Hard,   90_u64),
-        (0xBEEF_u64, 100_usize, 50_u32, Tier::Hard,   90_u64),
+        (0xDEAD_u64, 100_usize, 25_u32, Tier::Hard, 90_u64),
+        (0xBEEF_u64, 100_usize, 50_u32, Tier::Hard, 90_u64),
     ] {
         let name = format!("milp/mwis-warm-start-n{}-s{:x}", n, seed);
         cases.push(Case::custom(name, tier, budget, move |_budget| {
@@ -578,8 +577,7 @@ fn mwis_warm_start_cases(cases: &mut Vec<Case>) {
                 }
 
                 // Warm solve — arbitrary independent set as hint.
-                let (warm_set, warm_obj) =
-                    mwis::solve_microlp(&graph, &valuation, Some(&hint))?;
+                let (warm_set, warm_obj) = mwis::solve_microlp(&graph, &valuation, Some(&hint))?;
                 if !mwis::is_independent_set(&graph, &warm_set) {
                     return Err(format!(
                         "pair {}: warm solve returned a non-independent set",

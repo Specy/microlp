@@ -424,7 +424,8 @@ impl Problem {
                 kind: SolutionKind::Mip(Box::new(run.state)),
             })
         } else {
-            let deadline = options.time_limit.map(|d| Instant::now() + d);
+            let started = Instant::now();
+            let deadline = options.time_limit.map(|d| started + d);
             let mut solver = Solver::try_new(
                 &self.obj_coeffs,
                 &self.var_mins,
@@ -433,7 +434,10 @@ impl Problem {
                 &self.var_domains,
                 deadline,
             )?;
-            let status = match solver.initial_solve()? {
+            solver.operation_time_limit = options.time_limit;
+            let solve_result = solver.initial_solve();
+            solver.elapsed += started.elapsed();
+            let status = match solve_result? {
                 StopReason::Finished => Status::Optimal,
                 StopReason::Limit => Status::Interrupted,
             };
@@ -606,6 +610,7 @@ impl Solution {
         match &self.kind {
             SolutionKind::Lp(solver) => Stats {
                 lp_iterations: solver.lp_iterations,
+                elapsed: solver.elapsed,
                 best_bound: (self.status == Status::Optimal).then(|| self.objective()),
                 gap: (self.status == Status::Optimal).then_some(0.0),
                 ..Stats::default()
@@ -614,7 +619,8 @@ impl Solution {
         }
     }
 
-    /// Iterate over variable/value pairs (raw values, like [`Solution::var_value_raw`]).
+    /// Iterate over variable/value pairs (rounded for integer/boolean variables,
+    /// like [`Solution::var_value`]).
     ///
     /// On [`Status::Interrupted`] the yielded values are the search's current
     /// working point, not a usable solution — see [`Solution::objective`] for
@@ -638,8 +644,11 @@ impl Solution {
         }
         match &mut self.kind {
             SolutionKind::Lp(solver) => {
-                solver.deadline = time_limit.map(|d| Instant::now() + d);
-                self.status = match solver.initial_solve()? {
+                let started = Instant::now();
+                solver.deadline = time_limit.map(|d| started + d);
+                let solve_result = solver.initial_solve();
+                solver.elapsed += started.elapsed();
+                self.status = match solve_result? {
                     StopReason::Finished => Status::Optimal,
                     StopReason::Limit => Status::Interrupted,
                 };
@@ -661,10 +670,8 @@ impl Solution {
     /// open search tree is discarded and the search restarts from the edited
     /// problem.
     ///
-    /// The MILP re-solve runs with a fresh budget taken from the original
-    /// [`SolveOptions`] (each edit gets the full `time_limit`/`node_limit` again),
-    /// whereas the LP re-solve inherits the original absolute deadline; the two may
-    /// be aligned in a later release.
+    /// Every re-solve gets a fresh budget taken from the original
+    /// [`SolveOptions`] (each edit gets the full `time_limit`/`node_limit` again).
     ///
     /// # Errors
     ///
@@ -689,12 +696,16 @@ impl Solution {
                     ));
                 }
                 let expr = expr.into();
-                let sr = solver.add_constraint(
+                let started = Instant::now();
+                solver.deadline = solver.operation_time_limit.map(|d| started + d);
+                let solve_result = solver.add_constraint(
                     CsVec::new_from_unsorted(num_vars, expr.vars, expr.coeffs)
                         .map_err(|v| Error::InternalError(v.2.to_string()))?,
                     cmp_op,
                     rhs,
-                )?;
+                );
+                solver.elapsed += started.elapsed();
+                let sr = solve_result?;
                 Ok(Solution {
                     direction,
                     num_vars,
@@ -747,7 +758,11 @@ impl Solution {
                         "cannot edit an interrupted solution; resume() it first".to_string(),
                     ));
                 }
-                let sr = solver.fix_var(var.0, val)?;
+                let started = Instant::now();
+                solver.deadline = solver.operation_time_limit.map(|d| started + d);
+                let solve_result = solver.fix_var(var.0, val);
+                solver.elapsed += started.elapsed();
+                let sr = solve_result?;
                 Ok(Solution {
                     direction,
                     num_vars,
@@ -786,7 +801,8 @@ impl Solution {
     /// [`Error::Infeasible`] if the problem without this fix is infeasible — this
     /// is possible when a prior edit was interrupted before proving infeasibility
     /// and the unfix re-solve completes that proof. [`Error::InternalError`] on an
-    /// internal re-solve failure. The pure-LP path never errors.
+    /// internal re-solve failure. [`Error::InvalidOperation`] if a pure-LP
+    /// solution is interrupted and must be resumed before editing.
     pub fn unfix_var(self, var: Variable) -> Result<(Self, bool), Error> {
         let Solution {
             direction,
@@ -797,12 +813,24 @@ impl Solution {
         assert!(var.0 < num_vars);
         match kind {
             SolutionKind::Lp(mut solver) => {
-                let res = solver.unfix_var(var.0);
+                if status == Status::Interrupted {
+                    return Err(Error::InvalidOperation(
+                        "cannot edit an interrupted solution; resume() it first".to_string(),
+                    ));
+                }
+                let started = Instant::now();
+                solver.deadline = solver.operation_time_limit.map(|d| started + d);
+                let unfix_result = solver.unfix_var(var.0);
+                solver.elapsed += started.elapsed();
+                let (res, stop) = unfix_result?;
                 Ok((
                     Solution {
                         direction,
                         num_vars,
-                        status,
+                        status: match stop {
+                            StopReason::Finished => status,
+                            StopReason::Limit => Status::Interrupted,
+                        },
                         kind: SolutionKind::Lp(solver),
                     },
                     res,
@@ -873,7 +901,11 @@ impl Solution {
                         "cannot edit an interrupted solution; resume() it first".to_string(),
                     ));
                 }
-                let sr = solver.add_gomory_cut(var.0)?;
+                let started = Instant::now();
+                solver.deadline = solver.operation_time_limit.map(|d| started + d);
+                let solve_result = solver.add_gomory_cut(var.0);
+                solver.elapsed += started.elapsed();
+                let sr = solve_result?;
                 self.status = match sr {
                     StopReason::Finished => Status::Optimal,
                     StopReason::Limit => Status::Interrupted,

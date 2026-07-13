@@ -188,8 +188,9 @@ let solution = problem.solve_with(options)?;
 ```
 
 * `time_limit`, `node_limit` — budgets for this call; each `resume` gets a
-  fresh one. `node_limit` counts branch & bound nodes, so it is reproducible
-  across machines.
+  fresh one, and each post-solve edit gets a fresh copy of the original solve
+  budget. `node_limit` counts branch & bound nodes, so it is reproducible across
+  machines.
 * `mip_gap` — stop as soon as the solution is proven within this relative
   distance of the optimum, and report it as `Optimal`. The default `0.0`
   proves exact optimality.
