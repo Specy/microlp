@@ -267,6 +267,23 @@ impl std::fmt::Debug for MipState {
     }
 }
 
+impl MipState {
+    /// Objective of the solution exposed through the public value accessors.
+    /// Unboundedness classification uses a zero-objective solver, so a working
+    /// point without an incumbent is evaluated against the original model.
+    pub(crate) fn current_objective(&self) -> f64 {
+        if let Some(incumbent) = &self.incumbent {
+            return incumbent.objective;
+        }
+        self.base
+            .obj_coeffs
+            .iter()
+            .enumerate()
+            .map(|(v, &coefficient)| coefficient * self.solver.get_value(v))
+            .sum()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MipOutcome {
     Optimal,
@@ -296,14 +313,7 @@ pub(crate) fn status_of(outcome: MipOutcome, state: &MipState) -> Status {
 
 fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Error> {
     let deadline = options.time_limit.map(|d| Instant::now() + d);
-    let solver = Solver::try_new(
-        &problem.obj_coeffs,
-        &problem.var_mins,
-        &problem.var_maxs,
-        &problem.constraints,
-        &problem.var_domains,
-        deadline,
-    )?;
+    let solver = problem.build_solver(deadline)?;
     let root_bounds = problem
         .var_mins
         .iter()
@@ -384,39 +394,51 @@ pub(crate) fn effective_problem(base: &Problem, fixed: &BTreeMap<usize, f64>) ->
     p
 }
 
-/// Cheap feasibility check of a value vector against base + fixes: bounds and
-/// every constraint to the absolute `tolerances.feasibility`, integrality to
-/// `tolerances.integrality_rounding`. Only ever used as a warm-start
-/// pre-filter (see [`reedit_and_resolve`]) — an incumbent this accepts is not
-/// trusted blindly, it re-enters the search as a hint and is re-validated by
-/// the same absolute-tolerance guard [`try_adopt_incumbent`] applies to every
-/// candidate, so this function unifying on the ABSOLUTE `feasibility` value
-/// (rather than a row-magnitude-relative one) only tightens consistency
-/// between the two guards; it cannot admit anything the real guard would not
-/// also have to accept.
+fn candidate_variables_feasible(
+    values: &[f64],
+    domains: &[VarDomain],
+    tolerances: &Tolerances,
+    mut bounds: impl FnMut(usize) -> (f64, f64),
+) -> bool {
+    if values.len() != domains.len() {
+        return false;
+    }
+    values.iter().enumerate().all(|(v, &value)| {
+        let (lo, hi) = bounds(v);
+        value.is_finite()
+            && !lo.is_nan()
+            && !hi.is_nan()
+            && lo <= hi
+            && value >= lo - tolerances.feasibility
+            && value <= hi + tolerances.feasibility
+            && (!matches!(domains[v], VarDomain::Integer | VarDomain::Boolean)
+                || (value - value.round()).abs() <= tolerances.integrality_rounding)
+    })
+}
+
+/// Cheap feasibility check of a value vector against base + fixes: bounds,
+/// domains, and every user-scale constraint row. This is a warm-start prefilter;
+/// adoption re-validates the candidate against the active solver's scaled rows.
 pub(crate) fn incumbent_feasible(
     base: &Problem,
     fixed: &BTreeMap<usize, f64>,
     values: &[f64],
     tolerances: &Tolerances,
 ) -> bool {
-    for (v, &val) in values.iter().enumerate() {
-        let (mut lo, mut hi) = (base.var_mins[v], base.var_maxs[v]);
-        if let Some(&f) = fixed.get(&v) {
-            lo = f;
-            hi = f;
-        }
-        if val < lo - tolerances.feasibility || val > hi + tolerances.feasibility {
-            return false;
-        }
-        if matches!(base.var_domains[v], VarDomain::Integer | VarDomain::Boolean)
-            && (val - val.round()).abs() > tolerances.integrality_rounding
-        {
-            return false;
-        }
+    if !candidate_variables_feasible(values, &base.var_domains, tolerances, |v| {
+        fixed
+            .get(&v)
+            .map_or((base.var_mins[v], base.var_maxs[v]), |&value| {
+                (value, value)
+            })
+    }) {
+        return false;
     }
     for (coeffs, op, rhs) in &base.constraints {
         let lhs: f64 = coeffs.iter().map(|(i, c)| c * values[i]).sum();
+        if !lhs.is_finite() {
+            return false;
+        }
         let tol = tolerances.feasibility;
         let ok = match op {
             ComparisonOp::Eq => (lhs - rhs).abs() <= tol,
@@ -527,15 +549,11 @@ fn cutoff(incumbent_obj: f64, prune_epsilon: f64) -> f64 {
     incumbent_obj - f64::max(prune_epsilon, prune_epsilon * incumbent_obj.abs())
 }
 
-/// Try to adopt the solver's current solution (integral within `int_tol`) as
-/// the incumbent, using integer-ROUNDED values. When `require_feasible`, the
-/// rounded vector is validated against root bounds and the original rows first
-/// — guarding against the big-M trap where sub-tolerance fractionality times a
-/// huge coefficient is a real violation. Returns false iff validation failed
-/// (caller must branch instead). Rounded values are stored so the incumbent is
-/// exactly what the user reads.
-fn try_adopt_incumbent(state: &mut MipState, require_feasible: bool) -> bool {
-    let feasibility_tol = state.options.tolerances.feasibility;
+/// Validate and adopt the solver's current solution using integer-rounded
+/// values. `Ok(false)` means rounding produced an invalid candidate and the
+/// caller must branch. A valid candidate completes unboundedness classification.
+fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
+    let tolerances = &state.options.tolerances;
     let solver = &state.solver;
     let n = solver.num_vars;
     let domains = &solver.orig_var_domains;
@@ -545,17 +563,17 @@ fn try_adopt_incumbent(state: &mut MipState, require_feasible: bool) -> bool {
             *val = val.round();
         }
     }
-    if require_feasible {
-        let in_bounds = (0..n).all(|v| {
-            let (lo, hi) = state.root_bounds[v];
-            values[v] >= lo - feasibility_tol && values[v] <= hi + feasibility_tol
-        });
-        if !in_bounds || !solver.check_constraints(&values, feasibility_tol) {
-            debug!("integral-within-tol solution rejected: rounded values infeasible");
-            return false;
-        }
+    if !candidate_variables_feasible(&values, domains, tolerances, |v| state.root_bounds[v])
+        || !solver.check_constraints(&values, tolerances.feasibility)
+    {
+        debug!("integral-within-tol solution rejected: rounded values infeasible");
+        return Ok(false);
     }
     let objective = solver.objective_of(&values);
+    if !objective.is_finite() {
+        debug!("integral-within-tol solution rejected: objective is non-finite");
+        return Ok(false);
+    }
     let better = match &state.incumbent {
         Some(inc) => objective < inc.objective,
         None => true,
@@ -564,7 +582,11 @@ fn try_adopt_incumbent(state: &mut MipState, require_feasible: bool) -> bool {
         debug!("new incumbent, internal obj: {:.6}", objective);
         state.incumbent = Some(Incumbent { values, objective });
     }
-    true
+    if state.classifying_unbounded {
+        Err(Error::Unbounded)
+    } else {
+        Ok(true)
+    }
 }
 
 enum IntegralCandidate {
@@ -583,10 +605,7 @@ fn process_integral_candidate(
     domains: &[VarDomain],
     int_tol: f64,
 ) -> Result<IntegralCandidate, Error> {
-    let adopted = try_adopt_incumbent(state, true);
-    if adopted && state.classifying_unbounded && state.incumbent.is_some() {
-        return Err(Error::Unbounded);
-    }
+    let adopted = try_adopt_incumbent(state)?;
     if let Some(var) = branching::choose_branch_var(&state.solver, domains, 0.0, &state.pseudocosts)
     {
         return Ok(IntegralCandidate::Branch(var));
@@ -622,10 +641,7 @@ fn process_integral_candidate(
             });
     }
 
-    let adopted = try_adopt_incumbent(state, true);
-    if adopted && state.classifying_unbounded && state.incumbent.is_some() {
-        return Err(Error::Unbounded);
-    }
+    let adopted = try_adopt_incumbent(state)?;
     if let Some(var) = branching::choose_branch_var(&state.solver, domains, 0.0, &state.pseudocosts)
     {
         Ok(IntegralCandidate::Branch(var))
@@ -710,7 +726,7 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
         lp_bound: z,
         depth: parent.depth + 1,
         parent_id: id,
-        branch_var: var,
+        branch_var: Some(var),
         branch_up: false,
         branch_frac: f_down,
     };
@@ -720,7 +736,7 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
         lp_bound: z,
         depth: parent.depth + 1,
         parent_id: id,
-        branch_var: var,
+        branch_var: Some(var),
         branch_up: true,
         branch_frac: 1.0 - f_down,
     };
@@ -748,7 +764,7 @@ enum NodeLp {
     /// The node's LP is infeasible under its current bounds.
     Infeasible,
     /// A limit interrupted the solve (possibly during the slack retry); the
-    /// solver's half-pivoted state must not be consulted.
+    /// solver's unfinished, non-optimal state must not be used as a node result.
     Limit,
 }
 
@@ -827,7 +843,7 @@ fn pop_node(state: &mut MipState) -> Option<Node> {
 /// Returns `Ok(None)` on the normal path (the caller proceeds to build the root
 /// node). Returns `Ok(Some(MipOutcome::Interrupted))` only when the restore of the
 /// root basis fails AND the deadline strikes mid-restore: rather than let the
-/// caller read a half-solved `cur_obj_val` as the root bound, it un-sets
+/// caller read an unfinished `cur_obj_val` as the root bound, it un-sets
 /// `root_solved` so a resume re-enters `initial_solve` and continues honestly from
 /// the solver's feasibility flags.
 fn try_warm_start(
@@ -838,10 +854,11 @@ fn try_warm_start(
     let root_basis = state.solver.snapshot_basis();
     let mut applied: Vec<usize> = Vec::new();
     let mut ok = true;
+    let mut pending_error = None;
 
     for &(var, val) in hints {
         let v = var.idx();
-        if v >= state.solver.num_vars {
+        if v >= state.solver.num_vars || !val.is_finite() {
             ok = false;
             break;
         }
@@ -873,8 +890,12 @@ fn try_warm_start(
                     // If it rejects the completion, drop the hint — do not branch
                     // below-tolerance vars here, that fallback is only for the main
                     // search loop.
-                    if !try_adopt_incumbent(state, true) {
-                        debug!("warm-start hint rejected by feasibility guard; ignored");
+                    match try_adopt_incumbent(state) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            debug!("warm-start hint rejected by feasibility guard; ignored");
+                        }
+                        Err(error) => pending_error = Some(error),
                     }
                 } else {
                     debug!("warm-start hint LP-completed fractionally; ignored");
@@ -883,10 +904,12 @@ fn try_warm_start(
             Ok(StopReason::Limit) | Err(Error::Infeasible) => {
                 debug!("warm-start hint infeasible or out of time; ignored");
             }
-            Err(e) => return Err(e),
+            Err(error) => pending_error = Some(error),
         }
     } else {
-        debug!("warm-start hint invalid (unknown var or out of bounds); ignored");
+        debug!(
+            "warm-start hint invalid (unknown variable, non-finite value, or out of bounds); ignored"
+        );
     }
 
     // Restore the root state exactly: bounds back, then the optimal root basis
@@ -905,93 +928,169 @@ fn try_warm_start(
             .load_basis(&slack)
             .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
         if state.solver.reoptimize()? == StopReason::Limit {
-            // The root re-solve from slack ran out of budget MID-SOLVE. The
-            // solver's `cur_obj_val` is now a half-solved value; if we returned
-            // `Ok(None)` the caller would seed the root node's `lp_bound` from it
-            // — an invalid lower bound that can prune legitimate subtrees (the one
-            // breach of the "never consult half-solved state" invariant). Instead
-            // un-set `root_solved` and signal an immediate Interrupted: on resume
-            // the `!root_solved` block re-enters `initial_solve`, which continues
-            // honestly from the solver's feasibility flags. Untestable
-            // deterministically — it needs an LU failure on the root basis load
-            // AND a deadline strike on the very next re-solve, on the same node —
-            // but the invariant must hold structurally.
+            // A limit during the root re-solve leaves `cur_obj_val` unsuitable
+            // as a root bound. Mark the root unsolved and return Interrupted;
+            // `initialize_root` continues `initial_solve` from the solver's
+            // feasibility flags on resume.
             state.root_solved = false;
+            if let Some(error) = pending_error {
+                return Err(error);
+            }
             return Ok(Some(MipOutcome::Interrupted));
         }
+    }
+    if let Some(error) = pending_error {
+        return Err(error);
     }
     Ok(None)
 }
 
+/// Solve or resume the root relaxation, restore any advisory warm start, and
+/// either close the problem or seed the open tree. `None` means node processing
+/// can begin; `Some` is a completed or interrupted root outcome.
+fn initialize_root(
+    state: &mut MipState,
+    domains: &[VarDomain],
+) -> Result<Option<MipOutcome>, Error> {
+    if state.root_solved {
+        return Ok(None);
+    }
+
+    if state.solver.initial_solve()? == StopReason::Limit {
+        return Ok(Some(MipOutcome::Interrupted));
+    }
+    state.root_solved = true;
+
+    if let Some(hints) = state.options.warm_start.take() {
+        if let Some(outcome) = try_warm_start(state, &hints)? {
+            return Ok(Some(outcome));
+        }
+    }
+
+    let root = Node {
+        bound_changes: Vec::new(),
+        basis: state.solver.snapshot_basis(),
+        lp_bound: state.solver.cur_obj_val,
+        depth: 0,
+        parent_id: 0,
+        branch_var: None,
+        branch_up: false,
+        branch_frac: 1.0,
+    };
+    let int_tol = state.options.int_tol;
+    if branching::is_integral(&state.solver, domains, int_tol) {
+        match process_integral_candidate(state, domains, int_tol)? {
+            IntegralCandidate::Branch(var) => branch(state, &root, var),
+            IntegralCandidate::Closed => return Ok(Some(MipOutcome::Optimal)),
+            IntegralCandidate::Limit => {
+                state.root_solved = false;
+                return Ok(Some(MipOutcome::Interrupted));
+            }
+        }
+    } else {
+        match branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts) {
+            Some(var) => branch(state, &root, var),
+            // Fractional integer variables fixed to a non-integer value cannot
+            // produce an integer point or a useful branch.
+            None => return Err(Error::Infeasible),
+        }
+    }
+
+    Ok(None)
+}
+
+enum NodeVisit {
+    /// The node was discarded before an LP solve, so it consumes no node budget.
+    Pruned,
+    /// One node LP completed, including an infeasible relaxation.
+    Solved,
+    /// The node must be restored to the frontier. `lp_solved` distinguishes an
+    /// interrupted initial LP from an interrupted retry after a completed LP.
+    Interrupted { node: Node, lp_solved: bool },
+}
+
+/// Reconstruct and process one node selected by the outer search policy.
+fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result<NodeVisit, Error> {
+    if !apply_node_bounds(state, &node) {
+        state.diving = false;
+        return Ok(NodeVisit::Pruned);
+    }
+
+    let warm = state.last_solved_id == Some(node.parent_id);
+    if !warm && state.solver.load_basis(&node.basis).is_err() {
+        debug!("basis load failed; falling back to slack basis");
+        let slack = state.solver.slack_basis();
+        state
+            .solver
+            .load_basis(&slack)
+            .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
+    }
+
+    match solve_node_lp(state)? {
+        NodeLp::Solved => {}
+        NodeLp::Infeasible => {
+            state.last_solved_id = None;
+            state.diving = false;
+            return Ok(NodeVisit::Solved);
+        }
+        NodeLp::Limit => {
+            return Ok(NodeVisit::Interrupted {
+                node,
+                lp_solved: false,
+            })
+        }
+    }
+
+    let objective = state.solver.cur_obj_val;
+    if let Some(var) = node.branch_var {
+        state.pseudocosts.record(
+            var,
+            node.branch_up,
+            (objective - node.lp_bound).max(0.0) / node.branch_frac.max(params::BRANCH_FRAC_GUARD),
+        );
+    }
+    if let Some(incumbent) = &state.incumbent {
+        if objective >= cutoff(incumbent.objective, state.options.tolerances.prune_epsilon) {
+            state.last_solved_id = None;
+            state.diving = false;
+            return Ok(NodeVisit::Solved);
+        }
+    }
+
+    let int_tol = state.options.int_tol;
+    if branching::is_integral(&state.solver, domains, int_tol) {
+        match process_integral_candidate(state, domains, int_tol)? {
+            IntegralCandidate::Branch(var) => branch(state, &node, var),
+            IntegralCandidate::Closed => {
+                state.last_solved_id = None;
+                state.diving = false;
+            }
+            IntegralCandidate::Limit => {
+                return Ok(NodeVisit::Interrupted {
+                    node,
+                    lp_solved: true,
+                })
+            }
+        }
+        return Ok(NodeVisit::Solved);
+    }
+
+    match branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts) {
+        Some(var) => branch(state, &node, var),
+        None => {
+            state.last_solved_id = None;
+            state.diving = false;
+        }
+    }
+    Ok(NodeVisit::Solved)
+}
+
 fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
     let domains = state.solver.orig_var_domains.clone();
-    let int_tol = state.options.int_tol;
     state.solver.deadline = state.deadline;
 
-    // Root relaxation (also the resume path if the root was interrupted mid-LP:
-    // initial_solve continues from the solver's feasibility flags).
-    if !state.root_solved {
-        match state.solver.initial_solve()? {
-            StopReason::Limit => return Ok(MipOutcome::Interrupted),
-            StopReason::Finished => {}
-        }
-        state.root_solved = true;
-        if let Some(hints) = state.options.warm_start.take() {
-            // `Some(outcome)` means the restore failed and the deadline struck
-            // mid-re-solve: bail out immediately (root_solved was un-set inside)
-            // rather than build the root node from a half-solved bound.
-            if let Some(outcome) = try_warm_start(state, &hints)? {
-                return Ok(outcome);
-            }
-            if state.classifying_unbounded && state.incumbent.is_some() {
-                return Err(Error::Unbounded);
-            }
-        }
-        let root = Node {
-            bound_changes: Vec::new(),
-            basis: state.solver.snapshot_basis(),
-            lp_bound: state.solver.cur_obj_val,
-            depth: 0,
-            parent_id: 0,
-            // Placeholder: the root is never popped from `open` (it's consumed here,
-            // not pushed), so this is never fed into `pseudocosts.record`.
-            branch_var: 0,
-            branch_up: false,
-            branch_frac: 1.0,
-        };
-        if branching::is_integral(&state.solver, &domains, int_tol) {
-            match process_integral_candidate(state, &domains, int_tol)? {
-                IntegralCandidate::Branch(var) => {
-                    // A feasible rounded point is an incumbent, not an optimality
-                    // certificate when rounding changed any integer value. The LP
-                    // bound can still be strictly better, so split on the
-                    // below-tolerance fractionality and finish the proof.
-                    branch(state, &root, var);
-                }
-                IntegralCandidate::Closed => {
-                    // The LP point itself is exactly integral and passed the
-                    // independent feasibility guard, so its relaxation bound
-                    // certifies the incumbent.
-                    return Ok(MipOutcome::Optimal);
-                }
-                IntegralCandidate::Limit => {
-                    state.root_solved = false;
-                    return Ok(MipOutcome::Interrupted);
-                }
-            }
-        } else {
-            match branching::choose_branch_var(&state.solver, &domains, int_tol, &state.pseudocosts)
-            {
-                Some(var) => branch(state, &root, var),
-                // Non-integral relaxation with NO branchable var: every
-                // fractional int var is FIXED (lo == hi at a fractional
-                // value — e.g. a post-solve fix_var edit), and a fixed
-                // fractional integer admits no integer point at all. That is
-                // an infeasibility verdict, not a panic (branching on the
-                // fixed var would reproduce the node forever).
-                None => return Err(Error::Infeasible),
-            }
-        }
+    if let Some(outcome) = initialize_root(state, &domains)? {
+        return Ok(outcome);
     }
 
     let mut nodes_this_run: u64 = 0;
@@ -1017,7 +1116,7 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
             }
         }
 
-        // Limits are checked BETWEEN nodes; nothing half-solved is ever consulted.
+        // Global limits are checked between nodes; no unfinished node result is consulted.
         if check_deadline(&state.deadline) == StopReason::Limit {
             return Ok(MipOutcome::Interrupted);
         }
@@ -1046,96 +1145,20 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
             }
         }
 
-        // Load the node into the solver: bounds first (values derive from them),
-        // then the basis if the solver isn't already at this node's parent optimum.
-        if !apply_node_bounds(state, &node) {
-            state.diving = false;
-            continue; // crossing bounds — pruned without touching the solver
-        }
-        let warm = state.last_solved_id == Some(node.parent_id);
-        if !warm && state.solver.load_basis(&node.basis).is_err() {
-            // Robustness valve: a numerically singular basis falls back to the
-            // all-slack basis and the node is solved from scratch.
-            debug!("basis load failed; falling back to slack basis");
-            let slack = state.solver.slack_basis();
-            state
-                .solver
-                .load_basis(&slack)
-                .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
-        }
-
-        // Solve the node's LP. A re-solve that degrades into a singular LU is
-        // retried once from scratch on the all-slack basis inside solve_node_lp.
-        match solve_node_lp(state)? {
-            NodeLp::Solved => {}
-            NodeLp::Infeasible => {
+        match visit_node(state, node, &domains)? {
+            NodeVisit::Pruned => continue,
+            NodeVisit::Solved => {
                 state.stats.nodes_solved += 1;
                 nodes_this_run += 1;
-                state.last_solved_id = None;
-                state.diving = false;
-                continue;
             }
-            NodeLp::Limit => {
-                // Requeue UNSOLVED: the node's plain data is intact, the solver's
-                // half-pivoted state will be discarded by the next basis load. Stop
-                // diving too: after a resume the requeued node must be reachable via
-                // the best-bound jump, not privileged by a stale LIFO position — and
-                // the solver holds no useful warm state for it either way.
+            NodeVisit::Interrupted { node, lp_solved } => {
+                if lp_solved {
+                    state.stats.nodes_solved += 1;
+                }
                 state.open.push(node);
                 state.last_solved_id = None;
                 state.diving = false;
                 return Ok(MipOutcome::Interrupted);
-            }
-        }
-        state.stats.nodes_solved += 1;
-        nodes_this_run += 1;
-
-        let z = state.solver.cur_obj_val;
-        // Feed this node's actual degradation (vs. its parent's bound, the estimate
-        // used at branch time) back into the pseudocost that predicted it.
-        state.pseudocosts.record(
-            node.branch_var,
-            node.branch_up,
-            (z - node.lp_bound).max(0.0) / node.branch_frac.max(params::BRANCH_FRAC_GUARD),
-        );
-        if let Some(inc) = &state.incumbent {
-            if z >= cutoff(inc.objective, state.options.tolerances.prune_epsilon) {
-                state.last_solved_id = None;
-                state.diving = false;
-                continue;
-            }
-        }
-
-        if branching::is_integral(&state.solver, &domains, int_tol) {
-            match process_integral_candidate(state, &domains, int_tol)? {
-                IntegralCandidate::Branch(var) => {
-                    // As at the root, accepting the rounded point does not close
-                    // this node while its LP point is still fractional: its
-                    // subtree can contain a better integer point.
-                    branch(state, &node, var);
-                }
-                IntegralCandidate::Closed => {
-                    state.last_solved_id = None;
-                    state.diving = false;
-                }
-                IntegralCandidate::Limit => {
-                    state.open.push(node);
-                    state.last_solved_id = None;
-                    state.diving = false;
-                    return Ok(MipOutcome::Interrupted);
-                }
-            }
-            continue;
-        }
-
-        match branching::choose_branch_var(&state.solver, &domains, int_tol, &state.pseudocosts) {
-            Some(var) => branch(state, &node, var),
-            // Same verdict as the root case above: non-integral with no
-            // branchable var means a fixed-at-fractional integer var — the
-            // node's subproblem contains no integer point. Prune it.
-            None => {
-                state.last_solved_id = None;
-                state.diving = false;
             }
         }
     }
@@ -1219,11 +1242,9 @@ mod tests {
     fn driver_exact_node_exhaustion_reports_infeasible_not_interrupted() {
         // Same infeasible fixture (2x == 1, x int in [0,10]): the root LP is
         // fractional (x=0.5) and branches into x<=0 and x>=1, both LP-infeasible.
-        // The tree is therefore exactly two nodes; empirically node_limit=1 yields
-        // Interrupted and node_limit=2 exhausts it. With the limit set to that
-        // exact exhaustion count, the loop's empty-`open` check (which now runs
-        // BEFORE the node-limit check) must report the completed proof as
-        // Infeasible rather than a spurious Interrupted.
+        // The tree is therefore exactly two nodes: node_limit=1 interrupts and
+        // node_limit=2 exhausts it. At the exact exhaustion count, the empty-open
+        // check precedes the node-limit check and must report Infeasible.
         let mut p = Problem::new(OptimizationDirection::Minimize);
         let x = p.add_integer_var(1.0, (0, 10));
         p.add_constraint(&[(x, 2.0)], ComparisonOp::Eq, 1.0);
@@ -1269,6 +1290,17 @@ mod tests {
         }
         assert!(guard >= 1, "node_limit=1 should interrupt at least once");
         assert!((incumbent_obj(&r.state) - 11.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn open_children_have_branch_metadata() {
+        let mut options = SolveOptions::default();
+        options.node_limit = Some(0);
+        let run = run(&int_2var_problem(), options).unwrap();
+
+        assert_eq!(run.outcome, MipOutcome::Interrupted);
+        assert_eq!(run.state.open.len(), 2);
+        assert!(run.state.open.iter().all(|node| node.branch_var.is_some()));
     }
 
     #[test]
@@ -1406,7 +1438,7 @@ mod tests {
         // original `x - m*b == 10` row by 500 — must be rejected.
         state.options.tolerances.feasibility = Tolerances::default().feasibility;
         assert!(
-            !try_adopt_incumbent(state, true),
+            !try_adopt_incumbent(state).unwrap(),
             "a 500-unit rounding-induced violation must be rejected at the default feasibility tolerance"
         );
 
@@ -1414,18 +1446,15 @@ mod tests {
         // within bounds — the guard must accept it.
         state.options.tolerances.feasibility = 1e6;
         assert!(
-            try_adopt_incumbent(state, true),
+            try_adopt_incumbent(state).unwrap(),
             "the same violation must be accepted once tolerances.feasibility is loosened past it"
         );
     }
 
     #[test]
     fn incumbent_feasible_row_tolerance_is_absolute_not_relative_to_rhs() {
-        // Post-unification behavior check: `incumbent_feasible`'s row check
-        // used to be `1e-7 * rhs.abs().max(1.0)` (relative), which on a large
-        // rhs like 1000.0 would forgive violations up to 1e-4. It is now the
-        // same ABSOLUTE `tolerances.feasibility` (default 1e-7) the
-        // rounded-incumbent guard uses, regardless of the row's magnitude.
+        // `incumbent_feasible` uses the same absolute feasibility tolerance
+        // as the rounded-incumbent guard, regardless of row magnitude.
         let mut p = Problem::new(OptimizationDirection::Minimize);
         let x = p.add_var(1.0, (0.0, f64::INFINITY));
         p.add_constraint(&[(x, 1.0)], ComparisonOp::Le, 1000.0);
@@ -1440,14 +1469,71 @@ mod tests {
             &tolerances
         ));
 
-        // Outside the absolute tolerance (5e-5 > 1e-7) but well inside what the
-        // old relative-to-rhs formula (1e-4 on this row) would have forgiven:
-        // must now be rejected, proving the check no longer scales with rhs.
+        // A `5e-5` violation exceeds the `1e-7` absolute tolerance even though
+        // it is small relative to this row's right-hand side.
         assert!(!incumbent_feasible(
             &p,
             &fixed,
             &[1000.0 + 5e-5],
             &tolerances
         ));
+    }
+
+    #[test]
+    fn candidate_validation_rejects_non_finite_and_malformed_values() {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        problem.add_integer_var(1.0, (0, 10));
+        let fixed = BTreeMap::new();
+        let tolerances = Tolerances::default();
+
+        assert!(!incumbent_feasible(&problem, &fixed, &[], &tolerances));
+        assert!(!incumbent_feasible(
+            &problem,
+            &fixed,
+            &[f64::NAN],
+            &tolerances
+        ));
+        assert!(!incumbent_feasible(
+            &problem,
+            &fixed,
+            &[f64::INFINITY],
+            &tolerances
+        ));
+
+        let mut overflowing_row = Problem::new(OptimizationDirection::Minimize);
+        let x = overflowing_row.add_var(0.0, (0.0, f64::INFINITY));
+        overflowing_row.add_constraint(&[(x, 1.0e308)], ComparisonOp::Le, 1.0e308);
+        assert!(!incumbent_feasible(
+            &overflowing_row,
+            &fixed,
+            &[1.0e308],
+            &tolerances
+        ));
+    }
+
+    #[test]
+    fn valid_candidate_completes_unbounded_classification() {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        problem.add_integer_var(1.0, (0, 10));
+        let mut state = build_state(&problem, SolveOptions::default()).unwrap();
+        assert_eq!(state.solver.initial_solve().unwrap(), StopReason::Finished);
+        state.classifying_unbounded = true;
+
+        assert_eq!(try_adopt_incumbent(&mut state), Err(Error::Unbounded));
+    }
+
+    #[test]
+    fn warm_start_restores_bounds_before_unbounded_verdict() {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_integer_var(0.0, (0, 10));
+        let mut state = build_state(&problem, SolveOptions::default()).unwrap();
+        assert_eq!(state.solver.initial_solve().unwrap(), StopReason::Finished);
+        state.classifying_unbounded = true;
+
+        assert_eq!(
+            try_warm_start(&mut state, &[(x, 5.0)]),
+            Err(Error::Unbounded)
+        );
+        assert_eq!(state.solver.get_var_bounds(x.idx()), (0.0, 10.0));
     }
 }

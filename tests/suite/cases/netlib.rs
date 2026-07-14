@@ -14,12 +14,9 @@ use crate::mps_milp;
 use microlp::{MpsFile, OptimizationDirection};
 use std::io::BufReader;
 
-/// Instances pinned EXPECTED-TO-FAIL as `Err(Infeasible)`: such a case
-/// passes while its known engine bug reproduces exactly, and fails loudly
-/// the moment the engine starts answering — fixing the bug flips the marker
-/// deliberately, keeping the hard tier a usable gate in the meantime.
-/// (Currently empty; `brandy` lived here until the refresh valve in
-/// `Solver::restore_feasibility` fixed its false-infeasible.)
+/// Instances explicitly expected to return `Err(Infeasible)` despite a
+/// published feasible optimum. Any other result fails the case so the marker
+/// cannot silently bypass normal objective validation.
 const KNOWN_INFEASIBLE_BUG: &[&str] = &[];
 
 const NETLIB: &[(&str, f64)] = &[
@@ -54,12 +51,12 @@ pub fn register(cases: &mut Vec<Case>) {
                 let mut problem = file.problem;
                 problem.set_time_limit(budget);
                 match problem.solve() {
-                    // The bug reproducing exactly is the expected outcome.
+                    // A marked case accepts only its explicit expected error.
                     Err(microlp::Error::Infeasible) => Ok(()),
                     Ok(sol) => Err(format!(
-                        "the {} known failure appears HEALED: it solved with objective {} \
-                         — check it against the published value {} and remove it from \
-                         KNOWN_INFEASIBLE_BUG so it is verified normally from now on",
+                        "the {} marked failure solved with objective {} \
+                         — verify it against the published value {} and remove it from \
+                         KNOWN_INFEASIBLE_BUG to enable normal validation",
                         name,
                         sol.objective(),
                         expected

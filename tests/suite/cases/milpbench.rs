@@ -328,7 +328,7 @@ fn register_bench_instances(cases: &mut Vec<Case>) {
             // Independent shadow-model validation of the returned point
             // (feasibility, bounds, integrality, objective consistency).
             crate::verify::validate_incumbent(&parsed.spec, &sol)?;
-            // Regression guard against the recorded optimum (see `optimum` doc).
+            // Compare the result against the recorded optimum (see `optimum` doc).
             if !tol.matches(sol.objective(), optimum) {
                 return Err(format!(
                     "expected optimum {} (microlp-proven), got {} (diff {:.3e})",

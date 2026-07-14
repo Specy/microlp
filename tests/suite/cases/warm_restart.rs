@@ -13,31 +13,14 @@
 //!
 //! ## Why the per-round budget GROWS instead of staying fixed
 //!
-//! A fixed per-round budget does not converge. Root cause, confirmed
-//! empirically on all three real/oracle instances below: this driver's
-//! branch & bound is fully deterministic, and a "restart from scratch"
-//! round discards
-//! *all* search state except the incumbent value (unlike `Solution::resume`,
-//! which keeps the open-node frontier and therefore always advances). Once
-//! the warm-start hint stops improving (typically within the first couple of
-//! rounds — finding a good incumbent is cheap), every subsequent round with
-//! an identical hint and an identical fixed budget re-explores the exact same
-//! node sequence and gets cut off at the exact same point — making *zero*
-//! forward progress, forever. This is not specific to a weak instance: for
-//! `stein27`, `mod008` and the hard knapsack, proving optimality with the
-//! true optimal solution handed in as the hint up front still costs
-//! 66-99% of the nodes a cold, hint-free solve needs (finding a good
-//! solution is cheap; *proving* no better one exists is not) — so no small
-//! fixed budget can ever finish the proof, regardless of how good the hint
-//! is. Growing the budget a fixed, deterministic amount each round (doubling;
-//! no randomness, no wall-clock dependence for the node-limit family) fixes
-//! this: it costs some repeated work in the early rounds, but guarantees the
-//! round eventually gets far enough to close the proof — and the growth is
-//! clamped (see `geometric`) so a regression fails in bounded time.
-//! Every other property the task asks for is unchanged and still strictly
-//! asserted: fresh `Problem` each round, `warm_start`-only hint carry-over,
-//! monotone non-worsening incumbents, and the loop must reach `Status::Optimal`
-//! to succeed (exhausting the round guard is a hard failure, not tolerated).
+//! Branch & bound is deterministic, and a restart discards every search-tree
+//! state except the incumbent hint. Repeating an identical hint with an
+//! identical fixed budget therefore repeats the same search prefix. The
+//! geometric schedule gives later rounds enough budget to extend that prefix,
+//! while `geometric` caps growth so a non-converging case still terminates.
+//! The loop requires a fresh `Problem` each round, carries only a warm-start
+//! hint, checks monotone non-worsening incumbents, and must eventually reach
+//! `Status::Optimal`.
 //!
 //! Real problems exercised: the MIPLIB3 instances `stein27` (optimum 18) and
 //! `mod008` (optimum 307), read through the suite's own MPS reader (same
@@ -90,11 +73,9 @@ fn build_from_mps(name: &str) -> Result<(ModelSpec, Problem), String> {
 
 /// Frozen data for a strongly-correlated 0/1 knapsack (value = weight + 10):
 /// classically much harder for branch & bound than uncorrelated instances
-/// (weak LP bound, lots of symmetric near-ties) — an uncorrelated knapsack up
-/// to n=70 with this same RNG solved in under 3 ms on the dev machine, too
-/// easy to exercise multi-round restart behavior. n=40, seed fixed for
-/// reproducibility; measured full (unlimited) solve ~1.8 s / ~107,000 nodes
-/// — comparable in scale to mod008.
+/// (weak LP bound, lots of symmetric near-ties). The fixed 40-item seed is
+/// large enough to exercise multiple restart rounds while remaining bounded
+/// for the suite.
 fn hard_knapsack_data() -> (Vec<i64>, Vec<i64>, i64) {
     let n = 40usize;
     let mut rng = Rng::new(0xC0FFEE + n as u64);
@@ -224,35 +205,17 @@ where
     ))
 }
 
-/// A geometric schedule `start * growth^(round-1)`, exponent clamped at 8 so
-/// a convergence regression stalls at a bounded plateau instead of growing
-/// forever — a hung regression must become a bounded FAIL (the round guard),
-/// never a hung suite.
+/// A geometric schedule `start * growth^(round-1)` with its exponent clamped
+/// at 8. The plateau bounds the aggregate work when `MAX_ROUNDS` is exhausted.
 ///
-/// Worst-case totals if a case never converged, with `MAX_ROUNDS` = 40: the
-/// plateau `growth^8` is reached at round 9, leaving 31 plateau rounds, so
-/// for growth 2 the summed budget is `start * (2^0 + .. + 2^8 + 31 * 2^8)`
-/// = `start * 8447`:
-/// - warm-restart-stein27: 15 ms * 8447 ~ 2.1 min
-/// - warm-restart-mod008: 100 ms * 8447 ~ 14.1 min (the largest; still
-///   inside the ~15 min review bound)
-/// - warm-restart-knap-hard: 60 ms * 8447 ~ 8.4 min
-/// - nodelimit-steps-stein27: 250 * 8447 ~ 2.1M nodes ~ 2 min at the
-///   measured ~19k nodes/s
-/// - nodelimit-steps-knap-hard: 1,000 * 8447 ~ 8.4M nodes ~ 2.4 min at the
-///   measured ~59k nodes/s (its growth was tightened from 3 to 2 for exactly
-///   this bound: at growth 3 the plateau alone is 3^8 ~ 6.6M nodes/round,
-///   a ~60 min worst case)
-///
-/// Today's convergence (5-8 rounds, budgets well below the plateau) is
-/// unaffected by the clamp.
+/// With `MAX_ROUNDS = 40` and growth 2, the summed multiplier is
+/// `2^0 + ... + 2^8 + 31 * 2^8 = 8447`.
 fn geometric(start: f64, growth: f64, round: u32) -> f64 {
     start * growth.powi(round.saturating_sub(1).min(8) as i32)
 }
 
-/// Round guard for `run_restart_loop`: far above today's 5-8 round
-/// convergence, low enough that a total failure to converge exhausts the
-/// `geometric` worst cases above in minutes, not hours.
+/// Round guard for `run_restart_loop`; together with `geometric` it bounds a
+/// non-converging case's total budget.
 const MAX_ROUNDS: u32 = 40;
 
 // ------------------------------------------------------------------- cases

@@ -21,6 +21,8 @@ flate2 = "1.1.9"
 # a C++ toolchain); the good_lp-backed extras are opt-in features.
 highs = { version = "2.4.0", optional = true }
 good_lp = { version = "1.15.2", default-features = false, optional = true }
+# This direct dependency exposes scip-sys's Cargo link metadata to build.rs,
+# which uses it to locate the bundled runtime libraries deterministically.
 scip-sys = { version = "0.1.28", optional = true }
 
 [features]

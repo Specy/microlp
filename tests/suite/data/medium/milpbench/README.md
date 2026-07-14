@@ -55,7 +55,7 @@ CFL's easy instances are *wide* — ≈800 constraints over ≈160 400 variables
 an integral LP relaxation, so the simplex proves optimality in ~0.03 s. Because
 the LP relaxation is integral, the simplex-proven LP optimum is itself an
 integer-feasible point and therefore the true MILP optimum; the recorded
-objective is asserted as a regression guard.
+objective is asserted as the case's correctness oracle.
 
 MILPBench ships no certified optima for these families, so the objective is
 **microlp-proven, not externally certified** (see above for why it is a genuine

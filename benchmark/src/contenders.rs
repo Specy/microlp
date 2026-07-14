@@ -11,7 +11,9 @@
 //! by the caller.
 
 use crate::corpus::Instance;
-use crate::model::{Domain, ModelSpec};
+use crate::model::Domain;
+#[cfg(any(feature = "highs", feature = "clarabel", feature = "scip"))]
+use crate::model::ModelSpec;
 use microlp::Status;
 use std::time::Duration;
 
@@ -72,6 +74,7 @@ pub struct SolveTask {
     /// the report's correction-gap column): the solver may use every thread
     /// it wants, but must prove *exact* optimality — the caller forces
     /// `mip_gap` to 0 on reference solves.
+    #[cfg_attr(not(feature = "highs"), allow(dead_code))]
     pub reference: bool,
     /// Relative MIP gap at which a solver may stop and report the optimum
     /// (0 = exact). Applied to every solver that supports it, so "proved

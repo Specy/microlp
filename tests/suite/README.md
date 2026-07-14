@@ -43,9 +43,9 @@ given, the highest wins.
 * `easy` — milliseconds each; runs everywhere, including debug builds.
 * `medium` — the release-mode default (with `easy`); laptop-friendly.
 * `hard` — long-running MILPs, minutes each. CI runs
-  `--hard --parallel 4 --max-case-seconds 300`, capping every single case at
-  5 minutes (`--max-case-seconds` clamps each case's budget after
-  `--timeout-scale`).
+  `--hard --parallel 4 --max-case-seconds 300`, clamping the solve budget
+  supplied to each case to 5 minutes after `--timeout-scale`. Custom cases
+  cooperatively enforce that budget by passing it to their solves.
 * `xhard` — instances beyond the solver's current ceiling, on 10-minute
   budgets, with externally certified verdicts (see below). Run manually.
 
@@ -81,8 +81,10 @@ incumbent must validate against the shadow model and never be *better* than a
 proven optimum or bound.
 
 Panics are caught per case and reported as `PANIC` without aborting the run.
-Each case runs under a time budget, so a cycling or exploding solve becomes a
-`TIMEOUT` result instead of a hung suite.
+Standard `CaseRun::Solve` cases map a limit without an accepted result to
+`TIMEOUT`. Custom cases decide whether an interrupted solve is a pass, timeout,
+or failure. The runner has no process-level watchdog; custom cases must forward
+their supplied budget to every potentially long-running solve.
 
 ## Where the answers come from
 
@@ -118,11 +120,11 @@ against the independent reader.
 
 ## Known failures
 
-`KNOWN_INFEASIBLE_BUG` in `cases/netlib.rs` can pin an instance as
-expected-to-fail while a known engine bug reproduces exactly; the case then
-fails loudly the moment the engine starts answering, so fixing the bug flips
-the marker deliberately. The list is currently **empty** — every case asserts
-correct behavior and passes.
+`KNOWN_INFEASIBLE_BUG` in `cases/netlib.rs` marks instances that are explicitly
+expected to return `Err(Infeasible)` despite a published feasible optimum. A
+marked case rejects every other outcome so the exception cannot silently skip
+normal validation. The list is currently **empty** — every case asserts correct
+behavior and passes.
 
 ## Adding a case
 

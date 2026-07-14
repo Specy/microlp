@@ -41,10 +41,11 @@ Three principles shape everything:
    and never grows the LP. Branching is expressed purely as *variable bound changes* on the
    single `Solver` instance, and tree nodes are plain data that describe how to reconstruct
    a state on that instance.
-2. **Nothing half-solved is ever consulted.** Time and node limits only take effect *between*
-   node LP solves. A node whose LP is interrupted mid-pivot is pushed back **unsolved**; its
-   half-pivoted solver state is structurally unreachable (the next visit rebuilds state from
-   the node's own data). This is what makes pause/resume safe by construction.
+2. **No unfinished node LP is consulted.** A deadline is observed between completed simplex
+   pivots and may stop a solve before optimality. The driver pushes that node back
+   **unsolved** and makes no bound, candidate, or branch decision from the unfinished state.
+   The next visit rebuilds the node from its own data. Node budgets and global search
+   decisions are applied between node LP solves.
 3. **Loud failures over silent wrong answers.** Child-LP errors are never conflated with
    infeasibility; numerical failures either recover through a documented valve or propagate
    as errors; candidate solutions are re-validated before being accepted. Where the code
@@ -54,10 +55,10 @@ Three principles shape everything:
 
 | File | Responsibility |
 |---|---|
-| `src/lib.rs` | Public API: `Problem`, `Solution`, `Status`, re-exports of `SolveOptions`/`Tolerances`/`Stats`. Dispatches pure-LP vs MILP solves. |
-| `src/solver.rs` | The simplex engine (`Solver`): bounded-variable primal/dual simplex, basis management, and the small contract surface the MIP layer uses. |
+| `src/lib.rs` | Public API: `Problem`, `Solution`, `Status`, re-exports of `SolveOptions`/`Tolerances`/`Stats`. Owns solve/edit timing and the `Problem::build_solver` model-to-engine seam. |
+| `src/solver.rs` | The simplex engine (`Solver`): bounded-variable primal/dual simplex, shared row preparation, basis management, and the small contract surface the MIP layer uses. |
 | `src/lu.rs`, `src/sparse.rs`, `src/ordering.rs` | LU factorization with eta-file updates, sparse containers, fill-reducing ordering. |
-| `src/mip/mod.rs` | The branch & bound driver: `MipState`, the search loop, interruption/resume, warm starts, post-solve edits, bound/gap accounting. |
+| `src/mip/mod.rs` | The branch & bound driver: `MipState`, root initialization, single-node visits, outer search policy, interruption/resume, candidates, warm starts, edits, and bound/gap accounting. |
 | `src/mip/node.rs` | `Node` (plain-data tree node) and `effective_bounds` (bound-change collapsing). |
 | `src/mip/branching.rs` | Integrality checks and branch-variable selection (pseudocosts). |
 | `src/mip/params.rs` | Named, documented internal constants (see §7). |
@@ -94,6 +95,12 @@ Two normalizations happen at the boundary and hold everywhere inside:
   models are equilibrated alike (the exactness of power-of-two scaling means the reported
   optimum is unaffected; only internal conditioning improves).
 
+`prepare_row` is the single row-normalization contract used by both `Solver::try_new` and
+incremental `Solver::add_constraint`. It classifies empty rows, computes the power-of-two
+scale, scales coefficients and the right-hand side together, and derives slack bounds.
+The two callers still own their genuinely different work: initial matrix/basis construction
+versus extending a live matrix and repairing the current basis.
+
 ---
 
 ## 3. The LP engine (`src/solver.rs`)
@@ -123,8 +130,9 @@ place. Basic variable: update the row's bound mirrors, flag primal-infeasible if
 fell outside. Non-basic variable: clamp its value to the new range, propagate the delta into
 the basic values through the variable's column (same mechanism as `fix_var`), recompute its
 at-bound flags, and downgrade `is_dual_feasible` if the move broke the reduced-cost/bound
-pairing. Crossing bounds (`min > max`) returns `Err(Infeasible)` with state untouched.
-It does **not** run simplex — callers decide when to reoptimize.
+pairing. Crossing bounds (`min > max`) or either bound being NaN returns
+`Err(Infeasible)` with state untouched. Infinite bounds remain valid. It does **not** run
+simplex — callers decide when to reoptimize.
 
 *Why this is the branching primitive:* tightening a bound leaves every reduced cost
 untouched, so the current basis stays **dual feasible** — re-solving is a short dual-simplex
@@ -152,9 +160,10 @@ scratch, LU refactorized, feasibility flags recomputed honestly. Two contracts m
   and is the designated recovery everywhere.
 
 **`check_constraints(values, tol)` / `objective_of(values)`** — evaluate an explicit
-structural-variable vector against the *original* rows (sense recovered from slack bounds)
-within an **absolute** per-row tolerance, and compute its exact objective. These exist for
-the rounded-incumbent guard (§5.4) and are deliberately independent of the simplex state.
+structural-variable vector against the stored, scaled rows (sense recovered from slack
+bounds) within the correspondingly scaled **absolute** tolerance, and compute its objective.
+Non-finite row activity is infeasible. These exist for the rounded-incumbent guard (§5.4)
+and are deliberately independent of the current basis values.
 
 ---
 
@@ -167,7 +176,8 @@ Node {
     basis: Basis,                      // the PARENT's optimal basis (warm start)
     lp_bound: f64,                     // parent's LP objective = valid lower bound here
     depth, parent_id,                  // parent_id detects warm dives (§5.2)
-    branch_var, branch_up, branch_frac // metadata feeding pseudocost updates (§5.6)
+    branch_var: Option<usize>,         // None for the root, Some(var) for children
+    branch_up, branch_frac             // metadata feeding pseudocost updates (§5.6)
 }
 ```
 
@@ -175,6 +185,10 @@ Reconstructing any node's starting state = apply its `bound_changes` on top of t
 bounds, load its `basis`, reoptimize. That is the whole trick: because nodes carry no live
 state, they are trivially storable, resumable, and cheap (a basis is `total_vars` bytes; a
 bound-change list is `depth` entries).
+
+The optional branch variable is a correctness distinction: the root has no creating branch
+and therefore must never record a pseudocost observation. Every child stores the variable
+and direction that created it.
 
 `MipState` is the complete, resumable search:
 
@@ -188,9 +202,10 @@ bound-change list is `depth` entries).
 | `pseudocosts`, `stats`, `options`, `deadline`, `direction` | search intelligence and bookkeeping |
 | `base: Problem`, `fixed: BTreeMap<var, val>` | the CLEAN user problem + user-level fixes — the substrate for post-solve edits (§5.8) |
 
-`Solution` for a MILP holds `Status` + this `MipState` boxed; user reads come from the
-incumbent's plain values, never from the live solver. For a pure LP, `Solution` instead
-keeps the live solver (that is what makes LP incremental editing cheap).
+`Solution` for a MILP holds `Status` + this `MipState` boxed. When an incumbent exists,
+user reads come from its plain rounded values. An `Interrupted` solve without an incumbent
+instead exposes the live solver's current working point for inspection. For a pure LP,
+`Solution` keeps the live solver (that is what makes LP incremental editing cheap).
 
 ---
 
@@ -200,45 +215,41 @@ keeps the live solver (that is what makes LP incremental editing cheap).
 
 ```mermaid
 flowchart TD
-    A[run: build Solver from Problem] --> B[initial_solve: root LP relaxation]
-    B -->|Limit| I1((return Interrupted<br/>resume re-enters here))
-    B -->|Infeasible| E1((Err Infeasible))
-    B -->|Unbounded| UF[zero-objective integer-feasibility search]
-    UF -->|integer point found| EU((Err Unbounded))
-    UF -->|tree exhausted| E1
+    A[run: build_state via Problem::build_solver] --> L{{search_loop}}
+    L --> R[initialize_root]
+    R --> RS[initial_solve root relaxation]
+    RS -->|Limit| I1((Interrupted<br/>resume re-enters initialize_root))
+    RS -->|Infeasible| EI((Err Infeasible))
+    RS -->|Unbounded| UF[resume_or_classify rebuilds<br/>zero-objective feasibility search]
+    UF -->|valid integer point| EU((Err Unbounded))
+    UF -->|tree exhausted| EI
     UF -->|Limit| I1
-    B --> WS{warm_start hint?}
-    WS -->|yes| H[try_warm_start §5.7<br/>fix hinted vars → LP-complete →<br/>guarded adopt → restore root exactly]
-    WS -->|no| C
-    H --> C{root integral<br/>within int_tol?}
-    C -->|yes + guard passes + LP point exact| OPT((Optimal))
-    C -->|rounded or guard fails| BR0[adopt if feasible;<br/>branch below-tolerance var]
-    C -->|no| BR0[branch root: two children pushed]
-    BR0 --> L{{search loop}}
-    L --> L0{open empty?}
-    L0 -->|yes| DONE{incumbent?}
-    DONE -->|yes| OPT2((Optimal))
-    DONE -->|no| INF((Err Infeasible))
-    L0 -->|no| L1{gap ≤ mip_gap?<br/>deadline? node_limit?}
-    L1 -->|limit hit| I2((return Interrupted —<br/>everything stays in open))
-    L1 --> POP[pop_node: dive LIFO or<br/>best-bound jump §5.5]
-    POP --> PR1{stored lp_bound ≥ cutoff?}
-    PR1 -->|prune| L0
-    PR1 --> APPLY[apply bound diff vs applied<br/>+ load basis unless warm dive §5.2]
-    APPLY --> SOLVE[solve_node_lp:<br/>reoptimize, slack retry on singular §5.3]
-    SOLVE -->|Infeasible| L0
-    SOLVE -->|Limit| REQ[requeue node UNSOLVED] --> I3((return Interrupted))
-    SOLVE -->|Solved z| PC[record pseudocost observation §5.6]
-    PC --> PR2{z ≥ cutoff?}
-    PR2 -->|prune| L0
-    PR2 --> INT{integral within int_tol?}
-    INT -->|yes| GUARD{rounded values feasible? §5.4}
-    GUARD -->|yes| ADOPT[adopt incumbent]
-    ADOPT --> EXACT{LP point exactly integral?}
-    EXACT -->|yes| L0
-    EXACT -->|no| BTOL[branch the below-tolerance var<br/>children fix it exactly] --> L0
-    GUARD -->|no| BTOL
-    INT -->|no| BRANCH[pseudocost-choose var,<br/>push 2 children, cheaper side on top] --> L0
+    RS --> W[try_warm_start if configured:<br/>fix → LP-complete → validate → restore root]
+    W --> C{root candidate?}
+    C -->|closed| OPT((Optimal))
+    C -->|needs proof| SEED[branch and seed open nodes]
+    SEED --> O{open empty?}
+    O -->|yes + incumbent| OPT
+    O -->|yes + no incumbent| EI
+    O -->|no| G{gap or deadline reached?}
+    G -->|gap| OPT
+    G -->|deadline| I2((Interrupted<br/>frontier remains resumable))
+    G -->|continue| P[pop_node: warm dive or best-bound jump]
+    P --> SB{stored bound reaches cutoff?}
+    SB -->|yes: free prune| O
+    SB -->|no| NB{node LP budget exhausted?}
+    NB -->|yes: requeue| I2
+    NB -->|no| V[visit_node]
+    V --> AB[apply target bounds]
+    AB -->|crossed bounds| NP[NodeVisit::Pruned]
+    AB -->|valid| S[load basis if needed + solve_node_lp]
+    S -->|Limit: requeue unsolved| NI[NodeVisit::Interrupted]
+    S -->|Infeasible| NS[NodeVisit::Solved]
+    S -->|Solved| D[pseudocost + fresh cutoff + candidate/branch]
+    D --> NS
+    NP --> O
+    NS --> COUNT[increment solved-node budget] --> O
+    NI --> I2
 ```
 
 ### 5.2 Visiting a node: warm dives vs jumps
@@ -258,41 +269,44 @@ cost of the visit: **is the solver already sitting at this node's parent's optim
 
 ### 5.3 Node LP solving and the robustness valves
 
-`solve_node_lp` wraps `reoptimize` and owns error discrimination — the fix for the old
-design's worst habit (swallowing every child error as "pruned"):
+`solve_node_lp` wraps `reoptimize` and owns error discrimination:
 
 - `Err(Infeasible)` → genuinely infeasible node → prune. Correct and cheap.
 - `Err(Unbounded)` → impossible for a bounded node → surfaced as `InternalError`.
-- Any other error (singular LU from numerical degradation, discovered in the wild on
-  `miplib/enigma`) → **retry once from the slack basis** (identity, cannot fail to load),
+- Any other error, such as a singular LU from numerical degradation → **retry once from
+  the slack basis** (identity, cannot fail to load),
   re-solving the node from scratch; a second failure propagates. The retry is per-node-visit
   — it cannot mask a systematic failure.
 - `Ok(Limit)` → the deadline fired mid-solve → the node is pushed back **unsolved** and the
-  search returns `Interrupted`. Nothing reads the half-pivoted state: the node's next visit
-  starts from its own bounds + basis data. (This is the structural fix for the historical
-  `assert!(is_primal_feasible)` panic.)
+  search returns `Interrupted`. Nothing uses the coherent but non-optimal state as a solved
+  node: the next visit starts from its own bounds + basis data.
 
 One more valve lives inside the engine itself, in `restore_feasibility` (the dual phase-1):
 "no eligible entering column for a violated row" proves infeasibility only in exact
 arithmetic. Deep in an eta-file chain, accumulated round-off can promote a phantom bound
 violation into a leaving row whose (equally drifted) pivot row blocks every candidate — a
-*false* `Infeasible`. This is not hypothetical: `netlib/brandy` was mis-declared infeasible
-for the fork's whole history (a fork-era commit had tightened `EPS` from upstream minilp's
-`1e-8` to `1e-10` in service of a branch & bound design that no longer exists, putting phase-1 below the noise floor of a
-220-row basis). Before an infeasibility declaration is allowed to stand, the engine now
-refactorizes the basis and recomputes the basic values from the original data, then
-re-examines: a phantom dissolves, a real infeasibility survives and the next declaration
-stands. The valve is armed once per stall (any successful pivot re-arms it), so it cannot
-loop. Loosening `EPS` instead is NOT an option — the big-M correctness tests explode when
-basic integer values may legally sit `1e-8` off their bounds (see the `EPS` docs in
-`solver.rs`).
+*false* `Infeasible`. Before an infeasibility declaration can stand, the engine refactorizes
+the basis, recomputes basic values from the original data, and re-examines the row: a
+phantom violation dissolves, while a real infeasibility survives. The valve is armed once
+per stall and any successful pivot re-arms it, so it cannot loop. `EPS` remains tight
+because the big-M correctness models require basic integer values to resolve sharply onto
+their bounds (see the `EPS` docs in `solver.rs`).
 
 ### 5.4 Incumbents and the rounded-feasibility guard
 
 When a node's LP solution is integral within `int_tol` (default `1e-6`), it is a *candidate*
-— not yet an incumbent. `try_adopt_incumbent` first rounds every integer variable to the
-nearest integer and validates the rounded vector against the **root bounds and every
-original row** within the absolute `Tolerances::feasibility` (default `1e-7`).
+— not yet an incumbent. Every solver-produced candidate enters `try_adopt_incumbent`, which
+rounds integer variables and applies one validation funnel:
+
+1. `candidate_variables_feasible` rejects malformed lengths, non-finite values, invalid
+   bounds, bound violations, and domain violations.
+2. `Solver::check_constraints` validates the vector against the active solver's scaled rows
+   using the correspondingly scaled absolute `Tolerances::feasibility` (default `1e-7`).
+3. `objective_of` must produce a finite objective before the incumbent can change.
+
+Post-edit warm-start filtering deliberately remains separate: `incumbent_feasible` checks
+the clean `Problem` plus its fix overlay in original user scale before a solver exists. Both
+paths share variable/domain validation, but their row representations are not conflated.
 
 Why this exists — the **big-M trap**: with `int_tol = 1e-6`, a relaxation value like
 `b = 0.999999995` counts as integral. But if `b` multiplies a coefficient of `1e9` somewhere,
@@ -310,6 +324,11 @@ tolerance. The guard makes this impossible to adopt:
   retry once from the all-slack basis. This removes eta-chain drift on big-M rows; if the
   independently checked point is still invalid, return an internal error rather than
   force-accepting a potentially infeasible answer.
+
+During zero-objective unboundedness classification, the same funnel runs first; only a valid
+integer point returns `Err(Unbounded)`. If classification is interrupted before an incumbent
+exists, the public objective is evaluated from the original model coefficients and the
+current working values rather than from the temporary zero objective.
 
 The tolerance is deliberately **absolute**, never scaled by row magnitude: a relative
 tolerance (`1e-7·|rhs|`) evaluates to ~100 on a 1e9-scale row and would swallow exactly the
@@ -336,14 +355,13 @@ violations the guard exists to catch. A false *rejection* from the absolute chec
 
 ### 5.6 Pseudocost branching (`src/mip/branching.rs`)
 
-Which fractional variable to branch on is the single most impactful heuristic in B&B.
-Most-fractional selection is empirically ≈ random; the driver instead learns **pseudocosts**:
-per variable and direction, the average objective degradation per unit of fractionality
-observed across all branchings so far.
+The driver learns **pseudocosts**: per variable and direction, the average objective
+degradation per unit of fractionality observed across solved child nodes.
 
-- *Recording*: when a node's LP solves, its creating branch (`branch_var`, `branch_up`,
-  `branch_frac` on the node) contributes `max(0, z_child − parent_bound) / branch_frac`.
-  Only genuinely solved nodes record (never infeasible/interrupted ones).
+- *Recording*: when a node with `branch_var = Some(var)` solves, its creating branch
+  (`branch_up`, `branch_frac`) contributes
+  `max(0, z_child − parent_bound) / branch_frac`. The root and every
+  infeasible/interrupted node record nothing.
 - *Selection*: maximize the product score
   `max(est_down·f_down, ε) · max(est_up·f_up, ε)` — variables whose BOTH directions hurt
   the relaxation are the ones worth deciding early. Before any observations exist, estimates
@@ -351,9 +369,6 @@ observed across all branchings so far.
   gracefully to most-fractional.
 - *Dive order*: of the two children, the one with the LOWER estimated degradation is pushed
   last (popped first) — dive toward the side more likely to stay feasible and good.
-
-Measured effect on the correctness suite: total wall-clock halved, with the tree-heavy
-MIPLIB instances (`lseu`, `p0201`, `misc03`) shrinking the most.
 
 ### 5.7 Warm starts
 
@@ -364,19 +379,20 @@ feasibility guard as every other incumbent** — hints get no shortcut. Then res
 state *exactly* (bounds back, root basis reloaded, everything recomputed) so the search
 starts from the true relaxation. Hints are advisory by design: unknown variables,
 out-of-range values, infeasible or fractional completions all just drop the hint with a
-debug log — a bad hint must never break a solve.
+debug log — a bad hint must never break a solve. An error discovered while evaluating the
+hint is held until the temporary bounds and root basis have been restored, then propagated.
 
-**An important non-obvious fact** (discovered while building the integration tests): a warm
-start seeds the *incumbent*, which powers pruning — it does **not** carry any of the search
-tree. The search is deterministic, so re-solving the same problem from scratch with the same
-budget re-explores the same nodes; even hinting the true optimum leaves most of the
-*bound-proving* work intact (measured: 66–99% of a cold solve's nodes). Consequently:
+A warm start seeds the *incumbent*, which powers pruning; it does **not** carry the search
+tree. Restarting the same model with an unchanged hint and the same deterministic node
+budget repeats the same search prefix. Wall-clock cutoffs may vary, but still retain no
+frontier. Consequently:
 
 - To **continue** an interrupted solve of an unchanged problem: use `Solution::resume` —
   it keeps the open list and continues where it stopped, budget-for-budget.
 - Restart-with-hint is the right tool when the problem **changed** (edits) or the state was
-  lost — and callers who loop restart-with-hint must grow the budget between rounds
-  (a fixed budget provably never converges; see `tests/suite/cases/warm_restart.rs`).
+  lost. In a restart loop, once the carried hint stops improving, grow the budget so a later
+  round can progress beyond the repeated search prefix (see
+  `tests/suite/cases/warm_restart.rs`).
 
 ### 5.8 Post-solve edits
 
@@ -409,12 +425,21 @@ leave `base+fixed` infeasible-unproven, and the unfix re-solve may be the one to
 
 ### 5.9 Interruption and resume, end to end
 
-Every entry point (`solve_with`, `resume`, edits) computes a **fresh deadline** from
-`options.time_limit`. Interruption points, in order of checking per loop iteration:
-open-list-empty (a completed proof is never mislabeled as interrupted — checked *first*),
-gap target, deadline, node budget (`node_limit` is per-call: each `resume` gets a fresh
-budget, which makes deterministic stepped tests possible — `node_limit: Some(0)` + a hint
-is how the warm-start liveness test proves the hint path works with zero nodes solved).
+Timing is centralized without hiding the entry points' different policies:
+
+- A pure LP's initial timer starts before `Problem::build_solver`, so construction and the
+  initial simplex solve share one deadline. `Solution::resume` uses its explicitly supplied
+  budget; LP edits use the original operation time limit. `timed_lp_call` always accumulates
+  elapsed time, including calls that return an error.
+- A MILP's initial run and each post-edit rebuild use its `SolveOptions`; `resume` installs
+  the explicitly supplied fresh time budget on the retained search state. Paused MILPs are
+  editable because edits discard the tree, while an interrupted pure LP must resume before
+  its live basis can be edited safely.
+
+MIP interruption points, in loop order, are: empty open list, gap target, deadline, then
+node budget. Checking exhaustion first prevents a completed proof from being mislabeled as
+interrupted. `node_limit` is per search call, so every `resume` receives a fresh node budget;
+the retained frontier still supplies continuity between calls.
 
 `Status` tells the truth about what you have:
 
@@ -424,8 +449,9 @@ is how the warm-start liveness test proves the hint path works with zero nodes s
 | `Feasible` | limit hit; incumbent exists; `gap()` quantifies it | all valid |
 | `Interrupted` | limit hit before any usable solution | value accessors expose the **current working point** (possibly fractional/infeasible — checking the status is the caller's job); `resume()` continues |
 
-A time limit is a *status*, never an `Error` — errors are reserved for `Infeasible`,
-`Unbounded`, and internal failures.
+A time limit is a *status*, never an `Error`. Solve failures use `Infeasible`, `Unbounded`,
+or `InternalError`; public validation and state-machine misuse use `InvalidOptions` and
+`InvalidOperation` respectively.
 
 ---
 
@@ -459,8 +485,9 @@ match sol.status() {
 
 Reading values: `var_value` rounds integer variables (and asserts the stored value was
 already integral-clean — a failed assert means a solver bug, not user error);
-`var_value_raw`/`iter`/indexing return the stored values — for MILP those are the
-incumbent's already-rounded values, for LP the live basis values.
+`var_value_raw`/`iter`/indexing return the incumbent's already-rounded values for a MILP
+with an incumbent, or the live working values for a pure LP and for an interrupted MILP
+without an incumbent.
 
 ---
 
@@ -487,8 +514,7 @@ definition):** `SCORE_EPS`, `PSEUDOCOST_INIT_EPS`, `BRANCH_FRAC_GUARD` (all `1e-
 The layering rule: `EPS` decides *simplex* questions (is this coefficient zero, is this
 value at its bound); `int_tol` decides *integrality* questions; `feasibility` decides
 *solution acceptance*; `prune_epsilon` decides *tree* questions. They are close in
-magnitude but must never be conflated — several historical bugs were exactly such
-conflations.
+magnitude, but govern distinct layers and must not be conflated.
 
 ---
 
@@ -505,7 +531,8 @@ conflations.
 | Deadline mid-LP | requeue the node unsolved; return `Interrupted` |
 | Limit with no incumbent | `Status::Interrupted`; value accessors expose the current working point (inspection only) |
 | Search exhausted, no incumbent | `Err(Infeasible)` |
-| Warm-start hint bad in any way | hint dropped (debug log), solve proceeds cold |
+| Warm-start hint invalid, out of range, infeasible, fractional, or limited | hint dropped (debug log), solve proceeds cold |
+| Unexpected solver error while evaluating a warm start | restore root bounds and basis, then propagate the error |
 | Edit makes the problem infeasible | `Err(Infeasible)` from the re-solve — on the *composed base problem*, never on leaf state |
 
 The standing project policy: when something cannot be done properly, fail loudly
@@ -521,7 +548,7 @@ Three rings, innermost first:
 1. **Unit tests** in each module: the solver primitives (bound changes vs fresh solves,
    basis round-trips, slack-basis recovery), driver behaviors (optimum finding, infeasible
    detection, deterministic node-limit interruption/resume, exact-exhaustion status), and
-   pseudocost/selection arithmetic. Written TDD; several encode adversarially-verified facts
+   pseudocost/selection arithmetic. Several encode adversarially verified invariants
    (e.g. the warm-start liveness test *fails if the hint wiring is disconnected*).
 2. **Public-API integration tests** (`src/tests/mip_api.rs`, `src/tests/resume.rs`):
    status semantics, panics, sign handling, edit composition, warm starts, sliced resumes
@@ -533,8 +560,10 @@ Three rings, innermost first:
    objective consistency, and solver-soundness checks like "a feasible incumbent must never
    beat the proven optimum"). Cases are tiered **easy / medium / hard / xhard**; a tier
    flag is a cumulative upper limit (`-- --hard` runs easy + medium + hard). Easy + medium
-   is the default run; CI runs the full hard tier with a five-minute per-case cap
-   (`-- --hard --max-case-seconds 300`); **xhard** (`-- --xhard`) holds the MILPBench
+   is the default run; CI runs the full hard tier with each case's supplied solve budget
+   clamped to five minutes (`-- --hard --max-case-seconds 300`). This is cooperative for
+   custom cases: their runner must pass the supplied budget into every solve.
+   **xhard** (`-- --xhard`) holds the MILPBench
    families beyond the solver's current ceiling, on 10-minute budgets with externally
    certified (HiGHS) optima — those cases assert clean interrupts and bound sanity rather
    than completion. File-based cases derive their tier from the folder their instance
@@ -556,8 +585,8 @@ If you change ANYTHING in the solver, the default suite tier is the first thing 
 per branch (matrix rebuild + LU refactorization + a new slack column at every node) and
 stores solver clones per tree node. This design's per-node cost is: one bound change + a short
 warm-started dual simplex (dive), or one basis refactorization (jump); per-node memory is a
-basis snapshot + a bound list. Pseudocost branching then halved the suite's wall-clock again
-by shrinking the trees themselves.
+basis snapshot + a bound list. Pseudocost branching uses observed child degradation to
+shrink the tree while preserving the same node-state representation.
 
 **Known, accepted costs:** the best-bound jump and the (only when `mip_gap > 0`) bound scan
 are `O(open)` linear scans — fine at current scales, a heap if profiling ever says otherwise.
@@ -574,32 +603,44 @@ error, but proving optimality there needs the phase-4 items below.
 
 ## 11. Extension points (rough order of payoff)
 
-- **Cutting planes.** microlp generates no cutting planes today. Root-node cut rounds
-  (cut-and-branch) are the classic next multiplier on the graph-structured instances above.
-  The architecture supports it: cuts are rows added to the base problem before the tree
-  starts (NOT during — node bounds assume a fixed row set).
-- **Primal heuristics.** Rounding + diving heuristics produce early incumbents → earlier
-  pruning. `try_adopt_incumbent(state, true)` is the safe funnel for any candidate a
-  heuristic produces.
-- **Integer presolve.** Bound rounding is a no-op today (integer bounds come in integral via
-  the API), but coefficient tightening / probing on binaries is real value for big-M models.
-- **SOS1/SOS2, deferred by design.** The intended route is *implicit detection* (recognize
-  `Σ binaries ≤ 1` rows in a presolve pass). `Node.bound_changes` being a list already
-  supports multi-variable branches (fix half the set to 0), so SOS branching needs no
-  redesign of the tree.
-- **Basis aging / node memory** and **heap-based best-bound selection** — see §10.
-- **Suspected simplex cycling / tail degeneracy** — one hard-tier problem burns its whole
-  10-minute budget while already holding the correct answer (the bound proof never
-  finishes). An anti-cycling fallback (Bland's rule) or bound perturbation is the classic
-  fix, and pairs naturally with the cutting-plane work above.
+The current seams give presolve, node propagation, reduced-cost fixing, root cuts, and
+incumbent dives a specific home:
+
+- **Presolve and postsolve mapping.** `Problem::build_solver` is the single raw-model to
+  simplex boundary. A presolver belongs immediately before it and must return both the
+  transformed model and enough mapping data to reconstruct original variable values and
+  objectives. Pure-LP incremental edits either need reductions that remain valid under the
+  live edit API or a deliberate rebuild policy; they cannot silently reuse a stale mapping.
+- **Node propagation.** Propagation belongs inside `visit_node`, after target bounds are
+  applied and before `solve_node_lp`. Deduced bounds must be stored on the `Node` so children
+  inherit them, and `state.applied` must mirror every partial tightening even when a
+  contradiction prunes the node.
+- **Reduced-cost fixing.** This belongs after a node LP solves and before candidate/branch
+  inspection. Any bound change requires a reoptimization before integrality or branching
+  reads the solver values.
+- **Root cuts.** Root cut rounds belong in `initialize_root` before the first open node and
+  its basis are snapshotted. Once the frontier exists, the row set must remain fixed because
+  every stored basis is sized for it. Accepted cuts should use the same row-preparation
+  contract as other solver rows.
+- **Primal heuristics.** A bounded dive can run after a valid root or node LP. It must restore
+  the search bounds/basis bookkeeping and submit a completed solver point through
+  `try_adopt_incumbent(state)`; heuristic candidates receive no validation shortcut.
+- **SOS1/SOS2.** Detection fits naturally in presolve. `Node.bound_changes` already supports
+  multi-variable bound decisions, but propagation and basis bookkeeping must still obey the
+  node-visit contracts above.
+- **Basis aging / node memory**, **heap-based best-bound selection**, and an anti-cycling
+  fallback remain independent engine/search-policy improvements; see §10.
 
 ---
 
-## 12. History
+## 12. Design boundaries
 
-Until mid-2026 the MILP layer drove branching through the public incremental API
-(`add_constraint` per branch on cloned solvers), which coupled the tree, the engine, and
-the user-facing result into one recursive tangle (`Solver ⊃ bb_state ⊃ Step ⊃ Solution ⊃
-Solver`). Its symptoms — a deadline panic mid-search, edits acting on B&B leaves, errors
-swallowed as pruning, no gap/bound, most-fractional branching — are each addressed by name
-above by the current design.
+- Tree nodes remain plain data; live simplex machinery belongs only to `MipState::solver`.
+- The open tree assumes a fixed solver row set. Any root transformation must finish before
+  node bases are stored.
+- Every solver-produced integer candidate goes through `try_adopt_incumbent`; user-scale
+  prefilters do not replace active-solver row validation.
+- `MipState::base` remains the clean user model. Search-only bounds, cuts, and transformed
+  rows must not leak into the model used for public post-solve edits.
+- Entry points own their time-budget policy; shared helpers may implement timing mechanics
+  but must not make resume and edit budgets indistinguishable.

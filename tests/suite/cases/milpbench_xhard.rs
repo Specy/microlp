@@ -21,8 +21,7 @@
 //! * `Feasible` — the incumbent must validate and must never be **better**
 //!   than the certified optimum / proven bound (direction-aware: that would
 //!   mean solver unsoundness or a wrong certificate);
-//! * `Interrupted` — pass: no incumbent inside the budget is today's honest
-//!   reality for most of these families.
+//! * `Interrupted` — pass: no incumbent was found inside the configured budget.
 //!
 //! As the solver improves, these cases tighten automatically: the moment a
 //! run starts returning incumbents (or optima), the certified value starts
@@ -188,9 +187,8 @@ pub fn register(cases: &mut Vec<Case>) {
                             crate::LAST_SOLVE
                                 .with(|slot| *slot.borrow_mut() = Some((sol.objective(), optimum)));
                         }
-                        // No incumbent inside the budget: a clean interrupt is
-                        // the expected outcome today and proves limit handling
-                        // at scale.
+                        // No incumbent inside the budget: a clean interrupt
+                        // satisfies the xhard limit-handling contract.
                         Status::Interrupted => {}
                     }
                 }
