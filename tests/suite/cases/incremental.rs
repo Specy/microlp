@@ -17,8 +17,7 @@ use crate::oracles;
 use crate::rng::Rng;
 use microlp::ComparisonOp::{Ge, Le};
 use microlp::OptimizationDirection::Maximize;
-use microlp::{MpsFile, OptimizationDirection, Problem, Solution, Status, Variable};
-use std::io::BufReader;
+use microlp::{OptimizationDirection, Problem, Solution, Status, Variable};
 use std::time::Duration;
 
 const OBJ_TOL: f64 = 1e-6;
@@ -304,12 +303,15 @@ fn resume(cases: &mut Vec<Case>) {
         |_budget| {
             let path = locate("netlib", "israel.mps").0;
             let text = read_instance(&path)?;
-            let file = MpsFile::parse(
-                BufReader::new(text.as_bytes()),
-                OptimizationDirection::Minimize,
-            )
-            .map_err(|e| format!("parse: {}", e))?;
-            let mut problem = file.problem;
+            let parsed = crate::mps_milp::parse(&text, OptimizationDirection::Minimize, false)
+                .map_err(|e| format!("parse: {}", e))?;
+            if parsed.obj_offset != 0.0 {
+                return Err(format!(
+                    "israel has objective offset {}; expected value needs adjusting",
+                    parsed.obj_offset
+                ));
+            }
+            let mut problem = parsed.problem;
             problem.set_time_limit(Duration::from_millis(1));
             let mut sol = problem.solve().map_err(|e| format!("solve: {}", e))?;
             let mut slices = 0;

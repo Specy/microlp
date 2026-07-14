@@ -344,7 +344,7 @@ impl Solver {
 
             let min = orig_var_mins[v];
             let max = orig_var_maxs[v];
-            if min > max {
+            if min.is_nan() || max.is_nan() || min > max {
                 return Err(Error::Infeasible);
             }
 
@@ -1961,6 +1961,26 @@ mod tests {
         assert_eq!(&sol.primal_edge_sq_norms, &[3.25, 5.0]);
 
         assert_eq!(sol.cur_obj_val, 0.0);
+    }
+
+    #[test]
+    fn try_new_rejects_nan_bound() {
+        init();
+        // A NaN bound used to slip past the `min > max` guard (every
+        // comparison against NaN is false, including this one), so it was
+        // accepted as an ordinary bound. Downstream, the simplex loop's own
+        // bound comparisons against that NaN never resolve either, so the
+        // solve hangs forever instead of reporting Infeasible up front (the
+        // same thing set_var_bounds already guards against for edits).
+        let res = Solver::try_new(
+            &[1.0],
+            &[f64::NAN],
+            &[10.0],
+            &[],
+            &[VarDomain::Real],
+            Default::default(),
+        );
+        assert_eq!(res.unwrap_err(), Error::Infeasible);
     }
 
     /// Dense recalculations with pending etas must match a fresh factorization

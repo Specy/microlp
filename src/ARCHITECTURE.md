@@ -62,7 +62,6 @@ Three principles shape everything:
 | `src/mip/node.rs` | `Node` (plain-data tree node) and `effective_bounds` (bound-change collapsing). |
 | `src/mip/branching.rs` | Integrality checks and branch-variable selection (pseudocosts). |
 | `src/mip/params.rs` | Named, documented internal constants (see §7). |
-| `src/mps.rs` | MPS-format reader for the public API. |
 | `tests/suite/` | The problem-based correctness suite (see §9) — the safety net for all of this. |
 
 ---

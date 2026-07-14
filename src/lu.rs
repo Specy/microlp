@@ -139,7 +139,7 @@ pub fn lu_factorize<'a>(
         mat_nnz - size,
     );
 
-    let col_perm = super::ordering::order_simple(size, |c| get_col(c).0);
+    let col_perm = super::ordering::order_simple(size, |c| get_col(c).0)?;
 
     let mut orig_row2elt_count = vec![0; size];
     for col_rows in (0..size).map(|c| get_col(c).0) {

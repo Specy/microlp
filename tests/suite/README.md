@@ -95,7 +95,7 @@ their supplied budget to every potentially long-running solve.
 | `lp/metamorphic/*` | solver vs itself under invariants: objective scaling, duplicated constraints, min/max negation |
 | `milp/*` unit | rounding traps, diophantine (in)feasibility, boolean gates, big-M implications, coin change vs DP, magic squares, n-queens, interruption/restart behaviors |
 | `oracle/*` | exact oracles computed per run: knapsack/subset-sum DP, assignment brute force, tiny-ILP box enumeration |
-| `netlib/*` | official netlib optimal values (`lp/data/readme`), 11 significant digits; parsed with microlp's `MpsFile` and cross-validated against the suite's independent reader |
+| `netlib/*` | official netlib optimal values (`lp/data/readme`), 11 significant digits |
 | `miplib/*` | MIPLIB 3 official catalog (`miplib3.cat`): LP relaxation *and* integer optimum per instance |
 | `milpbench/*` | MILPBench instances. The medium-tier CFL instances are solver-proven optima (integral LP relaxation, so the LP bound certifies the answer); the xhard families carry HiGHS-certified verdicts — a proven optimum, a proven `[dual bound, incumbent]` envelope, or a proven unboundedness — see `data/xhard/milpbench/README.md` |
 | `incr/*` | the incremental Solution APIs (`add_constraint`, `fix_var`/`unfix_var`, `resume`) vs certified optima, oracles and from-scratch solves |
@@ -114,9 +114,6 @@ and `lp_parser_rs` for CPLEX-LP files (`lp_format.rs`, which consumes the
 crate's raw grammar output and owns the variable-domain semantics). Both
 adapters are loud on anything they cannot faithfully represent — a misparse
 would poison the suite, so unsupported constructs are errors, never guesses.
-netlib instances are additionally parsed with microlp's own `MpsFile`, whose
-`Problem` is the one actually solved, so the library parser is under test
-against the independent reader.
 
 ## Known failures
 

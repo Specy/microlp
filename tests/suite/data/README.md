@@ -71,9 +71,9 @@ minimization). Contributors per the same readme:
 
 Normalization: `blend.mps` as distributed uses fixed-format MPS with a *blank*
 RHS vector name (its RHS lines start directly with row names). Free-format,
-whitespace-tokenized readers — including microlp's `MpsFile` — cannot
-disambiguate that, so the vendored copy adds the explicit (semantically
-irrelevant) vector name `RHS` to those four lines. No numeric content changed.
+whitespace-tokenized readers cannot disambiguate that, so the vendored copy
+adds the explicit (semantically irrelevant) vector name `RHS` to those four
+lines. No numeric content changed.
 
 ## {medium,hard}/miplib3/ — MILP benchmark instances (plain MPS with INTORG/INTEND markers)
 
@@ -104,13 +104,12 @@ donator are from the same catalog's ORIGINS index:
 | gt2      | 21166.000    | 13460.233074  | (unlisted); S. Ceria |
 | bell3a   | 878430.32    | 862578.64     | W. Cook |
 
-Note: microlp's own `MpsFile` parser has no integer-marker support, so the
-suite reads these files independently via the external `mps` crate plus the
-semantics adapter in `tests/suite/mps_milp.rs` (which also recovers the
-INTORG/INTEND integer markers the crate drops). Integer columns that receive
-no BOUNDS entry default to bounds [0, 1] (the MPSX-era convention MIPLIB 3
-files were written for); every instance's parse is validated by checking the
-LP relaxation objective against the published value above.
+Note: the suite reads these files via the external `mps` crate plus the
+semantics adapter in `tests/suite/mps_milp.rs` (which recovers the
+INTORG/INTEND integer markers the crate itself drops). Integer columns that
+receive no BOUNDS entry default to bounds [0, 1] (the MPSX-era convention
+MIPLIB 3 files were written for); every instance's parse is validated by
+checking the LP relaxation objective against the published value above.
 
 ## Constructed cases (no external data)
 

@@ -12,8 +12,6 @@ subject to linear equality and inequality constraints.
 * Incremental: add constraints to an existing solution without solving it from scratch.
 * Interruptible: time/node limits with clean resume, warm starts from known solutions,
   and MIP gap reporting for integer problems.
-* Problems can be defined via an API or parsed from an
-  [MPS](https://en.wikipedia.org/wiki/MPS_(format)) file.
 
 # Entry points
 
@@ -21,8 +19,6 @@ Begin by creating a [`Problem`](struct.Problem.html) instance, declaring variabl
 constraints. Solving it will produce a [`Solution`](struct.Solution.html) that can be used to
 get the optimal objective value, corresponding variable values and to add more constraints
 to the problem.
-
-Alternatively, create an [`MpsFile`](mps/struct.MpsFile.html) by parsing a file in the MPS format.
 
 # Example
 
@@ -54,10 +50,11 @@ extern crate log;
 mod helpers;
 mod lu;
 mod mip;
-mod mps;
 mod ordering;
-/// Problem solvers built on top of the microlp library.
-pub mod problems_solvers;
+// Problem solvers built on top of the microlp library (not part of the
+// public API — exists only to exercise the crate's own tests).
+#[cfg(test)]
+mod problems_solvers;
 mod solver;
 mod sparse;
 mod tests;
@@ -908,5 +905,3 @@ impl<'a> IntoIterator for &'a Solution {
         self.iter()
     }
 }
-
-pub use mps::MpsFile;

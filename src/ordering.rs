@@ -1,10 +1,17 @@
 use super::sparse::{Error, Perm};
 
 /// Simplest preordering: order columns based on their size
-pub fn order_simple<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> Perm {
+pub fn order_simple<'a>(
+    size: usize,
+    get_col: impl Fn(usize) -> &'a [usize],
+) -> Result<Perm, Error> {
     let mut cols_queue = ColsQueue::new(size);
     for c in 0..size {
-        cols_queue.add(c, get_col(c).len() - 1);
+        let col = get_col(c);
+        if col.is_empty() {
+            return Err(Error::SingularMatrix);
+        }
+        cols_queue.add(c, col.len() - 1);
     }
 
     let mut new2orig = Vec::with_capacity(size);
@@ -21,7 +28,7 @@ pub fn order_simple<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> 
         orig2new[orig] = new;
     }
 
-    Perm { orig2new, new2orig }
+    Ok(Perm { orig2new, new2orig })
 }
 
 #[allow(dead_code)]
@@ -745,6 +752,19 @@ mod tests {
             });
             assert_eq!(res.unwrap_err(), Error::SingularMatrix);
         }
+    }
+
+    #[test]
+    fn order_simple_singular() {
+        init();
+        // Column 2 has no entries at all (a variable with zero coefficients
+        // in every row). order_simple used to compute `len() - 1`
+        // unconditionally and panic with a usize underflow instead of
+        // reporting SingularMatrix, unlike order_colamd's handling of the
+        // same class of input.
+        let mat = mat_from_triplets(3, 3, &[(0, 0), (1, 0), (2, 1)]);
+        let res = order_simple(3, |c| mat.outer_view(c).unwrap().into_raw_storage().0);
+        assert_eq!(res.unwrap_err(), Error::SingularMatrix);
     }
 
     #[test]
