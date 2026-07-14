@@ -23,7 +23,7 @@ jobs:
       - name: Cache Rust
         uses: actions/cache@v3
         with:
-          key: ${{ runner.os }}-nightly-${{ hashFiles('Cargo.toml') }}
+          key: ${{ runner.os }}-nightly-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'benchmark/Cargo.toml') }}
           path: |
             ~/.cargo/bin/
             ~/.cargo/registry/index/
@@ -49,7 +49,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: -- --deny warnings
+          args: --locked -- --deny warnings
   test:
     strategy:
       matrix:
@@ -67,7 +67,7 @@ jobs:
       - name: Cache Rust
         uses: actions/cache@v3
         with:
-          key: ${{ runner.os }}-${{ matrix.rust }}-${{ hashFiles('Cargo.toml') }}
+          key: ${{ runner.os }}-stable-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'benchmark/Cargo.toml') }}
           path: |
             ~/.cargo/bin/
             ~/.cargo/registry/index/
@@ -86,19 +86,19 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --release --lib
+          args: --locked --release --lib
 
       - name: Doctests
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --release --doc
+          args: --locked --release --doc
 
       - name: Exhaustive small-model oracles
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --release --test exhaustive_mip
+          args: --locked --release --test exhaustive_mip
 
       # Problem-based correctness suite. Tiers are cumulative (easy < medium
       # < hard < xhard); --hard runs everything up to and including the hard
@@ -117,7 +117,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --release --test suite ${{ matrix.os == 'ubuntu-latest' && '--features highs' || '' }} -- --hard --parallel 4 --max-case-seconds 300
+          args: --locked --release --test suite ${{ matrix.os == 'ubuntu-latest' && '--features highs' || '' }} -- --hard --parallel 4 --max-case-seconds 300
 
       - name: Test Rust with traces
         uses: actions-rs/cargo@v1
@@ -125,7 +125,7 @@ jobs:
           RUST_LOG: "trace"
         with:
           command: test
-          args: --lib
+          args: --locked --lib
 
   publish-crate:
     if: startsWith(github.ref, 'refs/tags/v')

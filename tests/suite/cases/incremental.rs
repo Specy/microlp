@@ -6,7 +6,7 @@
 //! enumeration oracle). On MILP solutions the same APIs re-solve the original
 //! problem plus every edit applied so far, keeping the previous incumbent as a
 //! warm start when it remains feasible (see `Solution::add_constraint`'s doc).
-//! The `*-milp` cases below assert exactly this fixed behavior against DP,
+//! The `*-milp` cases below assert this documented behavior against DP,
 //! brute-force, and hand-computed truths — they are regular default-tier
 //! cases, not known-failure placeholders.
 
@@ -332,14 +332,11 @@ fn resume(cases: &mut Vec<Case>) {
         },
     ));
 
-    // A genuine mid-search B&B interrupt (not Duration::ZERO): stein27 (~0.5 s
-    // to solve) reliably overruns a 50 ms first slice, returning a clean
-    // Feasible/Interrupted status instead of the old is_primal_feasible panic
-    // (the C1 known failure). Resuming in 100 ms slices must then reach the
-    // proven optimum 18. Standard tier so the default (CI) run guards
-    // resume-after-MILP-interrupt. If a very fast machine finishes inside the
-    // first slice the status is already Optimal and the objective check still
-    // holds.
+    // A genuine mid-search B&B interrupt (not Duration::ZERO): stein27 normally
+    // overruns the 50 ms first slice and returns Feasible or Interrupted.
+    // Resuming in 100 ms slices must reach the proven optimum 18. A sufficiently
+    // fast first solve may return Optimal immediately; the same objective check
+    // still applies.
     cases.push(Case::custom(
         "incr/resume-midway-milp",
         Tier::Medium,
@@ -375,15 +372,9 @@ fn milp_edits(cases: &mut Vec<Case>) {
     // re-solve the original problem plus every edit applied so far (the
     // previous incumbent is kept as a warm start when it remains feasible).
     // Each case below checks the edited result against an independent truth
-    // (DP, brute force, or a hand-computed optimum). add-constraint-mixed
-    // exercises the same re-solve path on a mixed continuous/integer problem;
-    // note its particular values happen to coincide with what the old
-    // incumbent-leaf bug would have produced too, so unlike the other five it
-    // would not by itself have caught that bug — it stays grouped here as a
-    // regression check on the mixed continuous/integer edit path. All six
-    // solve in low single-digit milliseconds (measured via a targeted
-    // `--hard` run), so they run in the default (Standard) tier alongside the
-    // rest of `incr/*`.
+    // (DP, brute force, or a hand-computed optimum). add-constraint-mixed also
+    // covers the re-solve path for a mixed continuous/integer problem. These
+    // small cases belong in the default tier alongside the rest of `incr/*`.
 
     cases.push(Case::custom(
         "incr/add-constraint-milp",

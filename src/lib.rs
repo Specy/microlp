@@ -387,7 +387,47 @@ pub(crate) enum StopReason {
     Finished,
 }
 
+fn status_after_stop(stop: StopReason, finished: Status) -> Status {
+    match stop {
+        StopReason::Finished => finished,
+        StopReason::Limit => Status::Interrupted,
+    }
+}
+
+fn timed_lp_call<T>(
+    solver: &mut Solver,
+    time_limit: Option<Duration>,
+    call: impl FnOnce(&mut Solver) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let started = Instant::now();
+    solver.deadline = time_limit.map(|duration| started + duration);
+    let result = call(solver);
+    solver.elapsed += started.elapsed();
+    result
+}
+
+fn ensure_lp_editable(status: Status) -> Result<(), Error> {
+    if status == Status::Interrupted {
+        Err(Error::InvalidOperation(
+            "cannot edit an interrupted solution; resume() it first".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 impl Problem {
+    pub(crate) fn build_solver(&self, deadline: solver::Deadline) -> Result<Solver, Error> {
+        Solver::try_new(
+            &self.obj_coeffs,
+            &self.var_mins,
+            &self.var_maxs,
+            &self.constraints,
+            &self.var_domains,
+            deadline,
+        )
+    }
+
     /// Solve with default options (respecting [`Problem::set_time_limit`] if set).
     ///
     /// # Errors
@@ -417,36 +457,21 @@ impl Problem {
         let num_vars = self.obj_coeffs.len();
         if self.has_integer_vars() {
             let run = mip::run(self, options)?;
-            Ok(Solution {
-                direction: self.direction,
-                num_vars,
-                status: mip::status_of(run.outcome, &run.state),
-                kind: SolutionKind::Mip(Box::new(run.state)),
-            })
+            Ok(Solution::from_mip_run(self.direction, num_vars, run))
         } else {
             let started = Instant::now();
             let deadline = options.time_limit.map(|d| started + d);
-            let mut solver = Solver::try_new(
-                &self.obj_coeffs,
-                &self.var_mins,
-                &self.var_maxs,
-                &self.constraints,
-                &self.var_domains,
-                deadline,
-            )?;
+            let mut solver = self.build_solver(deadline)?;
             solver.operation_time_limit = options.time_limit;
             let solve_result = solver.initial_solve();
             solver.elapsed += started.elapsed();
-            let status = match solve_result? {
-                StopReason::Finished => Status::Optimal,
-                StopReason::Limit => Status::Interrupted,
-            };
-            Ok(Solution {
-                direction: self.direction,
+            let status = status_after_stop(solve_result?, Status::Optimal);
+            Ok(Solution::from_lp(
+                self.direction,
                 num_vars,
                 status,
-                kind: SolutionKind::Lp(Box::new(solver)),
-            })
+                Box::new(solver),
+            ))
         }
     }
 }
@@ -482,6 +507,29 @@ impl std::fmt::Debug for Solution {
 }
 
 impl Solution {
+    fn from_lp(
+        direction: OptimizationDirection,
+        num_vars: usize,
+        status: Status,
+        solver: Box<Solver>,
+    ) -> Self {
+        Self {
+            direction,
+            num_vars,
+            status,
+            kind: SolutionKind::Lp(solver),
+        }
+    }
+
+    fn from_mip_run(direction: OptimizationDirection, num_vars: usize, run: mip::MipRun) -> Self {
+        Self {
+            direction,
+            num_vars,
+            status: mip::status_of(run.outcome, &run.state),
+            kind: SolutionKind::Mip(Box::new(run.state)),
+        }
+    }
+
     /// The outcome of the solve: proven optimal, feasible-but-unproven, or interrupted.
     ///
     /// This is the field that decides whether the value accessors mean
@@ -509,12 +557,7 @@ impl Solution {
     pub fn objective(&self) -> f64 {
         let internal = match &self.kind {
             SolutionKind::Lp(solver) => solver.cur_obj_val,
-            SolutionKind::Mip(state) => match &state.incumbent {
-                Some(incumbent) => incumbent.objective,
-                // No incumbent yet (interrupted early): the freshest number
-                // the search has is the current node LP's objective.
-                None => state.solver.cur_obj_val,
-            },
+            SolutionKind::Mip(state) => state.current_objective(),
         };
         match self.direction {
             OptimizationDirection::Minimize => internal,
@@ -644,14 +687,8 @@ impl Solution {
         }
         match &mut self.kind {
             SolutionKind::Lp(solver) => {
-                let started = Instant::now();
-                solver.deadline = time_limit.map(|d| started + d);
-                let solve_result = solver.initial_solve();
-                solver.elapsed += started.elapsed();
-                self.status = match solve_result? {
-                    StopReason::Finished => Status::Optimal,
-                    StopReason::Limit => Status::Interrupted,
-                };
+                let stop = timed_lp_call(solver, time_limit, Solver::initial_solve)?;
+                self.status = status_after_stop(stop, Status::Optimal);
             }
             SolutionKind::Mip(state) => {
                 let outcome = mip::resume_run(state, time_limit)?;
@@ -690,31 +727,23 @@ impl Solution {
         } = self;
         match kind {
             SolutionKind::Lp(mut solver) => {
-                if status == Status::Interrupted {
-                    return Err(Error::InvalidOperation(
-                        "cannot edit an interrupted solution; resume() it first".to_string(),
-                    ));
-                }
+                ensure_lp_editable(status)?;
                 let expr = expr.into();
-                let started = Instant::now();
-                solver.deadline = solver.operation_time_limit.map(|d| started + d);
-                let solve_result = solver.add_constraint(
-                    CsVec::new_from_unsorted(num_vars, expr.vars, expr.coeffs)
-                        .map_err(|v| Error::InternalError(v.2.to_string()))?,
-                    cmp_op,
-                    rhs,
-                );
-                solver.elapsed += started.elapsed();
-                let sr = solve_result?;
-                Ok(Solution {
+                let time_limit = solver.operation_time_limit;
+                let stop = timed_lp_call(&mut solver, time_limit, move |solver| {
+                    solver.add_constraint(
+                        CsVec::new_from_unsorted(num_vars, expr.vars, expr.coeffs)
+                            .map_err(|error| Error::InternalError(error.2.to_string()))?,
+                        cmp_op,
+                        rhs,
+                    )
+                })?;
+                Ok(Self::from_lp(
                     direction,
                     num_vars,
-                    status: match sr {
-                        StopReason::Finished => Status::Optimal,
-                        StopReason::Limit => Status::Interrupted,
-                    },
-                    kind: SolutionKind::Lp(solver),
-                })
+                    status_after_stop(stop, Status::Optimal),
+                    solver,
+                ))
             }
             SolutionKind::Mip(mut state) => {
                 // Edit-after-pause is allowed by design: any status is editable here.
@@ -723,12 +752,7 @@ impl Solution {
                     .map_err(|v| Error::InternalError(v.2.to_string()))?;
                 state.base.constraints.push((coeffs, cmp_op, rhs));
                 let run = mip::reedit_and_resolve(state)?;
-                Ok(Solution {
-                    direction,
-                    num_vars,
-                    status: mip::status_of(run.outcome, &run.state),
-                    kind: SolutionKind::Mip(Box::new(run.state)),
-                })
+                Ok(Self::from_mip_run(direction, num_vars, run))
             }
         }
     }
@@ -753,25 +777,16 @@ impl Solution {
         }
         match kind {
             SolutionKind::Lp(mut solver) => {
-                if status == Status::Interrupted {
-                    return Err(Error::InvalidOperation(
-                        "cannot edit an interrupted solution; resume() it first".to_string(),
-                    ));
-                }
-                let started = Instant::now();
-                solver.deadline = solver.operation_time_limit.map(|d| started + d);
-                let solve_result = solver.fix_var(var.0, val);
-                solver.elapsed += started.elapsed();
-                let sr = solve_result?;
-                Ok(Solution {
+                ensure_lp_editable(status)?;
+                let time_limit = solver.operation_time_limit;
+                let stop =
+                    timed_lp_call(&mut solver, time_limit, |solver| solver.fix_var(var.0, val))?;
+                Ok(Self::from_lp(
                     direction,
                     num_vars,
-                    status: match sr {
-                        StopReason::Finished => Status::Optimal,
-                        StopReason::Limit => Status::Interrupted,
-                    },
-                    kind: SolutionKind::Lp(solver),
-                })
+                    status_after_stop(stop, Status::Optimal),
+                    solver,
+                ))
             }
             SolutionKind::Mip(mut state) => {
                 if val < state.base.var_mins[var.0] || val > state.base.var_maxs[var.0] {
@@ -779,12 +794,7 @@ impl Solution {
                 }
                 state.fixed.insert(var.0, val);
                 let run = mip::reedit_and_resolve(state)?;
-                Ok(Solution {
-                    direction,
-                    num_vars,
-                    status: mip::status_of(run.outcome, &run.state),
-                    kind: SolutionKind::Mip(Box::new(run.state)),
-                })
+                Ok(Self::from_mip_run(direction, num_vars, run))
             }
         }
     }
@@ -813,26 +823,12 @@ impl Solution {
         assert!(var.0 < num_vars);
         match kind {
             SolutionKind::Lp(mut solver) => {
-                if status == Status::Interrupted {
-                    return Err(Error::InvalidOperation(
-                        "cannot edit an interrupted solution; resume() it first".to_string(),
-                    ));
-                }
-                let started = Instant::now();
-                solver.deadline = solver.operation_time_limit.map(|d| started + d);
-                let unfix_result = solver.unfix_var(var.0);
-                solver.elapsed += started.elapsed();
-                let (res, stop) = unfix_result?;
+                ensure_lp_editable(status)?;
+                let time_limit = solver.operation_time_limit;
+                let (res, stop) =
+                    timed_lp_call(&mut solver, time_limit, |solver| solver.unfix_var(var.0))?;
                 Ok((
-                    Solution {
-                        direction,
-                        num_vars,
-                        status: match stop {
-                            StopReason::Finished => status,
-                            StopReason::Limit => Status::Interrupted,
-                        },
-                        kind: SolutionKind::Lp(solver),
-                    },
+                    Self::from_lp(direction, num_vars, status_after_stop(stop, status), solver),
                     res,
                 ))
             }
@@ -854,15 +850,7 @@ impl Solution {
                 // that proof), and a node LP can fail internally. Propagate both
                 // rather than converting reachable errors into panics.
                 let run = mip::reedit_and_resolve(state)?;
-                Ok((
-                    Solution {
-                        direction,
-                        num_vars,
-                        status: mip::status_of(run.outcome, &run.state),
-                        kind: SolutionKind::Mip(Box::new(run.state)),
-                    },
-                    true,
-                ))
+                Ok((Self::from_mip_run(direction, num_vars, run), true))
             }
         }
     }

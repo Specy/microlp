@@ -495,9 +495,9 @@ fn integer_edits_match_fresh_exhaustive_models() {
 #[test]
 fn mixed_scale_active_rows_do_not_hide_a_feasible_integer_point() {
     // The second row can only be repaired by moving the first row's slack.
-    // Without equilibration that tableau coefficient is 1.2e-12, below the
-    // simplex's absolute pivot threshold, and the feasible model was declared
-    // infeasible.
+    // The unscaled tableau coefficient is 1.2e-12, below the simplex's absolute
+    // pivot threshold; equilibration keeps the feasible model numerically
+    // resolvable.
     let case = Case {
         n: 2,
         lo: [1, -2, 0, 0],
@@ -555,10 +555,29 @@ fn mixed_scale_pure_lp_is_not_misclassified_infeasible() {
 }
 
 #[test]
+fn mixed_scale_incremental_rows_are_not_misclassified_infeasible() {
+    let mut problem = Problem::new(OptimizationDirection::Minimize);
+    let x = problem.add_var(-2.0, (1.0, 2.0));
+    let y = problem.add_var(6.0, (-2.0, 3.0));
+    let solution = problem.solve().unwrap();
+    let solution = solution
+        .add_constraint([(x, 4.0e6), (y, 5.0e6)], ComparisonOp::Ge, 13.0e6)
+        .unwrap();
+    let solution = solution
+        .add_constraint([(x, 7.0e-6), (y, 6.0e-6)], ComparisonOp::Ge, 26.0e-6)
+        .unwrap();
+
+    assert_eq!(solution.status(), Status::Optimal);
+    assert!((solution.objective() - 8.0).abs() < 1e-7);
+    assert!((solution.var_value(x) - 2.0).abs() < 1e-7);
+    assert!((solution.var_value(y) - 2.0).abs() < 1e-7);
+}
+
+#[test]
 fn mixed_scale_branching_does_not_prune_the_true_optimum() {
-    // The LP relaxation starts at (0.9, -2.25). Branching x <= 0 must retain
-    // (0, -3), but the unscaled warm reoptimization used to report a worse LP
-    // bound and prune away the true integer optimum.
+    // The LP relaxation starts at (0.9, -2.25). After branching x <= 0, row
+    // scaling and warm reoptimization must retain (0, -3) and its valid LP
+    // bound so the true integer optimum remains in the search.
     let case = Case {
         n: 2,
         lo: [-3, -3, 0, 0],

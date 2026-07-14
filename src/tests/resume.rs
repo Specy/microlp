@@ -370,10 +370,8 @@ mod tests_resume {
         (problem, vars)
     }
 
-    /// Regression test for <https://github.com/Specy/microlp/issues/22>, where a
-    /// time-limited MILP solve used to panic instead of stopping gracefully.
-    /// The 1 ms slices force *many* mid-search interrupts, and the sliced
-    /// search must reach the unlimited solve's answer value-for-value.
+    /// One-millisecond slices exercise repeated mid-search interruptions. The
+    /// resumed search must reach the unlimited solve's answer value-for-value.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "test is too slow in debug mode")]
     fn resume_integer_variables_produces_same_result_as_unlimited() {

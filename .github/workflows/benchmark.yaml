@@ -38,7 +38,7 @@ jobs:
       - name: Cache Rust
         uses: actions/cache@v4
         with:
-          key: ${{ runner.os }}-benchmark-${{ hashFiles('Cargo.toml', 'benchmark/Cargo.toml') }}
+          key: ${{ runner.os }}-benchmark-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'benchmark/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-benchmark-
           path: |
             ~/.cargo/registry/index/
@@ -47,12 +47,12 @@ jobs:
             target/
 
       - name: Build
-        run: cargo build -p microlp-benchmark --release
+        run: cargo build --locked -p microlp-benchmark --release
 
       - name: Run benchmark
         run: |
           set -o pipefail
-          cargo run -p microlp-benchmark --release -- \
+          cargo run --locked -p microlp-benchmark --release -- \
             --time-limit "${{ inputs.time_limit }}" \
             --mip-gap "${{ inputs.mip_gap }}" \
             --out BENCHMARK.md 2>&1 | tee benchmark-progress.log

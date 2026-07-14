@@ -259,12 +259,11 @@ pub fn register(cases: &mut Vec<Case>) {
         (b, Expected::objective(3440.0))
     });
 
-    // A mid-search time limit must return a CLEAN status — never the old
-    // is_primal_feasible panic: Optimal if 30 ms happened to suffice, Feasible
-    // with a valid incumbent, or Interrupted with none — and resume(None) must
-    // then finish at the exact DP optimum. Knapsack sized so 30 ms rarely
-    // finishes it. Promoted to the standard tier now that the panic is fixed,
-    // so the default (CI) run guards the fix.
+    // A mid-search time limit must return a clean status: Optimal if 30 ms
+    // suffices, Feasible with a valid incumbent, or Interrupted with none.
+    // `resume(None)` must then finish at the exact DP optimum. The knapsack is
+    // sized so the first slice normally interrupts, while remaining suitable
+    // for the default tier.
     cases.push(Case::custom(
         "milp/time-limit-interrupt",
         Tier::Medium,

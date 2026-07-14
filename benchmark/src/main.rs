@@ -522,8 +522,8 @@ fn parse_result_line(stdout: &str, solver: &str) -> Option<CaseResult> {
             s.parse::<f64>().ok()
         }
     };
-    // Fields 5 and 6 (microlp's node and simplex-iteration counts) are still
-    // emitted by children but not used by the report.
+    // Protocol fields 5 and 6 carry microlp's node and simplex-iteration
+    // counts; the report does not consume them.
     Some(CaseResult {
         solver: solver.to_string(),
         ms: opt_f64(f[1]),

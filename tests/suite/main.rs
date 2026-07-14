@@ -46,9 +46,8 @@ struct Options {
     full: bool,
     list: bool,
     timeout_scale: f64,
-    /// Hard upper bound, in seconds, on any single case's time budget,
-    /// applied AFTER `timeout_scale`. Lets CI run the full suite with a
-    /// guarantee that no single instance exceeds the cap.
+    /// Maximum time budget supplied to a case, applied after `timeout_scale`.
+    /// Custom cases are responsible for forwarding this budget to their solves.
     max_case_seconds: Option<f64>,
     parallel: usize,
 }

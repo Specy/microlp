@@ -100,8 +100,8 @@ mod tests_mip_api {
         // Negative/NaN tolerances make exact integers look fractional; a
         // tolerance of 0.5 or more can classify every real value as integral
         // and makes the rounding-based branch split skip part of the domain.
-        // Keep a node limit on each reproducer so the pre-fix behavior cannot
-        // generate unchanged branches indefinitely.
+        // The node limit bounds any accidental unchanged-branch loop while
+        // each invalid tolerance is being rejected.
         for int_tol in [-1.0, f64::NAN, 0.5, f64::INFINITY] {
             let mut p = Problem::new(OptimizationDirection::Minimize);
             p.add_integer_var(1.0, (0, 1));
@@ -180,8 +180,8 @@ mod tests_mip_api {
     #[test]
     fn rounded_node_candidate_does_not_bypass_its_subtree_proof() {
         // a >= 0.5 forces an ordinary root branch. In the feasible a=1
-        // child, the remaining relaxation is the near-integral trap from the
-        // root regression above. The child must branch on b rather than treat
+        // child, the remaining relaxation is the near-integral root fixture
+        // above. The child must branch on b rather than treat
         // the feasible rounded point as proof that its whole subtree is done.
         let mut p = Problem::new(OptimizationDirection::Minimize);
         let a = p.add_binary_var(0.0);
@@ -233,6 +233,26 @@ mod tests_mip_api {
         let interrupted = p.solve_with(options).unwrap();
         assert_eq!(interrupted.status(), Status::Interrupted);
         assert_eq!(interrupted.resume(None).unwrap_err(), Error::Infeasible);
+    }
+
+    #[test]
+    fn interrupted_unbounded_classification_uses_original_objective() {
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let x = p.add_integer_var(7.0, (0, 1));
+        let y = p.add_var(-1.0, (0.0, f64::INFINITY));
+        p.add_constraint(&[(x, 1.0)], ComparisonOp::Eq, 0.5);
+
+        let mut options = SolveOptions::default();
+        options.node_limit = Some(0);
+
+        let sol = p.solve_with(options).unwrap();
+        assert_eq!(sol.status(), Status::Interrupted);
+        assert!((sol.var_value_raw(x) - 0.5).abs() < 1e-9);
+        assert!(sol.var_value_raw(y).abs() < 1e-9);
+        let from_values = 7.0 * sol.var_value_raw(x) - sol.var_value_raw(y);
+        assert!((from_values - 3.5).abs() < 1e-9);
+        assert!((sol.objective() - from_values).abs() < 1e-9);
+        assert_eq!(sol.stats().nodes_solved, 0);
     }
 
     #[test]
@@ -303,6 +323,20 @@ mod tests_mip_api {
             assert_eq!(sol.status(), Status::Optimal);
             assert!((sol.objective() - 11.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn warm_start_nan_for_nonbasic_variable_is_ignored() {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_integer_var(1.0, (0, 10));
+        let mut options = SolveOptions::default();
+        options.warm_start = Some(vec![(x, f64::NAN)]);
+
+        let solution = problem.solve_with(options).unwrap();
+
+        assert_eq!(solution.status(), Status::Optimal);
+        assert_eq!(solution.var_value(x), 0.0);
+        assert_eq!(solution.objective(), 0.0);
     }
 
     #[test]

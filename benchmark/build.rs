@@ -1,9 +1,6 @@
-//! With the `scip` feature, the bundled SCIP links dynamically and its
-//! shared libraries live deep inside scip-sys's build output — the produced
-//! binary would silently fail to start without them. On Windows the loader
-//! searches the executable's directory, so the libraries are copied next to
-//! it; on unix an rpath is embedded instead. Either way,
-//! `cargo run -p microlp-benchmark` works with no manual PATH surgery.
+//! Make the bundled SCIP runtime discoverable by benchmark executables. Cargo
+//! supplies its library directory through `scip-sys` link metadata: Windows
+//! DLLs are copied next to the executable, while Unix targets receive an rpath.
 
 use std::path::{Path, PathBuf};
 
@@ -12,96 +9,91 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_SCIP").is_none() {
         return;
     }
+
+    let lib_dir = scip_lib_dir();
     let windows = std::env::var("CARGO_CFG_TARGET_FAMILY").as_deref() == Ok("windows");
+    if windows {
+        copy_windows_runtime(&lib_dir);
+    } else {
+        let linux_target = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux");
+        configure_unix_rpath(&lib_dir, linux_target);
+    }
+}
+
+fn scip_lib_dir() -> PathBuf {
+    println!("cargo:rerun-if-env-changed=DEP_SCIP_LIBDIR");
+    PathBuf::from(
+        std::env::var_os("DEP_SCIP_LIBDIR")
+            .expect("scip feature enabled but scip-sys did not provide DEP_SCIP_LIBDIR"),
+    )
+}
+
+fn copy_windows_runtime(lib_dir: &Path) {
+    let install = lib_dir.parent().unwrap_or_else(|| {
+        panic!(
+            "DEP_SCIP_LIBDIR has no installation parent: {}",
+            lib_dir.display()
+        )
+    });
+    let bin_dir = install.join("bin");
+    let dlls: Vec<PathBuf> = std::fs::read_dir(&bin_dir)
+        .unwrap_or_else(|error| {
+            panic!(
+                "cannot read SCIP runtime directory {}: {}",
+                bin_dir.display(),
+                error
+            )
+        })
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "dll"))
+        .collect();
+    assert!(
+        !dlls.is_empty(),
+        "DEP_SCIP_LIBDIR points to an installation without Windows DLLs: {}",
+        lib_dir.display()
+    );
+
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
-    // OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out; the executable
-    // directory is three levels up.
     let exe_dir = out_dir
         .ancestors()
         .nth(3)
         .expect("unexpected OUT_DIR layout")
         .to_path_buf();
-    let install = find_scip_install(&exe_dir.join("build"), windows).unwrap_or_else(|| {
-        panic!(
-            "the scip feature is enabled but no scip-sys-*/out/scip_install with libraries \
-             for this platform exists under {} — did the scip-sys build change its layout?",
-            exe_dir.join("build").display()
-        )
-    });
-
-    if windows {
-        let bin = install.join("bin");
-        for entry in std::fs::read_dir(&bin).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if !path.extension().is_some_and(|e| e == "dll") {
-                continue;
-            }
-            let dest = exe_dir.join(path.file_name().expect("file name"));
-            if let Err(e) = std::fs::copy(&path, &dest) {
-                // A locked destination usually means a previous (identical)
-                // copy is currently loaded by a running benchmark binary.
-                println!(
-                    "cargo:warning=could not copy {} next to the executable: {}",
-                    path.display(),
-                    e
-                );
-            }
+    for path in dlls {
+        let destination = exe_dir.join(path.file_name().expect("DLL has a file name"));
+        if let Err(error) = std::fs::copy(&path, &destination) {
+            // The destination can be locked while an identical benchmark binary
+            // is running; keep the existing runtime and surface the copy failure.
+            println!(
+                "cargo:warning=could not copy {} next to the executable: {}",
+                path.display(),
+                error
+            );
         }
-    } else {
-        println!(
-            "cargo:rustc-link-arg=-Wl,-rpath,{}",
-            install.join("lib").display()
-        );
-        // Emit classic DT_RPATH instead of DT_RUNPATH: RUNPATH only applies
-        // to the executable's *direct* dependencies, but SCIP's shared
-        // library has dependencies of its own living in the same directory
-        // (and, transitively, the Fortran runtime), which only RPATH lets
-        // the loader resolve from there.
-        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
     }
 }
 
-/// The scip_install directory of the most recently built scip-sys, found by
-/// scanning the profile's build directory (there is no DEP_ env var for it:
-/// scip-sys is not a direct dependency of this crate).
-///
-/// A candidate must carry the *current target's* library format: a Windows
-/// and a WSL/Linux build can share one target directory (a checkout under
-/// /mnt/c), leaving one scip_install per platform side by side, and picking
-/// by recency alone can then grab the wrong platform's libraries.
-fn find_scip_install(build_dir: &Path, windows: bool) -> Option<PathBuf> {
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in std::fs::read_dir(build_dir).ok()?.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with("scip-sys-") {
-            continue;
-        }
-        let install = entry.path().join("out").join("scip_install");
-        if !has_platform_libs(&install, windows) {
-            continue;
-        }
-        let modified = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
-            best = Some((modified, install));
-        }
-    }
-    best.map(|(_, path)| path)
-}
-
-fn has_platform_libs(install: &Path, windows: bool) -> bool {
-    let (dir, matches): (PathBuf, fn(&str) -> bool) = if windows {
-        (install.join("bin"), |name| name.ends_with(".dll"))
-    } else {
-        (install.join("lib"), |name| {
-            name.starts_with("libscip.so")
-                || (name.starts_with("libscip") && name.contains(".dylib"))
-        })
-    };
-    std::fs::read_dir(dir)
+fn configure_unix_rpath(lib_dir: &Path, linux_target: bool) {
+    let has_scip = std::fs::read_dir(lib_dir)
         .into_iter()
         .flatten()
         .flatten()
-        .any(|e| matches(&e.file_name().to_string_lossy()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .any(|name| {
+            name.starts_with("libscip.so")
+                || (name.starts_with("libscip") && name.contains(".dylib"))
+        });
+    assert!(
+        has_scip,
+        "DEP_SCIP_LIBDIR contains no SCIP shared library: {}",
+        lib_dir.display()
+    );
+
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+    if linux_target {
+        // SCIP's shared library has runtime dependencies in the same directory.
+        // Classic DT_RPATH applies transitively, unlike DT_RUNPATH.
+        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
+    }
 }

@@ -18,12 +18,11 @@ type CsMat = sprs::CsMatI<f64, usize>;
 /// steps, reduced-cost optimality checks, bound-violation candidacy, and
 /// `float_eq`.
 ///
-/// Deliberately tight (upstream minilp uses `1e-8`); the whole correctness
-/// suite — including the big-M models, whose branch & bound relies on node
-/// LPs resolving basic integer values sharply onto their bounds — is
-/// calibrated against this value. Loosening it (globally or just for
-/// bound-violation candidacy) lets basic values legally sit ~1e-8 off their
-/// bounds, which 1e9-scale big-M rows amplify past the MIP layer's
+/// Deliberately tight because the big-M correctness models rely on node LPs
+/// resolving basic integer values sharply onto their bounds. Loosening it
+/// (globally or just for bound-violation candidacy) lets basic values sit
+/// about `1e-8` away from their bounds, which 1e9-scale big-M rows amplify
+/// past the MIP layer's
 /// rounded-incumbent feasibility guard and the branch-and-bound tree
 /// explodes. The flip side of running this tight — round-off noise being
 /// promoted into phantom infeasibilities — is handled where it bites, by
@@ -70,6 +69,55 @@ fn equilibration_scale(coeffs: &CsVec, rhs: f64) -> f64 {
     } else {
         1.0
     }
+}
+
+/// A non-empty constraint row in the exact representation consumed by the
+/// simplex engine. Structural coefficients and the right-hand side share the
+/// same power-of-two scale; the slack coefficient remains one.
+struct PreparedRow {
+    coeffs: CsVec,
+    rhs: f64,
+    row_scale: f64,
+    slack_var_min: f64,
+    slack_var_max: f64,
+}
+
+/// Validate empty-row semantics and prepare one retained row for storage.
+/// `None` denotes a tautology that does not need a slack variable.
+fn prepare_row(
+    mut coeffs: CsVec,
+    cmp_op: ComparisonOp,
+    rhs: f64,
+) -> Result<Option<PreparedRow>, Error> {
+    if coeffs.indices().is_empty() {
+        let tautological = match cmp_op {
+            ComparisonOp::Eq => float_eq(rhs, 0.0),
+            ComparisonOp::Le => 0.0 <= rhs,
+            ComparisonOp::Ge => 0.0 >= rhs,
+        };
+        return if tautological {
+            Ok(None)
+        } else {
+            Err(Error::Infeasible)
+        };
+    }
+
+    let row_scale = equilibration_scale(&coeffs, rhs);
+    if row_scale != 1.0 {
+        coeffs.map_inplace(|coeff| coeff * row_scale);
+    }
+    let (slack_var_min, slack_var_max) = match cmp_op {
+        ComparisonOp::Le => (0.0, f64::INFINITY),
+        ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
+        ComparisonOp::Eq => (0.0, 0.0),
+    };
+    Ok(Some(PreparedRow {
+        coeffs,
+        rhs: rhs * row_scale,
+        row_scale,
+        slack_var_min,
+        slack_var_max,
+    }))
 }
 
 pub(crate) fn float_eq(a: f64, b: f64) -> bool {
@@ -301,40 +349,20 @@ impl Solver {
         let mut basic_var_maxs = vec![];
 
         for (coeffs, cmp_op, rhs) in constraints {
-            let mut coeffs = coeffs.clone();
-            // Equilibrate every row (LP and MIP alike): scaling each row by an
-            // exact power of two keeps equivalent rows at very different scales
-            // from producing tableau coefficients below the pivot threshold,
-            // which would otherwise mis-declare a feasible model infeasible.
-            let row_scale = equilibration_scale(&coeffs, *rhs);
-            if row_scale != 1.0 {
-                coeffs.map_inplace(|coeff| coeff * row_scale);
-            }
-            let rhs = *rhs * row_scale;
-
-            if coeffs.indices().is_empty() {
-                let is_tautological = match cmp_op {
-                    ComparisonOp::Eq => float_eq(rhs, 0.0),
-                    ComparisonOp::Le => 0.0 <= rhs,
-                    ComparisonOp::Ge => 0.0 >= rhs,
-                };
-
-                if is_tautological {
-                    continue;
-                } else {
-                    return Err(Error::Infeasible);
-                }
-            }
+            let Some(PreparedRow {
+                coeffs,
+                rhs,
+                row_scale,
+                slack_var_min,
+                slack_var_max,
+            }) = prepare_row(coeffs.clone(), *cmp_op, *rhs)?
+            else {
+                continue;
+            };
 
             constraint_coeffs.push(coeffs.clone());
             orig_rhs.push(rhs);
             row_scales.push(row_scale);
-
-            let (slack_var_min, slack_var_max) = match cmp_op {
-                ComparisonOp::Le => (0.0, f64::INFINITY),
-                ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
-                ComparisonOp::Eq => (0.0, 0.0),
-            };
 
             orig_var_mins.push(slack_var_min);
             orig_var_maxs.push(slack_var_max);
@@ -521,6 +549,9 @@ impl Solver {
                     lhs += coeff * values[v];
                 }
             }
+            if !lhs.is_finite() {
+                return false;
+            }
             let slack = self.num_vars + r;
             let (smin, smax) = (self.orig_var_mins[slack], self.orig_var_maxs[slack]);
             let lo = if smax.is_finite() {
@@ -557,9 +588,10 @@ impl Solver {
 
     /// Change a variable's bounds in place. Records the new bounds and repairs the
     /// invariants that depend on them; does NOT run simplex — call [`Self::reoptimize`]
-    /// afterwards. Returns `Err(Infeasible)` (state untouched) if `min > max`.
+    /// afterwards. Returns `Err(Infeasible)` with state untouched if either bound
+    /// is NaN or `min > max`.
     pub(crate) fn set_var_bounds(&mut self, var: usize, min: f64, max: f64) -> Result<(), Error> {
-        if min > max {
+        if min.is_nan() || max.is_nan() || min > max {
             return Err(Error::Infeasible);
         }
         self.orig_var_mins[var] = min;
@@ -666,7 +698,7 @@ impl Solver {
     /// Rebuild the solver state from a basis snapshot and the CURRENT variable bounds:
     /// non-basic values come from statuses + bounds, basic values and reduced costs are
     /// recomputed from scratch, and the LU factorization is rebuilt. Feasibility flags
-    /// are recomputed honestly, so half-pivoted pre-load state is fully discarded.
+    /// are recomputed honestly, so any partially rebuilt pre-load state is discarded.
     ///
     /// Statuses are interpreted against the CURRENT bounds: a status referring to a
     /// bound that has since moved or become infinite is remapped to the nearest finite
@@ -964,39 +996,25 @@ impl Solver {
 
     pub(crate) fn add_constraint(
         &mut self,
-        mut coeffs: CsVec,
+        coeffs: CsVec,
         cmp_op: ComparisonOp,
         rhs: f64,
     ) -> Result<StopReason, Error> {
         assert!(self.is_primal_feasible);
         assert!(self.is_dual_feasible);
 
-        if coeffs.indices().is_empty() {
-            let is_tautological = match cmp_op {
-                ComparisonOp::Eq => float_eq(rhs, 0.0),
-                ComparisonOp::Le => 0.0 <= rhs,
-                ComparisonOp::Ge => 0.0 >= rhs,
-            };
-
-            return if is_tautological {
-                Ok(StopReason::Finished)
-            } else {
-                Err(Error::Infeasible)
-            };
-        }
-
-        let row_scale = equilibration_scale(&coeffs, rhs);
-        if row_scale != 1.0 {
-            coeffs.map_inplace(|coeff| coeff * row_scale);
-        }
-        let rhs = rhs * row_scale;
+        let Some(PreparedRow {
+            mut coeffs,
+            rhs,
+            row_scale,
+            slack_var_min,
+            slack_var_max,
+        }) = prepare_row(coeffs, cmp_op, rhs)?
+        else {
+            return Ok(StopReason::Finished);
+        };
 
         let slack_var = self.num_total_vars();
-        let (slack_var_min, slack_var_max) = match cmp_op {
-            ComparisonOp::Le => (0.0, f64::INFINITY),
-            ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
-            ComparisonOp::Eq => (0.0, 0.0),
-        };
 
         self.orig_obj_coeffs.push(0.0);
         self.orig_var_mins.push(slack_var_min);
@@ -1621,9 +1639,8 @@ impl Solver {
             }
         }
 
-        // Etas are applied to the dense solve directly — a pending eta file
-        // is NOT a reason to refactorize (it used to be, and on node-heavy
-        // MILP solves that meant a full refactorization every recalc).
+        // Etas are applied to the dense solve directly; a pending eta file
+        // does not require a full basis refactorization.
         self.basis_solver.solve_dense_with_etas(&mut cur_vals);
         self.basic_var_vals = cur_vals;
         Ok(())
@@ -1911,11 +1928,9 @@ mod tests {
         assert_eq!(sol.cur_obj_val, 0.0);
     }
 
-    /// The recalcs apply pending etas to their dense solves instead of
-    /// refactorizing (they used to reset the whole factorization). The
-    /// eta-aware results must match what a FRESH factorization of the same
-    /// basis computes; values are compared per-VAR because a reload
-    /// re-orders basis positions.
+    /// Dense recalculations with pending etas must match a fresh factorization
+    /// of the same basis. Values are compared per variable because reloading
+    /// may reorder basis positions.
     #[test]
     fn recalcs_with_pending_etas_match_a_fresh_factorization() {
         init();
@@ -1940,7 +1955,7 @@ mod tests {
         assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
         assert!(
             solver.basis_solver.eta_matrices.len() > 0,
-            "fixture must leave etas pending to exercise the new path"
+            "fixture must leave etas pending to exercise eta-aware recalculation"
         );
 
         // Recalculate through the eta-aware dense solves.
@@ -2160,17 +2175,56 @@ mod tests {
     }
 
     #[test]
+    fn set_var_bounds_nan_is_infeasible_and_leaves_state_untouched() {
+        let mut original =
+            Solver::try_new(&[1.0], &[0.0], &[10.0], &[], &[VarDomain::Real], None).unwrap();
+        assert_eq!(original.initial_solve().unwrap(), StopReason::Finished);
+
+        for (min, max) in [(f64::NAN, 10.0), (0.0, f64::NAN)] {
+            let mut solver = original.clone();
+            let bounds_before = solver.get_var_bounds(0);
+            let value_before = *solver.get_value(0);
+            let objective_before = solver.cur_obj_val;
+            let primal_before = solver.is_primal_feasible;
+            let dual_before = solver.is_dual_feasible;
+
+            assert_eq!(solver.set_var_bounds(0, min, max), Err(Error::Infeasible));
+            assert_eq!(solver.get_var_bounds(0), bounds_before);
+            assert_eq!(*solver.get_value(0), value_before);
+            assert_eq!(solver.cur_obj_val, objective_before);
+            assert_eq!(solver.is_primal_feasible, primal_before);
+            assert_eq!(solver.is_dual_feasible, dual_before);
+        }
+
+        let mut solver = original;
+        assert_eq!(
+            solver.set_var_bounds(0, f64::NEG_INFINITY, f64::INFINITY),
+            Ok(())
+        );
+        assert_eq!(solver.get_var_bounds(0), (f64::NEG_INFINITY, f64::INFINITY));
+    }
+
+    #[test]
+    fn check_constraints_rejects_non_finite_activity() {
+        let solver = Solver::try_new(
+            &[0.0],
+            &[0.0],
+            &[f64::INFINITY],
+            &[(to_sparse(&[1.0e308]), ComparisonOp::Eq, f64::INFINITY)],
+            &[VarDomain::Real],
+            None,
+        )
+        .unwrap();
+
+        assert!(!solver.check_constraints(&[1.0e308], 1.0e-7));
+    }
+
+    #[test]
     fn basis_snapshot_load_roundtrip() {
         init();
-        // NOTE: deviates from the task brief's literal fixture, which used obj [2.0, 1.0]
-        // with var 0 in (-inf, 0] and var 1 in [5, inf) under x+y<=6, x+2y<=8. That LP is
-        // unbounded (fix y at its min of 5: both constraints reduce to upper bounds on x,
-        // and x has no lower bound, so x -> -inf drives 2x+y -> -inf), so
-        // `initial_solve().unwrap()` panics with `Unbounded` before any basis code runs —
-        // confirmed empirically and by hand. Swapped in the fixture from the adjacent
-        // `initial_solve` test below (proven feasible+bounded, obj -68.0 at x=12, y=8,
-        // with both structural vars basic and both slacks non-basic), so the round trip
-        // exercises a non-trivial basis that actually differs from the slack basis.
+        // This bounded fixture has objective -68 at (12, 8), with both
+        // structural variables basic and both slacks non-basic. Its basis is
+        // therefore non-trivial and differs from the slack basis.
         let mut solver = Solver::try_new(
             &[-3.0, -4.0],
             &[f64::NEG_INFINITY, 5.0],
