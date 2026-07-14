@@ -48,6 +48,21 @@ pub(crate) const DEADLINE_CHECK_INTERVAL: u64 = 1000;
 /// rounding error through a poorly-conditioned pivot).
 pub(crate) const LU_STABILITY_THRESHOLD: f64 = 0.1;
 
+/// A variable bound whose magnitude is at least this large is treated as
+/// infinite when choosing a non-basic variable's INITIAL value (see
+/// [`initial_nonbasic_value`]). Seeding a non-basic variable *at* such a bound
+/// floods the tableau with a value that swamps the actual problem data — the
+/// rhs and structural coefficients lose all significance against it and the
+/// solve converges to a wrong vertex or NaN. This is issue #3: `f64::MAX`,
+/// `f32::MAX` and `i64::MAX` upper bounds produced non-optimal answers where
+/// `f64::INFINITY` did not, because only the latter skipped the seed-at-bound
+/// step. 2^52 is the largest f64 whose unit (`1.0`) is still exactly
+/// representable; beyond it a finite bound is numerically a stand-in for
+/// infinity, so we seed as if it were infinite. The true bound is left
+/// untouched in `orig_var_mins`/`orig_var_maxs`, so the ratio test still
+/// honours it exactly — only the starting vertex changes.
+const SEED_AS_INFINITE: f64 = 4_503_599_627_370_496.0; // 2^52
+
 /// Power-of-two row equilibration keeps the largest structural coefficient
 /// near one without rounding its mantissa. If scaling would overflow the RHS,
 /// leave the row unchanged and let the solver report any resulting numerical
@@ -123,8 +138,51 @@ fn prepare_row(
 pub(crate) fn float_eq(a: f64, b: f64) -> bool {
     (a - b).abs() < EPS
 }
-pub(crate) fn float_ne(a: f64, b: f64) -> bool {
-    !float_eq(a, b)
+
+/// Initial value for a non-basic structural variable, preferring the bound that
+/// keeps its reduced cost dual-feasible. Returns `(value, dual_feasible)`, where
+/// `dual_feasible` is false when no finite bound can satisfy dual feasibility (a
+/// free variable, or a variable unbounded on the side its objective coefficient
+/// pushes toward). Callers handle a fixed variable (`min == max`) separately.
+///
+/// A bound at or beyond [`SEED_AS_INFINITE`] is treated as infinite here so that
+/// a huge finite bound is never used as the seed value (issue #3); the caller's
+/// stored bounds are left untouched, so the ratio test still honours them.
+fn initial_nonbasic_value(obj_coeff: f64, min: f64, max: f64) -> (f64, bool) {
+    let min = if min <= -SEED_AS_INFINITE {
+        f64::NEG_INFINITY
+    } else {
+        min
+    };
+    let max = if max >= SEED_AS_INFINITE {
+        f64::INFINITY
+    } else {
+        max
+    };
+
+    if min.is_infinite() && max.is_infinite() {
+        // Free variable: dual-feasible only if the objective coefficient is zero.
+        (0.0, float_eq(obj_coeff, 0.0))
+    } else if obj_coeff > 0.0 {
+        // Prefer the lower bound; fall back to the upper if the lower is infinite.
+        if min.is_finite() {
+            (min, true)
+        } else {
+            (max, false)
+        }
+    } else if obj_coeff < 0.0 {
+        // Prefer the upper bound; fall back to the lower if the upper is infinite.
+        if max.is_finite() {
+            (max, true)
+        } else {
+            (min, false)
+        }
+    } else if min.is_finite() {
+        // Zero objective coefficient: any finite bound is dual-feasible.
+        (min, true)
+    } else {
+        (max, true)
+    }
 }
 
 #[inline]
@@ -294,40 +352,17 @@ impl Solver {
             var_states.push(VarState::NonBasic(nb_vars.len()));
             nb_vars.push(v);
 
-            // Try to choose values to achieve dual feasibility.
-            let init_val = if float_eq(min, max) {
-                // Fixed variable, the obj. coeff doesn't matter.
-                min
-            } else if min.is_infinite() && max.is_infinite() {
-                // Free variable, if we are lucky and obj. coeff is zero, then dual-feasible.
-                if float_ne(obj_coeffs[v], 0.0) {
-                    //TODO should this use float_eq?
-                    is_dual_feasible = false;
-                }
-                0.0
-            } else if obj_coeffs[v] > 0.0 {
-                // We need a finite value and prefer min for dual feasibility.
-                if min.is_finite() {
-                    min
-                } else {
-                    is_dual_feasible = false;
-                    max
-                }
-            } else if obj_coeffs[v] < 0.0 {
-                // We need a finite value and prefer max for dual feasibility.
-                if max.is_finite() {
-                    max
-                } else {
-                    is_dual_feasible = false;
-                    min
-                }
-            } else if min.is_finite() {
-                // Obj. coeff is zero, just take any finite value,
-                // dual feasibility will be satisfied.
-                min
+            // Choose an initial value, preferring a bound that keeps this
+            // variable's reduced cost dual-feasible.
+            let (init_val, var_dual_feasible) = if float_eq(min, max) {
+                // Fixed variable: the obj. coeff doesn't matter.
+                (min, true)
             } else {
-                max
+                initial_nonbasic_value(obj_coeffs[v], min, max)
             };
+            if !var_dual_feasible {
+                is_dual_feasible = false;
+            }
 
             nb_var_vals.push(init_val);
             obj_val += init_val * obj_coeffs[v];

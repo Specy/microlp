@@ -8,6 +8,6 @@ mod tsp;
 
 mod resume;
 
-mod broken_tests;
+mod regressions;
 
 mod mip_api;
