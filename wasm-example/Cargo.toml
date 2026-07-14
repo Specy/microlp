@@ -1,0 +1,21 @@
+[package]
+name = "microlp-wasm-example"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+microlp = { path = ".." }
+wasm-bindgen = "0.2"
+
+# Standalone crate: deliberately NOT a member of the microlp workspace, so a
+# plain `cargo build` at the repo root never pulls in wasm-bindgen. Build it on
+# its own with wasm-pack (see README.md).
+[workspace]
+
+[profile.release]
+# Smaller wasm output for an example binary.
+opt-level = "s"

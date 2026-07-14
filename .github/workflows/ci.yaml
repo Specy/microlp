@@ -127,9 +127,64 @@ jobs:
           command: test
           args: --locked --lib
 
+  wasm:
+    name: WASM
+    runs-on: "ubuntu-latest"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Cache Rust
+        uses: actions/cache@v3
+        with:
+          key: ${{ runner.os }}-wasm-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          override: true
+
+      # Compile guard: the library must build for wasm on its own. It can because
+      # it reads the clock from `web-time`, not `std::time::Instant` (which panics
+      # on wasm32-unknown-unknown). Library only: dev-dependencies and the
+      # benchmark crate stay native.
+      - name: Build library for wasm32-unknown-unknown
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --locked --release --lib --target wasm32-unknown-unknown
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      # Runtime guard: build the example to wasm and actually solve an LP and a
+      # MILP under Node. Each solve sets a time limit, so this exercises the
+      # web-time clock at runtime — catching a `std::time::Instant` regression
+      # that the compile step above cannot (it compiles fine, then panics).
+      - name: Run the wasm example under Node
+        working-directory: wasm-example
+        run: |
+          wasm-pack build --target nodejs
+          node test.js
+
   publish-crate:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [conformance, test]
+    needs: [conformance, test, wasm]
 
     name: Publish to Crates.io
     runs-on: "ubuntu-latest"
