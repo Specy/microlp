@@ -18,6 +18,14 @@ exclude = ["tests/suite/data", "benchmark", "BENCHMARK.md"]
 sprs = { version = "0.11.4", default-features = false }
 log = "0.4.33"
 web-time = "1.1.0"
+# Optional, off by default: only built for `cargo test --features highs`, which
+# turns on the suite's HiGHS cross-checks. Building it needs a C++ toolchain and
+# CMake, so plain `cargo test` and downstream consumers never pull it in.
+highs = { version = "2.4.0", optional = true }
+
+[features]
+# Cross-validate suite results against HiGHS (see the optional `highs` dep).
+highs = ["dep:highs"]
 
 [dev-dependencies]
 rand = "0.10.2"
@@ -29,8 +37,10 @@ flate2 = "1.1.9"
 bit-set = { version = "0.11.1", default-features = false }
 
 # The benchmark harness lives in its own workspace member so that its solver
-# dependencies (HiGHS and friends) never enter the library's dependency graph,
-# its dev-dependencies, or plain `cargo test` builds.
+# dependencies (SCIP, Clarabel, and friends) never enter the library's
+# dependency graph, its dev-dependencies, or plain `cargo test` builds. HiGHS is
+# additionally exposed as the optional, non-default `highs` feature above so the
+# suite can cross-check against it on demand; it is never built unless enabled.
 [workspace]
 members = ["benchmark"]
 

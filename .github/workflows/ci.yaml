@@ -109,11 +109,15 @@ jobs:
       # (MILPBench instances beyond the solver's ceiling, 10-minute budgets)
       # stays manual: run it locally with
       # `cargo test --release --test suite -- --xhard`.
+      # On Linux, additionally cross-check every result against HiGHS via
+      # `--features highs`. The grounding is OS-independent, so it runs on one
+      # runner only; building HiGHS needs CMake and a C++ compiler, both
+      # preinstalled on ubuntu-latest.
       - name: Correctness suite
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --release --test suite -- --hard --parallel 4 --max-case-seconds 300
+          args: --release --test suite ${{ matrix.os == 'ubuntu-latest' && '--features highs' || '' }} -- --hard --parallel 4 --max-case-seconds 300
 
       - name: Test Rust with traces
         uses: actions-rs/cargo@v1
