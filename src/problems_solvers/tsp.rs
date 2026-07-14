@@ -256,7 +256,6 @@ impl Tour {
             .collect::<Vec<_>>()
             .join(" ")
     }
-
 }
 
 /// Find all subtours in an integer solution. Each subtour is a vector of node indices
