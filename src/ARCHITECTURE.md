@@ -84,6 +84,15 @@ Two normalizations happen at the boundary and hold everywhere inside:
   ("total vars"), and every constraint is an equality against the basis matrix. A row's
   original sense is recoverable from its slack's bounds — `Solver::check_constraints`
   exploits exactly this.
+- **Rows are equilibrated by powers of two.** Before the simplex engine sees a model, each
+  non-empty row is multiplied by an exact power-of-two factor that brings its largest
+  structural coefficient near one. This prevents equivalent rows at `1e-6` and `1e6` scales
+  from producing structurally necessary tableau coefficients below the absolute pivot
+  threshold, which would otherwise mis-declare a feasible model infeasible.
+  `Solver::check_constraints` multiplies the caller's absolute feasibility tolerance by the
+  same per-row factor, so the user-space acceptance contract is unchanged. Pure-LP and MIP
+  models are equilibrated alike (the exactness of power-of-two scaling means the reported
+  optimum is unaffected; only internal conditioning improves).
 
 ---
 
@@ -451,8 +460,7 @@ match sol.status() {
 Reading values: `var_value` rounds integer variables (and asserts the stored value was
 already integral-clean — a failed assert means a solver bug, not user error);
 `var_value_raw`/`iter`/indexing return the stored values — for MILP those are the
-incumbent's already-rounded values, for LP the live basis values. `add_gomory_cut` remains
-an LP-only tool (it reads live tableau rows).
+incumbent's already-rounded values, for LP the live basis values.
 
 ---
 
@@ -566,10 +574,10 @@ error, but proving optimality there needs the phase-4 items below.
 
 ## 11. Extension points (rough order of payoff)
 
-- **Cutting planes inside the tree.** Gomory cuts exist as a user API but are not used
-  during B&B. Root-node cut rounds (cut-and-branch) are the classic next multiplier on the
-  graph-structured instances above. The architecture supports it: cuts are rows added to the
-  base problem before the tree starts (NOT during — node bounds assume a fixed row set).
+- **Cutting planes.** microlp generates no cutting planes today. Root-node cut rounds
+  (cut-and-branch) are the classic next multiplier on the graph-structured instances above.
+  The architecture supports it: cuts are rows added to the base problem before the tree
+  starts (NOT during — node bounds assume a fixed row set).
 - **Primal heuristics.** Rounding + diving heuristics produce early incumbents → earlier
   pruning. `try_adopt_incumbent(state, true)` is the safe funnel for any candidate a
   heuristic produces.

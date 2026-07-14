@@ -180,31 +180,6 @@ mod tests_general {
         }
     }
 
-    #[test]
-    fn gomory_cut() {
-        init();
-        let mut problem = Problem::new(OptimizationDirection::Minimize);
-        let v1 = problem.add_var(0.0, (0.0, f64::INFINITY));
-        let v2 = problem.add_var(-1.0, (0.0, f64::INFINITY));
-        problem.add_constraint([(v1, 3.0), (v2, 2.0)], ComparisonOp::Le, 6.0);
-        problem.add_constraint([(v1, -3.0), (v2, 2.0)], ComparisonOp::Le, 0.0);
-
-        let mut sol = problem.solve().unwrap();
-        assert_eq!(sol[v1], 1.0);
-        assert_eq!(sol[v2], 1.5);
-        assert_eq!(sol.objective(), -1.5);
-
-        sol = sol.add_gomory_cut(v2).unwrap();
-        assert!(f64::abs(sol[v1] - 2.0 / 3.0) < 1e-8);
-        assert_eq!(sol[v2], 1.0);
-        assert_eq!(sol.objective(), -1.0);
-
-        sol = sol.add_gomory_cut(v1).unwrap();
-        assert!(f64::abs(sol[v1] - 1.0) < 1e-8);
-        assert_eq!(sol[v2], 1.0);
-        assert_eq!(sol.objective(), -1.0);
-    }
-
     fn cast_result_to_integers(vec: Vec<f64>) -> Vec<i64> {
         vec.into_iter()
             .map(|x| {

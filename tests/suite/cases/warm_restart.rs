@@ -260,6 +260,7 @@ const MAX_ROUNDS: u32 = 40;
 pub fn register(cases: &mut Vec<Case>) {
     warm_restart_time_cases(cases);
     nodelimit_step_cases(cases);
+    mwis_warm_start_cases(cases);
 }
 
 fn warm_restart_time_cases(cases: &mut Vec<Case>) {
@@ -380,4 +381,242 @@ fn nodelimit_step_cases(cases: &mut Vec<Case>) {
             Ok(())
         },
     ));
+}
+
+// ----------------------------------------------------------------- MWIS helpers
+
+mod mwis {
+    use super::Rng;
+    use bit_set::BitSet;
+    use microlp::{
+        ComparisonOp::Le, OptimizationDirection::Maximize, Problem, SolveOptions, Status, Variable,
+    };
+
+    pub type Node = usize;
+    pub type Edge = (Node, Node);
+
+    #[derive(Debug, Clone)]
+    pub struct Graph {
+        neighborhoods: Vec<BitSet>,
+    }
+
+    impl Graph {
+        pub fn new(size: usize) -> Self {
+            Self {
+                neighborhoods: vec![BitSet::with_capacity(size); size],
+            }
+        }
+
+        pub fn size(&self) -> usize {
+            self.neighborhoods.len()
+        }
+
+        pub fn neighbors(&self, v: Node) -> &BitSet {
+            &self.neighborhoods[v]
+        }
+
+        pub fn edges(&self) -> impl Iterator<Item = Edge> + '_ {
+            self.neighborhoods
+                .iter()
+                .enumerate()
+                .flat_map(|(v, neighbors)| neighbors.iter().map(move |w: usize| (v, w)))
+                .filter(|(v, w)| v < w)
+        }
+
+        pub fn insert_edge(&mut self, v: Node, w: Node) {
+            self.neighborhoods[v].insert(w);
+            self.neighborhoods[w].insert(v);
+        }
+    }
+
+    pub fn is_independent_set(graph: &Graph, set: &BitSet) -> bool {
+        set.iter()
+            .all(|v| graph.neighbors(v).intersection(set).count() == 0)
+    }
+
+    /// Build a random maximal independent set by scanning nodes in a random
+    /// permutation: add a node if none of its neighbors were already selected.
+    pub fn random_independent_set(graph: &Graph, rng: &mut Rng) -> BitSet {
+        let n = graph.size();
+        let mut perm: Vec<usize> = (0..n).collect();
+        rng.shuffle(&mut perm);
+        let mut choosable: BitSet = (0..n).collect();
+        let mut selected = BitSet::new();
+        for node in perm {
+            if !choosable.contains(node) {
+                continue;
+            }
+            choosable.remove(node);
+            selected.insert(node);
+            choosable.difference_with(graph.neighbors(node));
+        }
+        selected
+    }
+
+    /// Build an Erdős–Rényi random graph: each edge appears independently with
+    /// probability `edge_pct / 100`.
+    pub fn random_graph(size: usize, edge_pct: u32, rng: &mut Rng) -> Graph {
+        let mut graph = Graph::new(size);
+        for v in 0..size {
+            for w in v + 1..size {
+                if rng.int(0, 99) < edge_pct as i64 {
+                    graph.insert_edge(v, w);
+                }
+            }
+        }
+        graph
+    }
+
+    /// Solve MWIS with microlp, optionally warm-starting from `hint`.
+    /// Returns (selected set, optimal objective) on success.
+    pub fn solve_microlp(
+        graph: &Graph,
+        valuation: &[f64],
+        hint: Option<&BitSet>,
+    ) -> Result<(BitSet, f64), String> {
+        let mut problem = Problem::new(Maximize);
+        let vars: Vec<Variable> = (0..graph.size())
+            .map(|v| problem.add_binary_var(valuation[v]))
+            .collect();
+        for (v, w) in graph.edges() {
+            problem.add_constraint(&[(vars[v], 1.0), (vars[w], 1.0)], Le, 1.0);
+        }
+        let mut opts = SolveOptions::default();
+        opts.warm_start = hint.map(|set| {
+            (0..graph.size())
+                .map(|v| (vars[v], if set.contains(v) { 1.0 } else { 0.0 }))
+                .collect()
+        });
+        let sol = problem
+            .solve_with(opts)
+            .map_err(|e| format!("microlp MWIS solve failed: {}", e))?;
+        match sol.status() {
+            Status::Optimal => {}
+            s => {
+                return Err(format!(
+                    "microlp MWIS did not reach Optimal (status: {:?})",
+                    s
+                ))
+            }
+        }
+        let selected: BitSet = (0..graph.size()).filter(|&v| sol[vars[v]] > 0.5).collect();
+        Ok((selected, sol.objective()))
+    }
+
+    /// Solve MWIS with HiGHS and return its optimal objective.
+    #[cfg(feature = "highs")]
+    pub fn solve_highs(graph: &Graph, valuation: &[f64]) -> Result<f64, String> {
+        let mut pb = highs::RowProblem::default();
+        let cols: Vec<highs::Col> = (0..graph.size())
+            .map(|v| pb.add_integer_column(valuation[v], 0.0..=1.0))
+            .collect();
+        for (v, w) in graph.edges() {
+            pb.add_row(..=1.0_f64, vec![(cols[v], 1.0), (cols[w], 1.0)]);
+        }
+        let mut model = pb.optimise(highs::Sense::Maximise);
+        model.set_option("output_flag", false);
+        let solved = model.solve();
+        match solved.status() {
+            highs::HighsModelStatus::Optimal => {
+                let values = solved.get_solution().columns().to_vec();
+                let obj: f64 = (0..graph.size()).map(|v| valuation[v] * values[v]).sum();
+                Ok(obj)
+            }
+            s => Err(format!("HiGHS MWIS returned status {:?}", s)),
+        }
+    }
+}
+
+// ------------------------------------------------------- MWIS warm-start cases
+
+fn mwis_warm_start_cases(cases: &mut Vec<Case>) {
+    // Three reproducible instances at different sizes and densities. Each
+    // case runs two (valuation, hint) pairs. Per pair:
+    //   1. Generate a random independent set as the warm-start hint.
+    //   2. Solve cold (no hint) and warm (arbitrary hint) — both to Optimal.
+    //   3. Assert the returned sets are independent and that their reported
+    //      objectives match the recomputed sums over the valuation.
+    //   4. Assert cold and warm agree on the optimal objective value.
+    //   5. Cross-validate against HiGHS when built with --features highs.
+    for (seed, n, edge_pct, tier, budget) in [
+        (0xABCD_u64, 100_usize, 5_u32, Tier::Medium, 30_u64),
+        (0x1234_u64, 100_usize, 15_u32, Tier::Medium, 30_u64),
+        (0xDEAD_u64, 100_usize, 25_u32, Tier::Hard, 90_u64),
+        (0xBEEF_u64, 100_usize, 50_u32, Tier::Hard, 90_u64),
+    ] {
+        let name = format!("milp/mwis-warm-start-n{}-s{:x}", n, seed);
+        cases.push(Case::custom(name, tier, budget, move |_budget| {
+            let mut rng = Rng::new(seed);
+            let graph = mwis::random_graph(n, edge_pct, &mut rng);
+
+            for pair in 0..2_u32 {
+                let valuation: Vec<f64> = (0..n).map(|_| rng.int(1, 100) as f64).collect();
+                let hint = mwis::random_independent_set(&graph, &mut rng);
+
+                if !mwis::is_independent_set(&graph, &hint) {
+                    return Err(format!(
+                        "pair {}: random_independent_set produced a non-independent set",
+                        pair
+                    ));
+                }
+
+                // Cold solve — no warm-start hint.
+                let (cold_set, cold_obj) = mwis::solve_microlp(&graph, &valuation, None)?;
+                if !mwis::is_independent_set(&graph, &cold_set) {
+                    return Err(format!(
+                        "pair {}: cold solve returned a non-independent set",
+                        pair
+                    ));
+                }
+                let cold_recomputed: f64 = cold_set.iter().map(|v| valuation[v]).sum();
+                if (cold_obj - cold_recomputed).abs() > 1e-6 {
+                    return Err(format!(
+                        "pair {}: cold objective {:.6} != recomputed sum {:.6}",
+                        pair, cold_obj, cold_recomputed
+                    ));
+                }
+
+                // Warm solve — arbitrary independent set as hint.
+                let (warm_set, warm_obj) = mwis::solve_microlp(&graph, &valuation, Some(&hint))?;
+                if !mwis::is_independent_set(&graph, &warm_set) {
+                    return Err(format!(
+                        "pair {}: warm solve returned a non-independent set",
+                        pair
+                    ));
+                }
+                let warm_recomputed: f64 = warm_set.iter().map(|v| valuation[v]).sum();
+                if (warm_obj - warm_recomputed).abs() > 1e-6 {
+                    return Err(format!(
+                        "pair {}: warm objective {:.6} != recomputed sum {:.6}",
+                        pair, warm_obj, warm_recomputed
+                    ));
+                }
+
+                // Both solves must agree on the optimum.
+                if (cold_obj - warm_obj).abs() > 1e-4 {
+                    return Err(format!(
+                        "pair {}: cold {:.6} != warm {:.6} — \
+                         warm start produced a different optimum (solver bug)",
+                        pair, cold_obj, warm_obj
+                    ));
+                }
+
+                // Cross-validate against HiGHS when compiled in.
+                #[cfg(feature = "highs")]
+                {
+                    let highs_obj = mwis::solve_highs(&graph, &valuation)?;
+                    if (cold_obj - highs_obj).abs() > 1e-4 {
+                        return Err(format!(
+                            "pair {}: microlp {:.6} != HiGHS {:.6} (diff {:.3e})",
+                            pair,
+                            cold_obj,
+                            highs_obj,
+                            (cold_obj - highs_obj).abs()
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }));
+    }
 }

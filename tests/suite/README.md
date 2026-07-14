@@ -96,7 +96,7 @@ Each case runs under a time budget, so a cycling or exploding solve becomes a
 | `netlib/*` | official netlib optimal values (`lp/data/readme`), 11 significant digits; parsed with microlp's `MpsFile` and cross-validated against the suite's independent reader |
 | `miplib/*` | MIPLIB 3 official catalog (`miplib3.cat`): LP relaxation *and* integer optimum per instance |
 | `milpbench/*` | MILPBench instances. The medium-tier CFL instances are solver-proven optima (integral LP relaxation, so the LP bound certifies the answer); the xhard families carry HiGHS-certified verdicts — a proven optimum, a proven `[dual bound, incumbent]` envelope, or a proven unboundedness — see `data/xhard/milpbench/README.md` |
-| `incr/*` | the incremental Solution APIs (`add_constraint`, `fix_var`/`unfix_var`, `add_gomory_cut`, `resume`) vs certified optima, oracles and from-scratch solves |
+| `incr/*` | the incremental Solution APIs (`add_constraint`, `fix_var`/`unfix_var`, `resume`) vs certified optima, oracles and from-scratch solves |
 | `milp/warm-restart-*`, `milp/nodelimit-steps-*` | restart-with-hint loops on real instances with monotone-improvement assertions |
 
 See [data/README.md](data/README.md) for per-instance attribution,

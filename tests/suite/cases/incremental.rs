@@ -1,5 +1,5 @@
 //! Cases for the incremental Solution APIs: `add_constraint`, `fix_var` /
-//! `unfix_var`, `add_gomory_cut` and `resume`.
+//! `unfix_var` and `resume`.
 //!
 //! On pure-LP solutions these are incremental (dual simplex) and are checked
 //! against external truths (certified optima, from-scratch solves, an ILP
@@ -16,7 +16,7 @@ use super::{Case, Tier};
 use crate::oracles;
 use crate::rng::Rng;
 use microlp::ComparisonOp::{Ge, Le};
-use microlp::OptimizationDirection::{Maximize, Minimize};
+use microlp::OptimizationDirection::Maximize;
 use microlp::{MpsFile, OptimizationDirection, Problem, Solution, Status, Variable};
 use std::io::BufReader;
 use std::time::Duration;
@@ -53,7 +53,6 @@ fn row_terms(inst: &CertifiedLp, vars: &[Variable], i: usize) -> Vec<(Variable, 
 pub fn register(cases: &mut Vec<Case>) {
     add_constraint_lp(cases);
     fix_unfix_lp(cases);
-    gomory(cases);
     resume(cases);
     milp_edits(cases);
 }
@@ -226,140 +225,6 @@ fn fix_unfix_lp(cases: &mut Vec<Case>) {
                 .map_err(|e| format!("unfix_var: {}", e))?;
             if was_fixed_again {
                 return Err("second unfix_var claimed the variable was still fixed".into());
-            }
-            Ok(())
-        }));
-    }
-}
-
-// ---------------------------------------------------------------- Gomory cuts
-
-fn gomory(cases: &mut Vec<Case>) {
-    // The crate's own textbook example, with every intermediate step asserted
-    // (objective -1.5 -> -1.0 across two cuts).
-    cases.push(Case::custom(
-        "incr/gomory-textbook",
-        Tier::Easy,
-        20,
-        |budget| {
-            let mut p = Problem::new(Minimize);
-            let v1 = p.add_var(0.0, (0.0, f64::INFINITY));
-            let v2 = p.add_var(-1.0, (0.0, f64::INFINITY));
-            p.add_constraint(&[(v1, 3.0), (v2, 2.0)], Le, 6.0);
-            p.add_constraint(&[(v1, -3.0), (v2, 2.0)], Le, 0.0);
-            p.set_time_limit(budget / 4);
-            let sol = p.solve().map_err(|e| format!("base: {}", e))?;
-            assert_close("relaxation objective", sol.objective(), -1.5)?;
-            assert_close("relaxation v2", sol.var_value_raw(v2), 1.5)?;
-
-            let sol = sol
-                .add_gomory_cut(v2)
-                .map_err(|e| format!("first cut: {}", e))?;
-            assert_close("after first cut", sol.objective(), -1.0)?;
-            assert_close("v2 integral", sol.var_value_raw(v2), 1.0)?;
-
-            let sol = sol
-                .add_gomory_cut(v1)
-                .map_err(|e| format!("second cut: {}", e))?;
-            assert_close("after second cut", sol.objective(), -1.0)?;
-            assert_close("v1 integral", sol.var_value_raw(v1), 1.0)?;
-            Ok(())
-        },
-    ));
-
-    // Oracle-checked cutting planes: on a small all-integer-data LP whose true
-    // ILP optimum comes from box enumeration, repeatedly cut fractional basic
-    // variables. A valid Gomory cut never removes an integer point, so the LP
-    // objective must never drop below the ILP optimum (maximization); if the
-    // LP becomes integral it must equal it exactly.
-    for (case_idx, seed) in (0..4u64).enumerate() {
-        let name = format!("incr/gomory-oracle/s{:02}", case_idx);
-        cases.push(Case::custom(name, Tier::Easy, 30, move |budget| {
-            let mut rng = Rng::new(0x6000 + seed);
-            let n = rng.usize(3, 4);
-            let bounds: Vec<(i64, i64)> = (0..n).map(|_| (0, rng.int(3, 5))).collect();
-            // Nonnegative rows anchored at a box point keep the ILP feasible.
-            let n_cons = rng.usize(2, 3);
-            let mut constraints = vec![];
-            for _ in 0..n_cons {
-                let coeffs: Vec<i64> = (0..n).map(|_| rng.int(1, 5)).collect();
-                let point: Vec<i64> = bounds
-                    .iter()
-                    .map(|&(lo, hi)| lo + rng.int(0, hi - lo))
-                    .collect();
-                let at_point: i64 = coeffs.iter().zip(&point).map(|(c, x)| c * x).sum();
-                constraints.push((coeffs, -1i8, at_point + rng.int(0, 3)));
-            }
-            let objective: Vec<i64> = (0..n).map(|_| rng.int(1, 9)).collect();
-
-            let ilp = oracles::TinyIlp {
-                bounds: bounds.clone(),
-                objective: objective.clone(),
-                constraints: constraints.clone(),
-                maximize: true,
-            };
-            let ilp_opt = ilp.brute_force().ok_or("oracle: unexpectedly infeasible")? as f64;
-
-            let mut p = Problem::new(Maximize);
-            let vars: Vec<_> = (0..n)
-                .map(|j| {
-                    p.add_var(
-                        objective[j] as f64,
-                        (bounds[j].0 as f64, bounds[j].1 as f64),
-                    )
-                })
-                .collect();
-            for (coeffs, _, rhs) in &constraints {
-                let terms: Vec<_> = coeffs
-                    .iter()
-                    .enumerate()
-                    .map(|(j, &c)| (vars[j], c as f64))
-                    .collect();
-                p.add_constraint(&terms, Le, *rhs as f64);
-            }
-            p.set_time_limit(budget / 4);
-            let mut sol = p.solve().map_err(|e| format!("relaxation: {}", e))?;
-
-            for round in 0..15 {
-                if sol.objective() < ilp_opt - 1e-6 {
-                    return Err(format!(
-                        "cut {} removed integer points: LP objective {} fell below \
-                         ILP optimum {}",
-                        round,
-                        sol.objective(),
-                        ilp_opt
-                    ));
-                }
-                // Find a fractional *basic* variable (value strictly between
-                // its bounds; add_gomory_cut panics on non-basic variables).
-                let mut cut_var = None;
-                for (j, &v) in vars.iter().enumerate() {
-                    let val = sol.var_value_raw(v);
-                    let fractional = (val - val.round()).abs() > 1e-6;
-                    let interior =
-                        val > bounds[j].0 as f64 + 1e-7 && val < bounds[j].1 as f64 - 1e-7;
-                    if fractional && interior {
-                        cut_var = Some(v);
-                        break;
-                    }
-                }
-                let Some(v) = cut_var else {
-                    break;
-                };
-                sol = sol
-                    .add_gomory_cut(v)
-                    .map_err(|e| format!("cut {} failed: {}", round, e))?;
-            }
-
-            let all_integral = vars
-                .iter()
-                .all(|&v| (sol.var_value_raw(v) - sol.var_value_raw(v).round()).abs() <= 1e-6);
-            if all_integral {
-                assert_close(
-                    "integral cut solution vs ILP oracle",
-                    sol.objective(),
-                    ilp_opt,
-                )?;
             }
             Ok(())
         }));

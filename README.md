@@ -188,8 +188,9 @@ let solution = problem.solve_with(options)?;
 ```
 
 * `time_limit`, `node_limit` — budgets for this call; each `resume` gets a
-  fresh one. `node_limit` counts branch & bound nodes, so it is reproducible
-  across machines.
+  fresh one, and each post-solve edit gets a fresh copy of the original solve
+  budget. `node_limit` counts branch & bound nodes, so it is reproducible across
+  machines.
 * `mip_gap` — stop as soon as the solution is proven within this relative
   distance of the optimum, and report it as `Optimal`. The default `0.0`
   proves exact optimality.
@@ -267,18 +268,6 @@ fn main() -> Result<(), Error> {
 
 An edit that makes the problem unsolvable returns `Err(Error::Infeasible)`
 from the edit call itself.
-
-On pure-LP solutions there is one more operation, `add_gomory_cut(var)`,
-which adds a cutting plane that pushes the given variable's fractional value
-toward an integer — a building block for experimenting with cutting-plane
-methods:
-
-```rust
-let mut solution = lp_problem.solve()?;
-while solution.var_value(x).fract() != 0.0 {
-    solution = solution.add_gomory_cut(x)?;
-}
-```
 
 ## Testing
 

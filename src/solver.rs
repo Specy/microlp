@@ -1,4 +1,4 @@
-use core::panic;
+use core::time::Duration;
 
 use crate::{
     helpers::{resized_view, to_dense},
@@ -49,6 +49,29 @@ pub(crate) const DEADLINE_CHECK_INTERVAL: u64 = 1000;
 /// rounding error through a poorly-conditioned pivot).
 pub(crate) const LU_STABILITY_THRESHOLD: f64 = 0.1;
 
+/// Power-of-two row equilibration keeps the largest structural coefficient
+/// near one without rounding its mantissa. If scaling would overflow the RHS,
+/// leave the row unchanged and let the solver report any resulting numerical
+/// failure explicitly.
+fn equilibration_scale(coeffs: &CsVec, rhs: f64) -> f64 {
+    let max_coeff = coeffs
+        .data()
+        .iter()
+        .map(|coeff| coeff.abs())
+        .fold(0.0, f64::max);
+    if max_coeff == 0.0 || !max_coeff.is_finite() {
+        return 1.0;
+    }
+
+    let exponent = (max_coeff.log2().floor() as i32).clamp(-1023, 1023);
+    let scale = 2.0_f64.powi(-exponent);
+    if scale.is_finite() && (rhs * scale).is_finite() {
+        scale
+    } else {
+        1.0
+    }
+}
+
 pub(crate) fn float_eq(a: f64, b: f64) -> bool {
     (a - b).abs() < EPS
 }
@@ -70,8 +93,12 @@ pub(crate) fn check_deadline(deadline: &Deadline) -> StopReason {
 pub(crate) struct Solver {
     pub(crate) num_vars: usize,
     pub(crate) deadline: Deadline,
+    /// Duration granted to each subsequent public pure-LP operation.
+    pub(crate) operation_time_limit: Option<Duration>,
     /// Total number of simplex pivots performed across all solves/reoptimizes on this instance.
     pub(crate) lp_iterations: u64,
+    /// Wall-clock time accumulated by public pure-LP operations.
+    pub(crate) elapsed: Duration,
 
     orig_obj_coeffs: Vec<f64>,
     orig_var_mins: Vec<f64>,
@@ -80,6 +107,10 @@ pub(crate) struct Solver {
     orig_constraints: CsMat, // excluding rhs
     orig_constraints_csc: CsMat,
     orig_rhs: Vec<f64>,
+    /// Positive per-row equilibration factors. Every row is multiplied by
+    /// these internally; validation multiplies its absolute user tolerance by
+    /// the same factor so the public feasibility contract stays unscaled.
+    row_scales: Vec<f64>,
 
     enable_primal_steepest_edge: bool,
     enable_dual_steepest_edge: bool,
@@ -261,6 +292,7 @@ impl Solver {
 
         let mut constraint_coeffs = vec![];
         let mut orig_rhs = vec![];
+        let mut row_scales = vec![];
 
         // Initially, all slack vars are basic.
         let mut basic_vars = vec![];
@@ -269,7 +301,16 @@ impl Solver {
         let mut basic_var_maxs = vec![];
 
         for (coeffs, cmp_op, rhs) in constraints {
-            let rhs = *rhs;
+            let mut coeffs = coeffs.clone();
+            // Equilibrate every row (LP and MIP alike): scaling each row by an
+            // exact power of two keeps equivalent rows at very different scales
+            // from producing tableau coefficients below the pivot threshold,
+            // which would otherwise mis-declare a feasible model infeasible.
+            let row_scale = equilibration_scale(&coeffs, *rhs);
+            if row_scale != 1.0 {
+                coeffs.map_inplace(|coeff| coeff * row_scale);
+            }
+            let rhs = *rhs * row_scale;
 
             if coeffs.indices().is_empty() {
                 let is_tautological = match cmp_op {
@@ -287,6 +328,7 @@ impl Solver {
 
             constraint_coeffs.push(coeffs.clone());
             orig_rhs.push(rhs);
+            row_scales.push(row_scale);
 
             let (slack_var_min, slack_var_max) = match cmp_op {
                 ComparisonOp::Le => (0.0, f64::INFINITY),
@@ -400,8 +442,11 @@ impl Solver {
             orig_constraints,
             orig_constraints_csc,
             orig_rhs,
+            row_scales,
             deadline,
+            operation_time_limit: None,
             lp_iterations: 0,
+            elapsed: Duration::ZERO,
             orig_var_domains: var_domains.to_vec(),
             enable_primal_steepest_edge,
             enable_dual_steepest_edge,
@@ -459,8 +504,11 @@ impl Solver {
     /// slack bounds are never touched by branching, so this always reflects the
     /// user's original rows.
     ///
-    /// The tolerance is deliberately NOT scaled by the row magnitude: this
-    /// check exists for the big-M trap, where a violation that is tiny
+    /// Rows carry an internal power-of-two equilibration factor; the
+    /// tolerance is multiplied by that same factor, which is algebraically
+    /// equivalent to applying `tol` to the unscaled user row. It is deliberately
+    /// NOT scaled by the row's magnitude: this check exists for the big-M trap,
+    /// where a violation that is tiny
     /// RELATIVE to huge row coefficients (e.g. 5.0 on a 1e9-scale row) is
     /// decisive in absolute terms. Any row-scale-relative tolerance would be
     /// blind to exactly the violations this guard is for.
@@ -485,7 +533,8 @@ impl Solver {
             } else {
                 f64::INFINITY
             };
-            if lhs < lo - tol || lhs > hi + tol {
+            let scaled_tol = tol * self.row_scales[r];
+            if lhs < lo - scaled_tol || lhs > hi + scaled_tol {
                 return false;
             }
         }
@@ -754,11 +803,12 @@ impl Solver {
         self.restore_feasibility()
     }
 
-    /// Return true if the var was really unset.
-    pub(crate) fn unfix_var(&mut self, var: usize) -> bool {
+    /// Return whether the var was really unset and whether reoptimization
+    /// finished within the active deadline.
+    pub(crate) fn unfix_var(&mut self, var: usize) -> Result<(bool, StopReason), Error> {
         if let VarState::NonBasic(col) = self.var_states[var] {
             if !std::mem::replace(&mut self.nb_var_is_fixed[col], false) {
-                return false;
+                return Ok((false, StopReason::Finished));
             }
 
             let cur_val = self.nb_var_vals[col];
@@ -767,36 +817,11 @@ impl Solver {
                 at_max: float_eq(cur_val, self.orig_var_maxs[var]),
             };
 
-            // Shouldn't result in error, presumably problem was solvable before this variable
-            // was fixed.
             self.is_dual_feasible = false;
-            //TODO check unwrap
-            self.optimize().unwrap();
-            true
+            let stop = self.optimize()?;
+            Ok((true, stop))
         } else {
-            false
-        }
-    }
-
-    pub(crate) fn add_gomory_cut(&mut self, var: usize) -> Result<StopReason, Error> {
-        if let VarState::Basic(row) = self.var_states[var] {
-            self.calc_row_coeffs(row);
-
-            let mut cut_coeffs = SparseVec::new();
-            for (col, &coeff) in self.row_coeffs.iter() {
-                let var = self.nb_vars[col];
-                cut_coeffs.push(var, coeff.floor() - coeff);
-            }
-
-            let cut_bound = self.basic_var_vals[row].floor() - self.basic_var_vals[row];
-            let num_total_vars = self.num_total_vars();
-            self.add_constraint(
-                cut_coeffs.into_csvec(num_total_vars),
-                ComparisonOp::Le,
-                cut_bound,
-            )
-        } else {
-            panic!("var {:?} is not basic!", var);
+            Ok((false, StopReason::Finished))
         }
     }
 
@@ -910,6 +935,8 @@ impl Solver {
                              refreshing basis before declaring infeasibility",
                             iter, row,
                         );
+                        self.basis_solver
+                            .reset(&self.orig_constraints_csc, &self.basic_vars)?;
                         self.recalc_basic_var_vals()?;
                         refreshed_since_pivot = true;
                         continue;
@@ -958,6 +985,12 @@ impl Solver {
             };
         }
 
+        let row_scale = equilibration_scale(&coeffs, rhs);
+        if row_scale != 1.0 {
+            coeffs.map_inplace(|coeff| coeff * row_scale);
+        }
+        let rhs = rhs * row_scale;
+
         let slack_var = self.num_total_vars();
         let (slack_var_min, slack_var_max) = match cmp_op {
             ComparisonOp::Le => (0.0, f64::INFINITY),
@@ -994,6 +1027,7 @@ impl Solver {
         new_orig_constraints = new_orig_constraints.append_outer_csvec(coeffs.view());
 
         self.orig_rhs.push(rhs);
+        self.row_scales.push(row_scale);
 
         self.orig_constraints = new_orig_constraints;
         self.orig_constraints_csc = self.orig_constraints.to_csc();
@@ -1852,24 +1886,27 @@ mod tests {
             &[0.0, f64::INFINITY, f64::INFINITY, f64::INFINITY, 0.0, 0.0]
         );
 
+        // Equilibration scales the second constraint (max structural
+        // coefficient 2) and its rhs by 1/2; the slack column stays 1. The
+        // unit-coefficient rows are unchanged.
         let orig_constraints_ref = vec![
             vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
-            vec![1.0, 2.0, 0.0, 1.0, 0.0, 0.0],
+            vec![0.5, 1.0, 0.0, 1.0, 0.0, 0.0],
             vec![1.0, 1.0, 0.0, 0.0, 1.0, 0.0],
             vec![0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         ];
         assert_matrix_eq(&sol.orig_constraints, &orig_constraints_ref);
 
-        assert_eq!(&sol.orig_rhs, &[6.0, 8.0, 2.0, 3.0]);
+        assert_eq!(&sol.orig_rhs, &[6.0, 4.0, 2.0, 3.0]);
 
         assert_eq!(&sol.basic_vars, &[2, 3, 4, 5]);
-        assert_eq!(&sol.basic_var_vals, &[1.0, -2.0, -3.0, -2.0]);
+        assert_eq!(&sol.basic_var_vals, &[1.0, -1.0, -3.0, -2.0]);
         assert_eq!(&sol.dual_edge_sq_norms, &[1.0, 1.0, 1.0, 1.0]);
 
         assert_eq!(&sol.nb_vars, &[0, 1]);
         assert_eq!(&sol.nb_var_obj_coeffs, &[-1.0, 1.0]);
         assert_eq!(&sol.nb_var_vals, &[0.0, 5.0]);
-        assert_eq!(&sol.primal_edge_sq_norms, &[4.0, 8.0]);
+        assert_eq!(&sol.primal_edge_sq_norms, &[3.25, 5.0]);
 
         assert_eq!(sol.cur_obj_val, 0.0);
     }
@@ -2019,7 +2056,11 @@ mod tests {
         assert_eq!(&sol.basic_var_vals, &[12.0, 8.0]);
         assert_eq!(&sol.nb_vars, &[2, 3]);
         assert_eq!(&sol.nb_var_vals, &[0.0, 0.0]);
-        assert_eq!(&sol.nb_var_obj_coeffs, &[3.2, 0.2]);
+        // The optimum (x=12, y=8, obj -68) is unchanged by equilibration; only
+        // the second constraint's slack reduced cost is scaled: that row
+        // (-x+4y<=20, max coeff 4) is equilibrated by 1/4, so its dual scales
+        // up 4x, 0.2 -> 0.8.
+        assert_eq!(&sol.nb_var_obj_coeffs, &[3.2, 0.8]);
         assert_eq!(sol.cur_obj_val, -68.0);
 
         let infeasible = Solver::try_new(

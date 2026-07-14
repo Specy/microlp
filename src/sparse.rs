@@ -1,5 +1,7 @@
 use crate::helpers::to_dense;
-use sprs::{CsMat, CsVec};
+use sprs::CsMat;
+#[cfg(test)]
+use sprs::CsVec;
 use std::fmt::{Display, Formatter};
 
 #[derive(Clone, Debug, Default)]
@@ -21,22 +23,12 @@ impl SparseVec {
         self.values.clear();
     }
 
-    pub(crate) fn push(&mut self, i: usize, val: f64) {
-        self.indices.push(i);
-        self.values.push(val);
-    }
-
     pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &f64)> {
         self.indices.iter().copied().zip(&self.values)
     }
 
     pub(crate) fn sq_norm(&self) -> f64 {
         self.values.iter().map(|&v| v * v).sum()
-    }
-
-    pub(crate) fn into_csvec(self, len: usize) -> CsVec<f64> {
-        //guaranteed to not panic
-        CsVec::new_from_unsorted(len, self.indices, self.values).unwrap()
     }
 }
 
