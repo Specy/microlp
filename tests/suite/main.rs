@@ -536,10 +536,12 @@ fn run_case(case: &Case, timeout_scale: f64, max_case_seconds: Option<f64>) -> S
                 problem.set_time_limit(budget);
                 let solve_result = problem.solve();
                 let details = match (&solve_result, &expected) {
-                    (Ok(sol), Expected::Objective { value, .. }) => Some(SolveDetails {
-                        found: sol.objective(),
-                        expected: *value,
-                    }),
+                    (Ok(outcome), Expected::Objective { value, .. }) => {
+                        outcome.solution().map(|sol| SolveDetails {
+                            found: sol.objective(),
+                            expected: *value,
+                        })
+                    }
                     _ => None,
                 };
                 match verify::check(&spec, &expected, solve_result) {

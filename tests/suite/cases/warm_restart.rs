@@ -1,7 +1,7 @@
 //! Warm-restart and node-limit-stepping integration cases on REAL problems.
 //!
 //! Unlike `incr::resume-*` (which continues the SAME persistent search state
-//! via `Solution::resume`), these cases rebuild a brand-new `Problem` from
+//! via `SolveOutcome::resume`), these cases rebuild a brand-new `Problem` from
 //! scratch every round and hand the previous round's incumbent in purely
 //! through `SolveOptions::warm_start` — the "periodically checkpoint and
 //! restart cold" workflow, as opposed to "keep the process alive and resume".
@@ -20,7 +20,7 @@
 //! while `geometric` caps growth so a non-converging case still terminates.
 //! The loop requires a fresh `Problem` each round, carries only a warm-start
 //! hint, checks monotone non-worsening incumbents, and must eventually reach
-//! `Status::Optimal`.
+//! `SolutionStatus::Optimal`.
 //!
 //! Real problems exercised: the MIPLIB3 instances `stein27` (optimum 18) and
 //! `mod008` (optimum 307), read through the suite's own MPS reader (same
@@ -38,7 +38,9 @@ use crate::rng::Rng;
 use crate::verify;
 use microlp::ComparisonOp::Le;
 use microlp::OptimizationDirection::{Maximize, Minimize};
-use microlp::{OptimizationDirection, Problem, SolveOptions, Status, Variable};
+use microlp::{
+    OptimizationDirection, Problem, SolutionStatus, SolveOptions, SolveOutcome, Variable,
+};
 use std::time::Duration;
 
 /// Objective tolerance for the known optima checked here (all exact integers
@@ -159,12 +161,12 @@ where
         }
         options.warm_start = hint.clone();
 
-        let sol = problem
+        let outcome = problem
             .solve_with(options)
             .map_err(|e| format!("round {}: solve errored: {}", round, e))?;
 
-        match sol.status() {
-            Status::Optimal => {
+        match outcome {
+            SolveOutcome::Solution(sol) if sol.status() == SolutionStatus::Optimal => {
                 verify::validate_incumbent(&spec, &sol)?;
                 if !tol.matches(sol.objective(), optimum) {
                     return Err(format!(
@@ -177,7 +179,7 @@ where
                 }
                 return Ok(round);
             }
-            Status::Feasible => {
+            SolveOutcome::Solution(sol) => {
                 verify::validate_incumbent(&spec, &sol)?;
                 let obj = sol.objective();
                 if let Some(prev) = hint_obj {
@@ -193,7 +195,7 @@ where
                 hint = Some(sol.iter().collect());
                 hint_obj = Some(obj);
             }
-            Status::Interrupted => {
+            SolveOutcome::Interrupted(_) => {
                 // No incumbent this round; keep the previous hint (if any).
             }
         }
@@ -352,7 +354,8 @@ mod mwis {
     use super::Rng;
     use bit_set::BitSet;
     use microlp::{
-        ComparisonOp::Le, OptimizationDirection::Maximize, Problem, SolveOptions, Status, Variable,
+        ComparisonOp::Le, OptimizationDirection::Maximize, Problem, SolutionStatus, SolveOptions,
+        Variable,
     };
 
     pub type Node = usize;
@@ -450,18 +453,17 @@ mod mwis {
                 .map(|v| (vars[v], if set.contains(v) { 1.0 } else { 0.0 }))
                 .collect()
         });
-        let sol = problem
+        let outcome = problem
             .solve_with(opts)
             .map_err(|e| format!("microlp MWIS solve failed: {}", e))?;
-        match sol.status() {
-            Status::Optimal => {}
-            s => {
-                return Err(format!(
-                    "microlp MWIS did not reach Optimal (status: {:?})",
-                    s
-                ))
-            }
+        if !outcome.is_optimal() {
+            return Err(format!(
+                "microlp MWIS did not reach Optimal (reason: {:?})",
+                outcome.termination_reason()
+            ));
         }
+        let sol = crate::verify::require_solution(outcome, "microlp MWIS solve")?;
+        debug_assert_eq!(sol.status(), SolutionStatus::Optimal);
         let selected: BitSet = (0..graph.size()).filter(|&v| sol[vars[v]] > 0.5).collect();
         Ok((selected, sol.objective()))
     }

@@ -1,6 +1,13 @@
 use microlp::{
-    ComparisonOp, Error, OptimizationDirection, Problem, SolveOptions, Status, Variable,
+    ComparisonOp, Error, OptimizationDirection, Problem, SolutionStatus, SolveOptions,
+    SolveOutcome, Variable,
 };
+
+fn expect_solution(outcome: SolveOutcome) -> microlp::Solution {
+    outcome
+        .into_solution()
+        .expect("an unlimited bounded feasible solve must return a solution")
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Row {
@@ -310,7 +317,11 @@ fn assert_solution(
     expected: i64,
     solution: &microlp::Solution,
 ) {
-    assert_eq!(solution.status(), Status::Optimal, "seed {seed}: {case:?}");
+    assert_eq!(
+        solution.status(),
+        SolutionStatus::Optimal,
+        "seed {seed}: {case:?}"
+    );
     assert!(
         (solution.objective() - expected as f64).abs() < 1e-7,
         "seed {seed}: objective {}, expected {expected}; {case:?}",
@@ -335,16 +346,19 @@ fn bounded_integer_models_match_exhaustive_enumeration() {
         match (expected, problem.solve()) {
             (None, Err(Error::Infeasible)) => {}
             (None, other) => panic!("seed {seed}: expected infeasible, got {other:?}; {case:?}"),
-            (Some((objective, values)), Ok(solution)) => {
+            (Some((objective, values)), Ok(outcome)) => {
+                let solution = expect_solution(outcome);
                 assert_solution(&case, &vars, seed, objective, &solution);
                 let cold_values: Vec<_> = vars.iter().map(|&var| solution.var_value(var)).collect();
 
                 if seed % 10 == 0 {
                     let (hinted_problem, hinted_vars, options) =
                         build_problem(&case, Some(&values));
-                    let hinted = hinted_problem.solve_with(options).unwrap_or_else(|error| {
-                        panic!("seed {seed}: valid warm start failed: {error}; {case:?}")
-                    });
+                    let hinted = expect_solution(
+                        hinted_problem.solve_with(options).unwrap_or_else(|error| {
+                            panic!("seed {seed}: valid warm start failed: {error}; {case:?}")
+                        }),
+                    );
                     assert_solution(&case, &hinted_vars, seed, objective, &hinted);
                 }
 
@@ -355,13 +369,14 @@ fn bounded_integer_models_match_exhaustive_enumeration() {
                         panic!("seed {seed}: node-limited solve failed: {error}; {case:?}")
                     });
                     for _ in 0..10_000 {
-                        if resumed.status() == Status::Optimal {
+                        if resumed.is_optimal() {
                             break;
                         }
-                        resumed = resumed.resume(None).unwrap_or_else(|error| {
+                        resumed = resumed.resume().unwrap_or_else(|error| {
                             panic!("seed {seed}: resume failed: {error}; {case:?}")
                         });
                     }
+                    let resumed = expect_solution(resumed);
                     assert_solution(&case, &vars, seed, objective, &resumed);
                     let resumed_values: Vec<_> =
                         vars.iter().map(|&var| resumed.var_value(var)).collect();
@@ -387,8 +402,13 @@ fn mixed_integer_models_match_integer_enumeration_and_analytic_lp() {
         match (expected, problem.solve()) {
             (None, Err(Error::Infeasible)) => {}
             (None, other) => panic!("seed {seed}: expected infeasible, got {other:?}; {case:?}"),
-            (Some((objective, _, _)), Ok(solution)) => {
-                assert_eq!(solution.status(), Status::Optimal, "seed {seed}: {case:?}");
+            (Some((objective, _, _)), Ok(outcome)) => {
+                let solution = expect_solution(outcome);
+                assert_eq!(
+                    solution.status(),
+                    SolutionStatus::Optimal,
+                    "seed {seed}: {case:?}"
+                );
                 assert!(
                     (solution.objective() - objective).abs() < 1e-6,
                     "seed {seed}: objective {}, expected {objective}; {case:?}",
@@ -414,9 +434,9 @@ fn integer_edits_match_fresh_exhaustive_models() {
             continue;
         };
         let (problem, vars, _) = build_problem(&case, None);
-        let solution = problem
-            .solve()
-            .unwrap_or_else(|error| panic!("seed {seed}: initial solve failed: {error}; {case:?}"));
+        let solution = expect_solution(problem.solve().unwrap_or_else(|error| {
+            panic!("seed {seed}: initial solve failed: {error}; {case:?}")
+        }));
 
         let fixed_var = seed as usize % case.n;
         let fixed_value = if seed % 2 == 0 {
@@ -439,11 +459,13 @@ fn integer_edits_match_fresh_exhaustive_models() {
                 "seed {seed}: fixed model should be infeasible, got {other:?}; {fixed_case:?}"
             ),
             (Some((objective, _)), Ok(fixed)) => {
+                let fixed = expect_solution(fixed);
                 assert_solution(&fixed_case, &vars, seed, objective, &fixed);
                 let (unfixed, was_fixed) = fixed
                     .unfix_var(vars[fixed_var])
                     .unwrap_or_else(|error| panic!("seed {seed}: unfix failed: {error}"));
                 assert!(was_fixed, "seed {seed}: fix was not recorded");
+                let unfixed = expect_solution(unfixed);
                 assert_solution(&case, &vars, seed, original_objective, &unfixed);
             }
             (Some(expected), other) => panic!(
@@ -483,6 +505,7 @@ fn integer_edits_match_fresh_exhaustive_models() {
                 "seed {seed}: edited model should be infeasible, got {other:?}; {edited_case:?}"
             ),
             (Some((objective, _)), Ok(edited)) => {
+                let edited = expect_solution(edited);
                 assert_solution(&edited_case, &vars, seed, objective, &edited)
             }
             (Some(expected), other) => panic!(
@@ -522,9 +545,11 @@ fn mixed_scale_active_rows_do_not_hide_a_feasible_integer_point() {
     assert_eq!((expected, values), (8, [2, 2, 0, 0]));
 
     let (problem, vars, _) = build_problem(&case, None);
-    let solution = problem
-        .solve()
-        .expect("a feasible bounded ILP must not be classified as infeasible");
+    let solution = expect_solution(
+        problem
+            .solve()
+            .expect("a feasible bounded ILP must not be classified as infeasible"),
+    );
     assert_solution(&case, &vars, 5_155, expected, &solution);
 }
 
@@ -541,10 +566,11 @@ fn mixed_scale_pure_lp_is_not_misclassified_infeasible() {
     p.add_constraint([(x, 4.0e6), (y, 5.0e6)], ComparisonOp::Ge, 13.0e6);
     p.add_constraint([(x, 7.0e-6), (y, 6.0e-6)], ComparisonOp::Ge, 26.0e-6);
 
-    let sol = p
-        .solve()
-        .expect("a feasible pure LP must not be classified as infeasible");
-    assert_eq!(sol.status(), Status::Optimal);
+    let sol = expect_solution(
+        p.solve()
+            .expect("a feasible pure LP must not be classified as infeasible"),
+    );
+    assert_eq!(sol.status(), SolutionStatus::Optimal);
     assert!(
         (sol.objective() - 8.0).abs() < 1e-7,
         "objective {}",
@@ -559,15 +585,19 @@ fn mixed_scale_incremental_rows_are_not_misclassified_infeasible() {
     let mut problem = Problem::new(OptimizationDirection::Minimize);
     let x = problem.add_var(-2.0, (1.0, 2.0));
     let y = problem.add_var(6.0, (-2.0, 3.0));
-    let solution = problem.solve().unwrap();
-    let solution = solution
-        .add_constraint([(x, 4.0e6), (y, 5.0e6)], ComparisonOp::Ge, 13.0e6)
-        .unwrap();
-    let solution = solution
-        .add_constraint([(x, 7.0e-6), (y, 6.0e-6)], ComparisonOp::Ge, 26.0e-6)
-        .unwrap();
+    let solution = expect_solution(problem.solve().unwrap());
+    let solution = expect_solution(
+        solution
+            .add_constraint([(x, 4.0e6), (y, 5.0e6)], ComparisonOp::Ge, 13.0e6)
+            .unwrap(),
+    );
+    let solution = expect_solution(
+        solution
+            .add_constraint([(x, 7.0e-6), (y, 6.0e-6)], ComparisonOp::Ge, 26.0e-6)
+            .unwrap(),
+    );
 
-    assert_eq!(solution.status(), Status::Optimal);
+    assert_eq!(solution.status(), SolutionStatus::Optimal);
     assert!((solution.objective() - 8.0).abs() < 1e-7);
     assert!((solution.var_value(x) - 2.0).abs() < 1e-7);
     assert!((solution.var_value(y) - 2.0).abs() < 1e-7);
@@ -614,6 +644,6 @@ fn mixed_scale_branching_does_not_prune_the_true_optimum() {
     assert_eq!((expected, values), (-6, [0, -3, 0, 0]));
 
     let (problem, vars, _) = build_problem(&case, None);
-    let solution = problem.solve().expect("fixture is bounded and feasible");
+    let solution = expect_solution(problem.solve().expect("fixture is bounded and feasible"));
     assert_solution(&case, &vars, 2_505, expected, &solution);
 }

@@ -135,10 +135,11 @@ fn build_random_lp(
 
 fn solve_obj(mut p: Problem, budget: std::time::Duration) -> Result<f64, String> {
     p.set_time_limit(budget);
-    let sol = p.solve().map_err(|e| format!("solver error: {}", e))?;
-    if sol.status() != microlp::Status::Optimal {
+    let outcome = p.solve().map_err(|e| format!("solver error: {}", e))?;
+    if !outcome.is_optimal() {
         return Err("hit time limit".into());
     }
+    let sol = crate::verify::require_solution(outcome, "LP solve")?;
     Ok(sol.objective())
 }
 

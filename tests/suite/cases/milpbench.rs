@@ -15,7 +15,7 @@
 //!    externally certified optima — see `cases/milpbench_xhard.rs`.
 //!
 //! Selection bar for this file: an instance is vendored here only if the solve
-//! returns `Status::Optimal` with `gap() == Some(0)` inside budget. MILPBench
+//! returns `SolutionStatus::Optimal` with `gap() == Some(0)` inside budget. MILPBench
 //! ships no certified optima for these families, so the case asserts
 //! **solver-proven** optimality — proven-optimal status, a zero gap, and an
 //! independent shadow-model validation of the returned point (feasibility,
@@ -29,7 +29,7 @@
 use super::{locate, read_instance, Case, Tier};
 use crate::lp_format;
 use crate::model::{Expected, Tol};
-use microlp::Status;
+use microlp::SolutionStatus;
 
 pub fn register(cases: &mut Vec<Case>) {
     register_reader_tests(cases);
@@ -156,12 +156,16 @@ fn register_reader_tests(cases: &mut Vec<Case>) {
             }
             let mut problem = parsed.problem;
             problem.set_time_limit(budget);
-            let sol = problem
+            let outcome = problem
                 .solve()
                 .map_err(|e| format!("solve errored: {}", e))?;
-            if sol.status() != Status::Optimal {
-                return Err(format!("expected Optimal, got {:?}", sol.status()));
+            if !outcome.is_optimal() {
+                return Err(format!(
+                    "expected Optimal, got {:?}",
+                    outcome.termination_reason()
+                ));
             }
+            let sol = crate::verify::require_solution(outcome, "objective-offset solve")?;
             if (sol.objective() - 6.0).abs() > 1e-6 {
                 return Err(format!(
                     "expected solved objective 6 (offset excluded), got {}",
@@ -303,19 +307,21 @@ fn register_bench_instances(cases: &mut Vec<Case>) {
             problem.set_time_limit(budget);
             // A solve *error* here (not a clean status) would be a solver bug on
             // a large input; surface it loudly rather than swallowing it.
-            let sol = problem.solve().map_err(|e| {
+            let outcome = problem.solve().map_err(|e| {
                 format!(
                     "solve errored (solver bug — investigate before vendoring): {}",
                     e
                 )
             })?;
             // Selection bar: proven optimality only.
-            if sol.status() != Status::Optimal {
+            if !outcome.is_optimal() {
                 return Err(format!(
-                    "expected Status::Optimal within budget, got {:?}",
-                    sol.status()
+                    "expected SolutionStatus::Optimal within budget, got {:?}",
+                    outcome.termination_reason()
                 ));
             }
+            let sol = crate::verify::require_solution(outcome, "MILPBench solve")?;
+            debug_assert_eq!(sol.status(), SolutionStatus::Optimal);
             match sol.gap() {
                 Some(g) if g.abs() <= 1e-6 => {}
                 other => {

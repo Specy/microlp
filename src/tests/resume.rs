@@ -6,6 +6,12 @@ mod tests_resume {
 
     use crate::{solver::float_eq, *};
 
+    fn solution(outcome: SolveOutcome) -> Solution {
+        outcome
+            .into_solution()
+            .expect("the completed solve must return a usable solution")
+    }
+
     /// Deterministic pseudo-random number generator for reproducible test data.
     /// Uses a simple xorshift64 algorithm.
     struct SimpleRng {
@@ -108,12 +114,12 @@ mod tests_resume {
         let (problem_unlimited, vars_unlimited) = build_complex_knapsack();
 
         let t0 = std::time::Instant::now();
-        let sol_unlimited = problem_unlimited.solve().unwrap();
+        let sol_unlimited = solution(problem_unlimited.solve().unwrap());
         let elapsed_unlimited = t0.elapsed();
 
         assert_eq!(
             sol_unlimited.status(),
-            Status::Optimal,
+            SolutionStatus::Optimal,
             "Unlimited solve should finish"
         );
 
@@ -128,18 +134,24 @@ mod tests_resume {
         problem_limited.set_time_limit(Duration::from_secs(1));
 
         let t1 = std::time::Instant::now();
-        let mut sol_limited = problem_limited.solve().unwrap();
+        let mut outcome_limited = problem_limited.solve().unwrap();
 
         let mut resume_count = 0u32;
-        while sol_limited.status() != Status::Optimal {
+        while !outcome_limited.is_optimal() {
             resume_count += 1;
-            sol_limited = sol_limited.resume(Some(Duration::from_secs(1))).unwrap();
+            outcome_limited = outcome_limited
+                .resume_with(ResumeOptions {
+                    time_limit: Some(Duration::from_secs(1)),
+                    ..ResumeOptions::default()
+                })
+                .unwrap();
         }
+        let sol_limited = solution(outcome_limited);
         let elapsed_limited = t1.elapsed();
 
         assert_eq!(
             sol_limited.status(),
-            Status::Optimal,
+            SolutionStatus::Optimal,
             "Resumed solve should eventually finish"
         );
 
@@ -239,12 +251,12 @@ mod tests_resume {
         let (problem_unlimited, vars_unlimited) = build_large_lp();
 
         let t0 = std::time::Instant::now();
-        let sol_unlimited = problem_unlimited.solve().unwrap();
+        let sol_unlimited = solution(problem_unlimited.solve().unwrap());
         let elapsed_unlimited = t0.elapsed();
 
         assert_eq!(
             sol_unlimited.status(),
-            Status::Optimal,
+            SolutionStatus::Optimal,
             "Unlimited solve should finish"
         );
 
@@ -265,20 +277,24 @@ mod tests_resume {
         problem_limited.set_time_limit(Duration::from_millis(100));
 
         let t1 = std::time::Instant::now();
-        let mut sol_limited = problem_limited.solve().unwrap();
+        let mut outcome_limited = problem_limited.solve().unwrap();
 
         let mut resume_count = 0u32;
-        while sol_limited.status() != Status::Optimal {
+        while !outcome_limited.is_optimal() {
             resume_count += 1;
-            sol_limited = sol_limited
-                .resume(Some(Duration::from_millis(100)))
+            outcome_limited = outcome_limited
+                .resume_with(ResumeOptions {
+                    time_limit: Some(Duration::from_millis(100)),
+                    ..ResumeOptions::default()
+                })
                 .unwrap();
         }
+        let sol_limited = solution(outcome_limited);
         let elapsed_limited = t1.elapsed();
 
         assert_eq!(
             sol_limited.status(),
-            Status::Optimal,
+            SolutionStatus::Optimal,
             "Resumed LP solve should eventually finish"
         );
 
@@ -381,12 +397,12 @@ mod tests_resume {
         let (problem_unlimited, vars_unlimited) = build_complex_integer_knapsack();
 
         let t0 = std::time::Instant::now();
-        let sol_unlimited = problem_unlimited.solve().unwrap();
+        let sol_unlimited = solution(problem_unlimited.solve().unwrap());
         let elapsed_unlimited = t0.elapsed();
 
         assert_eq!(
             sol_unlimited.status(),
-            Status::Optimal,
+            SolutionStatus::Optimal,
             "Unlimited solve should finish"
         );
 
@@ -407,13 +423,19 @@ mod tests_resume {
         problem_limited.set_time_limit(Duration::from_millis(1));
 
         let t1 = std::time::Instant::now();
-        let mut sol_limited = problem_limited.solve().unwrap();
+        let mut outcome_limited = problem_limited.solve().unwrap();
 
         let mut resume_count = 0u32;
-        while sol_limited.status() != Status::Optimal {
+        while !outcome_limited.is_optimal() {
             resume_count += 1;
-            sol_limited = sol_limited.resume(Some(Duration::from_millis(1))).unwrap();
+            outcome_limited = outcome_limited
+                .resume_with(ResumeOptions {
+                    time_limit: Some(Duration::from_millis(1)),
+                    ..ResumeOptions::default()
+                })
+                .unwrap();
         }
+        let sol_limited = solution(outcome_limited);
         let elapsed_limited = t1.elapsed();
 
         let values_limited: Vec<f64> = vars_limited

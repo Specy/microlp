@@ -14,7 +14,6 @@ use crate::corpus::Instance;
 use crate::model::Domain;
 #[cfg(any(feature = "highs", feature = "clarabel", feature = "scip"))]
 use crate::model::ModelSpec;
-use microlp::Status;
 use std::time::Duration;
 
 pub enum RunStatus {
@@ -175,23 +174,30 @@ impl Contender for Microlp {
         let mut options = microlp::SolveOptions::default();
         options.time_limit = Some(task.budget);
         options.mip_gap = task.mip_gap;
-        let solution = match problem.solve_with(options) {
-            Ok(s) => s,
+        let outcome = match problem.solve_with(options) {
+            Ok(outcome) => outcome,
             Err(microlp::Error::Infeasible) => return RunOutcome::bare(RunStatus::Infeasible),
             Err(microlp::Error::Unbounded) => return RunOutcome::bare(RunStatus::Unbounded),
             Err(e) => return RunOutcome::bare(RunStatus::Error(e.to_string())),
         };
 
-        let stats = solution.stats();
-        let (status, has_answer) = match solution.status() {
-            Status::Optimal => (RunStatus::Optimal, true),
-            Status::Feasible => (RunStatus::Feasible, true),
-            Status::Interrupted => (RunStatus::Interrupted, false),
+        let stats = outcome.stats();
+        let (status, objective, values) = match outcome {
+            microlp::SolveOutcome::Solution(solution) => {
+                let status = match solution.status() {
+                    microlp::SolutionStatus::Optimal => RunStatus::Optimal,
+                    microlp::SolutionStatus::Feasible => RunStatus::Feasible,
+                };
+                let objective = Some(solution.objective());
+                let values = Some(vars.iter().map(|&v| solution.var_value(v)).collect());
+                (status, objective, values)
+            }
+            microlp::SolveOutcome::Interrupted(_) => (RunStatus::Interrupted, None, None),
         };
         RunOutcome {
             status,
-            objective: has_answer.then(|| solution.objective()),
-            values: has_answer.then(|| vars.iter().map(|&v| solution.var_value(v)).collect()),
+            objective,
+            values,
             bound: stats.best_bound,
             gap: stats.gap,
             nodes: Some(stats.nodes_solved),

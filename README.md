@@ -50,7 +50,7 @@ problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
 problem.add_constraint(&[(x, 2.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
 
 // The optimum is 7, at x = 1, y = 3.
-let solution = problem.solve().unwrap();
+let solution = problem.solve().unwrap().into_solution().unwrap();
 assert_eq!(solution.objective(), 7.0);
 assert_eq!(solution.var_value(x), 1.0);
 assert_eq!(solution.var_value(y), 3.0);
@@ -93,36 +93,42 @@ problem.add_constraint(lhs, ComparisonOp::Eq, 0.0);
 
 `solve()` returns `Error::Infeasible` when the constraints contradict each
 other and `Error::Unbounded` when the objective can grow forever. Invalid
-numeric options return `Error::InvalidOptions`, a call that is illegal for the
-solution's state (e.g. editing an interrupted solution before `resume()`)
-returns `Error::InvalidOperation`, and unrecoverable numerical failures return
-`Error::InternalError`. Running out of time is not an error: it returns an
-`Ok(Solution)`, and `status()` tells you what you got:
+numeric options return `Error::InvalidOptions`, and unrecoverable numerical
+failures return `Error::InternalError`.
 
-* `Status::Optimal` — the proven optimum.
-* `Status::Feasible` — a limit was hit first; this is the best solution found
-  so far, valid but not proven optimal. `gap()` reports how close the proof
-  got.
-* `Status::Interrupted` — a limit was hit before any solution was found.
-  The accessors return the solver's in-progress values, which can be useful
-  for logging but are not an answer; check `status()` before using them.
+Reaching a limit is not an error. The successful result is a `SolveOutcome`:
 
+* `SolveOutcome::Solution` contains a validated assignment. Its status is
+  `SolutionStatus::Optimal` when exact optimality was proved, or
+  `SolutionStatus::Feasible` when a valid incumbent is available without an
+  exact proof.
+* `SolveOutcome::Interrupted` means a time or node limit fired before a usable
+  incumbent existed. It exposes the termination reason and statistics, but no
+  objective or variable-value accessors.
+
+`termination_reason()` distinguishes `ProvenOptimal`, `MipGap`, `TimeLimit`,
+and `NodeLimit`. In particular, reaching a configured MIP gap returns a
+feasible solution with reason `MipGap`
 ```rust
-use microlp::Status;
+use microlp::{SolutionStatus, SolveOutcome};
 
-let solution = problem.solve()?;
-match solution.status() {
-    Status::Optimal => println!("optimum: {}", solution.objective()),
-    Status::Feasible => println!(
-        "best so far: {} (gap: {:?})",
-        solution.objective(),
-        solution.gap()
-    ),
-    Status::Interrupted => println!("no solution yet, keep solving"),
+match problem.solve()? {
+    SolveOutcome::Solution(solution) => match solution.status() {
+        SolutionStatus::Optimal => println!("optimum: {}", solution.objective()),
+        SolutionStatus::Feasible => println!(
+            "best so far: {} (gap: {:?}, reason: {:?})",
+            solution.objective(),
+            solution.gap(),
+            solution.termination_reason()
+        ),
+    },
+    SolveOutcome::Interrupted(interrupted) => {
+        println!("no solution yet: {:?}", interrupted.termination_reason());
+    }
 }
 ```
 
-Values are read per variable or by iterating. For integer and boolean
+Values on a `Solution` are read per variable or by iterating. For integer and boolean
 variables `var_value` returns an exact integer, and the reported objective is
 computed from exactly the values you read:
 
@@ -130,7 +136,7 @@ computed from exactly the values you read:
 let value = solution.var_value(x);   // rounded to an exact integer for
                                      // integer/boolean variables
 let raw = solution.var_value_raw(x); // without the rounding
-let same = solution[x];              // indexing works too, this is equivalent to var_value()
+let same = solution[x];              // indexing is equivalent to var_value_raw()
 
 for (var, value) in &solution {
     println!("{}: {}", var.idx(), value);
@@ -142,32 +148,31 @@ iterations, elapsed time, the best proven bound and the current gap.
 
 ## Time limits and resuming
 
-Set a wall-clock budget with `set_time_limit`. When it runs out the solve
-stops and returns whatever it has (`Feasible` or `Interrupted`); `resume`
-continues the same search from where it stopped, with a fresh budget.
-`resume(None)` means "run to completion".
+Set a time budget with `set_time_limit`. When it runs out, the outcome
+contains either a feasible incumbent or an interrupted search. `resume()`
+continues the same search.
+
+Use `resume_with` to change the options of the resume.
 
 ```rust
-use microlp::Status;
+use microlp::{ResumeOptions, TerminationReason};
 use std::time::Duration;
 
 problem.set_time_limit(Duration::from_millis(100));
-let mut solution = problem.solve()?;
+let mut outcome = problem.solve()?;
 
-while solution.status() != Status::Optimal {
+while matches!(
+    outcome.termination_reason(),
+    TerminationReason::TimeLimit | TerminationReason::NodeLimit
+) {
     // Do something between slices: log progress, check for shutdown, ...
-    solution = solution.resume(Some(Duration::from_millis(100)))?;
+    let mut options = ResumeOptions::default();
+    options.time_limit = Some(Duration::from_millis(100));
+    outcome = outcome.resume_with(options)?;
 }
 ```
 
-Two things to know about limits:
-
-* They are checked periodically, so a solve can run slightly past its budget —
-  on very large problems, noticeably past it. The clock starts when `solve()`
-  is called; building the problem is not counted.
-* Solves are deterministic: the same problem with the same options always
-  gives the same result, and a solve interrupted and resumed any number of
-  times ends with exactly the same solution as an uninterrupted one.
+Time limits are checked periodically, so a solve can run slightly past its budget.
 
 ## Solve options
 
@@ -184,45 +189,45 @@ options.node_limit = Some(50_000); // deterministic alternative to a time limit
 options.mip_gap = 0.01;            // accept anything within 1% of optimal
 options.warm_start = Some(vec![(x, 1.0), (y, 3.0)]);
 
-let solution = problem.solve_with(options)?;
+let outcome = problem.solve_with(options)?;
 ```
 
-* `time_limit`, `node_limit` — budgets for this call; each `resume` gets a
-  fresh one, and each post-solve edit gets a fresh copy of the original solve
-  budget. `node_limit` counts branch & bound nodes, so it is reproducible across
-  machines.
-* `mip_gap` — stop as soon as the solution is proven within this relative
-  distance of the optimum, and report it as `Optimal`. The default `0.0`
-  proves exact optimality.
-* `warm_start` — a starting assignment (it may cover only some variables).
+* `time_limit`, `node_limit`: execution budgets for this call. Also applied to `resume()`
+* `mip_gap`: stop as soon as the solution is proven within this relative
+  distance of the optimum, and report a feasible solution with termination
+  reason `MipGap`. The default `0.0` requires exact optimality.
+* `warm_start`: a starting assignment (it may cover only some variables).
   A good one gives the solver an immediate solution to improve on. It is
-  advisory: if it isn't usable it is ignored, and it does not carry over any
-  proof — to continue an earlier search, use `resume` instead.
-* `int_tol`, `tolerances` — numeric tolerances. The defaults are the safe
-  choice; values must be finite and non-negative, and the two integrality
-  tolerances must be below `0.5`. Invalid settings are rejected instead of
-  being allowed to corrupt branching or pruning. See the
-  [documentation](https://docs.rs/microlp/) before changing them.
+  advisory: if it isn't usable it is ignored.
+* `int_tol`, `tolerances`: numeric tolerances. Values must be finite and non-negative, and the two integrality
+  tolerances must be below `0.5`.
 
 ## Changing a solved problem
 
 A `Solution` can be edited and re-solved: `add_constraint` adds a new
 constraint, `fix_var` pins a variable to a value, `unfix_var` releases a
 previous fix. Each call consumes the solution and returns a new, re-solved
-one, keeping as much earlier work as possible — in particular, the previous
+one, keeping as much earlier work as possible, in particular, the previous
 solution is used as a starting point whenever it is still valid for the
 changed problem.
 
-Problems with integer variables can be edited whatever the status, including
-a paused (`Feasible`/`Interrupted`) solve. Pure-LP solutions must reach
-`Optimal` before they can be edited — `resume` them first.
-
-A complete example — solve, react to the result, tighten the problem, and
-keep solving:
+Only a `Solution` can be edited. An interrupted outcome deliberately has no
+edit methods because it has no validated assignment. A feasible-but-unproven
+`Solution` can be edited. Every edit returns another `SolveOutcome`, so a
+limited reoptimization remains explicit and safe.
 
 ```rust
-use microlp::{ComparisonOp, Error, OptimizationDirection, Problem, Status};
+use microlp::{
+    ComparisonOp, Error, OptimizationDirection, Problem, SolveOutcome,
+};
 use std::time::Duration;
+
+fn resume_until_answer(mut outcome: SolveOutcome) -> Result<SolveOutcome, Error> {
+    while outcome.solution().is_none() {
+        outcome = outcome.resume()?;
+    }
+    Ok(outcome)
+}
 
 fn main() -> Result<(), Error> {
     // How many units of each product to make (0 to 10 each), maximizing
@@ -241,24 +246,33 @@ fn main() -> Result<(), Error> {
     );
 
     // First pass, with a time budget. (This toy instance solves instantly;
-    // on a real model this is where you might get Feasible instead.)
+    // on a real model this may first return Interrupted.)
     problem.set_time_limit(Duration::from_secs(1));
-    let mut solution = problem.solve()?;
+    let outcome = resume_until_answer(problem.solve()?)?;
+    let solution = outcome
+        .into_solution()
+        .expect("resume_until_answer guarantees a solution");
     println!("plan is worth {}", solution.objective());
 
     // Requirements change after seeing the plan: a customer needs at least
     // 3 units of product 0, and product 3 is out of stock. Edits apply to
     // the problem as you originally defined it, plus the other edits.
-    solution = solution.add_constraint(&[(units[0], 1.0)], ComparisonOp::Ge, 3.0)?;
-    solution = solution.fix_var(units[3], 0.0)?;
+    let outcome =
+        solution.add_constraint(&[(units[0], 1.0)], ComparisonOp::Ge, 3.0)?;
+    let solution = resume_until_answer(outcome)?
+        .into_solution()
+        .expect("resume_until_answer guarantees a solution");
+    let outcome = solution.fix_var(units[3], 0.0)?;
+    let solution = resume_until_answer(outcome)?
+        .into_solution()
+        .expect("resume_until_answer guarantees a solution");
     println!("revised plan is worth {}", solution.objective());
 
-    // Product 3 is available again: release it and solve to proven
-    // optimality, resuming in one-second slices.
-    let (mut solution, _was_fixed) = solution.unfix_var(units[3])?;
-    while solution.status() != Status::Optimal {
-        solution = solution.resume(Some(Duration::from_secs(1)))?;
-    }
+    // Product 3 is available again: release it and read the new solution.
+    let (outcome, _was_fixed) = solution.unfix_var(units[3])?;
+    let solution = resume_until_answer(outcome)?
+        .into_solution()
+        .expect("resume_until_answer guarantees a solution");
     for (i, &unit) in units.iter().enumerate() {
         println!("product {}: {} units", i, solution.var_value(unit));
     }
