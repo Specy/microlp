@@ -17,10 +17,14 @@ use crate::oracles;
 use crate::rng::Rng;
 use microlp::ComparisonOp::{Ge, Le};
 use microlp::OptimizationDirection::Maximize;
-use microlp::{OptimizationDirection, Problem, Solution, Status, Variable};
+use microlp::{OptimizationDirection, Problem, ResumeOptions, Solution, SolveOutcome, Variable};
 use std::time::Duration;
 
 const OBJ_TOL: f64 = 1e-6;
+
+fn require_solution(outcome: SolveOutcome, context: &str) -> Result<Solution, String> {
+    crate::verify::require_solution(outcome, context)
+}
 
 fn assert_close(what: &str, got: f64, want: f64) -> Result<(), String> {
     if (got - want).abs() > OBJ_TOL + OBJ_TOL * want.abs() {
@@ -76,12 +80,17 @@ fn add_constraint_lp(cases: &mut Vec<Case>) {
                 p.add_constraint(&terms, Le, inst.b[i] as f64);
             }
             p.set_time_limit(budget / 4);
-            let mut sol = p.solve().map_err(|e| format!("prefix solve: {}", e))?;
+            let mut sol = require_solution(
+                p.solve().map_err(|e| format!("prefix solve: {}", e))?,
+                "prefix solve",
+            )?;
             for i in split..n {
                 let terms = row_terms(&inst, &vars, i);
-                sol = sol
-                    .add_constraint(&terms, Le, inst.b[i] as f64)
-                    .map_err(|e| format!("add_constraint row {}: {}", i, e))?;
+                sol = require_solution(
+                    sol.add_constraint(&terms, Le, inst.b[i] as f64)
+                        .map_err(|e| format!("add_constraint row {}: {}", i, e))?,
+                    &format!("add_constraint row {}", i),
+                )?;
             }
             assert_close(
                 "incremental objective",
@@ -106,31 +115,35 @@ fn add_constraint_lp(cases: &mut Vec<Case>) {
             let x = p.add_var(1.0, (0.0, 10.0));
             let y = p.add_var(1.0, (0.0, 10.0));
             p.set_time_limit(budget / 4);
-            let sol = p.solve().map_err(|e| format!("base: {}", e))?;
+            let sol =
+                require_solution(p.solve().map_err(|e| format!("base: {}", e))?, "base solve")?;
             assert_close("base (bounds only)", sol.objective(), 20.0)?;
 
-            let sol = sol
-                .add_constraint(&[(x, 1.0), (y, 1.0)], Le, 15.0)
-                .map_err(|e| format!("step 1: {}", e))?;
+            let sol = require_solution(
+                sol.add_constraint(&[(x, 1.0), (y, 1.0)], Le, 15.0)
+                    .map_err(|e| format!("step 1: {}", e))?,
+                "step 1",
+            )?;
             assert_close("after x+y<=15", sol.objective(), 15.0)?;
 
-            let sol = sol
-                .add_constraint(&[(x, 1.0)], Le, 3.0)
-                .map_err(|e| format!("step 2: {}", e))?;
+            let sol = require_solution(
+                sol.add_constraint(&[(x, 1.0)], Le, 3.0)
+                    .map_err(|e| format!("step 2: {}", e))?,
+                "step 2",
+            )?;
             assert_close("after x<=3", sol.objective(), 13.0)?;
 
-            let sol = sol
-                .add_constraint(&[(y, 1.0), (x, -1.0)], Le, 0.0)
-                .map_err(|e| format!("step 3: {}", e))?;
+            let sol = require_solution(
+                sol.add_constraint(&[(y, 1.0), (x, -1.0)], Le, 0.0)
+                    .map_err(|e| format!("step 3: {}", e))?,
+                "step 3",
+            )?;
             assert_close("after y<=x", sol.objective(), 6.0)?;
 
             match sol.add_constraint(&[(x, 1.0), (y, 1.0)], Ge, 20.0) {
                 Err(microlp::Error::Infeasible) => Ok(()),
                 Err(e) => Err(format!("expected Infeasible on step 4, got error {}", e)),
-                Ok(s) => Err(format!(
-                    "expected Infeasible on step 4, got a solution with objective {}",
-                    s.objective()
-                )),
+                Ok(outcome) => Err(format!("expected Infeasible on step 4, got {outcome:?}")),
             }
         },
     ));
@@ -165,7 +178,8 @@ fn fix_unfix_lp(cases: &mut Vec<Case>) {
                     p.add_constraint(&terms, Le, inst.b[i] as f64);
                 }
                 p.set_time_limit(budget / 8);
-                p.solve().map_err(|e| format!("fresh solve: {}", e))
+                let outcome = p.solve().map_err(|e| format!("fresh solve: {}", e))?;
+                require_solution(outcome, "fresh solve")
             };
 
             let base = build_full(None)?;
@@ -183,10 +197,12 @@ fn fix_unfix_lp(cases: &mut Vec<Case>) {
             };
             let off = inst.x_star[j] as f64 - 1.0;
             let vars_handle: Vec<Variable> = base.iter().map(|(v, _)| v).collect();
-            let fixed_incr = base
-                .clone()
-                .fix_var(vars_handle[j], off)
-                .map_err(|e| format!("fix_var: {}", e))?;
+            let fixed_incr = require_solution(
+                base.clone()
+                    .fix_var(vars_handle[j], off)
+                    .map_err(|e| format!("fix_var: {}", e))?,
+                "fix_var",
+            )?;
             let fixed_fresh = build_full(Some((j, off)))?;
             assert_close(
                 "fix_var vs fresh bounded solve",
@@ -211,6 +227,7 @@ fn fix_unfix_lp(cases: &mut Vec<Case>) {
             if !was_fixed {
                 return Err("unfix_var returned false for a fixed variable".into());
             }
+            let restored = require_solution(restored, "unfix_var")?;
             assert_close("after unfix", restored.objective(), inst.objective as f64)?;
             for (jj, &want) in inst.x_star.iter().enumerate() {
                 assert_close(
@@ -233,7 +250,7 @@ fn fix_unfix_lp(cases: &mut Vec<Case>) {
 // ---------------------------------------------------------------- resume
 
 fn resume(cases: &mut Vec<Case>) {
-    // Duration::ZERO guarantees StopReason::Limit before any work; resume(None)
+    // Duration::ZERO guarantees StopReason::Limit before any work; resume()
     // must then complete the solve and reach the known optimum. Exercises the
     // resume entry paths deterministically for LP and MILP alike.
     cases.push(Case::custom(
@@ -248,14 +265,15 @@ fn resume(cases: &mut Vec<Case>) {
                 p.add_constraint(&terms, Le, inst.b[i] as f64);
             }
             p.set_time_limit(Duration::ZERO);
-            let sol = p.solve().map_err(|e| format!("limited solve: {}", e))?;
-            if sol.status() == Status::Optimal {
+            let outcome = p.solve().map_err(|e| format!("limited solve: {}", e))?;
+            if outcome.is_optimal() {
                 return Err("zero time limit did not interrupt the solve".into());
             }
-            let sol = sol.resume(None).map_err(|e| format!("resume: {}", e))?;
-            if sol.status() != Status::Optimal {
-                return Err("resume(None) did not finish".into());
+            let outcome = outcome.resume_with(ResumeOptions::default()).map_err(|e| format!("resume: {}", e))?;
+            if !outcome.is_optimal() {
+                return Err("resume() did not finish".into());
             }
+            let sol = require_solution(outcome, "resumed LP")?;
             assert_close("resumed objective", sol.objective(), inst.objective as f64)
         },
     ));
@@ -281,14 +299,15 @@ fn resume(cases: &mut Vec<Case>) {
                 .collect();
             p.add_constraint(&terms, Le, capacity as f64);
             p.set_time_limit(Duration::ZERO);
-            let sol = p.solve().map_err(|e| format!("limited solve: {}", e))?;
-            if sol.status() == Status::Optimal {
+            let outcome = p.solve().map_err(|e| format!("limited solve: {}", e))?;
+            if outcome.is_optimal() {
                 return Err("zero time limit did not interrupt the solve".into());
             }
-            let sol = sol.resume(None).map_err(|e| format!("resume: {}", e))?;
-            if sol.status() != Status::Optimal {
-                return Err("resume(None) did not finish".into());
+            let outcome = outcome.resume_with(ResumeOptions::default()).map_err(|e| format!("resume: {}", e))?;
+            if !outcome.is_optimal() {
+                return Err("resume() did not finish".into());
             }
+            let sol = require_solution(outcome, "resumed MILP")?;
             assert_close("resumed knapsack vs DP", sol.objective(), best)
         },
     ));
@@ -313,19 +332,22 @@ fn resume(cases: &mut Vec<Case>) {
             }
             let mut problem = parsed.problem;
             problem.set_time_limit(Duration::from_millis(1));
-            let mut sol = problem.solve().map_err(|e| format!("solve: {}", e))?;
+            let mut outcome = problem.solve().map_err(|e| format!("solve: {}", e))?;
             let mut slices = 0;
-            while sol.status() != Status::Optimal {
+            while !outcome.is_optimal() {
                 slices += 1;
                 if slices > 1000 {
                     return Err(
                         "LP resume made no progress after 1000 one-millisecond slices".into(),
                     );
                 }
-                sol = sol
-                    .resume(Some(Duration::from_millis(1)))
+                let mut options = ResumeOptions::default();
+                options.time_limit = Some(Duration::from_millis(1));
+                outcome = outcome
+                    .resume_with(options)
                     .map_err(|e| format!("resume slice {}: {}", slices, e))?;
             }
+            let sol = require_solution(outcome, "resumed LP")?;
             assert_close(
                 "israel objective via slices",
                 sol.objective(),
@@ -351,17 +373,20 @@ fn resume(cases: &mut Vec<Case>) {
             )?;
             let mut problem = parsed.problem;
             problem.set_time_limit(Duration::from_millis(50));
-            let mut sol = problem.solve().map_err(|e| format!("solve: {}", e))?;
+            let mut outcome = problem.solve().map_err(|e| format!("solve: {}", e))?;
             let mut slices = 0;
-            while sol.status() != Status::Optimal {
+            while !outcome.is_optimal() {
                 slices += 1;
                 if slices > 600 {
                     return Err("MILP resume made no progress after 600 slices".into());
                 }
-                sol = sol
-                    .resume(Some(Duration::from_millis(100)))
+                let mut options = ResumeOptions::default();
+                options.time_limit = Some(Duration::from_millis(100));
+                outcome = outcome
+                    .resume_with(options)
                     .map_err(|e| format!("resume slice {}: {}", slices, e))?;
             }
+            let sol = require_solution(outcome, "resumed MILP")?;
             assert_close("stein27 via interrupted+resumed B&B", sol.objective(), 18.0)
         },
     ));
@@ -396,13 +421,18 @@ fn milp_edits(cases: &mut Vec<Case>) {
                 .map(|(&v, &w)| (v, w as f64))
                 .collect();
             p.add_constraint(&terms, Le, capacity as f64);
-            let sol = p.solve().map_err(|e| format!("base solve: {}", e))?;
+            let sol = require_solution(
+                p.solve().map_err(|e| format!("base solve: {}", e))?,
+                "base solve",
+            )?;
             assert_close("base knapsack", sol.objective(), 4.0)?;
 
             // With x0 + x1 <= 1 the best is still 4 (e.g. items 0 and 2).
-            let sol = sol
-                .add_constraint(&[(vars[0], 1.0), (vars[1], 1.0)], Le, 1.0)
-                .map_err(|e| format!("add_constraint on MILP solution: {}", e))?;
+            let sol = require_solution(
+                sol.add_constraint(&[(vars[0], 1.0), (vars[1], 1.0)], Le, 1.0)
+                    .map_err(|e| format!("add_constraint on MILP solution: {}", e))?,
+                "add_constraint on MILP solution",
+            )?;
             assert_close("constrained knapsack", sol.objective(), 4.0)
         },
     ));
@@ -419,11 +449,16 @@ fn milp_edits(cases: &mut Vec<Case>) {
             let y = p.add_binary_var(4.0);
             let z = p.add_binary_var(3.0);
             p.add_constraint(&[(x, 4.0), (y, 3.0), (z, 2.0)], Le, 6.0);
-            let sol = p.solve().map_err(|e| format!("base solve: {}", e))?;
+            let sol = require_solution(
+                p.solve().map_err(|e| format!("base solve: {}", e))?,
+                "base solve",
+            )?;
             assert_close("base objective", sol.objective(), 8.0)?;
-            let sol = sol
-                .fix_var(y, 1.0)
-                .map_err(|e| format!("fix_var(y, 1) on MILP solution: {}", e))?;
+            let sol = require_solution(
+                sol.fix_var(y, 1.0)
+                    .map_err(|e| format!("fix_var(y, 1) on MILP solution: {}", e))?,
+                "fix_var(y, 1) on MILP solution",
+            )?;
             // The documented contract implies an integer-feasible re-solve.
             let vals = [
                 sol.var_value_raw(x),
@@ -487,15 +522,20 @@ fn milp_edits(cases: &mut Vec<Case>) {
                 .map(|(&v, &w)| (v, w as f64))
                 .collect();
             p.add_constraint(&terms, Le, capacity as f64);
-            let mut sol = p.solve().map_err(|e| format!("base solve: {}", e))?;
+            let mut sol = require_solution(
+                p.solve().map_err(|e| format!("base solve: {}", e))?,
+                "base solve",
+            )?;
             assert_close("base", sol.objective(), brute(&[]) as f64)?;
 
             let mut conflicts: Vec<(usize, usize)> = vec![];
             for &(i, j) in &[(0usize, 1usize), (2, 3), (4, 5)] {
                 conflicts.push((i, j));
-                sol = sol
-                    .add_constraint(&[(vars[i], 1.0), (vars[j], 1.0)], Le, 1.0)
-                    .map_err(|e| format!("adding conflict {:?}: {}", (i, j), e))?;
+                sol = require_solution(
+                    sol.add_constraint(&[(vars[i], 1.0), (vars[j], 1.0)], Le, 1.0)
+                        .map_err(|e| format!("adding conflict {:?}: {}", (i, j), e))?,
+                    &format!("adding conflict {:?}", (i, j)),
+                )?;
                 let want = brute(&conflicts) as f64;
                 assert_close(
                     &format!("after conflict {:?}", (i, j)),
@@ -543,12 +583,17 @@ fn milp_edits(cases: &mut Vec<Case>) {
                 .map(|(&v, &w)| (v, w as f64))
                 .collect();
             p.add_constraint(&terms, Le, capacity as f64);
-            let sol = p.solve().map_err(|e| format!("base solve: {}", e))?;
+            let sol = require_solution(
+                p.solve().map_err(|e| format!("base solve: {}", e))?,
+                "base solve",
+            )?;
             assert_close("base vs DP", sol.objective(), base_best)?;
 
-            let sol = sol
-                .fix_var(vars[0], 0.0)
-                .map_err(|e| format!("fix_var(x0, 0): {}", e))?;
+            let sol = require_solution(
+                sol.fix_var(vars[0], 0.0)
+                    .map_err(|e| format!("fix_var(x0, 0): {}", e))?,
+                "fix_var(x0, 0)",
+            )?;
             assert_close("fixed-out vs DP", sol.objective(), without0)?;
 
             let (sol, was_fixed) = sol
@@ -557,6 +602,7 @@ fn milp_edits(cases: &mut Vec<Case>) {
             if !was_fixed {
                 return Err("unfix_var returned false for a fixed variable".into());
             }
+            let sol = require_solution(sol, "unfix_var")?;
             assert_close("after unfix vs DP", sol.objective(), base_best)?;
             let (_, was_fixed_again) = sol
                 .unfix_var(vars[0])
@@ -579,13 +625,15 @@ fn milp_edits(cases: &mut Vec<Case>) {
             let x = p.add_binary_var(1.0);
             let y = p.add_binary_var(1.0);
             p.add_constraint(&[(x, 1.0), (y, 1.0)], Le, 2.0);
-            let sol = p.solve().map_err(|e| format!("base solve: {}", e))?;
+            let sol = require_solution(
+                p.solve().map_err(|e| format!("base solve: {}", e))?,
+                "base solve",
+            )?;
             match sol.fix_var(x, 0.5) {
                 Err(microlp::Error::Infeasible) => Ok(()),
                 Err(e) => Err(format!("expected Infeasible, got error {}", e)),
-                Ok(s) => Err(format!(
-                    "expected Infeasible fixing a binary to 0.5, got objective {}",
-                    s.objective()
+                Ok(outcome) => Err(format!(
+                    "expected Infeasible fixing a binary to 0.5, got {outcome:?}"
                 )),
             }
         },
@@ -609,12 +657,17 @@ fn milp_edits(cases: &mut Vec<Case>) {
             let z = p.add_integer_var(45.0, (0, i32::MAX));
             p.add_constraint(&[(x, 3.0), (y, 2.0), (z, 1.0)], Le, 20.0);
             p.add_constraint(&[(x, 2.0), (y, 1.0), (z, 3.0)], Le, 15.0);
-            let sol = p.solve().map_err(|e| format!("base solve: {}", e))?;
+            let sol = require_solution(
+                p.solve().map_err(|e| format!("base solve: {}", e))?,
+                "base solve",
+            )?;
             assert_close("base objective", sol.objective(), 405.0)?;
 
-            let sol = sol
-                .add_constraint(&[(y, 1.0)], Le, 5.0)
-                .map_err(|e| format!("adding y <= 5: {}", e))?;
+            let sol = require_solution(
+                sol.add_constraint(&[(y, 1.0)], Le, 5.0)
+                    .map_err(|e| format!("adding y <= 5: {}", e))?,
+                "adding y <= 5",
+            )?;
             assert_close("objective with y <= 5", sol.objective(), 395.0)?;
             let zv = sol.var_value_raw(z);
             if (zv - zv.round()).abs() > 1e-5 {

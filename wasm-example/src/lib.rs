@@ -32,7 +32,11 @@ pub fn solve_lp() -> Vec<f64> {
     p.add_constraint(&[(x, 3.0), (y, 2.0)], ComparisonOp::Le, 18.0);
     p.set_time_limit(Duration::from_secs(5));
 
-    let sol = p.solve().expect("LP is feasible and bounded");
+    let sol = p
+        .solve()
+        .expect("LP is feasible and bounded")
+        .into_solution()
+        .expect("the five-second budget must produce an LP solution");
     vec![sol.objective(), sol.var_value(x), sol.var_value(y)]
 }
 
@@ -54,6 +58,10 @@ pub fn solve_milp() -> Vec<f64> {
     p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 10.0);
     p.set_time_limit(Duration::from_secs(10));
 
-    let sol = p.solve().expect("MILP is feasible and bounded");
+    let sol = p
+        .solve()
+        .expect("MILP is feasible and bounded")
+        .into_solution()
+        .expect("the ten-second budget must produce a MILP solution");
     vec![sol.objective(), sol.var_value(x), sol.var_value(y)]
 }

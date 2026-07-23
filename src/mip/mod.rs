@@ -14,20 +14,27 @@ use node::{effective_bounds, Node};
 use std::collections::BTreeMap;
 use web_time::Instant;
 
-/// The outcome class of a finished or interrupted solve.
+/// Whether a usable solution is proven optimal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
-    /// Proven optimal (within the configured `mip_gap`, which defaults to exact).
+pub enum SolutionStatus {
+    /// The solver completed the optimality proof.
     Optimal,
-    /// A limit was hit; a feasible solution is available but optimality is unproven.
+    /// A valid incumbent is available, but exact optimality was not proven.
     Feasible,
-    /// A limit was hit before any usable solution was found. Value accessors
-    /// ([`crate::Solution::objective`] etc.) expose the search's current
-    /// working point on such solutions — possibly fractional and infeasible,
-    /// useful for inspection only. Checking the status before treating values
-    /// as the answer is the caller's responsibility; call
-    /// [`crate::Solution::resume`] to continue the search.
-    Interrupted,
+}
+
+/// Why a solve or resume call returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TerminationReason {
+    /// The LP or branch-and-bound optimality proof completed.
+    ProvenOptimal,
+    /// The configured relative MIP gap was reached before exact proof completed.
+    MipGap,
+    /// The wall-clock budget for this call was exhausted.
+    TimeLimit,
+    /// The branch-and-bound node budget for this call was exhausted.
+    NodeLimit,
 }
 
 /// Options controlling a solve. Construct with [`SolveOptions::default`] and
@@ -43,8 +50,10 @@ pub struct SolveOptions {
     /// budget applies per call, so each `resume` gets a fresh budget.
     /// The root relaxation does not count as a node.
     pub node_limit: Option<u64>,
-    /// Relative MIP gap at which the search stops and reports [`Status::Optimal`].
-    /// Must be finite and non-negative. Default `0.0` (prove exact optimality).
+    /// Relative MIP gap at which the search may stop with a feasible incumbent.
+    /// Such a stop reports [`SolutionStatus::Feasible`] and
+    /// [`TerminationReason::MipGap`]. Must be finite and non-negative. Default
+    /// `0.0` (prove exact optimality).
     pub mip_gap: f64,
     /// Integrality tolerance: a value within this distance of an integer counts
     /// as integral. Default `1e-6`. Loosening it does not loosen final
@@ -108,6 +117,35 @@ impl SolveOptions {
                 "invalid SolveOptions.tolerances.prune_epsilon: expected a finite non-negative value"
                     .to_string(),
             ));
+        }
+        Ok(())
+    }
+}
+
+/// Per-call options for continuing a resumable solve.
+///
+/// Time and node limits are fresh budgets for this call (`None` = unlimited).
+/// `options.mip_gap == None` means no MIP gap target (exact optimality, `0.0`).
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub struct ResumeOptions {
+    /// Fresh wall-clock budget for this resume (`None` = unlimited).
+    pub time_limit: Option<Duration>,
+    /// Fresh branch-and-bound node budget for this resume (`None` = unlimited).
+    pub node_limit: Option<u64>,
+    /// New relative MIP gap (`None` = no MIP gap / exact optimality `0.0`).
+    pub mip_gap: Option<f64>,
+}
+
+impl ResumeOptions {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        if let Some(mip_gap) = self.mip_gap {
+            if !mip_gap.is_finite() || mip_gap < 0.0 {
+                return Err(Error::InvalidOptions(
+                    "invalid ResumeOptions.mip_gap: expected a finite non-negative value"
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -284,31 +322,10 @@ impl MipState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MipOutcome {
-    Optimal,
-    Interrupted,
-}
-
 #[derive(Debug)]
 pub(crate) struct MipRun {
-    pub outcome: MipOutcome,
+    pub reason: TerminationReason,
     pub state: MipState,
-}
-
-pub(crate) fn status_of(outcome: MipOutcome, state: &MipState) -> Status {
-    match outcome {
-        MipOutcome::Optimal => Status::Optimal,
-        MipOutcome::Interrupted => {
-            if state.classifying_unbounded {
-                Status::Interrupted
-            } else if state.incumbent.is_some() {
-                Status::Feasible
-            } else {
-                Status::Interrupted
-            }
-        }
-    }
 }
 
 fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Error> {
@@ -367,7 +384,7 @@ fn begin_unbounded_classification(state: &mut MipState) -> Result<(), Error> {
     Ok(())
 }
 
-fn resume_or_classify(state: &mut MipState) -> Result<MipOutcome, Error> {
+fn resume_or_classify(state: &mut MipState) -> Result<TerminationReason, Error> {
     match resume_run_with_deadline(state) {
         Err(Error::Unbounded) if !state.classifying_unbounded => {
             begin_unbounded_classification(state)?;
@@ -380,8 +397,8 @@ fn resume_or_classify(state: &mut MipState) -> Result<MipOutcome, Error> {
 /// Build the search state for `problem` and run it under `options`.
 pub(crate) fn run(problem: &Problem, options: SolveOptions) -> Result<MipRun, Error> {
     let mut state = build_state(problem, options)?;
-    let outcome = resume_or_classify(&mut state)?;
-    Ok(MipRun { outcome, state })
+    let reason = resume_or_classify(&mut state)?;
+    Ok(MipRun { reason, state })
 }
 
 /// `base` with the fix_var overlay applied to the variable bounds.
@@ -483,16 +500,20 @@ pub(crate) fn reedit_and_resolve(state: Box<MipState>) -> Result<MipRun, Error> 
     Ok(run)
 }
 
-/// Continue a paused search with a fresh time budget.
+/// Continue a paused search with fresh per-call budgets and options.
 pub(crate) fn resume_run(
     state: &mut MipState,
-    time_limit: Option<Duration>,
-) -> Result<MipOutcome, Error> {
-    state.deadline = time_limit.map(|d| Instant::now() + d);
+    options: ResumeOptions,
+) -> Result<TerminationReason, Error> {
+    options.validate()?;
+    state.deadline = options.time_limit.map(|d| Instant::now() + d);
+    state.options.time_limit = options.time_limit;
+    state.options.node_limit = options.node_limit;
+    state.options.mip_gap = options.mip_gap.unwrap_or(0.0);
     resume_or_classify(state)
 }
 
-fn resume_run_with_deadline(state: &mut MipState) -> Result<MipOutcome, Error> {
+fn resume_run_with_deadline(state: &mut MipState) -> Result<TerminationReason, Error> {
     let started = Instant::now();
     let res = search_loop(state);
     state.stats.elapsed += started.elapsed();
@@ -505,6 +526,9 @@ fn resume_run_with_deadline(state: &mut MipState) -> Result<MipOutcome, Error> {
 /// bounds and the incumbent. `None` while nothing is known (no nodes, no incumbent).
 /// Only valid BETWEEN nodes (a popped node's subtree is otherwise unaccounted).
 fn global_bound_internal(state: &MipState) -> Option<f64> {
+    if !state.root_solved {
+        return None;
+    }
     let open_min = state
         .open
         .iter()
@@ -841,15 +865,15 @@ fn pop_node(state: &mut MipState) -> Option<Node> {
 /// the solver to the root optimum before returning.
 ///
 /// Returns `Ok(None)` on the normal path (the caller proceeds to build the root
-/// node). Returns `Ok(Some(MipOutcome::Interrupted))` only when the restore of the
-/// root basis fails AND the deadline strikes mid-restore: rather than let the
+/// node). Returns `Ok(Some(TerminationReason::TimeLimit))` only when the restore
+/// of the root basis fails AND the deadline strikes mid-restore: rather than let the
 /// caller read an unfinished `cur_obj_val` as the root bound, it un-sets
 /// `root_solved` so a resume re-enters `initial_solve` and continues honestly from
 /// the solver's feasibility flags.
 fn try_warm_start(
     state: &mut MipState,
     hints: &[(crate::Variable, f64)],
-) -> Result<Option<MipOutcome>, Error> {
+) -> Result<Option<TerminationReason>, Error> {
     let domains = state.solver.orig_var_domains.clone();
     let root_basis = state.solver.snapshot_basis();
     let mut applied: Vec<usize> = Vec::new();
@@ -936,7 +960,7 @@ fn try_warm_start(
             if let Some(error) = pending_error {
                 return Err(error);
             }
-            return Ok(Some(MipOutcome::Interrupted));
+            return Ok(Some(TerminationReason::TimeLimit));
         }
     }
     if let Some(error) = pending_error {
@@ -951,13 +975,13 @@ fn try_warm_start(
 fn initialize_root(
     state: &mut MipState,
     domains: &[VarDomain],
-) -> Result<Option<MipOutcome>, Error> {
+) -> Result<Option<TerminationReason>, Error> {
     if state.root_solved {
         return Ok(None);
     }
 
     if state.solver.initial_solve()? == StopReason::Limit {
-        return Ok(Some(MipOutcome::Interrupted));
+        return Ok(Some(TerminationReason::TimeLimit));
     }
     state.root_solved = true;
 
@@ -981,10 +1005,12 @@ fn initialize_root(
     if branching::is_integral(&state.solver, domains, int_tol) {
         match process_integral_candidate(state, domains, int_tol)? {
             IntegralCandidate::Branch(var) => branch(state, &root, var),
-            IntegralCandidate::Closed => return Ok(Some(MipOutcome::Optimal)),
+            IntegralCandidate::Closed => {
+                return Ok(Some(TerminationReason::ProvenOptimal));
+            }
             IntegralCandidate::Limit => {
                 state.root_solved = false;
-                return Ok(Some(MipOutcome::Interrupted));
+                return Ok(Some(TerminationReason::TimeLimit));
             }
         }
     } else {
@@ -1085,7 +1111,7 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
     Ok(NodeVisit::Solved)
 }
 
-fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
+fn search_loop(state: &mut MipState) -> Result<TerminationReason, Error> {
     let domains = state.solver.orig_var_domains.clone();
     state.solver.deadline = state.deadline;
 
@@ -1106,19 +1132,20 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
             break;
         }
 
-        // Gap-based stop: an incumbent within `mip_gap` of the proven bound counts
-        // as optimal. Checked first so it takes priority over limit interruptions.
+        // Gap-based stop: an incumbent within `mip_gap` of the proven bound is a
+        // valid feasible result, but the exact proof remains incomplete. Checked
+        // first so it takes priority over limit interruptions.
         if state.options.mip_gap > 0.0 {
             if let (Some(inc), Some(bound)) = (&state.incumbent, global_bound_internal(state)) {
                 if relative_gap(inc.objective, bound) <= state.options.mip_gap {
-                    return Ok(MipOutcome::Optimal);
+                    return Ok(TerminationReason::MipGap);
                 }
             }
         }
 
         // Global limits are checked between nodes; no unfinished node result is consulted.
         if check_deadline(&state.deadline) == StopReason::Limit {
-            return Ok(MipOutcome::Interrupted);
+            return Ok(TerminationReason::TimeLimit);
         }
         let node = match pop_node(state) {
             Some(n) => n,
@@ -1141,7 +1168,7 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
             if nodes_this_run >= nl {
                 state.open.push(node);
                 state.diving = false;
-                return Ok(MipOutcome::Interrupted);
+                return Ok(TerminationReason::NodeLimit);
             }
         }
 
@@ -1158,13 +1185,13 @@ fn search_loop(state: &mut MipState) -> Result<MipOutcome, Error> {
                 state.open.push(node);
                 state.last_solved_id = None;
                 state.diving = false;
-                return Ok(MipOutcome::Interrupted);
+                return Ok(TerminationReason::TimeLimit);
             }
         }
     }
 
     if state.incumbent.is_some() {
-        Ok(MipOutcome::Optimal)
+        Ok(TerminationReason::ProvenOptimal)
     } else {
         Err(Error::Infeasible)
     }
@@ -1209,7 +1236,7 @@ mod tests {
     #[test]
     fn driver_finds_integer_optimum() {
         let run = run(&int_2var_problem(), SolveOptions::default()).unwrap();
-        assert_eq!(run.outcome, MipOutcome::Optimal);
+        assert_eq!(run.reason, TerminationReason::ProvenOptimal);
         // Internal space == user space for Minimize.
         assert!((incumbent_obj(&run.state) - 11.0).abs() < 1e-6);
         let inc = run.state.incumbent.as_ref().unwrap();
@@ -1221,7 +1248,7 @@ mod tests {
     #[test]
     fn driver_binary_knapsack_maximize() {
         let run = run(&binary_knapsack(), SolveOptions::default()).unwrap();
-        assert_eq!(run.outcome, MipOutcome::Optimal);
+        assert_eq!(run.reason, TerminationReason::ProvenOptimal);
         // Maximize is negated internally: internal optimum is -21.
         assert!((incumbent_obj(&run.state) + 21.0).abs() < 1e-6);
     }
@@ -1273,7 +1300,7 @@ mod tests {
         let mut options = SolveOptions::default();
         options.node_limit = Some(2);
         let r = run(&int_2var_problem(), options).unwrap();
-        assert_eq!(r.outcome, MipOutcome::Optimal);
+        assert_eq!(r.reason, TerminationReason::ProvenOptimal);
         assert!((incumbent_obj(&r.state) - 11.0).abs() < 1e-6);
     }
 
@@ -1283,10 +1310,10 @@ mod tests {
         options.node_limit = Some(1);
         let mut r = run(&int_2var_problem(), options).unwrap();
         let mut guard = 0;
-        while r.outcome == MipOutcome::Interrupted {
+        while r.reason != TerminationReason::ProvenOptimal {
             guard += 1;
             assert!(guard < 10_000, "resume loop did not terminate");
-            r.outcome = resume_run(&mut r.state, None).unwrap();
+            r.reason = resume_run(&mut r.state, ResumeOptions::default()).unwrap();
         }
         assert!(guard >= 1, "node_limit=1 should interrupt at least once");
         assert!((incumbent_obj(&r.state) - 11.0).abs() < 1e-6);
@@ -1298,7 +1325,7 @@ mod tests {
         options.node_limit = Some(0);
         let run = run(&int_2var_problem(), options).unwrap();
 
-        assert_eq!(run.outcome, MipOutcome::Interrupted);
+        assert_eq!(run.reason, TerminationReason::NodeLimit);
         assert_eq!(run.state.open.len(), 2);
         assert!(run.state.open.iter().all(|node| node.branch_var.is_some()));
     }
@@ -1308,27 +1335,47 @@ mod tests {
         let mut options = SolveOptions::default();
         options.time_limit = Some(Duration::ZERO);
         let mut r = run(&binary_knapsack(), options).unwrap();
-        assert_eq!(r.outcome, MipOutcome::Interrupted);
+        assert_eq!(r.reason, TerminationReason::TimeLimit);
         assert!(r.state.incumbent.is_none());
-        assert_eq!(status_of(r.outcome, &r.state), Status::Interrupted);
-        let outcome = resume_run(&mut r.state, None).unwrap();
-        assert_eq!(outcome, MipOutcome::Optimal);
+        let resume_options = ResumeOptions {
+            time_limit: Some(Duration::from_secs(10)),
+            ..ResumeOptions::default()
+        };
+        let reason = resume_run(&mut r.state, resume_options).unwrap();
+        assert_eq!(reason, TerminationReason::ProvenOptimal);
         assert!((incumbent_obj(&r.state) + 21.0).abs() < 1e-6);
     }
 
     #[test]
     fn optimal_solve_reports_zero_gap_and_matching_bound() {
         let r = run(&int_2var_problem(), SolveOptions::default()).unwrap();
-        assert_eq!(r.outcome, MipOutcome::Optimal);
+        assert_eq!(r.reason, TerminationReason::ProvenOptimal);
         assert_eq!(r.state.stats.gap, Some(0.0));
         // User space == internal for Minimize.
         assert!((r.state.stats.best_bound.unwrap() - 11.0).abs() < 1e-6);
     }
 
     #[test]
+    fn unsolved_root_with_incumbent_has_no_proven_bound_or_gap() {
+        let problem = binary_knapsack();
+        let mut state = build_state(&problem, SolveOptions::default()).unwrap();
+        state.incumbent = Some(Incumbent {
+            values: vec![0.0; problem.obj_coeffs.len()],
+            objective: 0.0,
+        });
+        state.root_solved = false;
+        state.open.clear();
+
+        fill_bound_stats(&mut state);
+
+        assert_eq!(state.stats.best_bound, None);
+        assert_eq!(state.stats.gap, None);
+    }
+
+    #[test]
     fn maximize_bound_is_in_user_space() {
         let r = run(&binary_knapsack(), SolveOptions::default()).unwrap();
-        assert_eq!(r.outcome, MipOutcome::Optimal);
+        assert_eq!(r.reason, TerminationReason::ProvenOptimal);
         // Internally -21; user-facing bound must be +21.
         assert!((r.state.stats.best_bound.unwrap() - 21.0).abs() < 1e-6);
     }
@@ -1338,7 +1385,7 @@ mod tests {
         let mut options = SolveOptions::default();
         options.mip_gap = 0.5;
         let r = run(&binary_knapsack(), options).unwrap();
-        assert_eq!(r.outcome, MipOutcome::Optimal); // optimal within the configured gap
+        assert_eq!(r.reason, TerminationReason::MipGap);
         let inc = -incumbent_obj(&r.state); // user space (Maximize)
         let bound = r.state.stats.best_bound.unwrap();
         // Incumbent within 50% of the proven bound, and never better than it.
@@ -1353,12 +1400,19 @@ mod tests {
         let mut r = run(&binary_knapsack(), options).unwrap();
         // Resume with node budget until an incumbent exists but the search isn't done.
         let mut guard = 0;
-        while r.outcome == MipOutcome::Interrupted && r.state.incumbent.is_none() {
+        while r.reason == TerminationReason::NodeLimit && r.state.incumbent.is_none() {
             guard += 1;
             assert!(guard < 10_000);
-            r.outcome = resume_run(&mut r.state, None).unwrap();
+            r.reason = resume_run(
+                &mut r.state,
+                ResumeOptions {
+                    node_limit: Some(2),
+                    ..ResumeOptions::default()
+                },
+            )
+            .unwrap();
         }
-        if r.outcome == MipOutcome::Interrupted {
+        if r.reason == TerminationReason::NodeLimit {
             // Feasible-but-unproven: a gap must be reported.
             assert!(r.state.stats.gap.unwrap() >= 0.0);
             assert!(r.state.stats.best_bound.is_some());
@@ -1378,10 +1432,10 @@ mod tests {
         options.node_limit = Some(1);
         let mut r = run(&binary_knapsack(), options).unwrap();
         let mut guard = 0;
-        while r.outcome == MipOutcome::Interrupted {
+        while r.reason != TerminationReason::ProvenOptimal {
             guard += 1;
             assert!(guard < 10_000);
-            r.outcome = resume_run(&mut r.state, None).unwrap();
+            r.reason = resume_run(&mut r.state, ResumeOptions::default()).unwrap();
         }
         assert!((incumbent_obj(&r.state) + 21.0).abs() < 1e-6);
         // After a best-bound jump the pop is NOT the last-pushed node at least once

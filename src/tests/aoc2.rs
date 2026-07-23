@@ -47,7 +47,11 @@ mod tests_aoc2 {
         }
 
         // Solve
-        let sol = problem.solve().unwrap();
+        let sol = problem
+            .solve()
+            .unwrap()
+            .into_solution()
+            .expect("an unlimited bounded solve must return a solution");
 
         // Get solution values
         let values: Vec<i64> = press_counts

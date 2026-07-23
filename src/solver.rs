@@ -2062,22 +2062,62 @@ mod tests {
         let mut problem = Problem::new(OptimizationDirection::Minimize);
         let x = problem.add_integer_var(1.0, (0, 10));
         problem.add_constraint([(x, 30.0)], ComparisonOp::Ge, 90.0);
-        assert!((problem.solve().unwrap().objective() - 3.0).abs() < EPS);
+        assert!(
+            (problem
+                .solve()
+                .unwrap()
+                .into_solution()
+                .unwrap()
+                .objective()
+                - 3.0)
+                .abs()
+                < EPS
+        );
 
         let mut problem = Problem::new(OptimizationDirection::Minimize);
         let x = problem.add_integer_var(1.0, (0, 10));
         problem.add_constraint([(x, 30.0)], ComparisonOp::Ge, 91.0);
-        assert!((problem.solve().unwrap().objective() - 4.0).abs() < EPS);
+        assert!(
+            (problem
+                .solve()
+                .unwrap()
+                .into_solution()
+                .unwrap()
+                .objective()
+                - 4.0)
+                .abs()
+                < EPS
+        );
 
         let mut problem = Problem::new(OptimizationDirection::Maximize);
         let x = problem.add_integer_var(1.0, (0, 10));
         problem.add_constraint([(x, 30.0)], ComparisonOp::Le, 90.0);
-        assert!((problem.solve().unwrap().objective() - 3.0).abs() < EPS);
+        assert!(
+            (problem
+                .solve()
+                .unwrap()
+                .into_solution()
+                .unwrap()
+                .objective()
+                - 3.0)
+                .abs()
+                < EPS
+        );
 
         let mut problem = Problem::new(OptimizationDirection::Maximize);
         let x = problem.add_integer_var(1.0, (0, 10));
         problem.add_constraint([(x, 30.0)], ComparisonOp::Le, 91.0);
-        assert!((problem.solve().unwrap().objective() - 3.0).abs() < EPS);
+        assert!(
+            (problem
+                .solve()
+                .unwrap()
+                .into_solution()
+                .unwrap()
+                .objective()
+                - 3.0)
+                .abs()
+                < EPS
+        );
     }
 
     #[test]
@@ -2098,7 +2138,7 @@ mod tests {
             ComparisonOp::Ge,
             logn,
         );
-        let sol = problem.solve().unwrap();
+        let sol = problem.solve().unwrap().into_solution().unwrap();
         assert_eq!(sol.objective().round() as i64, 14);
     }
 

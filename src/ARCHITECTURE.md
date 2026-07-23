@@ -55,7 +55,7 @@ Three principles shape everything:
 
 | File | Responsibility |
 |---|---|
-| `src/lib.rs` | Public API: `Problem`, `Solution`, `Status`, re-exports of `SolveOptions`/`Tolerances`/`Stats`. Owns solve/edit timing and the `Problem::build_solver` model-to-engine seam. |
+| `src/lib.rs` | Public API: `Problem`, `SolveOutcome`, `Solution`, `InterruptedSolve`, and re-exports of solve options, statuses, reasons, and statistics. Owns solve/edit timing and the `Problem::build_solver` model-to-engine seam. |
 | `src/solver.rs` | The simplex engine (`Solver`): bounded-variable primal/dual simplex, shared row preparation, basis management, and the small contract surface the MIP layer uses. |
 | `src/lu.rs`, `src/sparse.rs`, `src/ordering.rs` | LU factorization with eta-file updates, sparse containers, fill-reducing ordering. |
 | `src/mip/mod.rs` | The branch & bound driver: `MipState`, root initialization, single-node visits, outer search policy, interruption/resume, candidates, warm starts, edits, and bound/gap accounting. |
@@ -201,10 +201,11 @@ and direction that created it.
 | `pseudocosts`, `stats`, `options`, `deadline`, `direction` | search intelligence and bookkeeping |
 | `base: Problem`, `fixed: BTreeMap<var, val>` | the CLEAN user problem + user-level fixes — the substrate for post-solve edits (§5.8) |
 
-`Solution` for a MILP holds `Status` + this `MipState` boxed. When an incumbent exists,
-user reads come from its plain rounded values. An `Interrupted` solve without an incumbent
-instead exposes the live solver's current working point for inspection. For a pure LP,
-`Solution` keeps the live solver (that is what makes LP incremental editing cheap).
+`Solution` for a MILP holds `SolutionStatus`, `TerminationReason`, and this `MipState`
+boxed. User reads come from its validated incumbent's plain rounded values.
+`InterruptedSolve` also retains the live state for resume, but exposes only its reason and
+statistics. For a pure LP, `Solution` keeps the live solver (that is what makes LP
+incremental editing cheap).
 
 ---
 
@@ -231,7 +232,7 @@ flowchart TD
     O -->|yes + incumbent| OPT
     O -->|yes + no incumbent| EI
     O -->|no| G{gap or deadline reached?}
-    G -->|gap| OPT
+    G -->|gap| GAP((Feasible / MipGap))
     G -->|deadline| I2((Interrupted<br/>frontier remains resumable))
     G -->|continue| P[pop_node: warm dive or best-bound jump]
     P --> SB{stored bound reaches cutoff?}
@@ -386,7 +387,7 @@ tree. Restarting the same model with an unchanged hint and the same deterministi
 budget repeats the same search prefix. Wall-clock cutoffs may vary, but still retain no
 frontier. Consequently:
 
-- To **continue** an interrupted solve of an unchanged problem: use `Solution::resume` —
+- To **continue** an interrupted solve of an unchanged problem: use `SolveOutcome::resume` —
   it keeps the open list and continues where it stopped, budget-for-budget.
 - Restart-with-hint is the right tool when the problem **changed** (edits) or the state was
   lost. In a restart loop, once the carried hint stops improving, grow the budget so a later
@@ -412,45 +413,43 @@ sequenceDiagram
     M->>M: yes → seed options.warm_start with it
     M->>M: run(effective_problem(base, fixed), options) — fresh search
     M->>S: new MipState (base/fixed restored onto it)
-    S->>U: new Solution
+    S->>U: new SolveOutcome
 ```
 
 `base` is a clean copy of the user's problem that accumulates edits; `fixed` is the
 `fix_var` overlay (so `unfix_var` can restore original bounds). Every edit re-solves the
-*composed* problem from the root, warm-started by the surviving incumbent. Edits work on
-paused (`Feasible`/`Interrupted`) solutions too — that is the "edit after a time limit"
-feature. `unfix_var` returns `Result<(Solution, bool), Error>`; a prior interrupted edit can
-leave `base+fixed` infeasible-unproven, and the unfix re-solve may be the one to prove it.
+*composed* problem from the root, warm-started by the surviving incumbent. Edits exist only
+on a validated `Solution`, including a feasible-but-unproven one; an `InterruptedSolve`
+cannot be edited. `unfix_var` returns `Result<(SolveOutcome, bool), Error>`, so every
+limited re-solve remains typed explicitly.
 
 ### 5.9 Interruption and resume, end to end
 
 Timing is centralized without hiding the entry points' different policies:
 
 - A pure LP's initial timer starts before `Problem::build_solver`, so construction and the
-  initial simplex solve share one deadline. `Solution::resume` uses its explicitly supplied
-  budget; LP edits use the original operation time limit. `timed_lp_call` always accumulates
+  initial simplex solve share one deadline. `SolveOutcome::resume_with` uses its explicitly
+  supplied fresh budget; LP edits use the current operation time limit. `timed_lp_call` always accumulates
   elapsed time, including calls that return an error.
-- A MILP's initial run and each post-edit rebuild use its `SolveOptions`; `resume` installs
-  the explicitly supplied fresh time budget on the retained search state. Paused MILPs are
-  editable because edits discard the tree, while an interrupted pure LP must resume before
-  its live basis can be edited safely.
+- A MILP's initial run and each post-edit rebuild use its `SolveOptions`; `resume_with`
+  installs fresh time/node budgets on the retained search state. It preserves the configured
+  MIP gap unless `ResumeOptions::mip_gap` explicitly replaces it.
 
 MIP interruption points, in loop order, are: empty open list, gap target, deadline, then
 node budget. Checking exhaustion first prevents a completed proof from being mislabeled as
 interrupted. `node_limit` is per search call, so every `resume` receives a fresh node budget;
 the retained frontier still supplies continuity between calls.
 
-`Status` tells the truth about what you have:
+`SolveOutcome` makes answer safety structural:
 
-| Status | Meaning | Accessors |
+| Outcome | Status/reason | Accessors |
 |---|---|---|
-| `Optimal` | proof complete (within `mip_gap`) | all valid |
-| `Feasible` | limit hit; incumbent exists; `gap()` quantifies it | all valid |
-| `Interrupted` | limit hit before any usable solution | value accessors expose the **current working point** (possibly fractional/infeasible — checking the status is the caller's job); `resume()` continues |
+| `Solution` | `Optimal / ProvenOptimal` | objective, values, gap, stats, edits |
+| `Solution` | `Feasible / MipGap`, `TimeLimit`, or `NodeLimit` | objective, values, gap, stats, edits |
+| `Interrupted` | `TimeLimit` or `NodeLimit` | reason, stats, resume only |
 
-A time limit is a *status*, never an `Error`. Solve failures use `Infeasible`, `Unbounded`,
-or `InternalError`; public validation and state-machine misuse use `InvalidOptions` and
-`InvalidOperation` respectively.
+A limit is an outcome, never an `Error`. Solve failures use `Infeasible`, `Unbounded`,
+`InvalidOptions`, `InvalidOperation`, or `InternalError`.
 
 ---
 
@@ -469,24 +468,38 @@ options.mip_gap   = 0.01;                    // stop at a proven 1% gap
 options.warm_start = Some(vec![(x, 2.0)]);   // advisory hint
 options.tolerances.feasibility = 1e-7;       // expert knobs, see §7
 
-let sol = problem.solve_with(options)?;
-match sol.status() {
-    Status::Optimal | Status::Feasible => {
-        let _ = (sol.objective(), sol.var_value(x), sol.gap(), sol.stats());
-        // continue searching, or edit and re-solve:
-        let sol = sol.resume(Some(Duration::from_secs(10)))?;
-        let sol = sol.add_constraint(&[(x, 1.0)], ComparisonOp::Le, 4.0)?;
-        let (sol, was_fixed) = sol.fix_var(x, 3.0)?.unfix_var(x)?;
-    }
-    Status::Interrupted => { let _ = sol.resume(None)?; } // finish the job
+let mut outcome = problem.solve_with(options)?;
+if matches!(
+    outcome.termination_reason(),
+    TerminationReason::TimeLimit | TerminationReason::NodeLimit
+) {
+    let mut resume = ResumeOptions::default();
+    resume.time_limit = Some(Duration::from_secs(10));
+    outcome = outcome.resume_with(resume)?;
 }
+
+if let Some(sol) = outcome.solution() {
+    let _ = (
+        sol.status(),
+        sol.termination_reason(),
+        sol.objective(),
+        sol.var_value(x),
+        sol.gap(),
+        sol.stats(),
+    );
+}
+
+// Only an explicit gap change continues a gap-satisfied solve toward exact proof.
+let mut exact = ResumeOptions::default();
+exact.mip_gap = Some(0.0);
+let outcome = outcome.resume_with(exact)?;
 ```
 
 Reading values: `var_value` rounds integer variables (and asserts the stored value was
 already integral-clean — a failed assert means a solver bug, not user error);
 `var_value_raw`/`iter`/indexing return the incumbent's already-rounded values for a MILP
-with an incumbent, or the live working values for a pure LP and for an interrupted MILP
-without an incumbent.
+with an incumbent, or the optimal live working values for a pure LP. Interrupted outcomes
+expose no answer-value accessors.
 
 ---
 
@@ -528,7 +541,7 @@ magnitude, but govern distinct layers and must not be conflated.
 | `load_basis` failure on a jump | load the slack basis (infallible) and solve the node from scratch |
 | Phase-1 stall (“no entering column”) | refresh the basis (fresh LU + recomputed values) and retry once per stall; declare `Infeasible` only if it survives the refresh |
 | Deadline mid-LP | requeue the node unsolved; return `Interrupted` |
-| Limit with no incumbent | `Status::Interrupted`; value accessors expose the current working point (inspection only) |
+| Limit with no incumbent | `SolveOutcome::Interrupted`; only reason, stats, and resume are exposed |
 | Search exhausted, no incumbent | `Err(Infeasible)` |
 | Warm-start hint invalid, out of range, infeasible, fractional, or limited | hint dropped (debug log), solve proceeds cold |
 | Unexpected solver error while evaluating a warm start | restore root bounds and basis, then propagate the error |

@@ -13,7 +13,7 @@
 use super::{locate, read_instance, Case, Tier};
 use crate::model::{Expected, Tol};
 use crate::mps_milp;
-use microlp::{OptimizationDirection, Status};
+use microlp::{OptimizationDirection, SolutionStatus, SolveOutcome};
 
 /// Instances whose integer solve is not guaranteed to finish inside its
 /// (generous) budget on a laptop. For these the `/int` case tolerates a clean
@@ -127,40 +127,40 @@ pub fn register(cases: &mut Vec<Case>) {
                     let parsed = load(name, false)?;
                     let mut problem = parsed.problem;
                     problem.set_time_limit(budget);
-                    let sol = problem
+                    let outcome = problem
                         .solve()
                         .map_err(|e| format!("solve errored: {}", e))?;
-                    let has_incumbent = matches!(sol.status(), Status::Optimal | Status::Feasible);
-                    if has_incumbent {
-                        crate::LAST_SOLVE.with(|slot| {
-                            *slot.borrow_mut() = Some((sol.objective(), int_opt));
-                        });
-                    }
-                    match sol.status() {
-                        Status::Optimal => {
+                    match outcome {
+                        SolveOutcome::Solution(sol) => {
+                            crate::LAST_SOLVE.with(|slot| {
+                                *slot.borrow_mut() = Some((sol.objective(), int_opt));
+                            });
                             crate::verify::validate_incumbent(&parsed.spec, &sol)?;
-                            if !int_tol.matches(sol.objective(), int_opt) {
-                                return Err(format!(
-                                    "expected int optimum {}, got {} (diff {:.3e})",
-                                    int_opt,
-                                    sol.objective(),
-                                    (sol.objective() - int_opt).abs()
-                                ));
+                            match sol.status() {
+                                SolutionStatus::Optimal => {
+                                    if !int_tol.matches(sol.objective(), int_opt) {
+                                        return Err(format!(
+                                            "expected int optimum {}, got {} (diff {:.3e})",
+                                            int_opt,
+                                            sol.objective(),
+                                            (sol.objective() - int_opt).abs()
+                                        ));
+                                    }
+                                }
+                                SolutionStatus::Feasible => {
+                                    let tol = int_tol.abs + int_tol.rel * int_opt.abs();
+                                    if sol.objective() < int_opt - tol {
+                                        return Err(format!(
+                                            "feasible incumbent objective {} is below the proven \
+                                             optimum {} — solver unsoundness",
+                                            sol.objective(),
+                                            int_opt
+                                        ));
+                                    }
+                                }
                             }
                         }
-                        Status::Feasible => {
-                            crate::verify::validate_incumbent(&parsed.spec, &sol)?;
-                            let tol = int_tol.abs + int_tol.rel * int_opt.abs();
-                            if sol.objective() < int_opt - tol {
-                                return Err(format!(
-                                    "feasible incumbent objective {} is below the proven \
-                                     optimum {} — solver unsoundness",
-                                    sol.objective(),
-                                    int_opt
-                                ));
-                            }
-                        }
-                        Status::Interrupted => {}
+                        SolveOutcome::Interrupted(_) => {}
                     }
                     Ok(())
                 },

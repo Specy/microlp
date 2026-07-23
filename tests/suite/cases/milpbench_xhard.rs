@@ -32,7 +32,7 @@
 use super::{locate, read_instance, Case};
 use crate::lp_format;
 use crate::model::Tol;
-use microlp::{OptimizationDirection, Status};
+use microlp::{OptimizationDirection, SolutionStatus, SolveOutcome};
 
 struct XhardInstance {
     /// Family sub-directory under `data/xhard/milpbench/`.
@@ -148,10 +148,10 @@ pub fn register(cases: &mut Vec<Case>) {
                     let optimum = *optimum;
                     // A solve *error* (not a clean status) at this scale is a
                     // solver bug; surface it loudly.
-                    let sol = result
+                    let outcome = result
                         .map_err(|e| format!("solve errored (solver bug at scale): {}", e))?;
-                    match sol.status() {
-                        Status::Optimal => {
+                    match outcome {
+                        SolveOutcome::Solution(sol) if sol.status() == SolutionStatus::Optimal => {
                             crate::verify::validate_incumbent(&parsed.spec, &sol)?;
                             if !XHARD_TOL.matches(sol.objective(), optimum) {
                                 return Err(format!(
@@ -165,7 +165,7 @@ pub fn register(cases: &mut Vec<Case>) {
                             crate::LAST_SOLVE
                                 .with(|slot| *slot.borrow_mut() = Some((sol.objective(), optimum)));
                         }
-                        Status::Feasible => {
+                        SolveOutcome::Solution(sol) => {
                             crate::verify::validate_incumbent(&parsed.spec, &sol)?;
                             let slack = XHARD_TOL.slack(optimum);
                             let better_than_optimal = match parsed.direction {
@@ -189,18 +189,18 @@ pub fn register(cases: &mut Vec<Case>) {
                         }
                         // No incumbent inside the budget: a clean interrupt
                         // satisfies the xhard limit-handling contract.
-                        Status::Interrupted => {}
+                        SolveOutcome::Interrupted(_) => {}
                     }
                 }
                 Certificate::Envelope { lo, hi } => {
                     let (lo, hi) = (*lo, *hi);
                     let slack = XHARD_TOL.slack(lo.abs().max(hi.abs()));
-                    let sol = result
+                    let outcome = result
                         .map_err(|e| format!("solve errored (solver bug at scale): {}", e))?;
-                    match sol.status() {
+                    match outcome {
                         // A claimed proven optimum must land inside the
                         // externally proven envelope.
-                        Status::Optimal => {
+                        SolveOutcome::Solution(sol) if sol.status() == SolutionStatus::Optimal => {
                             crate::verify::validate_incumbent(&parsed.spec, &sol)?;
                             if sol.objective() < lo - slack || sol.objective() > hi + slack {
                                 return Err(format!(
@@ -214,7 +214,7 @@ pub fn register(cases: &mut Vec<Case>) {
                         }
                         // A feasible incumbent can be arbitrarily bad, but
                         // never better than the proven dual bound.
-                        Status::Feasible => {
+                        SolveOutcome::Solution(sol) => {
                             crate::verify::validate_incumbent(&parsed.spec, &sol)?;
                             let beats_proven_bound = match parsed.direction {
                                 OptimizationDirection::Maximize => sol.objective() > hi + slack,
@@ -231,7 +231,7 @@ pub fn register(cases: &mut Vec<Case>) {
                                 ));
                             }
                         }
-                        Status::Interrupted => {}
+                        SolveOutcome::Interrupted(_) => {}
                     }
                 }
                 Certificate::Unbounded => match result {
@@ -246,24 +246,22 @@ pub fn register(cases: &mut Vec<Case>) {
                             e
                         ))
                     }
-                    Ok(sol) => match sol.status() {
+                    Ok(SolveOutcome::Solution(sol)) if sol.status() == SolutionStatus::Optimal => {
                         // A finite "proven optimum" on an unbounded problem is
                         // unsound, full stop.
-                        Status::Optimal => {
-                            return Err(format!(
-                                "solver claims a finite proven optimum {} on a \
-                                 certified-unbounded instance — unsound",
-                                sol.objective()
-                            ))
-                        }
-                        // An honest, validated incumbent with no optimality
-                        // claim is fine (B&B may find one before noticing the
-                        // unbounded direction).
-                        Status::Feasible => {
-                            crate::verify::validate_incumbent(&parsed.spec, &sol)?;
-                        }
-                        Status::Interrupted => {}
-                    },
+                        return Err(format!(
+                            "solver claims a finite proven optimum {} on a \
+                             certified-unbounded instance — unsound",
+                            sol.objective()
+                        ));
+                    }
+                    // An honest, validated incumbent with no optimality
+                    // claim is fine (B&B may find one before noticing the
+                    // unbounded direction).
+                    Ok(SolveOutcome::Solution(sol)) => {
+                        crate::verify::validate_incumbent(&parsed.spec, &sol)?;
+                    }
+                    Ok(SolveOutcome::Interrupted(_)) => {}
                 },
             }
             Ok(())

@@ -301,7 +301,11 @@ mod tests_aoc {
             );
         }
 
-        let solution = problem.solve().expect("microlp solve failed");
+        let solution = problem
+            .solve()
+            .expect("microlp solve failed")
+            .into_solution()
+            .expect("an unlimited bounded solve must return a solution");
         vars.iter().map(|&var| solution.var_value(var) as i64).sum()
     }
 

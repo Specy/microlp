@@ -9,6 +9,12 @@ mod tests_general {
         let _ = env_logger::builder().is_test(true).try_init();
     }
 
+    fn solution(outcome: SolveOutcome) -> Solution {
+        outcome
+            .into_solution()
+            .expect("an unlimited bounded feasible solve must return a solution")
+    }
+
     #[test]
     fn optimize() {
         init();
@@ -18,7 +24,7 @@ mod tests_general {
         problem.add_constraint([(v1, 1.0), (v2, 1.0)], ComparisonOp::Le, 20.0);
         problem.add_constraint([(v2, -4.0), (v1, 1.0)], ComparisonOp::Ge, -20.0);
 
-        let sol = problem.solve().unwrap();
+        let sol = solution(problem.solve().unwrap());
         assert_eq!(sol[v1], 12.0);
         assert_eq!(sol[v2], 8.0);
         assert_eq!(sol.objective(), 68.0);
@@ -38,12 +44,12 @@ mod tests_general {
         for (expr, op, b) in trivial.iter().cloned() {
             problem.add_constraint(expr, op, b);
         }
-        assert_eq!(problem.solve().map(|s| s.objective()), Ok(0.0));
+        assert_eq!(solution(problem.solve().unwrap()).objective(), 0.0);
 
         {
-            let mut sol = problem.solve().unwrap();
+            let mut sol = solution(problem.solve().unwrap());
             for (expr, op, b) in trivial.iter().cloned() {
-                sol = sol.add_constraint(expr, op, b).unwrap();
+                sol = solution(sol.add_constraint(expr, op, b).unwrap());
             }
             assert_eq!(sol.objective(), 0.0);
         }
@@ -61,7 +67,7 @@ mod tests_general {
         }
 
         for (expr, op, b) in infeasible.iter().cloned() {
-            let sol = problem.solve().unwrap().add_constraint(expr, op, b);
+            let sol = solution(problem.solve().unwrap()).add_constraint(expr, op, b);
             assert_eq!(sol.map(|_| "solved"), Err(Error::Infeasible));
         }
 
@@ -79,7 +85,7 @@ mod tests_general {
         problem.add_constraint([(v1, 1.0), (v2, 1.0)], ComparisonOp::Ge, 2.0);
         problem.add_constraint([(v1, 1.0), (v2, -1.0)], ComparisonOp::Ge, 0.0);
 
-        let sol = problem.solve().unwrap();
+        let sol = solution(problem.solve().unwrap());
         assert_eq!(sol[v1], 2.0);
         assert_eq!(sol[v2], 2.0);
         assert_eq!(sol.objective(), 6.0);
@@ -94,27 +100,27 @@ mod tests_general {
         problem.add_constraint([(v1, 1.0), (v2, 1.0)], ComparisonOp::Le, 4.0);
         problem.add_constraint([(v1, 1.0), (v2, 1.0)], ComparisonOp::Ge, 1.0);
 
-        let orig_sol = problem.solve().unwrap();
+        let orig_sol = solution(problem.solve().unwrap());
 
         {
-            let mut sol = orig_sol.clone().fix_var(v1, 0.5).unwrap();
+            let mut sol = solution(orig_sol.clone().fix_var(v1, 0.5).unwrap());
             assert_eq!(sol[v1], 0.5);
             assert_eq!(sol[v2], 3.0);
             assert_eq!(sol.objective(), 6.5);
 
-            sol = sol.unfix_var(v1).unwrap().0;
+            sol = solution(sol.unfix_var(v1).unwrap().0);
             assert_eq!(sol[v1], 1.0);
             assert_eq!(sol[v2], 3.0);
             assert_eq!(sol.objective(), 7.0);
         }
 
         {
-            let mut sol = orig_sol.clone().fix_var(v2, 2.5).unwrap();
+            let mut sol = solution(orig_sol.clone().fix_var(v2, 2.5).unwrap());
             assert_eq!(sol[v1], 1.5);
             assert_eq!(sol[v2], 2.5);
             assert_eq!(sol.objective(), 6.5);
 
-            sol = sol.unfix_var(v2).unwrap().0;
+            sol = solution(sol.unfix_var(v2).unwrap().0);
             assert_eq!(sol[v1], 1.0);
             assert_eq!(sol[v2], 3.0);
             assert_eq!(sol.objective(), 7.0);
@@ -126,7 +132,7 @@ mod tests_general {
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut problem = Problem::new(OptimizationDirection::Minimize);
             let x = problem.add_var(1.0, (0.0, 10.0));
-            let solution = problem.solve().unwrap();
+            let solution = solution(problem.solve().unwrap());
             assert!(
                 matches!(solution.fix_var(x, invalid), Err(Error::Infeasible)),
                 "non-finite fix {invalid} was not rejected"
@@ -143,13 +149,15 @@ mod tests_general {
         problem.add_constraint([(v1, 1.0), (v2, 1.0)], ComparisonOp::Le, 4.0);
         problem.add_constraint([(v1, 1.0), (v2, 1.0)], ComparisonOp::Ge, 2.0);
 
-        let orig_sol = problem.solve().unwrap();
+        let orig_sol = solution(problem.solve().unwrap());
 
         {
-            let sol = orig_sol
-                .clone()
-                .add_constraint([(v1, -1.0), (v2, 1.0)], ComparisonOp::Le, 0.0)
-                .unwrap();
+            let sol = solution(
+                orig_sol
+                    .clone()
+                    .add_constraint([(v1, -1.0), (v2, 1.0)], ComparisonOp::Le, 0.0)
+                    .unwrap(),
+            );
 
             assert_eq!(sol[v1], 1.0);
             assert_eq!(sol[v2], 1.0);
@@ -157,22 +165,24 @@ mod tests_general {
         }
 
         {
-            let sol = orig_sol
-                .clone()
-                .fix_var(v2, 1.5)
-                .unwrap()
-                .add_constraint([(v1, -1.0), (v2, 1.0)], ComparisonOp::Le, 0.0)
-                .unwrap();
+            let fixed = solution(orig_sol.clone().fix_var(v2, 1.5).unwrap());
+            let sol = solution(
+                fixed
+                    .add_constraint([(v1, -1.0), (v2, 1.0)], ComparisonOp::Le, 0.0)
+                    .unwrap(),
+            );
             assert_eq!(sol[v1], 1.5);
             assert_eq!(sol[v2], 1.5);
             assert_eq!(sol.objective(), 4.5);
         }
 
         {
-            let sol = orig_sol
-                .clone()
-                .add_constraint([(v1, -1.0), (v2, 1.0)], ComparisonOp::Ge, 3.0)
-                .unwrap();
+            let sol = solution(
+                orig_sol
+                    .clone()
+                    .add_constraint([(v1, -1.0), (v2, 1.0)], ComparisonOp::Ge, 3.0)
+                    .unwrap(),
+            );
 
             assert_eq!(sol[v1], 0.0);
             assert_eq!(sol[v2], 3.0);
@@ -211,7 +221,7 @@ mod tests_general {
             .map(|v| (*v, weights[v.0] as f64))
             .collect::<Vec<_>>();
         problem.add_constraint(&entries, ComparisonOp::Le, capacity as f64);
-        let sol = problem.solve().unwrap();
+        let sol = solution(problem.solve().unwrap());
 
         let values = vars.iter().map(|v| sol.var_value(*v)).collect::<Vec<_>>();
         assert_eq!(
@@ -251,7 +261,7 @@ mod tests_general {
                 1.0,
             );
         }
-        let sol = problem.solve().unwrap();
+        let sol = solution(problem.solve().unwrap());
         let values = vars.iter().map(|v| sol.var_value(*v)).collect::<Vec<_>>();
         assert_eq!(cast_result_to_integers(values), vec![1, 0, 1, 0, 0, 0]);
         assert_eq!(sol.objective(), 2.0);
@@ -272,7 +282,7 @@ mod tests_general {
         // Labor time constraint: 2x + y + 3z ≤ 15
         problem.add_constraint(&[(x, 2.0), (y, 1.0), (z, 3.0)], ComparisonOp::Le, 15.0);
 
-        let sol = problem.solve().unwrap();
+        let sol = solution(problem.solve().unwrap());
 
         assert_eq!(
             [sol.var_value(x), sol.var_value(y), sol.var_value(z)],
@@ -348,7 +358,7 @@ mod tests_general {
             prev_inventory = inventory[i]
         }
 
-        let sol = problem.solve().unwrap();
+        let sol = solution(problem.solve().unwrap());
 
         assert!(
             float_eq(sol.objective(), 3440.0),
@@ -369,7 +379,8 @@ mod tests_general {
         // A zero duration guarantees the deadline is already passed before solving starts.
         problem.set_time_limit(Duration::ZERO);
         let result = problem.solve().unwrap();
-        assert_eq!(result.status(), Status::Interrupted);
+        assert!(matches!(&result, SolveOutcome::Interrupted(_)));
+        assert_eq!(result.termination_reason(), TerminationReason::TimeLimit);
     }
 
     #[test]
@@ -383,7 +394,7 @@ mod tests_general {
 
         // A generous time limit should let a small problem solve without issue.
         problem.set_time_limit(Duration::from_secs(60));
-        let sol = problem.solve().unwrap();
+        let sol = solution(problem.solve().unwrap());
         assert_eq!(sol.objective(), 7.0);
         assert_eq!(sol[x], 1.0);
         assert_eq!(sol[y], 3.0);
@@ -409,7 +420,8 @@ mod tests_general {
 
         problem.set_time_limit(Duration::ZERO);
         let result = problem.solve().unwrap();
-        assert_eq!(result.status(), Status::Interrupted);
+        assert!(matches!(&result, SolveOutcome::Interrupted(_)));
+        assert_eq!(result.termination_reason(), TerminationReason::TimeLimit);
     }
 
     #[test]
@@ -427,7 +439,7 @@ mod tests_general {
         problem.add_constraint([(b, -m), (x, 1.0)], ComparisonOp::Le, 10.0);
         problem.add_constraint([(b, -m), (x, 1.0)], ComparisonOp::Ge, -m + 10.0);
 
-        let sol = problem.solve().unwrap();
+        let sol = solution(problem.solve().unwrap());
 
         assert_eq!([sol.var_value(x), sol.var_value(b)], [5.0, 0.0]);
         assert_eq!(sol.objective().round(), 5.0);
