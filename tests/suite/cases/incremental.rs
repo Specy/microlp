@@ -269,7 +269,9 @@ fn resume(cases: &mut Vec<Case>) {
             if outcome.is_optimal() {
                 return Err("zero time limit did not interrupt the solve".into());
             }
-            let outcome = outcome.resume_with(ResumeOptions::default()).map_err(|e| format!("resume: {}", e))?;
+            let outcome = outcome
+                .resume_with(ResumeOptions::default())
+                .map_err(|e| format!("resume: {}", e))?;
             if !outcome.is_optimal() {
                 return Err("resume() did not finish".into());
             }
@@ -303,7 +305,9 @@ fn resume(cases: &mut Vec<Case>) {
             if outcome.is_optimal() {
                 return Err("zero time limit did not interrupt the solve".into());
             }
-            let outcome = outcome.resume_with(ResumeOptions::default()).map_err(|e| format!("resume: {}", e))?;
+            let outcome = outcome
+                .resume_with(ResumeOptions::default())
+                .map_err(|e| format!("resume: {}", e))?;
             if !outcome.is_optimal() {
                 return Err("resume() did not finish".into());
             }

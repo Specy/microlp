@@ -55,9 +55,9 @@ USAGE:
 OPTIONS:
   --time-limit <secs>   per-solver budget for every instance (default 300)
   --mip-gap <fraction>  relative MIP gap at which every solver may stop and
-                        report the optimum (default 0 = exact; e.g. 0.01
-                        accepts anything proven within 1%). Reference solves
-                        stay exact regardless.
+                        report a gap-satisfied feasible solution (default 0 =
+                        exact; e.g. 0.01 accepts anything proven within 1%).
+                        Reference solves stay exact regardless.
   --solvers <a,b,...>   run only these solvers (default: all compiled in)
   --filter <substr>     run only instances whose name contains this
                         (repeatable; matches are OR-ed)

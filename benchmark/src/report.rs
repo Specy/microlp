@@ -48,9 +48,19 @@ impl CaseResult {
         self.status == "optimal"
     }
 
+    fn gap_satisfied(&self) -> bool {
+        self.status == "gap-satisfied"
+    }
+
     /// The solver proved something: an optimum, infeasibility or unboundedness.
     fn conclusive(&self) -> bool {
         matches!(self.status.as_str(), "optimal" | "infeasible" | "unbounded")
+    }
+
+    /// The solver completed the requested proof target. A configured-gap stop
+    /// belongs here without being promoted to exact optimality.
+    fn completed_to_target(&self) -> bool {
+        self.conclusive() || self.gap_satisfied()
     }
 
     /// The solve ended because of the budget, not because of a defect.
@@ -108,7 +118,7 @@ pub fn render(data: &RunData) -> String {
         data.instances.iter().partition(|(_, results)| {
             !results
                 .iter()
-                .all(|r| r.conclusive() && r.ms.is_some_and(|ms| ms < data.min_ms))
+                .all(|r| r.completed_to_target() && r.ms.is_some_and(|ms| ms < data.min_ms))
         });
 
     let mut md = String::new();
@@ -150,8 +160,8 @@ fn header(md: &mut String, data: &RunData, kept: usize, trivial: usize) {
     } else {
         format!(
             "and every solver (microlp included) may stop once its solution is \
-             proven within a relative MIP gap of {} — \"proved optimum\" then \
-             means proven within that tolerance",
+             proven within a relative MIP gap of {}; those outcomes are reported \
+             separately as gap-satisfied feasible solutions, never as exact optima",
             data.mip_gap
         )
     };
@@ -185,17 +195,21 @@ fn header(md: &mut String, data: &RunData, kept: usize, trivial: usize) {
         if data.mip_gap == 0.0 {
             "0 (exact)".to_string()
         } else {
-            format!("{} (proofs within this tolerance count as optimal)", data.mip_gap)
+            format!(
+                "{} (gap-satisfied stops remain distinct from exact optima)",
+                data.mip_gap
+            )
         },
     ));
 }
 
 fn outcome_counts(md: &mut String, data: &RunData, kept: &[&Row]) {
     md.push_str("## Outcomes\n\n");
-    md.push_str("| solver | proved optimum | timed out | failed |\n");
-    md.push_str("| --- | ---: | ---: | ---: |\n");
+    md.push_str("| solver | proved optimum | gap satisfied | timed out | failed |\n");
+    md.push_str("| --- | ---: | ---: | ---: | ---: |\n");
     for solver in &data.solvers {
         let mut proved = 0;
+        let mut gap_satisfied = 0;
         let mut timed_out = 0;
         let mut failed = 0;
         for row in kept {
@@ -207,6 +221,8 @@ fn outcome_counts(md: &mut String, data: &RunData, kept: &[&Row]) {
             // spells it out). An LP-only solver on a MILP counts nowhere.
             if r.conclusive() {
                 proved += 1;
+            } else if r.gap_satisfied() {
+                gap_satisfied += 1;
             } else if r.budget_limited() {
                 timed_out += 1;
             } else if !r.not_applicable() {
@@ -214,22 +230,23 @@ fn outcome_counts(md: &mut String, data: &RunData, kept: &[&Row]) {
             }
         }
         md.push_str(&format!(
-            "| {} | {} | {} | {} |\n",
-            solver, proved, timed_out, failed
+            "| {} | {} | {} | {} | {} |\n",
+            solver, proved, gap_satisfied, timed_out, failed
         ));
     }
     md.push('\n');
 }
 
-/// (microlp ms, rival ms) pairs over instances both solved to proven optimality.
-fn both_optimal_pairs<'a>(kept: &[&'a Row], rival: &str) -> Vec<(&'a InstanceInfo, f64, f64)> {
+/// (microlp ms, rival ms) pairs over instances where both solvers completed
+/// the requested proof target. At gap 0 this means exact optimality.
+fn both_target_pairs<'a>(kept: &[&'a Row], rival: &str) -> Vec<(&'a InstanceInfo, f64, f64)> {
     let mut out = vec![];
     for row in kept {
         let (Some(m), Some(r)) = (result_of(row, "microlp"), result_of(row, rival)) else {
             continue;
         };
-        if m.optimal() && r.optimal() {
-            if let (Some(mm), Some(rm)) = (m.ms, r.ms) {
+        if m.completed_to_target() && r.completed_to_target() {
+            if let (Some(_), Some(_), Some(mm), Some(rm)) = (m.objective, r.objective, m.ms, r.ms) {
                 out.push((&row.0, mm, rm));
             }
         }
@@ -238,7 +255,7 @@ fn both_optimal_pairs<'a>(kept: &[&'a Row], rival: &str) -> Vec<(&'a InstanceInf
 }
 
 fn slowest_relative(md: &mut String, kept: &[&Row], rival: &str) {
-    let mut pairs = both_optimal_pairs(kept, rival);
+    let mut pairs = both_target_pairs(kept, rival);
     pairs.sort_by(|a, b| ((b.1 + 1.0) / (b.2 + 1.0)).total_cmp(&((a.1 + 1.0) / (a.2 + 1.0))));
     if pairs.is_empty() {
         return;
@@ -248,7 +265,8 @@ fn slowest_relative(md: &mut String, kept: &[&Row], rival: &str) {
         "The instances where microlp is furthest behind {rival} — the most \
          concrete list of what to profile next. The time ratio is microlp's \
          time over {rival}'s (with a 1 ms shift on both); below 1× microlp \
-         is faster.\n\n",
+         is faster. Both solvers completed the configured proof target on \
+         every row shown.\n\n",
     ));
     md.push_str(&format!(
         "| instance | class | microlp | {} | time ratio |\n",
@@ -358,14 +376,15 @@ fn unsolved(md: &mut String, data: &RunData, kept: &[&Row]) {
 fn best_incumbents(md: &mut String, data: &RunData, kept: &[&Row]) {
     let rows: Vec<&&Row> = kept
         .iter()
-        .filter(|row| !row.1.iter().any(|r| r.conclusive()))
+        .filter(|row| !row.1.iter().any(|r| r.completed_to_target()))
         .collect();
     if rows.is_empty() {
         return;
     }
-    md.push_str("## Best solution found where nothing was proved\n\n");
+    md.push_str("## Best solution found where no target was met\n\n");
     md.push_str(
-        "No solver proved these instances within the budget, so the incumbents \
+        "No solver met the configured proof target on these instances within \
+         the budget, so the incumbents \
          they were holding when time ran out compare solution quality instead. \
          Every value shown passed the independent feasibility check; **bold** \
          marks the best incumbent, percentages are the distance behind it, and \
@@ -483,7 +502,7 @@ fn alerts(md: &mut String, data: &RunData, kept: &[&Row]) {
     let mut failures: Vec<String> = vec![];
     for row in kept {
         for r in &row.1 {
-            if !r.conclusive() && !r.budget_limited() && !r.not_applicable() {
+            if !r.completed_to_target() && !r.budget_limited() && !r.not_applicable() {
                 failures.push(format!(
                     "| {} | {} | {} |",
                     row.0.name,
@@ -519,7 +538,10 @@ fn trivial_section(md: &mut String, data: &RunData, trivial: &[&Row]) {
 
 fn full_results(md: &mut String, data: &RunData, kept: &[&Row]) {
     md.push_str("## Full results\n\n");
-    md.push_str("Cells show wall time; non-optimal outcomes are spelled out.\n\n");
+    md.push_str(
+        "Cells show wall time; gap-satisfied and other non-optimal outcomes are \
+         spelled out.\n\n",
+    );
     md.push_str("| instance | class | rows | cols | int | nnz |");
     for s in &data.solvers {
         md.push_str(&format!(" {} |", s));
@@ -555,6 +577,13 @@ fn full_results(md: &mut String, data: &RunData, kept: &[&Row]) {
 fn result_cell(r: &CaseResult) -> String {
     match r.status.as_str() {
         "optimal" => r.ms.map(fmt_time).unwrap_or_else(|| "?".into()),
+        "gap-satisfied" => format!(
+            "{} (gap satisfied{})",
+            r.ms.map(fmt_time).unwrap_or_else(|| "?".into()),
+            r.gap
+                .map(|g| format!(", {}", fmt_pct(g)))
+                .unwrap_or_default()
+        ),
         "feasible" => format!(
             "feasible{}",
             r.gap
@@ -698,5 +727,26 @@ fn git_describe() -> String {
             )
         }
         None => "unversioned checkout".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CaseResult;
+
+    #[test]
+    fn gap_satisfied_is_completed_to_target_without_claiming_exact_optimality() {
+        let result = CaseResult {
+            solver: "solver".into(),
+            ms: Some(1.0),
+            objective: Some(10.0),
+            bound: Some(9.0),
+            gap: Some(0.1),
+            status: "gap-satisfied".into(),
+        };
+
+        assert!(result.completed_to_target());
+        assert!(!result.optimal());
+        assert!(!result.budget_limited());
     }
 }

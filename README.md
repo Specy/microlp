@@ -7,8 +7,6 @@ A linear programming solver: it finds the minimum (or maximum) of a linear
 function of a set of variables subject to linear equality and inequality
 constraints. Variables can be real, integer or boolean.
 
-This is a fork of the archived [minilp](https://github.com/ztlpn/minilp) crate, which was made to fix some bugs, add MILP solving, new features and allow the community to make issues and PRs.
-
 ### Disclaimer
 
 I cannot guarantee that the solver always gives optimal solutions (nor that it is bug free), but I'm trying to expand the test suite to cover most cases and catch any bugs that come with it. If you find a bug, want to contribute new testcases or new features, consider reporting it or contributing and sending a PR.
@@ -23,16 +21,15 @@ directly.
 
 ## Features
 
-* Pure Rust, no dependencies on native code. Runs on WebAssembly.
+* Pure Rust. Runs on WebAssembly.
 * Real, integer and boolean variables.
-* Time limits with possibility to edit and resume the solve.
-* Edit problems after solving and resume the solve from scratch.
+* Time limits and MIP gap, with possibility to edit and resume the solve.
 * Warm starts from a known solution.
 * Handles problems with hundreds of thousands of variables and constraints.
 
 Integer and boolean variables are handled with branch & bound. The library is
 already quite powerful and fast, but it may still cycle or lose precision on
-some hard problems — please report bugs and contribute code!
+some hard problems. Please report bugs and contribute code!
 
 ## Basic usage
 
@@ -91,24 +88,22 @@ problem.add_constraint(lhs, ComparisonOp::Eq, 0.0);
 
 ## Solving and reading the solution
 
-`solve()` returns `Error::Infeasible` when the constraints contradict each
-other and `Error::Unbounded` when the objective can grow forever. Invalid
-numeric options return `Error::InvalidOptions`, and unrecoverable numerical
-failures return `Error::InternalError`.
+`solve()` tries to find the optimal solution, it returns `Error::Infeasible` when the constraints contradict each other and `Error::Unbounded` when the objective can grow forever. Invalid numeric options return `Error::InvalidOptions`, and unrecoverable numerical failures return `Error::InternalError`.
 
-Reaching a limit is not an error. The successful result is a `SolveOutcome`:
+When a solver decides to produce a solution it might be for different reasons:
 
 * `SolveOutcome::Solution` contains a validated assignment. Its status is
   `SolutionStatus::Optimal` when exact optimality was proved, or
   `SolutionStatus::Feasible` when a valid incumbent is available without an
-  exact proof.
+  exact proof, for example if a time or node limit has been reached.
 * `SolveOutcome::Interrupted` means a time or node limit fired before a usable
   incumbent existed. It exposes the termination reason and statistics, but no
-  objective or variable-value accessors.
+  objective or variable-value accessors as they are not available. This case is
+  not "impossible" to solve, just that not enough time was spent to find a
+  solution. In this case you might want to use `resume()` to continue the search.
 
 `termination_reason()` distinguishes `ProvenOptimal`, `MipGap`, `TimeLimit`,
-and `NodeLimit`. In particular, reaching a configured MIP gap returns a
-feasible solution with reason `MipGap`
+and `NodeLimit`.
 ```rust
 use microlp::{SolutionStatus, SolveOutcome};
 
@@ -150,9 +145,10 @@ iterations, elapsed time, the best proven bound and the current gap.
 
 Set a time budget with `set_time_limit`. When it runs out, the outcome
 contains either a feasible incumbent or an interrupted search. `resume()`
-continues the same search.
+continues the same search with the per-call options used by the immediately
+preceding solve or resume.
 
-Use `resume_with` to change the options of the resume.
+Use `resume_with` to resume with different settings.
 
 ```rust
 use microlp::{ResumeOptions, TerminationReason};
@@ -192,7 +188,7 @@ options.warm_start = Some(vec![(x, 1.0), (y, 3.0)]);
 let outcome = problem.solve_with(options)?;
 ```
 
-* `time_limit`, `node_limit`: execution budgets for this call. Also applied to `resume()`
+* `time_limit`, `node_limit`: execution budgets for this call.
 * `mip_gap`: stop as soon as the solution is proven within this relative
   distance of the optimum, and report a feasible solution with termination
   reason `MipGap`. The default `0.0` requires exact optimality.

@@ -47,8 +47,10 @@ pub struct SolveOptions {
     pub time_limit: Option<Duration>,
     /// Maximum number of branch & bound nodes to solve in this call
     /// (`None` = unlimited). Deterministic alternative to `time_limit`; the
-    /// budget applies per call, so each `resume` gets a fresh budget.
-    /// The root relaxation does not count as a node.
+    /// budget applies per call, so [`crate::SolveOutcome::resume`] reapplies it
+    /// as a fresh budget. [`crate::SolveOutcome::resume_with`] instead uses the
+    /// value supplied to that call. The root relaxation does not count as a
+    /// node.
     pub node_limit: Option<u64>,
     /// Relative MIP gap at which the search may stop with a feasible incumbent.
     /// Such a stop reports [`SolutionStatus::Feasible`] and
@@ -124,7 +126,9 @@ impl SolveOptions {
 
 /// Per-call options for continuing a resumable solve.
 ///
-/// Time and node limits are fresh budgets for this call (`None` = unlimited).
+/// Every field replaces the value used by the preceding call; values are not
+/// merged. Time and node limits are fresh budgets for this call
+/// (`None` = unlimited).
 /// `options.mip_gap == None` means no MIP gap target (exact optimality, `0.0`).
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
@@ -1132,11 +1136,19 @@ fn search_loop(state: &mut MipState) -> Result<TerminationReason, Error> {
             break;
         }
 
-        // Gap-based stop: an incumbent within `mip_gap` of the proven bound is a
-        // valid feasible result, but the exact proof remains incomplete. Checked
-        // first so it takes priority over limit interruptions.
+        // Proof-quality stops: exact incumbent/bound equality wins; otherwise
+        // an incumbent within `mip_gap` is a valid feasible result. Checked
+        // first so proof quality takes priority over limit interruptions.
         if state.options.mip_gap > 0.0 {
             if let (Some(inc), Some(bound)) = (&state.incumbent, global_bound_internal(state)) {
+                // The open tree may still contain nodes whose stored bounds
+                // equal the incumbent. Equality of the incumbent and global
+                // bound is nevertheless a complete proof, so it must not be
+                // weakened to a gap-satisfied feasible result.
+                if bound >= inc.objective {
+                    state.open.clear();
+                    break;
+                }
                 if relative_gap(inc.objective, bound) <= state.options.mip_gap {
                     return Ok(TerminationReason::MipGap);
                 }

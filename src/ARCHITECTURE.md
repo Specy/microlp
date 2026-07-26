@@ -346,9 +346,11 @@ violations the guard exists to catch. A false *rejection* from the absolute chec
   the bound *is* the incumbent: proof complete. Valid only between nodes — a popped node's
   subtree is otherwise unaccounted.
 - **Gap** = `(incumbent − bound) / max(|incumbent|, ε)` in minimize space (sign-free — the
-  formula is direction-invariant). `mip_gap > 0` stops the search early with `Optimal`
-  (proven within the requested gap); the default `0.0` demands exact proof and adds zero
-  overhead (the check short-circuits).
+  formula is direction-invariant). `mip_gap > 0` may stop the search early with a feasible
+  solution and `TerminationReason::MipGap`; the default `0.0` demands exact proof and adds
+  zero overhead (the check short-circuits). During a positive-gap check, equality of the
+  incumbent and global bound is still classified as an exact proof even when the open list
+  contains dominated nodes.
 - **Pruning** uses `cutoff(incumbent) = incumbent − max(ε, ε·|incumbent|)` with
   `ε = Tolerances::prune_epsilon` (default 1e-9), applied twice per node: against the stored
   parent bound *before* any LP work, and against the fresh objective after.
@@ -431,14 +433,17 @@ Timing is centralized without hiding the entry points' different policies:
   initial simplex solve share one deadline. `SolveOutcome::resume_with` uses its explicitly
   supplied fresh budget; LP edits use the current operation time limit. `timed_lp_call` always accumulates
   elapsed time, including calls that return an error.
-- A MILP's initial run and each post-edit rebuild use its `SolveOptions`; `resume_with`
-  installs fresh time/node budgets on the retained search state. It preserves the configured
-  MIP gap unless `ResumeOptions::mip_gap` explicitly replaces it.
+- A MILP's initial run and each post-edit rebuild use its `SolveOptions`. `resume_with`
+  replaces all three per-call controls on the retained search state with exactly the supplied
+  `time_limit`, `node_limit`, and `mip_gap` values; `None` means unlimited budgets or no gap
+  target. Plain `resume()` instead passes back the options used by the immediately preceding
+  solve or resume call.
 
-MIP interruption points, in loop order, are: empty open list, gap target, deadline, then
-node budget. Checking exhaustion first prevents a completed proof from being mislabeled as
-interrupted. `node_limit` is per search call, so every `resume` receives a fresh node budget;
-the retained frontier still supplies continuity between calls.
+MIP interruption points, in loop order, are: empty open list; when a positive gap target is
+active, exact incumbent/bound equality and then the gap target; deadline; then node budget.
+Checking proof conditions first prevents a completed proof from being mislabeled as interrupted
+or merely gap-satisfied. `node_limit` is per search call, so every `resume` receives a fresh node
+budget; the retained frontier still supplies continuity between calls.
 
 `SolveOutcome` makes answer safety structural:
 
@@ -489,10 +494,9 @@ if let Some(sol) = outcome.solution() {
     );
 }
 
-// Only an explicit gap change continues a gap-satisfied solve toward exact proof.
-let mut exact = ResumeOptions::default();
-exact.mip_gap = Some(0.0);
-let outcome = outcome.resume_with(exact)?;
+// resume() would reuse the satisfied gap. resume_with(default) replaces it
+// with no gap target and continues toward exact proof.
+let outcome = outcome.resume_with(ResumeOptions::default())?;
 ```
 
 Reading values: `var_value` rounds integer variables (and asserts the stored value was

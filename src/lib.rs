@@ -1,45 +1,82 @@
 /*!
-A fast linear programming solver library.
+A linear programming solver: it finds the minimum (or maximum) of a linear
+function of a set of variables subject to linear equality and inequality
+constraints. Variables can be real, integer, or boolean.
 
-[Linear programming](https://en.wikipedia.org/wiki/Linear_programming) is a technique for
-finding the minimum (or maximum) of a linear function of a set of continuous variables
-subject to linear equality and inequality constraints.
+# Getting started
+
+You can use microlp directly, but [good_lp](https://github.com/rust-or/good_lp)
+and the [rooc modeling language](https://github.com/specy/rooc) provide
+higher-level ways to write models.
 
 # Features
 
-* Pure Rust implementation.
-* Able to solve problems with hundreds of thousands of variables and constraints.
-* Incremental: add constraints to an existing solution without solving it from scratch.
-* Interruptible: time/node limits with clean resume, warm starts from known solutions,
-  and MIP gap reporting for integer problems.
+* Pure Rust. Runs on WebAssembly.
+* Real, integer, and boolean variables.
+* Time limits and MIP gap, with the possibility to edit and resume a solve.
+* Warm starts from a known solution.
+* Handles problems with hundreds of thousands of variables and constraints.
 
-# Entry points
+Integer and boolean variables are handled with branch & bound. The solver may
+still cycle or lose precision on some hard problems.
 
-Begin by creating a [`Problem`](struct.Problem.html) instance, declaring variables and adding
-constraints. Solving it produces a [`SolveOutcome`]. A
-[`SolveOutcome::Solution`] contains a validated optimal or feasible assignment;
-[`SolveOutcome::Interrupted`] contains resumable search state but no answer
-values.
+# Solving and reading the solution
+
+[`Problem::solve`] tries to find the optimal solution. Contradictory
+constraints produce [`Error::Infeasible`], while an objective that can improve
+forever produces [`Error::Unbounded`]. Invalid explicit numeric options produce
+[`Error::InvalidOptions`], and unrecoverable numerical failures produce
+[`Error::InternalError`].
+
+When a solve call returns successfully:
+
+* [`SolveOutcome::Solution`] contains a validated assignment. Its status is
+  [`SolutionStatus::Optimal`] when exact optimality was proved, or
+  [`SolutionStatus::Feasible`] when a valid incumbent is available without an
+  exact proof, for example after reaching a time limit, node limit, or MIP gap.
+* [`SolveOutcome::Interrupted`] means a time or node limit fired before a usable
+  incumbent existed. It exposes the [`TerminationReason`] and [`Stats`], but no
+  objective or variable values because no validated assignment is available.
+  This does not mean the problem is impossible to solve. Use
+  [`SolveOutcome::resume`] to continue the search.
+
+[`SolveOutcome::termination_reason`] distinguishes
+[`TerminationReason::ProvenOptimal`], [`TerminationReason::MipGap`],
+[`TerminationReason::TimeLimit`], and [`TerminationReason::NodeLimit`].
+
+# Time limits, resuming, and editing
+
+[`Problem::set_time_limit`] sets a time budget. [`SolveOutcome::resume`] uses
+the per-call options from the immediately preceding solve or resume call.
+[`SolveOutcome::resume_with`] instead uses only the supplied [`ResumeOptions`]:
+every field replaces the previous setting, and values are not merged.
+
+A [`Solution`] can be edited and re-solved. [`Solution::add_constraint`] adds a
+constraint, [`Solution::fix_var`] pins a variable to a value, and
+[`Solution::unfix_var`] releases a previous fix. Each edit consumes the
+solution and returns a new [`SolveOutcome`], preserving earlier solver work
+where possible.
 
 # Example
 
 ```
-use microlp::{Problem, OptimizationDirection, ComparisonOp};
+use microlp::{ComparisonOp, OptimizationDirection, Problem};
 
-// Maximize an objective function x + 2 * y of two variables x >= 0 and 0 <= y <= 3
+// Maximize x + 2y, where x is real with x >= 0 and y is an integer
+// with 0 <= y <= 3.
 let mut problem = Problem::new(OptimizationDirection::Maximize);
 let x = problem.add_var(1.0, (0.0, f64::INFINITY));
-let y = problem.add_var(2.0, (0.0, 3.0));
+let y = problem.add_integer_var(2.0, (0, 3));
 
-// subject to constraints: x + y <= 4 and 2 * x + y >= 2.
+// Subject to x + y <= 4 and 2x + y >= 2.
 problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
 problem.add_constraint(&[(x, 2.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
 
-// Optimal value is 7, achieved at x = 1 and y = 3.
+// The optimum is 7, at x = 1, y = 3.
 let solution = problem.solve().unwrap().into_solution().unwrap();
 assert_eq!(solution.objective(), 7.0);
-assert_eq!(solution[x], 1.0);
-assert_eq!(solution[y], 3.0);
+assert_eq!(solution.var_value(x), 1.0);
+assert_eq!(solution.var_value(y), 3.0);
 ```
 */
 
@@ -409,12 +446,16 @@ impl Problem {
         )
     }
 
-    /// Solve with default options (respecting [`Problem::set_time_limit`] if set).
+    /// Try to find the optimal solution with the default options.
+    ///
+    /// A time limit set with [`Problem::set_time_limit`] produces a typed
+    /// [`SolveOutcome`] rather than an error.
     ///
     /// # Errors
     ///
     /// [`Error::Infeasible`] if no feasible (integer) point exists,
-    /// [`Error::Unbounded`] if the objective is unbounded.
+    /// [`Error::Unbounded`] if the objective is unbounded, or
+    /// [`Error::InternalError`] if an unrecoverable numerical failure occurs.
     pub fn solve(&self) -> Result<SolveOutcome, Error> {
         let options = SolveOptions {
             time_limit: self.time_limit,
@@ -423,7 +464,7 @@ impl Problem {
         self.solve_with(options)
     }
 
-    /// Solve with explicit [`SolveOptions`].
+    /// Try to find the optimal solution with explicit [`SolveOptions`].
     ///
     /// A limit is an outcome rather than an error. If a valid incumbent exists,
     /// the result is [`SolveOutcome::Solution`] with
@@ -471,16 +512,19 @@ enum SolveState {
     Mip(Box<mip::MipState>),
 }
 
-/// The result of a bounded solve call.
+/// The result of a solve, resume, or post-solve edit call.
 ///
 /// A [`Solution`] always contains a validated feasible assignment.
 /// [`InterruptedSolve`] contains resumable search state but deliberately has no
-/// objective or variable-value accessors.
+/// objective or variable-value accessors. An interruption means that a limit
+/// fired before an assignment was available, not that the problem is
+/// infeasible.
 #[derive(Clone)]
 pub enum SolveOutcome {
-    /// A usable optimal or feasible solution.
+    /// A validated assignment that is either exactly optimal or
+    /// feasible-but-unproven.
     Solution(Solution),
-    /// A limit fired before any usable solution was available.
+    /// A time or node limit fired before any usable solution was available.
     Interrupted(InterruptedSolve),
 }
 
@@ -618,7 +662,8 @@ impl SolveOutcome {
         )
     }
 
-    /// Options to re-apply the budgets and target used in the previous solve call.
+    /// Options to re-apply the budgets and target used in the previous solve or
+    /// resume call.
     pub fn last_resume_options(&self) -> ResumeOptions {
         match self {
             Self::Solution(solution) => solution.last_options.clone(),
@@ -632,15 +677,17 @@ impl SolveOutcome {
         self.resume_with(options)
     }
 
-    /// Continue with explicit fresh budgets and an optional new MIP gap.
+    /// Continue with explicit replacement budgets and MIP gap.
     ///
-    /// Time and node limits are fresh per-call budgets (`None` = unlimited).
+    /// Every field replaces the value used by the preceding call; values are
+    /// not merged. Time and node limits are fresh per-call budgets
+    /// (`None` = unlimited).
     /// `options.mip_gap == None` means no MIP gap target (exact optimality `0.0`).
     pub fn resume_with(self, options: ResumeOptions) -> Result<Self, Error> {
+        options.validate()?;
         if self.is_optimal() {
             return Ok(self);
         }
-        options.validate()?;
         let (direction, num_vars, state) = match self {
             Self::Solution(solution) => {
                 debug_assert_eq!(solution.status, SolutionStatus::Feasible);
@@ -819,7 +866,7 @@ impl Solution {
         }
     }
 
-    /// Options used in the previous solve call.
+    /// Options used in the previous solve or resume call.
     pub fn last_resume_options(&self) -> ResumeOptions {
         self.last_options.clone()
     }
@@ -855,7 +902,11 @@ impl Solution {
                     )
                 })?;
                 Ok(SolveOutcome::from_lp_stop(
-                    direction, num_vars, stop, solver, last_options,
+                    direction,
+                    num_vars,
+                    stop,
+                    solver,
+                    last_options,
                 ))
             }
             SolveState::Mip(mut state) => {
@@ -865,18 +916,32 @@ impl Solution {
                 state.base.constraints.push((coefficients, cmp_op, rhs));
                 let run = mip::reedit_and_resolve(state)?;
                 Ok(SolveOutcome::from_mip_run(
-                    direction, num_vars, run, last_options,
+                    direction,
+                    num_vars,
+                    run,
+                    last_options,
                 ))
             }
         }
     }
 
-    /// Fix a variable and re-solve, returning a typed outcome.
+    /// Pin a variable to a value and re-solve.
+    ///
+    /// This model edit changes the variable's effective lower and upper bounds
+    /// to `val`. A later [`Solution::unfix_var`] restores its original bounds.
+    /// Fixing the same variable again replaces its previous fixed value. The
+    /// existing solve state is retained where possible, and a previous
+    /// assignment is reused as a starting point when it remains valid.
     ///
     /// # Errors
     ///
-    /// [`Error::Infeasible`] if the fix is outside the original bounds or
-    /// `val` is not finite.
+    /// [`Error::Infeasible`] if `val` is not finite, is outside the variable's
+    /// original bounds, is incompatible with its integer or boolean domain, or
+    /// leaves the edited problem without a feasible assignment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `var` is out of range for this solution.
     pub fn fix_var(self, var: Variable, val: f64) -> Result<SolveOutcome, Error> {
         let last_options = self.last_options.clone();
         let Self {
@@ -895,7 +960,11 @@ impl Solution {
                 let stop =
                     timed_lp_call(&mut solver, time_limit, |solver| solver.fix_var(var.0, val))?;
                 Ok(SolveOutcome::from_lp_stop(
-                    direction, num_vars, stop, solver, last_options,
+                    direction,
+                    num_vars,
+                    stop,
+                    solver,
+                    last_options,
                 ))
             }
             SolveState::Mip(mut state) => {
@@ -905,15 +974,24 @@ impl Solution {
                 state.fixed.insert(var.0, val);
                 let run = mip::reedit_and_resolve(state)?;
                 Ok(SolveOutcome::from_mip_run(
-                    direction, num_vars, run, last_options,
+                    direction,
+                    num_vars,
+                    run,
+                    last_options,
                 ))
             }
         }
     }
 
-    /// Undo a previous [`Solution::fix_var`].
+    /// Release a fix created by [`Solution::fix_var`] and re-solve.
     ///
-    /// The boolean reports whether the variable was actually fixed.
+    /// The variable's original bounds are restored. The returned boolean is
+    /// `true` when a fix was released. If the variable was not fixed, this is a
+    /// no-op and the boolean is `false`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `var` is out of range for this solution.
     pub fn unfix_var(self, var: Variable) -> Result<(SolveOutcome, bool), Error> {
         let last_options = self.last_options.clone();
         let Self {
@@ -959,7 +1037,11 @@ impl Solution {
     }
 }
 
-/// A resumable search that has not produced a usable solution.
+/// A resumable search that has not yet produced a usable solution.
+///
+/// This means a time or node limit fired before a validated assignment became
+/// available. It does not mean that the problem is infeasible; continue it with
+/// [`SolveOutcome::resume`] or [`SolveOutcome::resume_with`].
 ///
 /// ```compile_fail
 /// # use microlp::InterruptedSolve;
@@ -1005,7 +1087,7 @@ impl InterruptedSolve {
         }
     }
 
-    /// Options used in the previous solve call.
+    /// Options used in the previous solve or resume call.
     pub fn last_resume_options(&self) -> ResumeOptions {
         self.last_options.clone()
     }
