@@ -14,10 +14,10 @@ I cannot guarantee that the solver always gives optimal solutions (nor that it i
 ## Getting started
 
 You can use [microlp](https://crates.io/crates/microlp) on its own, but it's
-recommended to use it with [good_lp](https://github.com/rust-or/good_lp) or
-with the [rooc modeling language](https://github.com/specy/rooc), as they make
-it easier to write models. The sections below show how to use microlp
-directly.
+recommended to use it with the [rooc modeling language](https://github.com/specy/rooc) or 
+[good_lp](https://github.com/rust-or/good_lp), as they make it easier to write models.
+
+The sections below show how to use microlp directly.
 
 ## Features
 

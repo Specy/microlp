@@ -1,7 +1,7 @@
 //! Branch & bound driver for mixed-integer problems.
 //!
 //! Owns exactly one [`Solver`] per search. Branching changes variable bounds in
-//! place (never adds constraint rows), so the LP never grows during the search.
+//! place.
 
 pub(crate) mod branching;
 pub(crate) mod node;
@@ -43,14 +43,12 @@ pub enum TerminationReason {
 #[non_exhaustive]
 pub struct SolveOptions {
     /// Wall-clock budget for this call (`None` = unlimited). On expiry the search
-    /// stops cleanly and can be resumed.
+    /// and can be resumed.
     pub time_limit: Option<Duration>,
     /// Maximum number of branch & bound nodes to solve in this call
     /// (`None` = unlimited). Deterministic alternative to `time_limit`; the
     /// budget applies per call, so [`crate::SolveOutcome::resume`] reapplies it
-    /// as a fresh budget. [`crate::SolveOutcome::resume_with`] instead uses the
-    /// value supplied to that call. The root relaxation does not count as a
-    /// node.
+    /// as a fresh budget. The root relaxation does not count as a node.
     pub node_limit: Option<u64>,
     /// Relative MIP gap at which the search may stop with a feasible incumbent.
     /// Such a stop reports [`SolutionStatus::Feasible`] and
@@ -58,17 +56,14 @@ pub struct SolveOptions {
     /// `0.0` (prove exact optimality).
     pub mip_gap: f64,
     /// Integrality tolerance: a value within this distance of an integer counts
-    /// as integral. Default `1e-6`. Loosening it does not loosen final
-    /// feasibility: a rounded candidate must still pass the absolute
-    /// `tolerances.feasibility` per-row/bound check (default `1e-7`) before it
-    /// is accepted, so a very loose `int_tol` mainly causes extra exact-fixing
-    /// branching rather than admitting an infeasible point. Must be finite and
-    /// in the half-open range `[0, 0.5)`.
+    /// as integral. Default `1e-6`. A very loose `int_tol` mainly causes extra 
+    /// exact-fixing branching rather than admitting an infeasible point.
+    /// Must be finite and in the half-open range `[0, 0.5)`.
     pub int_tol: f64,
     /// Optional (partial) starting assignment used to seed the incumbent.
-    /// Advisory: an infeasible or incomplete hint is ignored. Default `None`.
+    /// An infeasible or incomplete hint is ignored. Default `None`.
     pub warm_start: Option<Vec<(Variable, f64)>>,
-    /// Expert-level numeric tolerances (see [`Tolerances`]). Most callers
+    /// Edit the tolerances used by the solver, most callers
     /// should leave this at [`Tolerances::default`]; override an individual
     /// field only once you understand the correctness/permissiveness
     /// trade-off documented on it.
@@ -124,18 +119,16 @@ impl SolveOptions {
     }
 }
 
-/// Per-call options for continuing a resumable solve.
+/// Overrides for the solver settings used for a subsequent search/resume call.
 ///
-/// Every field replaces the value used by the preceding call; values are not
-/// merged. Time and node limits are fresh budgets for this call
-/// (`None` = unlimited).
-/// `options.mip_gap == None` means no MIP gap target (exact optimality, `0.0`).
+/// These fields override the ones defined in the previous call to 
+/// [`Problem::solve`] or [`Problem::resume`].
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct ResumeOptions {
-    /// Fresh wall-clock budget for this resume (`None` = unlimited).
+    /// New wall-clock budget (`None` = unlimited).
     pub time_limit: Option<Duration>,
-    /// Fresh branch-and-bound node budget for this resume (`None` = unlimited).
+    /// New branch-and-bound node budget (`None` = unlimited).
     pub node_limit: Option<u64>,
     /// New relative MIP gap (`None` = no MIP gap / exact optimality `0.0`).
     pub mip_gap: Option<f64>,
@@ -155,54 +148,25 @@ impl ResumeOptions {
     }
 }
 
-/// Expert-level numeric tolerances for a solve (see [`SolveOptions::tolerances`]).
+/// Numeric tolerances for a solve (see [`SolveOptions::tolerances`]).
 ///
-/// These are distinct from the rest of [`SolveOptions`] in kind: each field
-/// here trades correctness risk against permissiveness in a way that
-/// requires understanding a specific piece of solver behavior to tune
-/// safely, so they are grouped separately rather than left as top-level
-/// `SolveOptions` fields. Most callers never need to touch this and should
-/// start from [`Tolerances::default`].
-///
-/// Purely internal numeric constants that carry no user-facing meaning (e.g.
-/// denominator guards, branching heuristics) live in a separate, undocumented-
-/// to-callers internal module instead of here — this struct is reserved for
-/// numbers whose value is part of the solver's observable contract.
+/// This options override the solver's tolerances when solving the problem.
+/// Only edit those if you are sure of the impact of changing those values.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct Tolerances {
-    /// Absolute tolerance, in the same units as the problem's bounds and
-    /// constraint right-hand sides, used to validate a rounded-to-integer
-    /// candidate solution before it is accepted as the incumbent (the
-    /// "rounded-incumbent guard"): applied to each variable's distance
+    /// Uused to validate a rounded-to-integer
+    /// candidate solution before it is accepted as the incumbent.
+    /// Applied to each variable's distance
     /// outside its bounds and to each row's distance outside its feasible
     /// range. Also used, identically, by the post-edit warm-start
     /// pre-filter that decides whether a previous incumbent survives a
     /// [`crate::Solution`] edit.
-    ///
-    /// This is deliberately an ABSOLUTE tolerance, never one scaled by a
-    /// row's or bound's magnitude: a relative tolerance is blind to the
-    /// "big-M" trap, where a violation that is tiny RELATIVE to a huge row
-    /// coefficient (e.g. a slack of 5.0 against a coefficient of 1e9) is
-    /// nonetheless decisive in absolute terms — exactly the case this guard
-    /// exists to catch. See `Solver::check_constraints` for the full
-    /// rationale.
-    ///
     /// Must be finite and non-negative. Default `1e-7`.
     pub feasibility: f64,
     /// Distance from the nearest integer within which an integer/boolean
     /// variable's value is still treated as exactly that integer. Used by
-    /// the post-edit warm-start pre-filter's integrality check, mirroring
-    /// [`crate::Solution::var_value`]'s own rounding check.
-    ///
-    /// Note: [`crate::Solution::var_value`]'s internal rounding sanity
-    /// assert always uses [`Tolerances::default`]'s value for this field,
-    /// never the value configured for the solve that produced the solution.
-    /// That assert exists purely to catch a solver bug — an accepted
-    /// incumbent must already be integral-clean by the time it reaches the
-    /// user — not to reflect a caller's preference, so it intentionally does
-    /// not follow a loosened setting here.
-    ///
+    /// the post-edit warm-start pre-filter's integrality check.
     /// Must be finite and in the half-open range `[0, 0.5)`. Default `1e-5`.
     pub integrality_rounding: f64,
     /// Relative slack subtracted from the incumbent objective to form the

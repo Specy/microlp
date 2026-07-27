@@ -5,8 +5,9 @@ constraints. Variables can be real, integer, or boolean.
 
 # Getting started
 
-You can use microlp directly, but [good_lp](https://github.com/rust-or/good_lp)
-and the [rooc modeling language](https://github.com/specy/rooc) provide
+You can use microlp directly, but the
+[rooc modeling language](https://github.com/specy/rooc) and 
+[good_lp](https://github.com/rust-or/good_lp) provide
 higher-level ways to write models.
 
 # Features
@@ -19,6 +20,28 @@ higher-level ways to write models.
 
 Integer and boolean variables are handled with branch & bound. The solver may
 still cycle or lose precision on some hard problems.
+
+# Example
+
+```
+use microlp::{ComparisonOp, OptimizationDirection, Problem};
+
+// Maximize x + 2y, where x is real with x >= 0 and y is an integer
+// with 0 <= y <= 3.
+let mut problem = Problem::new(OptimizationDirection::Maximize);
+let x = problem.add_var(1.0, (0.0, f64::INFINITY));
+let y = problem.add_integer_var(2.0, (0, 3));
+
+// Subject to x + y <= 4 and 2x + y >= 2.
+problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
+problem.add_constraint(&[(x, 2.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
+
+// The optimum is 7, at x = 1, y = 3.
+let solution = problem.solve().unwrap().into_solution().unwrap();
+assert_eq!(solution.objective(), 7.0);
+assert_eq!(solution.var_value(x), 1.0);
+assert_eq!(solution.var_value(y), 3.0);
+```
 
 # Solving and reading the solution
 
@@ -56,27 +79,7 @@ constraint, [`Solution::fix_var`] pins a variable to a value, and
 [`Solution::unfix_var`] releases a previous fix. Each edit consumes the
 solution and returns a new [`SolveOutcome`] for the edited problem.
 
-# Example
 
-```
-use microlp::{ComparisonOp, OptimizationDirection, Problem};
-
-// Maximize x + 2y, where x is real with x >= 0 and y is an integer
-// with 0 <= y <= 3.
-let mut problem = Problem::new(OptimizationDirection::Maximize);
-let x = problem.add_var(1.0, (0.0, f64::INFINITY));
-let y = problem.add_integer_var(2.0, (0, 3));
-
-// Subject to x + y <= 4 and 2x + y >= 2.
-problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
-problem.add_constraint(&[(x, 2.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
-
-// The optimum is 7, at x = 1, y = 3.
-let solution = problem.solve().unwrap().into_solution().unwrap();
-assert_eq!(solution.objective(), 7.0);
-assert_eq!(solution.var_value(x), 1.0);
-assert_eq!(solution.var_value(y), 3.0);
-```
 */
 
 #![deny(missing_debug_implementations, missing_docs)]
@@ -458,9 +461,7 @@ impl Problem {
     /// Tries to solve the problem using the default options.
     ///
     /// A time limit configured with [`Problem::set_time_limit`] is applied to
-    /// this call. Reaching a limit returns a [`SolveOutcome`] rather than an
-    /// error, so the outcome may contain an optimal solution, a feasible
-    /// solution, or an interrupted search.
+    /// this call.
     ///
     /// # Errors
     ///
@@ -477,13 +478,8 @@ impl Problem {
 
     /// Tries to solve the problem using the supplied [`SolveOptions`].
     ///
-    /// These options control this call directly; a time limit previously set
-    /// with [`Problem::set_time_limit`] does not replace
-    /// [`SolveOptions::time_limit`].
-    ///
-    /// When a usable assignment is available, reaching a limit returns
-    /// [`SolveOutcome::Solution`] with [`SolutionStatus::Feasible`]. Otherwise
-    /// it returns [`SolveOutcome::Interrupted`].
+    /// These options control this call directly and override any previously set
+    /// options.
     ///
     /// # Errors
     ///
@@ -527,12 +523,12 @@ enum SolveState {
     Mip(Box<mip::MipState>),
 }
 
-/// The result of a successful solve, resume, or post-solve edit call.
+/// The result of a successful solve.
 ///
 /// The outcome either contains a validated [`Solution`] or reports that a
 /// configured limit interrupted the call before a usable assignment was found.
 /// An interrupted outcome has no objective or variable values, but it can be
-/// continued and does not mean that the problem is infeasible.
+/// resumed to keep searching for an incumbent.
 #[derive(Clone)]
 pub enum SolveOutcome {
     /// A validated assignment that is optimal or feasible without a proof of
@@ -1115,13 +1111,6 @@ impl Solution {
 /// values because no validated assignment is available. It does not mean that
 /// the problem is infeasible. Continue it through [`SolveOutcome::resume`] or
 /// [`SolveOutcome::resume_with`].
-///
-/// ```compile_fail
-/// # use microlp::InterruptedSolve;
-/// fn invalid(interrupted: &InterruptedSolve) {
-///     let _ = interrupted.objective();
-/// }
-/// ```
 #[derive(Clone)]
 pub struct InterruptedSolve {
     direction: OptimizationDirection,
