@@ -6,7 +6,7 @@ constraints. Variables can be real, integer, or boolean.
 # Getting started
 
 You can use microlp directly, but the
-[rooc modeling language](https://github.com/specy/rooc) and 
+[rooc modeling language](https://github.com/specy/rooc) and
 [good_lp](https://github.com/rust-or/good_lp) provide
 higher-level ways to write models.
 

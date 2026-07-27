@@ -56,7 +56,7 @@ pub struct SolveOptions {
     /// `0.0` (prove exact optimality).
     pub mip_gap: f64,
     /// Integrality tolerance: a value within this distance of an integer counts
-    /// as integral. Default `1e-6`. A very loose `int_tol` mainly causes extra 
+    /// as integral. Default `1e-6`. A very loose `int_tol` mainly causes extra
     /// exact-fixing branching rather than admitting an infeasible point.
     /// Must be finite and in the half-open range `[0, 0.5)`.
     pub int_tol: f64,
@@ -121,7 +121,7 @@ impl SolveOptions {
 
 /// Overrides for the solver settings used for a subsequent search/resume call.
 ///
-/// These fields override the ones defined in the previous call to 
+/// These fields override the ones defined in the previous call to
 /// [`Problem::solve`] or [`Problem::resume`].
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
