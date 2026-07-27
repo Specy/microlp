@@ -261,7 +261,7 @@ pub fn register(cases: &mut Vec<Case>) {
 
     // A mid-search time limit must return a clean status: Optimal if 30 ms
     // suffices, Feasible with a valid incumbent, or Interrupted with none.
-    // `resume(None)` must then finish at the exact DP optimum. The knapsack is
+    // `resume()` must then finish at the exact DP optimum. The knapsack is
     // sized so the first slice normally interrupts, while remaining suitable
     // for the default tier.
     cases.push(Case::custom(
@@ -292,11 +292,11 @@ pub fn register(cases: &mut Vec<Case>) {
             p.add_constraint(&terms, Le, cap);
             p.set_time_limit(std::time::Duration::from_millis(30));
 
-            let sol = p
+            let outcome = p
                 .solve()
                 .map_err(|e| format!("interrupted solve errored: {}", e))?;
-            match sol.status() {
-                microlp::Status::Optimal => {
+            match outcome.solution() {
+                Some(sol) if sol.status() == microlp::SolutionStatus::Optimal => {
                     if (sol.objective() - best).abs() > 1e-6 {
                         return Err(format!(
                             "finished within 30 ms but objective {} != DP optimum {}",
@@ -305,7 +305,7 @@ pub fn register(cases: &mut Vec<Case>) {
                         ));
                     }
                 }
-                microlp::Status::Feasible => {
+                Some(sol) => {
                     // The incumbent must be a feasible 0/1 knapsack point and no
                     // better than the true optimum.
                     let mut weight = 0.0;
@@ -330,15 +330,16 @@ pub fn register(cases: &mut Vec<Case>) {
                         ));
                     }
                 }
-                microlp::Status::Interrupted => {
+                None => {
                     // No incumbent yet; value accessors would panic. Resume below.
                 }
             }
             // Resuming to completion must reach the proven optimum.
-            let sol = sol.resume(None).map_err(|e| format!("resume: {}", e))?;
-            if sol.status() != microlp::Status::Optimal {
-                return Err("resume(None) did not reach Optimal".into());
+            let outcome = outcome.resume().map_err(|e| format!("resume: {}", e))?;
+            if !outcome.is_optimal() {
+                return Err("resume() did not reach Optimal".into());
             }
+            let sol = crate::verify::require_solution(outcome, "resumed knapsack")?;
             if (sol.objective() - best).abs() > 1e-6 {
                 return Err(format!(
                     "resumed objective {} != DP optimum {}",
@@ -393,12 +394,13 @@ pub fn register(cases: &mut Vec<Case>) {
                             }
                         }
                         p.set_time_limit(budget / 8);
-                        let sol = p
+                        let outcome = p
                             .solve()
                             .map_err(|e| format!("{}({},{}): {}", gate, a, bit, e))?;
-                        if sol.status() != microlp::Status::Optimal {
+                        if !outcome.is_optimal() {
                             return Err("hit time limit".into());
                         }
+                        let sol = crate::verify::require_solution(outcome, "boolean gate solve")?;
                         let got = sol.objective();
                         if (got - want).abs() > 1e-6 {
                             return Err(format!(

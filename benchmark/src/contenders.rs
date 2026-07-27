@@ -5,8 +5,9 @@
 //!
 //! Fairness settings applied to every rival: one thread, the same relative
 //! MIP gap as microlp (0 by default — prove exact optimality), everything
-//! else at the solver's own defaults. Solvers that time out report the
-//! incumbent they were holding, so timed-out instances still compare
+//! else at the solver's own defaults. Exact proofs and configured-gap stops
+//! stay distinct in the common result model. Solvers that time out report
+//! the incumbent they were holding, so timed-out instances still compare
 //! solution quality; every reported incumbent is independently re-validated
 //! by the caller.
 
@@ -14,11 +15,11 @@ use crate::corpus::Instance;
 use crate::model::Domain;
 #[cfg(any(feature = "highs", feature = "clarabel", feature = "scip"))]
 use crate::model::ModelSpec;
-use microlp::Status;
 use std::time::Duration;
 
 pub enum RunStatus {
     Optimal,
+    GapSatisfied,
     Feasible,
     Interrupted,
     Infeasible,
@@ -30,6 +31,7 @@ impl RunStatus {
     pub fn label(&self) -> String {
         match self {
             RunStatus::Optimal => "optimal".into(),
+            RunStatus::GapSatisfied => "gap-satisfied".into(),
             RunStatus::Feasible => "feasible".into(),
             RunStatus::Interrupted => "interrupted".into(),
             RunStatus::Infeasible => "infeasible".into(),
@@ -76,9 +78,9 @@ pub struct SolveTask {
     /// `mip_gap` to 0 on reference solves.
     #[cfg_attr(not(feature = "highs"), allow(dead_code))]
     pub reference: bool,
-    /// Relative MIP gap at which a solver may stop and report the optimum
-    /// (0 = exact). Applied to every solver that supports it, so "proved
-    /// optimum" keeps meaning the same thing for everyone.
+    /// Relative MIP gap at which a solver may stop with a gap-satisfied
+    /// feasible solution (0 = exact). Applied to every solver that supports
+    /// it; only an exact proof maps to [`RunStatus::Optimal`].
     pub mip_gap: f64,
 }
 
@@ -175,23 +177,35 @@ impl Contender for Microlp {
         let mut options = microlp::SolveOptions::default();
         options.time_limit = Some(task.budget);
         options.mip_gap = task.mip_gap;
-        let solution = match problem.solve_with(options) {
-            Ok(s) => s,
+        let outcome = match problem.solve_with(options) {
+            Ok(outcome) => outcome,
             Err(microlp::Error::Infeasible) => return RunOutcome::bare(RunStatus::Infeasible),
             Err(microlp::Error::Unbounded) => return RunOutcome::bare(RunStatus::Unbounded),
             Err(e) => return RunOutcome::bare(RunStatus::Error(e.to_string())),
         };
 
-        let stats = solution.stats();
-        let (status, has_answer) = match solution.status() {
-            Status::Optimal => (RunStatus::Optimal, true),
-            Status::Feasible => (RunStatus::Feasible, true),
-            Status::Interrupted => (RunStatus::Interrupted, false),
+        let stats = outcome.stats();
+        let (status, objective, values) = match outcome {
+            microlp::SolveOutcome::Solution(solution) => {
+                let status = match solution.status() {
+                    microlp::SolutionStatus::Optimal => RunStatus::Optimal,
+                    microlp::SolutionStatus::Feasible
+                        if solution.termination_reason() == microlp::TerminationReason::MipGap =>
+                    {
+                        RunStatus::GapSatisfied
+                    }
+                    microlp::SolutionStatus::Feasible => RunStatus::Feasible,
+                };
+                let objective = Some(solution.objective());
+                let values = Some(vars.iter().map(|&v| solution.var_value(v)).collect());
+                (status, objective, values)
+            }
+            microlp::SolveOutcome::Interrupted(_) => (RunStatus::Interrupted, None, None),
         };
         RunOutcome {
             status,
-            objective: has_answer.then(|| solution.objective()),
-            values: has_answer.then(|| vars.iter().map(|&v| solution.var_value(v)).collect()),
+            objective,
+            values,
             bound: stats.best_bound,
             gap: stats.gap,
             nodes: Some(stats.nodes_solved),
@@ -271,12 +285,17 @@ mod highs_solver {
             S::Optimal => {
                 let values = solved.get_solution().columns().to_vec();
                 let objective = objective_of(&inst.spec, &values);
+                let gap = if inst.is_mip { solved.mip_gap() } else { 0.0 };
                 RunOutcome {
-                    status: RunStatus::Optimal,
+                    status: completed_status(inst.is_mip, gap, task.mip_gap),
                     objective: Some(objective),
                     values: Some(values),
-                    bound: Some(objective),
-                    gap: Some(0.0),
+                    bound: if inst.is_mip {
+                        mip_dual_bound(&solved)
+                    } else {
+                        Some(objective)
+                    },
+                    gap: Some(gap),
                     nodes: None,
                     simplex_iters: None,
                 }
@@ -299,7 +318,7 @@ mod highs_solver {
                         status: RunStatus::Feasible,
                         objective: Some(objective),
                         values: Some(values),
-                        bound: None,
+                        bound: mip_dual_bound(&solved),
                         gap: Some(gap),
                         nodes: None,
                         simplex_iters: None,
@@ -310,6 +329,29 @@ mod highs_solver {
             }
             other => RunOutcome::bare(RunStatus::Error(format!("HiGHS status {:?}", other))),
         }
+    }
+
+    pub(super) fn completed_status(is_mip: bool, gap: f64, target: f64) -> RunStatus {
+        if !is_mip || gap == 0.0 {
+            RunStatus::Optimal
+        } else if gap.is_finite()
+            && target > 0.0
+            && gap > 0.0
+            && gap <= target + 1e-12 * target.abs().max(1.0)
+        {
+            RunStatus::GapSatisfied
+        } else {
+            RunStatus::Error(format!(
+                "HiGHS reported MIP gap {gap} for target {target} on a completed solve"
+            ))
+        }
+    }
+
+    fn mip_dual_bound(solved: &highs::SolvedModel) -> Option<f64> {
+        solved
+            .double_info_value(c"mip_dual_bound")
+            .ok()
+            .filter(|bound| bound.is_finite() && bound.abs() < 1e29)
     }
 }
 
@@ -431,24 +473,36 @@ mod good_lp_solver {
         }
     }
 
+    pub(super) fn completed_status(status: SolutionStatus) -> Option<RunStatus> {
+        match status {
+            SolutionStatus::Optimal => Some(RunStatus::Optimal),
+            SolutionStatus::GapLimit => Some(RunStatus::GapSatisfied),
+            SolutionStatus::TimeLimit => None,
+        }
+    }
+
     fn finish<S: good_lp::Solution>(
         res: Result<S, ResolutionError>,
         inst: &Instance,
         handles: &[good_lp::Variable],
     ) -> RunOutcome {
         match res {
-            // GapLimit means "proved within the configured mip gap", which
-            // is exactly what the other solvers report as Optimal then.
             Ok(sol) => match sol.status() {
                 SolutionStatus::Optimal | SolutionStatus::GapLimit => {
+                    let status = completed_status(sol.status())
+                        .expect("optimal and gap-limit statuses are completed solves");
                     let values: Vec<f64> = handles.iter().map(|&h| sol.value(h)).collect();
                     let objective = objective_of(&inst.spec, &values);
+                    let exact = matches!(status, RunStatus::Optimal);
                     RunOutcome {
-                        status: RunStatus::Optimal,
+                        status,
                         objective: Some(objective),
                         values: Some(values),
-                        bound: Some(objective),
-                        gap: Some(0.0),
+                        // good_lp's generic Solution interface exposes
+                        // neither SCIP's dual bound nor its achieved gap.
+                        // Never synthesize exact proof metadata for GapLimit.
+                        bound: exact.then_some(objective),
+                        gap: exact.then_some(0.0),
                         nodes: None,
                         simplex_iters: None,
                     }
@@ -484,5 +538,96 @@ mod good_lp_solver {
             Err(ResolutionError::Unbounded) => RunOutcome::bare(RunStatus::Unbounded),
             Err(e) => RunOutcome::bare(RunStatus::Error(e.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(any(feature = "highs", feature = "clarabel", feature = "scip"))]
+    use super::RunStatus;
+    use super::{Contender, Microlp, SolveTask};
+    use crate::corpus::Instance;
+    use crate::model::{ConstraintSpec, Domain, ModelSpec, VarSpec};
+    use microlp::{ComparisonOp, OptimizationDirection};
+    use std::time::Duration;
+
+    #[test]
+    fn microlp_gap_stop_is_not_mapped_to_exact_optimality() {
+        let instance = Instance {
+            spec: ModelSpec {
+                vars: [8.0, 11.0, 6.0, 4.0]
+                    .into_iter()
+                    .map(|obj_coeff| VarSpec {
+                        obj_coeff,
+                        min: 0.0,
+                        max: 1.0,
+                        domain: Domain::Integer,
+                    })
+                    .collect(),
+                constraints: vec![ConstraintSpec {
+                    terms: vec![(0, 5.0), (1, 7.0), (2, 4.0), (3, 3.0)],
+                    op: ComparisonOp::Le,
+                    rhs: 14.0,
+                }],
+            },
+            direction: OptimizationDirection::Maximize,
+            is_mip: true,
+            rows: 1,
+            cols: 4,
+            ints: 4,
+            nnz: 4,
+        };
+        let outcome = Microlp.run(
+            &instance,
+            &SolveTask {
+                budget: Duration::from_secs(10),
+                reference: false,
+                mip_gap: 0.5,
+            },
+        );
+
+        assert!(matches!(outcome.status, super::RunStatus::GapSatisfied));
+        assert!(outcome.gap.is_some_and(|gap| gap > 0.0 && gap <= 0.5));
+    }
+
+    #[cfg(feature = "highs")]
+    #[test]
+    fn highs_positive_mip_gap_is_not_mapped_to_exact_optimality() {
+        assert!(matches!(
+            super::highs_solver::completed_status(true, 0.125, 0.5),
+            RunStatus::GapSatisfied
+        ));
+        assert!(matches!(
+            super::highs_solver::completed_status(true, 0.0, 0.5),
+            RunStatus::Optimal
+        ));
+        assert!(matches!(
+            super::highs_solver::completed_status(true, 0.125, 0.0),
+            RunStatus::Error(_)
+        ));
+        assert!(matches!(
+            super::highs_solver::completed_status(true, f64::NAN, 0.5),
+            RunStatus::Error(_)
+        ));
+        assert!(matches!(
+            super::highs_solver::completed_status(false, f64::INFINITY, 0.5),
+            RunStatus::Optimal
+        ));
+    }
+
+    #[cfg(any(feature = "clarabel", feature = "scip"))]
+    #[test]
+    fn good_lp_gap_limit_is_not_mapped_to_exact_optimality() {
+        use good_lp::solvers::SolutionStatus;
+
+        assert!(matches!(
+            super::good_lp_solver::completed_status(SolutionStatus::GapLimit),
+            Some(RunStatus::GapSatisfied)
+        ));
+        assert!(matches!(
+            super::good_lp_solver::completed_status(SolutionStatus::Optimal),
+            Some(RunStatus::Optimal)
+        ));
+        assert!(super::good_lp_solver::completed_status(SolutionStatus::TimeLimit).is_none());
     }
 }

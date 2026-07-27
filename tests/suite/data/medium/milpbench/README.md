@@ -46,7 +46,7 @@ instances in `CFL_easy`). The `CFL_easy` Drive archive they came from is
 ## Selection criteria
 
 An instance is vendored only if microlp solves it to **proven optimality**
-(`Status::Optimal`, `gap() == Some(0)`) within a per-instance budget, and its
+(`SolutionStatus::Optimal`, `gap() == Some(0)`) within a per-instance budget, and its
 returned solution passes the suite's independent shadow-model validation
 (feasibility, bounds, integrality, objective consistency).
 

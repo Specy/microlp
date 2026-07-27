@@ -45,14 +45,21 @@ pub fn register(cases: &mut Vec<Case>) {
                 match problem.solve() {
                     // A marked case accepts only its explicit expected error.
                     Err(microlp::Error::Infeasible) => Ok(()),
-                    Ok(sol) => Err(format!(
-                        "the {} marked failure solved with objective {} \
-                         — verify it against the published value {} and remove it from \
-                         KNOWN_INFEASIBLE_BUG to enable normal validation",
-                        name,
-                        sol.objective(),
-                        expected
-                    )),
+                    Ok(outcome) => match outcome.solution() {
+                        Some(sol) => Err(format!(
+                            "the {} marked failure solved with objective {} \
+                             — verify it against the published value {} and remove it from \
+                             KNOWN_INFEASIBLE_BUG to enable normal validation",
+                            name,
+                            sol.objective(),
+                            expected
+                        )),
+                        None => Err(format!(
+                            "the {} marked failure was interrupted instead of returning \
+                             Err(Infeasible)",
+                            name
+                        )),
+                    },
                     Err(e) => Err(format!(
                         "known failure changed shape: expected Err(Infeasible), got: {}",
                         e

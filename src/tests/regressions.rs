@@ -21,7 +21,11 @@ mod regression_tests {
             problem.add_constraint(&[(x, 3.0), (y, 2.0), (z, 1.0)], ComparisonOp::Le, 20.0);
             problem.add_constraint(&[(x, 2.0), (y, 1.0), (z, 3.0)], ComparisonOp::Le, 15.0);
 
-            let sol = problem.solve().unwrap();
+            let sol = problem
+                .solve()
+                .unwrap()
+                .into_solution()
+                .expect("an unlimited bounded solve must return a solution");
 
             assert!(
                 (sol.var_value(x) - 2.0).abs() < 1e-6,
@@ -63,7 +67,11 @@ mod regression_tests {
 
                 let sol = problem
                     .solve()
-                    .unwrap_or_else(|e| panic!("max={max} (~2^{k}) must be feasible, got {e:?}"));
+                    .unwrap_or_else(|e| panic!("max={max} (~2^{k}) must be feasible, got {e:?}"))
+                    .into_solution()
+                    .unwrap_or_else(|interrupted| {
+                        panic!("max={max} (~2^{k}) must finish without limits, got {interrupted:?}")
+                    });
 
                 assert!(
                     (sol.var_value(x) - 1.0).abs() < 1e-6,

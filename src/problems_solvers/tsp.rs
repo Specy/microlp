@@ -53,7 +53,11 @@ pub fn solve_tsp(problem: &TspProblem) -> Tour {
     // The solver's built-in branch & bound handles integrality at each iteration.
 
     loop {
-        let solution = lp_problem.solve().unwrap();
+        let solution = lp_problem
+            .solve()
+            .unwrap()
+            .into_solution()
+            .expect("an unlimited bounded TSP solve must return a solution");
         info!(
             "solved integer problem, obj. value: {:.2}",
             solution.objective(),

@@ -1,13 +1,13 @@
 [package]
 name = "microlp"
-version = "0.5.0"
+version = "0.6.0"
 authors = [
     "Alexey Zatelepin <alex.zatelepin@gmail.com>",
     "Specy <specy.dev@gmail.com>"
 ]
 edition = "2021"
 license = "Apache-2.0"
-description = "A fast linear programming solver library."
+description = "A linear programming solver for real, integer, and boolean variables."
 repository = "https://github.com/Specy/microlp/"
 readme = "README.md"
 keywords = ["linear-programming", "optimization"]
