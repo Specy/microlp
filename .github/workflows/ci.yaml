@@ -41,22 +41,13 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@nightly
         with:
-          profile: minimal
-          toolchain: nightly
           components: rustfmt, clippy
-          override: true
 
       - name: Rustfmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --check
+        run: cargo fmt --check
 
       - name: Clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --locked -- --deny warnings
+        run: cargo clippy --locked -- --deny warnings
   test:
     strategy:
       matrix:
@@ -69,10 +60,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
 
       - name: Cache Rust
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           key: ${{ runner.os }}-stable-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'benchmark/Cargo.toml') }}
           path: |
@@ -83,29 +74,16 @@ jobs:
             target/
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Test Rust (unit tests)
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --locked --release --lib
+        run: cargo test --locked --release --lib
 
       - name: Doctests
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --locked --release --doc
+        run: cargo test --locked --release --doc
 
       - name: Exhaustive small-model oracles
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --locked --release --test exhaustive_mip
+        run: cargo test --locked --release --test exhaustive_mip
 
       # Problem-based correctness suite. Tiers are cumulative (easy < medium
       # < hard < xhard); --hard runs everything up to and including the hard
@@ -120,29 +98,27 @@ jobs:
       # `--features highs`. The grounding is OS-independent, so it runs on one
       # runner only; building HiGHS needs CMake and a C++ compiler, both
       # preinstalled on ubuntu-latest.
+      # The `--features highs` fragment below is a workflow literal selected by
+      # the matrix, not external input, so interpolating it into the command is
+      # safe and keeps the step shell-agnostic (this job also runs on Windows,
+      # where the default shell is PowerShell).
       - name: Correctness suite
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --locked --release --test suite ${{ matrix.os == 'ubuntu-latest' && '--features highs' || '' }} -- --hard --parallel 4 --max-case-seconds 300
+        run: cargo test --locked --release --test suite ${{ matrix.os == 'ubuntu-latest' && '--features highs' || '' }} -- --hard --parallel 4 --max-case-seconds 300
 
       - name: Test Rust with traces
-        uses: actions-rs/cargo@v1
         env:
           RUST_LOG: "trace"
-        with:
-          command: test
-          args: --locked --lib
+        run: cargo test --locked --lib
 
   wasm:
     name: WASM
     runs-on: "ubuntu-latest"
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
 
       - name: Cache Rust
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           key: ${{ runner.os }}-wasm-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           path: |
@@ -152,22 +128,16 @@ jobs:
             target/
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
-          target: wasm32-unknown-unknown
-          override: true
+          targets: wasm32-unknown-unknown
 
       # Compile guard: the library must build for wasm on its own. It can because
       # it reads the clock from `web-time`, not `std::time::Instant` (which panics
       # on wasm32-unknown-unknown). Library only: dev-dependencies and the
       # benchmark crate stay native.
       - name: Build library for wasm32-unknown-unknown
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --locked --release --lib --target wasm32-unknown-unknown
+        run: cargo build --locked --release --lib --target wasm32-unknown-unknown
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -197,16 +167,32 @@ jobs:
     runs-on: "ubuntu-latest"
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
+        with:
+          # Nothing here talks to the repository, so do not leave the job's
+          # GITHUB_TOKEN sitting in .git/config for the build to find.
+          persist-credentials: false
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
+      - name: Verify tag matches crate version
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          # Select by name: this is a workspace, and `--no-deps` also lists the
+          # benchmark crate, in no guaranteed order.
+          manifest="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "microlp") | .version')"
+          if [[ "$tagged" != "$manifest" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest" >&2
+            exit 1
+          fi
+          echo "Publishing microlp $manifest"
+
+      # The token goes through the environment, not the command line: argv is
+      # readable by every other process on the runner via /proc, and unlike log
+      # output it is not masked.
       - name: Publish
-        run: cargo publish --token ${REGISTRY_TOKEN}
         env:
-          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: cargo publish --locked -p microlp

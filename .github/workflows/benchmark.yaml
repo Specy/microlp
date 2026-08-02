@@ -17,6 +17,9 @@ on:
         required: false
         default: "0.0001"
 
+permissions:
+  contents: read
+
 concurrency:
   group: benchmark
   cancel-in-progress: false
@@ -49,12 +52,18 @@ jobs:
       - name: Build
         run: cargo build --locked -p microlp-benchmark --release
 
+      # The inputs reach the shell as environment variables rather than being
+      # pasted into the command text, so a value like `1; curl ...` stays an
+      # argument instead of becoming a second command.
       - name: Run benchmark
+        env:
+          TIME_LIMIT: ${{ inputs.time_limit }}
+          MIP_GAP: ${{ inputs.mip_gap }}
         run: |
           set -o pipefail
           cargo run --locked -p microlp-benchmark --release -- \
-            --time-limit "${{ inputs.time_limit }}" \
-            --mip-gap "${{ inputs.mip_gap }}" \
+            --time-limit "$TIME_LIMIT" \
+            --mip-gap "$MIP_GAP" \
             --out BENCHMARK.md 2>&1 | tee benchmark-progress.log
 
       - name: Publish report to the job summary
