@@ -8,6 +8,13 @@ on:
     tags:
       - v*
 
+# Least privilege by default: no job here needs to write to the repository, and
+# the publish job authenticates to crates.io with its own token. Without this
+# block the workflow inherits the repository default, which can be a read/write
+# GITHUB_TOKEN in every job.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -18,10 +25,10 @@ jobs:
     runs-on: "ubuntu-latest"
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
 
       - name: Cache Rust
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           key: ${{ runner.os }}-nightly-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'benchmark/Cargo.toml') }}
           path: |
@@ -32,7 +39,7 @@ jobs:
             target/
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@nightly
         with:
           profile: minimal
           toolchain: nightly
