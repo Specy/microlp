@@ -157,8 +157,8 @@ pub fn lu_factorize<'a>(
     let mut new2orig_row = (0..size).collect::<Vec<_>>();
     let mut orig2new_row = new2orig_row.clone();
 
-    for i_col in 0..size {
-        let mat_col = get_col(col_perm.new2orig[i_col]);
+    for (i_col, &orig_col) in col_perm.new2orig.iter().enumerate() {
+        let mat_col = get_col(orig_col);
 
         // Solve the equation L'_j * x = a_j (x will be in scratch.rhs).
         // L'_j is a sq. matrix with the first j columns of L

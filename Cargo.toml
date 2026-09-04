@@ -9,7 +9,6 @@ edition = "2021"
 license = "Apache-2.0"
 description = "A linear programming solver for real, integer, and boolean variables."
 repository = "https://github.com/Specy/microlp/"
-readme = "README.md"
 keywords = ["linear-programming", "optimization"]
 categories = ["mathematics", "science"]
 exclude = ["tests/suite/data", "benchmark", "BENCHMARK.md"]
