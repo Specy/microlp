@@ -999,7 +999,9 @@ impl Solution {
     ///
     /// Returns [`Error::Infeasible`] if `val` is not finite, is outside the
     /// variable's original bounds, is incompatible with its integer or boolean
-    /// domain, or leaves the edited problem without a feasible assignment.
+    /// domain, or leaves the edited problem without a feasible assignment. A
+    /// numerical failure while re-solving is returned as
+    /// [`Error::InternalError`].
     ///
     /// # Panics
     ///

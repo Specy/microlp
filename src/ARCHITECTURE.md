@@ -107,7 +107,8 @@ versus extending a live matrix and repairing the current basis.
 The simplex core is the minilp lineage: a **bounded-variable
 revised simplex** with both primal and dual iterations, steepest-edge pricing, the Harris
 two-pass ratio test for numerical stability, and an LU-factorized basis updated by eta
-matrices (refactorized when the eta file outgrows the factors).
+matrices (refactorized when the eta file outgrows the factors, recomputing the values from
+the original data each time — see §5.3 for the terminal rebuild).
 
 State you need to know when reading it:
 
@@ -140,9 +141,12 @@ single biggest performance lever in the design (see §10).
 
 **`reoptimize() -> Result<StopReason, Error>`** — the re-solve entry: dual simplex if primal
 feasibility is broken, then (only if needed, e.g. after loosening bounds or a basis load
-with drift) recompute reduced costs and run primal simplex. Returns `StopReason::Limit` if
-the deadline fires mid-run — leaving the honest feasibility flags so a later call continues
-where it left off.
+with drift) recompute reduced costs and run primal simplex, alternating (bounded, §5.3) until
+both feasibility flags hold as *measured* when a phase ends. A phase never assumes the flag the
+other phase owns still holds: the Harris ratio tests deliberately trade bounded
+infeasibility on that side for pivot size, so the phase measures it. Returns
+`StopReason::Limit` if the deadline fires mid-run — leaving the honest feasibility flags so
+a later call continues where it left off.
 
 **`snapshot_basis() / load_basis(&Basis)`** — a `Basis` is one status per total variable:
 `Basic | AtLower | AtUpper | Free` (~1 byte each). That is the *entire* warm-start state a
@@ -292,6 +296,35 @@ per stall and any successful pivot re-arms it, so it cannot loop. `EPS` remains 
 because the big-M correctness models require basic integer values to resolve sharply onto
 their bounds (see the `EPS` docs in `solver.rs`).
 
+The same rebuild guards the *other* exit of both phases. The phase loops compare basic values
+against their bounds, never against the rows those values were derived from, and a pivot on a
+small element (anything above `EPS` is accepted) multiplies round-off by its reciprocal: issue
+#44 ended the dual phase with a perfectly conditioned basis whose exact solution is `0` and an
+incrementally-updated value of `2^-26` — inside its bounds, off its row by `1.5e-8`, and
+rejected by the MIP layer's independent guard. Before a phase may end, the engine computes
+every equilibrated row's absolute residual (O(nnz)), ignoring rows already within the
+round-off floor of their own activity (`REBUILD_NOISE_FLOOR`, where a rebuild could not help);
+above `REBUILD_RESIDUAL_TOL` it refactorizes, recomputes the values from the original data,
+and re-examines. The primal phase — the one about to declare optimality on its reduced costs —
+also recomputes those before ending, whether the residual fired or it merely pivoted since the
+last exact recomputation; the dual phase leaves them incremental for the reason given below. Both re-examinations are bounded per phase
+(`MAX_TERMINAL_RESTARTS`): exact recomputation can expose noise-level infeasibilities that a
+degenerate pivot "fixes" and the next incremental update hides again, a cycle with no
+objective progress to break it. Each phase then ends by *measuring* the flag the other phase
+owns rather than assuming it, and `run_phases` alternates them — bounded by
+`MAX_PHASE_ROUNDS`, because the Harris ratio tests relax by `EPS` in the *step*, so on rows
+with a large coefficient spread the phases can trade tolerance-level violations indefinitely;
+on exhaustion the point is accepted as it stands with a `warn!`, since those violations are
+the engine's own tolerance rather than a wrong answer. Refactorizations triggered by eta-file
+growth, and the phase-1 stall valve, recompute the *values* as well (and the objective
+value, but only when it has drifted by more than `1e-9` relative — on a degenerate tree a
+last-bit change to the node bound is enough to re-route the whole search), so value drift
+never outlives a factorization — but they leave the reduced costs
+incremental on purpose: recomputing those mid-phase exposes noise-level dual infeasibilities
+on large-coefficient columns that the dual ratio test's clamp turns into forced degenerate
+pivots, changing the vertex and with it the whole search (measured on miplib/gt2: 50 ms →
+2.6 min). Reduced costs are recomputed only where a phase ends.
+
 ### 5.4 Incumbents and the rounded-feasibility guard
 
 When a node's LP solution is integral within `int_tol` (default `1e-6`), it is a *candidate*
@@ -321,9 +354,12 @@ tolerance. The guard makes this impossible to adopt:
 - Guard **fails** → do not adopt; **branch on the offending below-tolerance variable**
   (children `⌊v⌋` / `⌊v⌋+1` fix it exactly, and the dive resolves the truth).
 - Degenerate fallback: if every integer variable is *exactly* integral yet the check failed,
-  retry once from the all-slack basis. This removes eta-chain drift on big-M rows; if the
-  independently checked point is still invalid, return an internal error rather than
-  force-accepting a potentially infeasible answer.
+  retry once from the all-slack basis. The engine already ends every phase on rebuilt values
+  (§5.3), so this is not about drift: the guard is absolute in *user* units while the engine
+  works on equilibrated rows, and on a row with huge coefficients a generic vertex cannot meet
+  it in floating point at all — a re-solve from scratch can land on an equivalent vertex whose
+  activities are exactly representable. If the independently checked point is still invalid,
+  return an internal error rather than force-accepting a potentially infeasible answer.
 
 During zero-objective unboundedness classification, the same funnel runs first; only a valid
 integer point returns `Err(Unbounded)`. If classification is interrupted before an incumbent
@@ -524,8 +560,12 @@ Two homes, by audience:
 **Internal — `src/mip/params.rs` and `src/solver.rs` consts (each documented at its
 definition):** `SCORE_EPS`, `PSEUDOCOST_INIT_EPS`, `BRANCH_FRAC_GUARD` (all `1e-6`),
 `GAP_DENOM_GUARD` (`1e-10`), `HINT_BOUNDS_SLACK` (`1e-9`), `DEADLINE_CHECK_INTERVAL`
-(`1000` pivots), `LU_STABILITY_THRESHOLD` (`0.1`), and the simplex pivot tolerance
-`EPS` (`1e-10`) — the one number the whole engine's float comparisons are built on.
+(`1000` pivots), `LU_STABILITY_THRESHOLD` (`0.1`), `REBUILD_RESIDUAL_TOL` (`1e-9`) and
+`REBUILD_NOISE_FLOOR` (`1e-13`: the absolute row residual above which a phase rebuilds its
+terminal values before ending, and the per-unit-activity floor below which it never bothers —
+§5.3), `MAX_TERMINAL_RESTARTS` (`4`) and `MAX_PHASE_ROUNDS` (`8`: the bounds on terminal
+re-examination and on phase alternation — §5.3), and the simplex pivot tolerance `EPS`
+(`1e-10`) — the one number the whole engine's float comparisons are built on.
 
 The layering rule: `EPS` decides *simplex* questions (is this coefficient zero, is this
 value at its bound); `int_tol` decides *integrality* questions; `feasibility` decides
@@ -541,7 +581,9 @@ magnitude, but govern distinct layers and must not be conflated.
 | Root LP unbounded on a MILP | run a resumable zero-objective integer-feasibility search; any integer point proves `Unbounded`, exhaustion proves `Infeasible` |
 | Node LP infeasible | prune (correct) |
 | Node LP unbounded | impossible when the node is bounded → `InternalError` |
-| Singular LU or an exactly-integral candidate with guard-breaking drift | retry once from the slack basis; then propagate |
+| Singular LU (or any other non-`Infeasible`/`Unbounded` error) in a node LP, or an exactly-integral candidate that fails the feasibility guard | retry once from the slack basis; then propagate |
+| Phase about to end on drifted values (row residual above `REBUILD_RESIDUAL_TOL`) | refactorize, recompute values from the original data, re-examine; at most `MAX_TERMINAL_RESTARTS` per phase |
+| Phases still trading `EPS`-level infeasibilities after `MAX_PHASE_ROUNDS` | accept the point as it stands, `warn!` |
 | `load_basis` failure on a jump | load the slack basis (infallible) and solve the node from scratch |
 | Phase-1 stall (“no entering column”) | refresh the basis (fresh LU + recomputed values) and retry once per stall; declare `Infeasible` only if it survives the refresh |
 | Deadline mid-LP | requeue the node unsolved; return `Interrupted` |

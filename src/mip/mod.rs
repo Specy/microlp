@@ -589,9 +589,16 @@ enum IntegralCandidate {
 
 /// Adopt a feasible rounded candidate, but close the current subtree only when
 /// the LP point itself is exactly integral. If an exactly integral point fails
-/// the independent feasibility guard, retry once from the all-slack basis:
-/// large coefficients can leave an eta-updated continuous value just outside
-/// the absolute guard even though a clean factorization recovers the vertex.
+/// the independent feasibility guard, retry once from the all-slack basis.
+/// The engine already ends every phase on values rebuilt from the original
+/// data (`solver::REBUILD_RESIDUAL_TOL`), so this is not about drift: the
+/// guard is absolute in *user* units while the engine works on equilibrated
+/// rows, and on a row with huge coefficients a generic vertex cannot meet the
+/// guard in floating point at all. A re-solve from scratch can land on an
+/// equivalent vertex whose activities are exactly representable (measured:
+/// 16 of 601 adversarial big-M models solve only because of it) — and if the
+/// independently checked point is still invalid the error stands rather than
+/// force-accepting a point that violates the user's tolerance.
 fn process_integral_candidate(
     state: &mut MipState,
     domains: &[VarDomain],

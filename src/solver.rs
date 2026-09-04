@@ -26,8 +26,59 @@ type CsMat = sprs::CsMatI<f64, usize>;
 /// rounded-incumbent feasibility guard and the branch-and-bound tree
 /// explodes. The flip side of running this tight — round-off noise being
 /// promoted into phantom infeasibilities — is handled where it bites, by
-/// the refresh valve in [`Solver::restore_feasibility`].
+/// the refresh valve in [`Solver::restore_feasibility`] and by the terminal
+/// rebuild gated by [`REBUILD_RESIDUAL_TOL`].
 pub const EPS: f64 = 1e-10;
+
+/// Largest absolute equilibrated-row residual a simplex phase may end on.
+///
+/// Basic values are updated incrementally pivot after pivot, and a pivot on a
+/// small element (the ratio tests accept anything above `EPS`) multiplies
+/// round-off by its reciprocal: a `1e-8` pivot turns machine epsilon into a
+/// `1e-8` error in a basic value. The phase loops only ever compare basic
+/// values against their *bounds*, so such a point can pass as feasible while
+/// no longer satisfying the rows it was derived from (issue #44: a perfectly
+/// conditioned final basis whose exact solution is `0`, reported as `2^-26`).
+/// Before a phase is allowed to end, every row's residual `|a·x − b|` (on the
+/// equilibrated row, so coefficients are O(1)) is compared against this
+/// tolerance; anything larger discards the incremental values, refactorizes,
+/// recomputes them from the original data, and re-examines. Rows whose
+/// residual is already within [`REBUILD_NOISE_FLOOR`] of their own activity
+/// are exempt — a fresh factorization could not do better there — so this
+/// fires only on drift a rebuild can remove, and it is bounded per phase
+/// ([`MAX_TERMINAL_RESTARTS`]) so it cannot loop. `1e-9` is one order above
+/// `EPS`: a smaller inconsistency is below the resolution of the engine's own
+/// bound comparisons anyway. The tolerance is absolute, like the MIP layer's
+/// row guard (`check_constraints`), not relative: a relative one stays silent
+/// on large-activity rows, exactly where an absolute guard bites hardest.
+pub(crate) const REBUILD_RESIDUAL_TOL: f64 = 1e-9;
+
+/// Round-off floor of a row residual, per unit of the row's activity
+/// magnitude `1 + |b| + Σ|aᵢxᵢ|`: a few hundred ulps, which is what an LU
+/// solve with threshold pivoting itself leaves behind. A residual under this
+/// floor is not drift, and rebuilding would not reduce it.
+pub(crate) const REBUILD_NOISE_FLOOR: f64 = 1e-13;
+
+/// Upper bound on the times one phase may re-examine its terminal stall after
+/// recomputing values or reduced costs. Exact recomputation can expose
+/// noise-level infeasibilities that a degenerate pivot then "fixes", after
+/// which the incremental update hides them again — a cycle with no objective
+/// progress to break it. Beyond the bound the phase ends on the point it has,
+/// and the flags are measured honestly.
+const MAX_TERMINAL_RESTARTS: usize = 4;
+
+/// Upper bound on dual/primal phase alternations in [`Solver::run_phases`].
+/// Each phase ends by measuring the flag the other phase owns, so one round is
+/// the norm and two the exception. The Harris ratio tests relax by `EPS` *in
+/// the step*, so a basic value whose column coefficient dwarfs the binding
+/// one can end a phase violated by a multiple of `EPS`, and the other phase
+/// then pays for the repair with fresh `EPS`-level infeasibility on its side:
+/// on rows with a large coefficient spread the two can trade tolerance-level
+/// violations indefinitely. After this many rounds the point is accepted as
+/// it stands and a `warn!` records it — those violations are the engine's own
+/// tolerance, not a wrong answer, and an error here would refuse problems the
+/// previous, unmeasured alternation answered.
+const MAX_PHASE_ROUNDS: usize = 8;
 
 /// How often (in simplex iterations) the primal/dual loops in `optimize` and
 /// `restore_feasibility` check the deadline and emit a progress `debug!` log.
@@ -135,6 +186,16 @@ fn prepare_row(
     }))
 }
 
+/// Whether a non-basic column's reduced cost is dual feasible for its current
+/// position: at its lower bound it must not pay to increase, at its upper it
+/// must not pay to decrease, and a free column (at neither bound) is feasible
+/// only when its reduced cost is zero within `EPS`. Without that last clause a
+/// free zero-cost column counts as infeasible forever, and the primal phase it
+/// triggers picks it as entering with an infinite step.
+fn nb_dual_feasible(state: &NonBasicVarState, obj_coeff: f64) -> bool {
+    state.at_min && obj_coeff > -EPS || state.at_max && obj_coeff < EPS || obj_coeff.abs() < EPS
+}
+
 pub(crate) fn float_eq(a: f64, b: f64) -> bool {
     (a - b).abs() < EPS
 }
@@ -223,6 +284,13 @@ pub(crate) struct Solver {
 
     is_primal_feasible: bool,
     is_dual_feasible: bool,
+    /// True while `nb_var_obj_coeffs`/`cur_obj_val` carry the phase-1
+    /// artificial objective installed at construction (neither primal nor dual
+    /// feasible to start). Cleared by `recalc_obj_coeffs`, which installs the
+    /// real reduced costs. A rebuild must leave the reduced costs alone while
+    /// this is set: the artificial objective has no original coefficients to
+    /// recompute from.
+    artificial_obj: bool,
 
     // Updated on each pivot
     /// For each var: whether it is basic/non-basic and the corresponding index.
@@ -515,6 +583,7 @@ impl Solver {
             enable_dual_steepest_edge,
             is_primal_feasible,
             is_dual_feasible,
+            artificial_obj: need_artificial_obj,
             var_states,
             basis_solver: BasisSolver {
                 lu_factors,
@@ -661,31 +730,56 @@ impl Solver {
                 };
                 // A var at a loosened bound may no longer justify its reduced cost.
                 self.is_dual_feasible = self.is_dual_feasible
-                    && (self.nb_var_states[col].at_min && self.nb_var_obj_coeffs[col] > -EPS
-                        || self.nb_var_states[col].at_max && self.nb_var_obj_coeffs[col] < EPS
-                        || self.nb_var_obj_coeffs[col].abs() < EPS);
+                    && nb_dual_feasible(&self.nb_var_states[col], self.nb_var_obj_coeffs[col]);
             }
         }
         Ok(())
     }
 
-    /// Re-solve after bound changes or a basis load: dual simplex to restore primal
-    /// feasibility, then primal simplex if reduced costs became dual-infeasible
-    /// (only happens after loosening bounds or a numerically imperfect basis load).
+    /// Re-solve after bound changes, an edit, or a basis load: the two phases
+    /// alternate (dual simplex while primal feasibility is broken, primal
+    /// simplex while reduced costs are dual-infeasible) until both flags hold
+    /// as measured at the end of a phase; see [`Self::run_phases`].
     pub(crate) fn reoptimize(&mut self) -> Result<StopReason, Error> {
-        if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
-            return Ok(StopReason::Limit);
-        }
-        if !self.is_dual_feasible {
-            self.recalc_obj_coeffs()?;
-            if self.optimize()? == StopReason::Limit {
-                return Ok(StopReason::Limit);
-            }
-            // Primal simplex may have moved through vertices; make sure primal holds too.
+        self.run_phases()
+    }
+
+    /// Alternate the two simplex phases until both feasibility flags hold as
+    /// *measured* at the end of a phase: each phase re-measures the flag the
+    /// other one owns when it ends, because the Harris ratio tests trade
+    /// bounded infeasibility on that side for pivot size. Bounded by
+    /// [`MAX_PHASE_ROUNDS`], after which the point is accepted as it stands.
+    /// Returns `Limit` as soon as the deadline fires, leaving the honest flags
+    /// for a later call to continue from.
+    fn run_phases(&mut self) -> Result<StopReason, Error> {
+        for _ in 0..MAX_PHASE_ROUNDS {
             if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
                 return Ok(StopReason::Limit);
             }
+            if !self.is_dual_feasible {
+                self.recalc_obj_coeffs()?;
+                if self.optimize()? == StopReason::Limit {
+                    return Ok(StopReason::Limit);
+                }
+            }
+            if self.is_primal_feasible && self.is_dual_feasible {
+                return Ok(StopReason::Finished);
+            }
         }
+        // See `MAX_PHASE_ROUNDS`: what is left is tolerance-level, not wrong.
+        let (primal_vars, primal_sum) = self.calc_primal_infeasibility();
+        let (dual_vars, dual_sum) = self.calc_dual_infeasibility();
+        log::warn!(
+            "simplex phases still trading EPS-level infeasibilities after {} rounds \
+             (primal: {} vars, {:e}; dual: {} coeffs, {:e}); accepting the current point",
+            MAX_PHASE_ROUNDS,
+            primal_vars,
+            primal_sum,
+            dual_vars,
+            dual_sum,
+        );
+        self.is_primal_feasible = true;
+        self.is_dual_feasible = true;
         Ok(StopReason::Finished)
     }
 
@@ -867,7 +961,7 @@ impl Solver {
         self.nb_var_is_fixed[col] = true;
 
         self.is_primal_feasible = false;
-        self.restore_feasibility()
+        self.reoptimize()
     }
 
     /// Return whether the var was really unset and whether reoptimization
@@ -885,7 +979,7 @@ impl Solver {
             };
 
             self.is_dual_feasible = false;
-            let stop = self.optimize()?;
+            let stop = self.reoptimize()?;
             Ok((true, stop))
         } else {
             Ok((false, StopReason::Finished))
@@ -905,15 +999,8 @@ impl Solver {
             return Ok(StopReason::Limit);
         }
 
-        if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
+        if self.run_phases()? == StopReason::Limit {
             return Ok(StopReason::Limit);
-        }
-
-        if !self.is_dual_feasible {
-            self.recalc_obj_coeffs()?;
-            if self.optimize()? == StopReason::Limit {
-                return Ok(StopReason::Limit);
-            }
         }
 
         // Disable updates of primal sq. norms, because lengthy primal simplex runs
@@ -924,8 +1011,18 @@ impl Solver {
     }
 
     fn optimize(&mut self) -> Result<StopReason, Error> {
+        debug_assert!(
+            !self.artificial_obj,
+            "optimize runs on real reduced costs; recalc_obj_coeffs installs them"
+        );
+        // Terminal valve, as in `restore_feasibility`: optimality is declared
+        // only on reduced costs recomputed from the original data and on basic
+        // values that still satisfy the rows. Bounded per phase, and the
+        // reduced-cost recomputation is skipped when nothing pivoted since the
+        // last exact one (the caller installs exact reduced costs on entry).
+        let mut pivoted_since_recalc = false;
+        let mut terminal_restarts = 0;
         for iter in 0.. {
-            self.lp_iterations += 1;
             if iter % DEADLINE_CHECK_INTERVAL == 0 {
                 if check_deadline(&self.deadline) == StopReason::Limit {
                     return Ok(StopReason::Limit);
@@ -940,7 +1037,35 @@ impl Solver {
 
             if let Some(pivot_info) = self.choose_pivot()? {
                 self.pivot(&pivot_info)?;
+                self.lp_iterations += 1;
+                pivoted_since_recalc = true;
             } else {
+                if terminal_restarts < MAX_TERMINAL_RESTARTS {
+                    let residual = self.primal_residual();
+                    let re_examine = if residual > REBUILD_RESIDUAL_TOL {
+                        debug!(
+                            "optimize iter {}: terminal residual {:e} exceeds {:e}; \
+                             rebuilding before declaring optimality",
+                            iter, residual, REBUILD_RESIDUAL_TOL,
+                        );
+                        self.rebuild()?;
+                        true
+                    } else if pivoted_since_recalc {
+                        // Reduced costs drift the same way the values do, and
+                        // recomputing them through the current factorization
+                        // is one transposed solve: re-examine on exact ones
+                        // before declaring optimality.
+                        self.recalc_obj_coeffs()?;
+                        true
+                    } else {
+                        false
+                    };
+                    if re_examine {
+                        terminal_restarts += 1;
+                        pivoted_since_recalc = false;
+                        continue;
+                    }
+                }
                 debug!(
                     "found optimum in {} iterations, obj.: {}",
                     iter + 1,
@@ -951,6 +1076,9 @@ impl Solver {
         }
 
         self.is_dual_feasible = true;
+        // Primal simplex moves through vertices: report where it actually
+        // ended instead of assuming primal feasibility survived.
+        self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
         Ok(StopReason::Finished)
     }
 
@@ -961,13 +1089,16 @@ impl Solver {
             "artificial obj."
         };
 
-        // Numerics valve, armed once per stall: before an infeasibility
-        // declaration is allowed to stand, the basis gets refactorized and
-        // the basic values recomputed from the original data. See below.
-        let mut refreshed_since_pivot = false;
+        // Numerics valve, armed once per stall: neither an infeasibility
+        // declaration nor a "feasible" termination is allowed to stand on
+        // incrementally-updated values — both first get the basis
+        // refactorized and the values recomputed from the original data
+        // (see below). Any successful pivot re-arms it, and the terminal
+        // re-examinations are bounded per phase, so neither path can loop.
+        let mut rebuilt_since_pivot = false;
+        let mut terminal_restarts = 0;
 
         for iter in 0.. {
-            self.lp_iterations += 1;
             if iter % DEADLINE_CHECK_INTERVAL == 0 {
                 if check_deadline(&self.deadline) == StopReason::Limit {
                     return Ok(StopReason::Limit);
@@ -984,7 +1115,7 @@ impl Solver {
                 self.calc_row_coeffs(row);
                 let pivot_info = match self.choose_entering_col_dual(row, leaving_new_val) {
                     Ok(pivot_info) => pivot_info,
-                    Err(Error::Infeasible) if !refreshed_since_pivot => {
+                    Err(Error::Infeasible) if !rebuilt_since_pivot => {
                         // "No eligible entering column" is a proof of primal
                         // infeasibility only in exact arithmetic. This deep
                         // in an eta-file chain, the leaving row can be a
@@ -1002,19 +1133,40 @@ impl Solver {
                              refreshing basis before declaring infeasibility",
                             iter, row,
                         );
-                        self.basis_solver
-                            .reset(&self.orig_constraints_csc, &self.basic_vars)?;
-                        self.recalc_basic_var_vals()?;
-                        refreshed_since_pivot = true;
+                        self.refresh_values()?;
+                        rebuilt_since_pivot = true;
                         continue;
                     }
                     Err(e) => return Err(e),
                 };
                 self.calc_col_coeffs(pivot_info.col);
                 self.pivot(&pivot_info)?;
+                self.lp_iterations += 1;
                 // Any successful pivot is progress: re-arm the valve.
-                refreshed_since_pivot = false;
+                rebuilt_since_pivot = false;
             } else {
+                // The bound checks above look at basic values, not at the
+                // rows they were derived from: a pivot on a small element can
+                // leave every value inside its bounds yet off the basis
+                // equations by far more than `EPS` (issue #44). End the phase
+                // only on a point a fresh factorization would also produce.
+                // Values only: recomputing the reduced costs here is the same
+                // mid-search hazard `refresh_values` describes — measured on
+                // miplib/gt2 as 50 ms → 3.9 min with a full `rebuild()`.
+                if !rebuilt_since_pivot && terminal_restarts < MAX_TERMINAL_RESTARTS {
+                    let residual = self.primal_residual();
+                    if residual > REBUILD_RESIDUAL_TOL {
+                        debug!(
+                            "restore feasibility iter {}: terminal residual {:e} exceeds {:e}; \
+                             rebuilding the basic values before ending the phase",
+                            iter, residual, REBUILD_RESIDUAL_TOL,
+                        );
+                        self.refresh_values()?;
+                        terminal_restarts += 1;
+                        rebuilt_since_pivot = true;
+                        continue;
+                    }
+                }
                 debug!(
                     "restored feasibility in {} iterations, {}: {}",
                     iter + 1,
@@ -1026,6 +1178,10 @@ impl Solver {
         }
 
         self.is_primal_feasible = true;
+        // The Harris ratio test trades bounded dual infeasibility for pivot
+        // size: report what is actually there instead of assuming the flag
+        // still holds. (The artificial objective is never dual feasible.)
+        self.is_dual_feasible = self.is_dual_feasible && self.calc_dual_infeasibility().0 == 0;
         Ok(StopReason::Finished)
     }
 
@@ -1106,7 +1262,7 @@ impl Solver {
         }
 
         self.is_primal_feasible = false;
-        self.restore_feasibility()
+        self.reoptimize()
     }
 
     /// Number of infeasible basic vars and sum of their infeasibilities.
@@ -1135,7 +1291,7 @@ impl Solver {
         let mut num_vars = 0;
         let mut infeasibility = 0.0;
         for (&obj_coeff, var_state) in self.nb_var_obj_coeffs.iter().zip(&self.nb_var_states) {
-            if !(var_state.at_min && obj_coeff > -EPS || var_state.at_max && obj_coeff < EPS) {
+            if !nb_dual_feasible(var_state, obj_coeff) {
                 num_vars += 1;
                 infeasibility += obj_coeff.abs();
             }
@@ -1180,9 +1336,7 @@ impl Solver {
                 .filter_map(|(col, (&obj_coeff, var_state))| {
                     // Choose only among non-basic vars that can be changed
                     // with objective decreasing.
-                    if (var_state.at_min && obj_coeff > -EPS)
-                        || (var_state.at_max && obj_coeff < EPS)
-                    {
+                    if nb_dual_feasible(var_state, obj_coeff) {
                         None
                     } else {
                         Some((col, obj_coeff))
@@ -1499,9 +1653,6 @@ impl Solver {
     }
 
     fn pivot(&mut self, pivot_info: &PivotInfo) -> Result<(), Error> {
-        // TODO: periodically (say, every 1000 pivots) recalc basic vars and object coeffs
-        // from scratch for numerical stability.
-
         self.cur_obj_val += self.nb_var_obj_coeffs[pivot_info.col] * pivot_info.entering_diff;
 
         let entering_var = self.nb_vars[pivot_info.col];
@@ -1584,8 +1735,11 @@ impl Solver {
             self.basis_solver
                 .push_eta_matrix(&self.col_coeffs, pivot_elem.row, pivot_coeff);
         } else {
-            self.basis_solver
-                .reset(&self.orig_constraints_csc, &self.basic_vars)?;
+            // Refactorizing anyway: also replace the incrementally-updated
+            // basic values with ones computed from the original data, so
+            // value drift never outlives a factorization. The reduced costs
+            // stay incremental on purpose — see `refresh_values`.
+            self.refresh_values()?;
         }
         Ok(())
     }
@@ -1662,6 +1816,82 @@ impl Solver {
         }
     }
 
+    /// Largest absolute residual `|a·x − b|` over the equilibrated rows, on the
+    /// current basic and non-basic values, ignoring rows whose residual is
+    /// within [`REBUILD_NOISE_FLOOR`] of their own activity magnitude
+    /// `1 + |b| + Σ|aᵢxᵢ|` (a fresh factorization could not improve them). A
+    /// basic solution satisfies every row exactly in exact arithmetic, so what
+    /// remains is how far the incremental pivot updates have drifted from the
+    /// basis equations; see [`REBUILD_RESIDUAL_TOL`]. Non-finite values report
+    /// `INFINITY`. O(nnz).
+    fn primal_residual(&self) -> f64 {
+        let mut worst: f64 = 0.0;
+        for (r, row) in self.orig_constraints.outer_iterator().enumerate() {
+            let mut activity = 0.0;
+            let mut magnitude = 0.0;
+            for (var, &coeff) in row.iter() {
+                let term = coeff * *self.get_value(var);
+                activity += term;
+                magnitude += term.abs();
+            }
+            let rhs = self.orig_rhs[r];
+            let residual = (activity - rhs).abs();
+            if !residual.is_finite() {
+                return f64::INFINITY;
+            }
+            if residual > REBUILD_NOISE_FLOOR * (1.0 + rhs.abs() + magnitude) {
+                worst = worst.max(residual);
+            }
+        }
+        worst
+    }
+
+    /// Refactorize the current basis and recompute the basic values from the
+    /// original data, discarding the drift the incremental pivot updates
+    /// accumulated. The reduced costs are deliberately left incremental: this
+    /// runs *mid-phase* (the phase-1 stall valve and every eta-file
+    /// refactorization), and recomputing them there exposes noise-level
+    /// (~1e-10) dual infeasibilities on large-coefficient columns which the
+    /// dual ratio test's clamp turns into forced degenerate pivots — a
+    /// different vertex, and a different branch-and-bound path after it.
+    /// Measured on miplib/gt2: 50 ms with values-only refreshes, 2.6 min
+    /// with the reduced costs recomputed at each refactorization. Phase exits
+    /// use [`Self::rebuild`], which recomputes both.
+    fn refresh_values(&mut self) -> Result<(), Error> {
+        self.basis_solver
+            .reset(&self.orig_constraints_csc, &self.basic_vars)?;
+        self.recalc_basic_var_vals()?;
+        // The incrementally updated objective is refreshed only when it has
+        // drifted materially. It feeds the branch-and-bound's node bounds and
+        // pseudocosts, and on a degenerate tree replacing it with an exact
+        // value that differs only in the last bits changes tie-breaking enough
+        // to change the whole search: measured on miplib/gt2 as 75 ms → 3.9 min
+        // when refreshed unconditionally, while the largest discrepancy seen
+        // over 78k refactorizations there was 1.6e-10 — round-off, five orders
+        // below any pruning slack. Real drift is caught; noise is left alone.
+        if !self.artificial_obj {
+            let exact = self.exact_obj_val();
+            if (exact - self.cur_obj_val).abs() > REBUILD_RESIDUAL_TOL * (1.0 + exact.abs()) {
+                self.cur_obj_val = exact;
+            }
+        }
+        Ok(())
+    }
+
+    /// Refactorize and recompute the basic values — and, unless the phase-1
+    /// artificial objective is in force, the reduced costs and objective
+    /// value — from the original data. For the primal phase's terminal stall
+    /// only, where optimality is about to be declared on those reduced costs;
+    /// see [`Self::refresh_values`] for why every other refresh leaves them
+    /// alone.
+    fn rebuild(&mut self) -> Result<(), Error> {
+        self.refresh_values()?;
+        if !self.artificial_obj {
+            self.recalc_obj_coeffs()?;
+        }
+        Ok(())
+    }
+
     fn recalc_basic_var_vals(&mut self) -> Result<(), Error> {
         let mut cur_vals = self.orig_rhs.clone();
         for (i, var) in self.nb_vars.iter().enumerate() {
@@ -1702,14 +1932,21 @@ impl Solver {
                 .push(self.orig_obj_coeffs[var] - dot_prod);
         }
 
-        self.cur_obj_val = 0.0;
+        self.cur_obj_val = self.exact_obj_val();
+        self.artificial_obj = false;
+        Ok(())
+    }
+
+    /// Objective value of the current point from the original coefficients.
+    fn exact_obj_val(&self) -> f64 {
+        let mut obj = 0.0;
         for (r, &var) in self.basic_vars.iter().enumerate() {
-            self.cur_obj_val += self.orig_obj_coeffs[var] * self.basic_var_vals[r];
+            obj += self.orig_obj_coeffs[var] * self.basic_var_vals[r];
         }
         for (c, &var) in self.nb_vars.iter().enumerate() {
-            self.cur_obj_val += self.orig_obj_coeffs[var] * self.nb_var_vals[c];
+            obj += self.orig_obj_coeffs[var] * self.nb_var_vals[c];
         }
-        Ok(())
+        obj
     }
 
     #[allow(dead_code)]
@@ -2297,6 +2534,88 @@ mod tests {
             Ok(())
         );
         assert_eq!(solver.get_var_bounds(0), (f64::NEG_INFINITY, f64::INFINITY));
+    }
+
+    /// Issue #44 at the engine level. The dual phase pivots `x2` into the
+    /// basis on the `-1.19e-8` coefficient, multiplying round-off by ~1e8;
+    /// the final basis is perfectly conditioned and its exact solution is
+    /// `x1 = x2 = 0`, but the incrementally-updated values said `x2 = 2^-26`
+    /// — inside its bounds, off its row by `1.5e-8`. A phase must end on
+    /// values that satisfy the rows, not merely sit inside their bounds.
+    #[test]
+    fn phase_ends_on_values_that_satisfy_the_rows() {
+        init();
+        let tiny = -1.190834764418229e-8;
+        let mut solver = Solver::try_new(
+            &[1.0, 0.0, 0.0],
+            &[-1.0, 0.0, 0.0],
+            &[0.0, 1.0, 0.0],
+            &[
+                (
+                    to_sparse(&[0.0, 8.510167104926385, 0.0]),
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+                (to_sparse(&[-1.0, tiny, 0.0]), ComparisonOp::Eq, 0.0),
+            ],
+            &[VarDomain::Real, VarDomain::Real, VarDomain::Integer],
+            None,
+        )
+        .unwrap();
+        assert_eq!(solver.initial_solve().unwrap(), StopReason::Finished);
+
+        let residual = solver.primal_residual();
+        assert!(
+            residual <= REBUILD_RESIDUAL_TOL,
+            "terminal residual {residual:e} exceeds {REBUILD_RESIDUAL_TOL:e}"
+        );
+        for var in 0..3 {
+            let value = *solver.get_value(var);
+            assert!(
+                value.abs() < 1e-12,
+                "var {var} = {value:e}; the only feasible point is 0"
+            );
+        }
+        assert!(solver.is_primal_feasible && solver.is_dual_feasible);
+    }
+
+    /// The terminal valve in isolation, with no refactorization in play:
+    /// plant drift into a basic value that stays inside its bounds and let the
+    /// dual phase end. The bound checks see nothing; the residual check must.
+    #[test]
+    fn terminal_stall_rebuilds_drifted_basic_values() {
+        init();
+        // minimize -x - 2y, x, y in [0, 3], x + y <= 4: optimum y = 3, x = 1 (basic).
+        let mut solver = Solver::try_new(
+            &[-1.0, -2.0],
+            &[0.0, 0.0],
+            &[3.0, 3.0],
+            &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 4.0)],
+            &[VarDomain::Real, VarDomain::Real],
+            None,
+        )
+        .unwrap();
+        assert_eq!(solver.initial_solve().unwrap(), StopReason::Finished);
+        assert_eq!(solver.basic_vars, vec![0]);
+        assert!((solver.basic_var_vals[0] - 1.0).abs() < 1e-12);
+        assert!(solver.primal_residual() <= REBUILD_RESIDUAL_TOL);
+
+        // Far beyond EPS, still inside [0, 3]: invisible to the bound checks.
+        solver.basic_var_vals[0] -= 1e-6;
+        assert!(
+            solver.primal_residual() > REBUILD_RESIDUAL_TOL,
+            "planted drift must show up as a row residual"
+        );
+        solver.is_primal_feasible = false;
+        assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
+
+        assert!(solver.primal_residual() <= REBUILD_RESIDUAL_TOL);
+        assert!(
+            (solver.basic_var_vals[0] - 1.0).abs() < 1e-12,
+            "drifted value {} was not rebuilt",
+            solver.basic_var_vals[0]
+        );
+        assert!((solver.cur_obj_val + 7.0).abs() < 1e-12);
     }
 
     #[test]

@@ -15,6 +15,53 @@ mod tests_general {
             .expect("an unlimited bounded feasible solve must return a solution")
     }
 
+    /// A free variable with a zero objective coefficient is dual feasible at
+    /// its reduced cost of zero. Counting any column at neither bound as
+    /// infeasible (as the dual-feasibility measurement once did) launches a
+    /// primal phase that picks it as entering with an infinite step: either
+    /// `Err(Unbounded)` or, with a row to block on, a NaN objective loop.
+    #[test]
+    fn free_zero_cost_variable_is_dual_feasible() {
+        init();
+        for (with_row, integer) in [(false, false), (true, false), (true, true)] {
+            let mut problem = Problem::new(OptimizationDirection::Minimize);
+            let x = if integer {
+                problem.add_integer_var(1.0, (0, 1000))
+            } else {
+                problem.add_var(1.0, (0.0, f64::INFINITY))
+            };
+            let y = problem.add_var(0.0, (f64::NEG_INFINITY, f64::INFINITY));
+            problem.add_constraint([(x, 1.0)], ComparisonOp::Ge, 1.0);
+            if with_row {
+                problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 10.0);
+            }
+            let sol = solution(problem.solve().unwrap());
+            assert!(
+                (sol.objective() - 1.0).abs() < 1e-9 && (sol[x] - 1.0).abs() < 1e-9,
+                "with_row={with_row} integer={integer}: obj={} x={}",
+                sol.objective(),
+                sol[x]
+            );
+        }
+
+        // The same free column when the start is dual-infeasible (z improves
+        // without a finite bound to seed at), so the primal phase runs
+        // regardless of how the flags are measured.
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_var(1.0, (0.0, f64::INFINITY));
+        let y = problem.add_var(0.0, (f64::NEG_INFINITY, f64::INFINITY));
+        let z = problem.add_var(-1.0, (0.0, f64::INFINITY));
+        problem.add_constraint([(x, 1.0)], ComparisonOp::Ge, 1.0);
+        problem.add_constraint([(z, 1.0)], ComparisonOp::Le, 5.0);
+        problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 10.0);
+        let sol = solution(problem.solve().unwrap());
+        assert!(
+            (sol.objective() + 4.0).abs() < 1e-9,
+            "dual-infeasible start: obj={}",
+            sol.objective()
+        );
+    }
+
     #[test]
     fn optimize() {
         init();
