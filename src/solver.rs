@@ -67,6 +67,21 @@ fn contract_tol(feasibility: f64, row_scale: f64) -> f64 {
     (feasibility * row_scale).min(EPS)
 }
 
+/// The tolerance a constraint row is *validated* to: the absolute tolerance
+/// `tol`, in whatever units the row is expressed in, floored at the row's
+/// round-off — [`REBUILD_NOISE_FLOOR`] times the magnitude of its activity,
+/// `1 + |b| + Σ|aᵢxᵢ|`. Below that floor a violation cannot be told from
+/// round-off in double precision, so no point could pass. The engine holds
+/// each row to the same floor ([`Solver::var_tol`]) and the MIP layer's guard
+/// and warm-start pre-filter check with this, so what the engine accepts and
+/// what validation accepts agree wherever double precision allows. The floor
+/// is a few hundred ulps of the activity, far below any violation the
+/// absolute guard exists to catch (a rounded big-M binary moves its row by
+/// the whole M).
+pub(crate) fn row_tolerance(tol: f64, rhs: f64, magnitude: f64) -> f64 {
+    tol.max(REBUILD_NOISE_FLOOR * (1.0 + rhs.abs() + magnitude))
+}
+
 /// A simplex phase may end only when every row's residual `|a·x − b|` is
 /// within this multiple of the row's own tolerance ([`Solver::var_tol`]).
 ///
@@ -83,9 +98,11 @@ fn contract_tol(feasibility: f64, row_scale: f64) -> f64 {
 /// and re-examines. Every row's tolerance is at least its own round-off floor
 /// ([`REBUILD_NOISE_FLOOR`]), so this fires only on drift a rebuild can
 /// remove, and it is bounded per phase ([`MAX_TERMINAL_RESTARTS`]) so it
-/// cannot loop. One order above the tolerance: a smaller inconsistency
-/// is below the resolution of the engine's own bound comparisons anyway.
-pub(crate) const REBUILD_RESIDUAL_FACTOR: f64 = 10.0;
+/// cannot loop. The multiple is one — the tolerance itself: a residual within
+/// it is what the bound checks and the validation guard already allow, and
+/// anything beyond it is drift. (A first cut used ten, which left a window in
+/// which the engine could end on a residual the MIP guard then rejected.)
+pub(crate) const REBUILD_RESIDUAL_FACTOR: f64 = 1.0;
 
 /// Relative drift of the incrementally-updated objective above which a
 /// mid-phase refresh replaces it with the exact value; see `refresh_values`.
@@ -783,8 +800,9 @@ impl Solver {
     }
 
     /// Check `values` (one entry per structural var) against every ORIGINAL
-    /// constraint row, within the ABSOLUTE tolerance `tol`. Bounds are not
-    /// checked here. Each row's sense is encoded by its slack var's bounds
+    /// constraint row, within the ABSOLUTE tolerance `tol` floored at the
+    /// row's round-off ([`row_tolerance`]). Bounds are not checked here. Each
+    /// row's sense is encoded by its slack var's bounds
     /// (lhs + s = rhs with s in [smin, smax]  ⇔  rhs - smax ≤ lhs ≤ rhs - smin);
     /// slack bounds are never touched by branching, so this always reflects the
     /// user's original rows.
@@ -792,18 +810,23 @@ impl Solver {
     /// Rows carry an internal power-of-two equilibration factor; the
     /// tolerance is multiplied by that same factor, which is algebraically
     /// equivalent to applying `tol` to the unscaled user row. It is deliberately
-    /// NOT scaled by the row's magnitude: this check exists for the big-M trap,
-    /// where a violation that is tiny
-    /// RELATIVE to huge row coefficients (e.g. 5.0 on a 1e9-scale row) is
-    /// decisive in absolute terms. Any row-scale-relative tolerance would be
-    /// blind to exactly the violations this guard is for.
+    /// NOT scaled by the row's coefficient magnitude: this check exists for
+    /// the big-M trap, where a violation that is tiny RELATIVE to huge row
+    /// coefficients (e.g. 5.0 on a 1e9-scale row) is decisive in absolute
+    /// terms, and any coefficient-relative tolerance would be blind to exactly
+    /// the violations this guard is for. The only relaxation is the round-off
+    /// floor of the activity itself, below which double precision cannot tell
+    /// a violation from a feasible point at all.
     pub(crate) fn check_constraints(&self, values: &[f64], tol: f64) -> bool {
         for (r, row) in self.orig_constraints.outer_iterator().enumerate() {
             let rhs = self.orig_rhs[r];
             let mut lhs = 0.0;
+            let mut magnitude = 0.0;
             for (v, &coeff) in row.iter() {
                 if v < self.num_vars {
-                    lhs += coeff * values[v];
+                    let term = coeff * values[v];
+                    lhs += term;
+                    magnitude += term.abs();
                 }
             }
             if !lhs.is_finite() {
@@ -821,7 +844,7 @@ impl Solver {
             } else {
                 f64::INFINITY
             };
-            let scaled_tol = tol * self.row_scales[r];
+            let scaled_tol = row_tolerance(tol * self.row_scales[r], rhs, magnitude);
             if lhs < lo - scaled_tol || lhs > hi + scaled_tol {
                 return false;
             }
@@ -2821,6 +2844,53 @@ mod tests {
             solver.basic_var_vals[0]
         );
         assert!((solver.cur_obj_val + 7.0).abs() < 1e-12);
+
+        // A residual of a few tolerances — above what the bound checks and
+        // the validation guard allow, but inside the window a gate one order
+        // above the tolerance would have let through — must be rebuilt too.
+        let tol = solver.basic_var_tols[0];
+        assert_eq!(tol, EPS, "a well-scaled row's slack is held to EPS");
+        solver.basic_var_vals[0] -= 3.0 * tol;
+        assert!(solver.measure_rows() > REBUILD_RESIDUAL_FACTOR);
+        solver.is_primal_feasible = false;
+        assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
+        assert!(
+            (solver.basic_var_vals[0] - 1.0).abs() < 1e-14,
+            "a {}x-tolerance residual was not rebuilt: value {}",
+            3.0,
+            solver.basic_var_vals[0]
+        );
+    }
+
+    /// The validation guard is absolute, floored at the row's round-off: a
+    /// violation below a few hundred ulps of the activity is accepted (no
+    /// double-precision point could do better), while the big-M trap — a
+    /// violation that is tiny relative to the coefficients but large in
+    /// absolute terms — is still rejected.
+    #[test]
+    fn check_constraints_floors_at_the_rows_round_off() {
+        init();
+        // 1e9 (x - b) == 10 with x, b continuous here: the guard only reads rows.
+        let solver = Solver::try_new(
+            &[1.0, 0.0],
+            &[0.0, 0.0],
+            &[f64::INFINITY, 1.0],
+            &[(to_sparse(&[1e9, -1e9]), ComparisonOp::Eq, 10.0)],
+            &[VarDomain::Real, VarDomain::Real],
+            None,
+        )
+        .unwrap();
+        let tol = DEFAULT_FEASIBILITY_TOL;
+        // Exact: 1e9 * (1 + 1e-8) - 1e9 = 10.
+        assert!(solver.check_constraints(&[1.0 + 1e-8, 1.0], tol));
+        // Off by one ulp of x: the activity moves by ~2e-7 in user units,
+        // above the absolute tolerance but far below the row's round-off
+        // floor (1e-13 x 2e9 = 2e-4), so it is accepted.
+        let x = f64::from_bits((1.0f64 + 1e-8).to_bits() + 1);
+        assert!(solver.check_constraints(&[x, 1.0], tol));
+        // The big-M trap: b rounded from 5e-7 to 0 moves the row by 500.
+        assert!(!solver.check_constraints(&[510.0 / 1e9 + 1.0, 0.0], tol));
+        assert!(!solver.check_constraints(&[1.0 + 1e-8 + 1e-3 / 1e9 * 1e3, 1.0], tol));
     }
 
     /// Phase-round exhaustion accepts only what the Harris relaxations can

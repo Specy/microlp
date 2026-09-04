@@ -305,22 +305,26 @@ small element (anything above `EPS` is accepted) multiplies round-off by its rec
 incrementally-updated value of `2^-26` — inside its bounds, off its row by `1.5e-8`, and
 rejected by the MIP layer's independent guard. Before a phase may end, the engine re-derives every row's round-off floor from the current
 values and measures each row's residual against the row's tolerance (O(nnz)); the tolerance
-is at least the floor, so residuals at round-off level never trip the gate, and beyond
-`REBUILD_RESIDUAL_FACTOR` times the tolerance it refactorizes, recomputes the values from the
-original data, and re-examines. The dual phase also prices once more on the freshly derived
+is at least the floor, so residuals at round-off level never trip the gate, and beyond the
+tolerance itself (`REBUILD_RESIDUAL_FACTOR`, one — a first cut used ten, which left a window
+in which the engine could end on a residual the MIP guard then rejected) it refactorizes,
+recomputes the values from the original data, and re-examines. The dual phase also prices once more on the freshly derived
 tolerances before it ends, since a value the stale tolerance accepted can lie outside the
 fresh one. The primal phase — the one about to declare optimality on its reduced costs —
 also recomputes those before ending, whether the residual fired or it merely pivoted since the
 last exact recomputation; the dual phase leaves them incremental for the reason given below. Both re-examinations are bounded per phase
 (`MAX_TERMINAL_RESTARTS`): exact recomputation can expose noise-level infeasibilities that a
 degenerate pivot "fixes" and the next incremental update hides again, a cycle with no
-objective progress to break it. Each phase then ends by *measuring* the flag the other phase
-owns rather than assuming it, and `run_phases` alternates them — bounded by
+objective progress to break it; a phase that uses up its re-examinations and still fails the
+residual gate says so with a `warn!`. Each phase then ends by *measuring* the flag the other
+phase owns rather than assuming it, and `run_phases` alternates them — bounded by
 `MAX_PHASE_ROUNDS`, because the Harris ratio tests relax in the *step* (by the row's
 tolerance on the primal side), so on rows with a large coefficient spread the phases can trade
-tolerance-level violations indefinitely;
-on exhaustion the point is accepted as it stands with a `warn!`, since those violations are
-the engine's own tolerance rather than a wrong answer. Refactorizations triggered by eta-file
+tolerance-level violations indefinitely. On exhaustion the worst remaining violation on each
+side is *measured*: within `PHASE_ACCEPT_FACTOR` tolerances — what the Harris relaxations can
+leave behind — the point is accepted with a `warn!`, since those violations are the engine's
+own tolerance rather than a wrong answer; beyond that the phases have not converged and the
+solve fails with `InternalError` rather than certifying the point. Refactorizations triggered by eta-file
 growth, and the phase-1 stall valve, recompute the *values* as well (and the objective
 value, but only when it has drifted by more than `1e-9` relative — on a degenerate tree a
 last-bit change to the node bound is enough to re-route the whole search), so value drift
@@ -358,13 +362,14 @@ tolerance. The guard makes this impossible to adopt:
   the proof.
 - Guard **fails** → do not adopt; **branch on the offending below-tolerance variable**
   (children `⌊v⌋` / `⌊v⌋+1` fix it exactly, and the dive resolves the truth).
-- Degenerate fallback: if every integer variable is *exactly* integral yet the check failed,
-  retry once from the all-slack basis. The engine already ends every phase on rebuilt values
-  (§5.3), so this is not about drift: the guard is absolute in *user* units while the engine
-  works on equilibrated rows, and on a row with huge coefficients a generic vertex cannot meet
-  it in floating point at all — a re-solve from scratch can land on an equivalent vertex whose
-  activities are exactly representable. If the independently checked point is still invalid,
-  return an internal error rather than force-accepting a potentially infeasible answer.
+- If every integer variable is *exactly* integral yet the check failed, the solve fails with
+  an `InternalError`. The guard's tolerance is absolute in user units but floored at the row's
+  round-off (`solver::row_tolerance`: a few hundred ulps of the activity, below which no
+  double-precision point could pass), and the engine holds every row to that same tolerance
+  and ends each phase on values that satisfy it (§5.3) — so a rejected exact point is an
+  inconsistency to surface, not something to hide. (An earlier fallback re-solved from the
+  slack basis hoping to land on an exactly representable vertex; with the floor in the guard
+  it had nothing left to do.)
 
 During zero-objective unboundedness classification, the same funnel runs first; only a valid
 integer point returns `Err(Unbounded)`. If classification is interrupted before an incumbent
@@ -558,7 +563,7 @@ Two homes, by audience:
 |---|---|---|
 | `int_tol` | `1e-6` | "is this LP value integral?" — a rounded feasible point may be adopted, but branching continues until its LP point is exact. Must be finite and in `[0, 0.5)`. |
 | `mip_gap` | `0.0` | early-stop proof quality (relative gap) |
-| `tolerances.feasibility` | `1e-7` **absolute**, user units | the row tolerance the engine itself works to (each slack is held to `feasibility × row_scale` in equilibrated units, capped at `EPS` and floored at the row's own round-off — §5.3), the rounded-incumbent guard, and the post-edit incumbent pre-filter (§5.4 explains why absolute) |
+| `tolerances.feasibility` | `1e-7` **absolute**, user units | the row tolerance the engine itself works to (each slack is held to `feasibility × row_scale` in equilibrated units, capped at `EPS` and floored at the row's own round-off — §5.3), the rounded-incumbent guard, and the post-edit incumbent pre-filter (both floored at the same round-off, `row_tolerance`; §5.4 explains why absolute) |
 | `tolerances.integrality_rounding` | `1e-5` | integrality check in the edit pre-filter; `var_value`'s sanity assert pins the *default* deliberately |
 | `tolerances.prune_epsilon` | `1e-9` | the pruning cutoff slack |
 
@@ -569,11 +574,13 @@ definition):** `SCORE_EPS`, `PSEUDOCOST_INIT_EPS`, `BRANCH_FRAC_GUARD` (all `1e-
 the public default is defined from; each slack is held to `feasibility × row_scale` in
 equilibrated units, capped at `EPS`), `REBUILD_NOISE_FLOOR` (`1e-13` per unit of a row's
 activity magnitude: the round-off floor of a basic value, re-derived from the current point
-at every rebuild — the floor of every slack's tolerance, and the level below which a row
-residual is not drift) and `REBUILD_RESIDUAL_FACTOR` (`10`: a phase rebuilds its terminal
-values when a row's residual exceeds that multiple of the row's tolerance — §5.3),
-`MAX_TERMINAL_RESTARTS` (`4`) and `MAX_PHASE_ROUNDS` (`8`: the bounds on terminal
-re-examination and on phase alternation — §5.3), `OBJECTIVE_DRIFT_TOL` (`1e-9`, relative), and
+at every rebuild — the floor of every slack's tolerance, the level below which a row
+residual is not drift, and the floor of the validation guard's tolerance via `row_tolerance`)
+and `REBUILD_RESIDUAL_FACTOR` (`1`: a phase rebuilds its terminal values when a row's
+residual exceeds the row's tolerance — §5.3), `MAX_TERMINAL_RESTARTS` (`4`) and
+`MAX_PHASE_ROUNDS` (`8`: the bounds on terminal re-examination and on phase alternation —
+§5.3), `PHASE_ACCEPT_FACTOR` (`10`: the multiple of the tolerances within which an exhausted
+alternation is accepted rather than failed — §5.3), `OBJECTIVE_DRIFT_TOL` (`1e-9`, relative), and
 the simplex pivot tolerance `EPS` (`1e-10`) — the resolution of every other float comparison
 in the engine.
 
@@ -595,9 +602,10 @@ They are close in magnitude, but govern distinct layers and must not be conflate
 | Root LP unbounded on a MILP | run a resumable zero-objective integer-feasibility search; any integer point proves `Unbounded`, exhaustion proves `Infeasible` |
 | Node LP infeasible | prune (correct) |
 | Node LP unbounded | impossible when the node is bounded → `InternalError` |
-| Singular LU (or any other non-`Infeasible`/`Unbounded` error) in a node LP, or an exactly-integral candidate that fails the feasibility guard | retry once from the slack basis; then propagate |
-| Phase about to end on drifted values (a row residual beyond `REBUILD_RESIDUAL_FACTOR` × the row's tolerance) | refactorize, recompute values from the original data, re-examine; at most `MAX_TERMINAL_RESTARTS` per phase |
-| Phases still trading `EPS`-level infeasibilities after `MAX_PHASE_ROUNDS` | accept the point as it stands, `warn!` |
+| Singular LU (or any other non-`Infeasible`/`Unbounded` error) in a node LP | retry once from the slack basis; then propagate |
+| Exactly-integral candidate that fails the feasibility guard (absolute, floored at the row's round-off) | `InternalError` — the engine holds every row to the guard's tolerance, so this is an inconsistency to surface (§5.4) |
+| Phase about to end on drifted values (a row residual beyond the row's tolerance) | refactorize, recompute values from the original data, re-examine; at most `MAX_TERMINAL_RESTARTS` per phase, then `warn!` if the residual remains |
+| Phases still trading tolerance-level infeasibilities after `MAX_PHASE_ROUNDS` | measure: within `PHASE_ACCEPT_FACTOR` tolerances accept with a `warn!`; beyond, `InternalError` |
 | `load_basis` failure on a jump | load the slack basis (infallible) and solve the node from scratch |
 | Phase-1 stall (“no entering column”) | refresh the basis (fresh LU + recomputed values) and retry once per stall; declare `Infeasible` only if it survives the refresh |
 | Deadline mid-LP | requeue the node unsolved; return `Interrupted` |

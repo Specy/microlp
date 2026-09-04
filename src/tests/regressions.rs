@@ -268,6 +268,60 @@ mod regression_tests {
         }
     }
 
+    /// The residual class behind issue #44 once the engine held its rows
+    /// honestly: a row with coefficients around `1e8` and an activity near
+    /// `6e9`, whose exact vertex is not representable in double precision.
+    /// The validation guard demanded an absolute `1e-7` there — below one ulp
+    /// of the activity — so no returned point could pass and the solve ended
+    /// in `InternalError` (5 of 300 such random models on the fix branch, 6 on
+    /// master). The guard is now floored at the row's round-off, which is
+    /// also the tolerance the engine holds the row to. A brute-force
+    /// enumeration of the two integer variables is the oracle.
+    #[test]
+    fn huge_coefficient_row_validates_within_round_off() {
+        let (a0, a1, a2) = (233961702.1092298, -38659774.0504899, -132943028.20165081);
+        let rhs = 5.839427392501522e9;
+        let (c0, c1, c2) = (-0.5093205118777648, -1.9993457673342485, -0.9845099835842941);
+        let x1_max = 68.6087643341415;
+
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x0 = problem.add_integer_var(c0, (0, 68));
+        let x1 = problem.add_var(c1, (0.0, x1_max));
+        let x2 = problem.add_integer_var(c2, (0, 68));
+        problem.add_constraint([(x0, a0), (x1, a1), (x2, a2)], ComparisonOp::Eq, rhs);
+        let sol = problem
+            .solve()
+            .unwrap_or_else(|e| panic!("feasible model (60, 47, 48) must solve, got {e:?}"))
+            .into_solution()
+            .unwrap();
+
+        // Oracle: for each integer pair the row pins x1.
+        let mut best = f64::INFINITY;
+        for i0 in 0..=68 {
+            for i2 in 0..=68 {
+                let v1 = (rhs - a0 * f64::from(i0) - a2 * f64::from(i2)) / a1;
+                if (0.0..=x1_max).contains(&v1) {
+                    best = best.min(c0 * f64::from(i0) + c1 * v1 + c2 * f64::from(i2));
+                }
+            }
+        }
+        assert!(best.is_finite());
+        assert!(
+            (sol.objective() - best).abs() <= 1e-9 * best.abs(),
+            "objective {} vs brute force {}",
+            sol.objective(),
+            best
+        );
+        let activity = a0 * sol[x0] + a1 * sol[x1] + a2 * sol[x2];
+        let magnitude = (a0 * sol[x0]).abs() + (a1 * sol[x1]).abs() + (a2 * sol[x2]).abs();
+        assert!(
+            (activity - rhs).abs() <= 1e-13 * (1.0 + rhs.abs() + magnitude),
+            "row off by {:e} at activity magnitude {:e}",
+            activity - rhs,
+            magnitude
+        );
+    }
+
     /// `Tolerances::feasibility` is the tolerance the engine works to. At the
     /// default `1e-7` the `k = 1` model may legitimately stop at `x = -1e-4`
     /// (its row is off by `2e-8`); asking for `1e-9` yields the exact vertex.

@@ -429,11 +429,14 @@ pub(crate) fn incumbent_feasible(
         return false;
     }
     for (coeffs, op, rhs) in &base.constraints {
-        let lhs: f64 = coeffs.iter().map(|(i, c)| c * values[i]).sum();
+        let (lhs, magnitude) = coeffs.iter().fold((0.0, 0.0), |(lhs, mag), (i, c)| {
+            let term = c * values[i];
+            (lhs + term, mag + term.abs())
+        });
         if !lhs.is_finite() {
             return false;
         }
-        let tol = tolerances.feasibility;
+        let tol = crate::solver::row_tolerance(tolerances.feasibility, *rhs, magnitude);
         let ok = match op {
             ComparisonOp::Eq => (lhs - rhs).abs() <= tol,
             ComparisonOp::Le => lhs <= rhs + tol,
@@ -593,62 +596,19 @@ fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
 enum IntegralCandidate {
     Closed,
     Branch(usize),
-    Limit,
 }
 
 /// Adopt a feasible rounded candidate, but close the current subtree only when
-/// the LP point itself is exactly integral. If an exactly integral point fails
-/// the independent feasibility guard, retry once from the all-slack basis.
-/// The engine already ends every phase on values rebuilt from the original
-/// data (`solver::REBUILD_RESIDUAL_FACTOR`), so this is not about drift: the
-/// guard is absolute in *user* units while the engine works on equilibrated
-/// rows, and on a row with huge coefficients a generic vertex cannot meet the
-/// guard in floating point at all. A re-solve from scratch can land on an
-/// equivalent vertex whose activities are exactly representable (measured:
-/// 16 of 601 adversarial big-M models solve only because of it) — and if the
-/// independently checked point is still invalid the error stands rather than
-/// force-accepting a point that violates the user's tolerance.
+/// the LP point itself is exactly integral. An exactly integral point that
+/// fails the independent feasibility guard is an internal error: the engine
+/// ends every phase on values that satisfy the rows to the same tolerance the
+/// guard checks (`solver::row_tolerance`, round-off floor included), so there
+/// is no honest way to accept the point, and a retry from another basis — the
+/// earlier fallback — would only hide the inconsistency it reveals.
 fn process_integral_candidate(
     state: &mut MipState,
     domains: &[VarDomain],
-    int_tol: f64,
 ) -> Result<IntegralCandidate, Error> {
-    let adopted = try_adopt_incumbent(state)?;
-    if let Some(var) = branching::choose_branch_var(&state.solver, domains, 0.0, &state.pseudocosts)
-    {
-        return Ok(IntegralCandidate::Branch(var));
-    }
-    if adopted {
-        return Ok(IntegralCandidate::Closed);
-    }
-
-    debug!("exactly integral candidate failed guard; retrying from slack basis");
-    let slack = state.solver.slack_basis();
-    state
-        .solver
-        .load_basis(&slack)
-        .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
-    match solve_node_lp(state)? {
-        NodeLp::Limit => return Ok(IntegralCandidate::Limit),
-        NodeLp::Infeasible => {
-            return Err(Error::InternalError(
-                "integral candidate became infeasible after slack-basis retry".to_string(),
-            ))
-        }
-        NodeLp::Solved => {}
-    }
-
-    if !branching::is_integral(&state.solver, domains, int_tol) {
-        return branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts)
-            .map(IntegralCandidate::Branch)
-            .ok_or_else(|| {
-                Error::InternalError(
-                    "slack-basis retry produced a non-integral point with no branchable variable"
-                        .to_string(),
-                )
-            });
-    }
-
     let adopted = try_adopt_incumbent(state)?;
     if let Some(var) = branching::choose_branch_var(&state.solver, domains, 0.0, &state.pseudocosts)
     {
@@ -657,8 +617,7 @@ fn process_integral_candidate(
         Ok(IntegralCandidate::Closed)
     } else {
         Err(Error::InternalError(
-            "exactly integral solution failed feasibility validation after slack-basis retry"
-                .to_string(),
+            "exactly integral solution failed feasibility validation".to_string(),
         ))
     }
 }
@@ -987,14 +946,10 @@ fn initialize_root(
     };
     let int_tol = state.options.int_tol;
     if branching::is_integral(&state.solver, domains, int_tol) {
-        match process_integral_candidate(state, domains, int_tol)? {
+        match process_integral_candidate(state, domains)? {
             IntegralCandidate::Branch(var) => branch(state, &root, var),
             IntegralCandidate::Closed => {
                 return Ok(Some(TerminationReason::ProvenOptimal));
-            }
-            IntegralCandidate::Limit => {
-                state.root_solved = false;
-                return Ok(Some(TerminationReason::TimeLimit));
             }
         }
     } else {
@@ -1069,17 +1024,11 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
 
     let int_tol = state.options.int_tol;
     if branching::is_integral(&state.solver, domains, int_tol) {
-        match process_integral_candidate(state, domains, int_tol)? {
+        match process_integral_candidate(state, domains)? {
             IntegralCandidate::Branch(var) => branch(state, &node, var),
             IntegralCandidate::Closed => {
                 state.last_solved_id = None;
                 state.diving = false;
-            }
-            IntegralCandidate::Limit => {
-                return Ok(NodeVisit::Interrupted {
-                    node,
-                    lp_solved: true,
-                })
             }
         }
         return Ok(NodeVisit::Solved);
