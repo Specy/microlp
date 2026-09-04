@@ -123,6 +123,15 @@ const MAX_TERMINAL_RESTARTS: usize = 4;
 /// previous, unmeasured alternation answered.
 const MAX_PHASE_ROUNDS: usize = 8;
 
+/// When [`Solver::run_phases`] exhausts [`MAX_PHASE_ROUNDS`], the point is
+/// accepted only if its worst remaining violation, primal or dual, is within
+/// this multiple of the variable's own tolerance. The Harris ratio tests bound
+/// what a phase can leave on the other side by one tolerance per variable
+/// (plus round-off), so anything beyond a small multiple is not the phases
+/// trading tolerance-level violations but a failure to converge, and it is
+/// reported as such rather than certified as optimal.
+const PHASE_ACCEPT_FACTOR: f64 = 10.0;
+
 /// How often (in simplex iterations) the primal/dual loops in `optimize` and
 /// `restore_feasibility` check the deadline and emit a progress `debug!` log.
 /// Checking every iteration would make the deadline check itself a
@@ -749,6 +758,23 @@ impl Solver {
         worst
     }
 
+    /// A phase that has used up [`MAX_TERMINAL_RESTARTS`] ends on the point
+    /// it has. Say so loudly when that point still fails the terminal residual
+    /// gate: the drift a rebuild could not clear then reaches the caller.
+    fn warn_if_terminal_residual_remains(&mut self, phase: &str, iter: u64) {
+        let excess = self.measure_rows();
+        if excess > REBUILD_RESIDUAL_FACTOR {
+            log::warn!(
+                "{} iter {}: ending the phase after {} terminal re-examinations with a row \
+                 residual still {:.1}x its tolerance",
+                phase,
+                iter,
+                MAX_TERMINAL_RESTARTS,
+                excess,
+            );
+        }
+    }
+
     pub(crate) fn get_value(&self, var: usize) -> &f64 {
         match self.var_states[var] {
             VarState::Basic(idx) => &self.basic_var_vals[idx],
@@ -894,21 +920,72 @@ impl Solver {
                 return Ok(StopReason::Finished);
             }
         }
-        // See `MAX_PHASE_ROUNDS`: what is left is tolerance-level, not wrong.
-        let (primal_vars, primal_sum) = self.calc_primal_infeasibility();
-        let (dual_vars, dual_sum) = self.calc_dual_infeasibility();
+        self.accept_exhausted_point()?;
+        Ok(StopReason::Finished)
+    }
+
+    /// The exit of [`Self::run_phases`] after [`MAX_PHASE_ROUNDS`]: measure
+    /// what is left instead of assuming it is tolerance-level. Within
+    /// [`PHASE_ACCEPT_FACTOR`] times the tolerances the point is accepted
+    /// with a `warn!`; beyond that the phases have not converged and the
+    /// caller gets an error rather than a point certified as optimal.
+    fn accept_exhausted_point(&mut self) -> Result<(), Error> {
+        let primal_excess = self.max_primal_excess();
+        let dual_excess = self.max_dual_excess();
+        if !(primal_excess <= PHASE_ACCEPT_FACTOR && dual_excess <= PHASE_ACCEPT_FACTOR) {
+            return Err(Error::InternalError(format!(
+                "simplex phases did not converge in {} rounds: worst primal violation is \
+                 {:.1}x its tolerance, worst dual violation {:.1}x",
+                MAX_PHASE_ROUNDS, primal_excess, dual_excess,
+            )));
+        }
         log::warn!(
-            "simplex phases still trading EPS-level infeasibilities after {} rounds \
-             (primal: {} vars, {:e}; dual: {} coeffs, {:e}); accepting the current point",
+            "simplex phases still trading tolerance-level infeasibilities after {} rounds \
+             (worst primal {:.1}x, worst dual {:.1}x its tolerance); accepting the current point",
             MAX_PHASE_ROUNDS,
-            primal_vars,
-            primal_sum,
-            dual_vars,
-            dual_sum,
+            primal_excess,
+            dual_excess,
         );
         self.is_primal_feasible = true;
         self.is_dual_feasible = true;
-        Ok(StopReason::Finished)
+        Ok(())
+    }
+
+    /// Largest bound violation of a basic variable as a multiple of that
+    /// variable's tolerance (`0` when none is violated; `INFINITY` for a
+    /// non-finite value).
+    fn max_primal_excess(&self) -> f64 {
+        let mut worst: f64 = 0.0;
+        for (((&val, &min), &max), &tol) in self
+            .basic_var_vals
+            .iter()
+            .zip(&self.basic_var_mins)
+            .zip(&self.basic_var_maxs)
+            .zip(&self.basic_var_tols)
+        {
+            if !val.is_finite() {
+                return f64::INFINITY;
+            }
+            let violation = (min - val).max(val - max).max(0.0);
+            worst = worst.max(violation / tol);
+        }
+        worst
+    }
+
+    /// Largest dual infeasibility of a non-basic column as a multiple of the
+    /// tolerance it is priced with (`0` when every column is dual feasible;
+    /// `INFINITY` for a non-finite reduced cost).
+    fn max_dual_excess(&self) -> f64 {
+        let mut worst: f64 = 0.0;
+        for (&obj_coeff, var_state) in self.nb_var_obj_coeffs.iter().zip(&self.nb_var_states) {
+            if !obj_coeff.is_finite() {
+                return f64::INFINITY;
+            }
+            if !nb_dual_feasible(var_state, obj_coeff) {
+                worst = worst.max(obj_coeff.abs() / EPS);
+            }
+        }
+        worst
     }
 
     pub(crate) fn snapshot_basis(&self) -> Basis {
@@ -1171,7 +1248,9 @@ impl Solver {
                 self.lp_iterations += 1;
                 pivoted_since_recalc = true;
             } else {
-                if terminal_restarts < MAX_TERMINAL_RESTARTS {
+                if terminal_restarts >= MAX_TERMINAL_RESTARTS {
+                    self.warn_if_terminal_residual_remains("optimize", iter);
+                } else {
                     let excess = self.measure_rows();
                     let re_examine = if excess > REBUILD_RESIDUAL_FACTOR {
                         debug!(
@@ -1284,7 +1363,9 @@ impl Solver {
                 // Values only: recomputing the reduced costs here is the same
                 // mid-search hazard `refresh_values` describes — measured on
                 // miplib/gt2 as 50 ms → 3.9 min with a full `rebuild()`.
-                if !rebuilt_since_pivot && terminal_restarts < MAX_TERMINAL_RESTARTS {
+                if !rebuilt_since_pivot && terminal_restarts >= MAX_TERMINAL_RESTARTS {
+                    self.warn_if_terminal_residual_remains("restore feasibility", iter);
+                } else if !rebuilt_since_pivot {
                     let excess = self.measure_rows();
                     if excess > REBUILD_RESIDUAL_FACTOR {
                         debug!(
@@ -2740,6 +2821,63 @@ mod tests {
             solver.basic_var_vals[0]
         );
         assert!((solver.cur_obj_val + 7.0).abs() < 1e-12);
+    }
+
+    /// Phase-round exhaustion accepts only what the Harris relaxations can
+    /// leave behind: a violation a few tolerances wide is accepted (with a
+    /// warning), a large one — primal or dual — is an error rather than a
+    /// point certified optimal. Ablation: with the measurement removed both
+    /// large violations would be accepted.
+    #[test]
+    fn exhausted_phases_accept_only_tolerance_level_violations() {
+        init();
+        // minimize -x - 2y, x, y in [0, 3], x + y <= 4: optimum y = 3, x = 1 (basic).
+        let build = || {
+            let mut solver = Solver::try_new(
+                &[-1.0, -2.0],
+                &[0.0, 0.0],
+                &[3.0, 3.0],
+                &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 4.0)],
+                &[VarDomain::Real, VarDomain::Real],
+                None,
+            )
+            .unwrap();
+            assert_eq!(solver.initial_solve().unwrap(), StopReason::Finished);
+            assert_eq!(solver.basic_vars, vec![0]);
+            solver
+        };
+
+        let mut solver = build();
+        let tol = solver.basic_var_tols[0];
+        solver.basic_var_vals[0] = solver.basic_var_maxs[0] + 3.0 * tol;
+        assert!((solver.max_primal_excess() - 3.0).abs() < 1e-6);
+        solver.is_primal_feasible = false;
+        solver.accept_exhausted_point().unwrap();
+        assert!(solver.is_primal_feasible && solver.is_dual_feasible);
+
+        let mut solver = build();
+        solver.basic_var_vals[0] = solver.basic_var_maxs[0] + 100.0 * tol;
+        assert!(matches!(
+            solver.accept_exhausted_point(),
+            Err(Error::InternalError(_))
+        ));
+
+        let mut solver = build();
+        // A reduced cost of the wrong sign for a column at its lower bound.
+        let col = solver
+            .nb_var_states
+            .iter()
+            .position(|st| st.at_min)
+            .expect("a non-basic column at its lower bound");
+        solver.nb_var_obj_coeffs[col] = -3.0 * EPS;
+        assert!((solver.max_dual_excess() - 3.0).abs() < 1e-6);
+        solver.accept_exhausted_point().unwrap();
+        let mut solver = build();
+        solver.nb_var_obj_coeffs[col] = -100.0 * EPS;
+        assert!(matches!(
+            solver.accept_exhausted_point(),
+            Err(Error::InternalError(_))
+        ));
     }
 
     /// Each row's slack is held to the user's absolute tolerance expressed in
