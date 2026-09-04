@@ -291,8 +291,10 @@ arithmetic. Deep in an eta-file chain, accumulated round-off can promote a phant
 violation into a leaving row whose (equally drifted) pivot row blocks every candidate — a
 *false* `Infeasible`. Before an infeasibility declaration can stand, the engine refactorizes
 the basis, recomputes basic values from the original data, and re-examines the row: a
-phantom violation dissolves, while a real infeasibility survives. The valve is armed once
-per stall and any successful pivot re-arms it, so it cannot loop. `EPS` remains tight
+phantom violation dissolves, while a real infeasibility survives. The refresh also re-derives
+each row's round-off floor from the recomputed values, so a violation that is only round-off
+is no longer priced at all instead of being chased again; the valve is armed once per stall
+and any successful pivot re-arms it, so it cannot loop. `EPS` remains tight
 because the big-M correctness models require basic integer values to resolve sharply onto
 their bounds (see the `EPS` docs in `solver.rs`).
 
@@ -301,19 +303,22 @@ against their bounds, never against the rows those values were derived from, and
 small element (anything above `EPS` is accepted) multiplies round-off by its reciprocal: issue
 #44 ended the dual phase with a perfectly conditioned basis whose exact solution is `0` and an
 incrementally-updated value of `2^-26` — inside its bounds, off its row by `1.5e-8`, and
-rejected by the MIP layer's independent guard. Before a phase may end, the engine computes
-every equilibrated row's absolute residual (O(nnz)), ignoring rows already within the
-round-off floor of their own activity (`REBUILD_NOISE_FLOOR`, where a rebuild could not help);
-above `REBUILD_RESIDUAL_TOL` it refactorizes, recomputes the values from the original data,
-and re-examines. The primal phase — the one about to declare optimality on its reduced costs —
+rejected by the MIP layer's independent guard. Before a phase may end, the engine re-derives every row's round-off floor from the current
+values and measures each row's residual against the row's tolerance (O(nnz)); the tolerance
+is at least the floor, so residuals at round-off level never trip the gate, and beyond
+`REBUILD_RESIDUAL_FACTOR` times the tolerance it refactorizes, recomputes the values from the
+original data, and re-examines. The dual phase also prices once more on the freshly derived
+tolerances before it ends, since a value the stale tolerance accepted can lie outside the
+fresh one. The primal phase — the one about to declare optimality on its reduced costs —
 also recomputes those before ending, whether the residual fired or it merely pivoted since the
 last exact recomputation; the dual phase leaves them incremental for the reason given below. Both re-examinations are bounded per phase
 (`MAX_TERMINAL_RESTARTS`): exact recomputation can expose noise-level infeasibilities that a
 degenerate pivot "fixes" and the next incremental update hides again, a cycle with no
 objective progress to break it. Each phase then ends by *measuring* the flag the other phase
 owns rather than assuming it, and `run_phases` alternates them — bounded by
-`MAX_PHASE_ROUNDS`, because the Harris ratio tests relax by `EPS` in the *step*, so on rows
-with a large coefficient spread the phases can trade tolerance-level violations indefinitely;
+`MAX_PHASE_ROUNDS`, because the Harris ratio tests relax in the *step* (by the row's
+tolerance on the primal side), so on rows with a large coefficient spread the phases can trade
+tolerance-level violations indefinitely;
 on exhaustion the point is accepted as it stands with a `warn!`, since those violations are
 the engine's own tolerance rather than a wrong answer. Refactorizations triggered by eta-file
 growth, and the phase-1 stall valve, recompute the *values* as well (and the objective
@@ -553,24 +558,33 @@ Two homes, by audience:
 |---|---|---|
 | `int_tol` | `1e-6` | "is this LP value integral?" — a rounded feasible point may be adopted, but branching continues until its LP point is exact. Must be finite and in `[0, 0.5)`. |
 | `mip_gap` | `0.0` | early-stop proof quality (relative gap) |
-| `tolerances.feasibility` | `1e-7` **absolute** | the rounded-incumbent guard and the post-edit incumbent pre-filter (§5.4 explains why absolute) |
+| `tolerances.feasibility` | `1e-7` **absolute**, user units | the row tolerance the engine itself works to (each slack is held to `feasibility × row_scale` in equilibrated units, capped at `EPS` and floored at the row's own round-off — §5.3), the rounded-incumbent guard, and the post-edit incumbent pre-filter (§5.4 explains why absolute) |
 | `tolerances.integrality_rounding` | `1e-5` | integrality check in the edit pre-filter; `var_value`'s sanity assert pins the *default* deliberately |
 | `tolerances.prune_epsilon` | `1e-9` | the pruning cutoff slack |
 
 **Internal — `src/mip/params.rs` and `src/solver.rs` consts (each documented at its
 definition):** `SCORE_EPS`, `PSEUDOCOST_INIT_EPS`, `BRANCH_FRAC_GUARD` (all `1e-6`),
 `GAP_DENOM_GUARD` (`1e-10`), `HINT_BOUNDS_SLACK` (`1e-9`), `DEADLINE_CHECK_INTERVAL`
-(`1000` pivots), `LU_STABILITY_THRESHOLD` (`0.1`), `REBUILD_RESIDUAL_TOL` (`1e-9`) and
-`REBUILD_NOISE_FLOOR` (`1e-13`: the absolute row residual above which a phase rebuilds its
-terminal values before ending, and the per-unit-activity floor below which it never bothers —
-§5.3), `MAX_TERMINAL_RESTARTS` (`4`) and `MAX_PHASE_ROUNDS` (`8`: the bounds on terminal
-re-examination and on phase alternation — §5.3), and the simplex pivot tolerance `EPS`
-(`1e-10`) — the one number the whole engine's float comparisons are built on.
+(`1000` pivots), `LU_STABILITY_THRESHOLD` (`0.1`), `DEFAULT_FEASIBILITY_TOL` (the `1e-7`
+the public default is defined from; each slack is held to `feasibility × row_scale` in
+equilibrated units, capped at `EPS`), `REBUILD_NOISE_FLOOR` (`1e-13` per unit of a row's
+activity magnitude: the round-off floor of a basic value, re-derived from the current point
+at every rebuild — the floor of every slack's tolerance, and the level below which a row
+residual is not drift) and `REBUILD_RESIDUAL_FACTOR` (`10`: a phase rebuilds its terminal
+values when a row's residual exceeds that multiple of the row's tolerance — §5.3),
+`MAX_TERMINAL_RESTARTS` (`4`) and `MAX_PHASE_ROUNDS` (`8`: the bounds on terminal
+re-examination and on phase alternation — §5.3), `OBJECTIVE_DRIFT_TOL` (`1e-9`, relative), and
+the simplex pivot tolerance `EPS` (`1e-10`) — the resolution of every other float comparison
+in the engine.
 
 The layering rule: `EPS` decides *simplex* questions (is this coefficient zero, is this
 value at its bound); `int_tol` decides *integrality* questions; `feasibility` decides
-*solution acceptance*; `prune_epsilon` decides *tree* questions. They are close in
-magnitude, but govern distinct layers and must not be conflated.
+*solution acceptance* — and, expressed per row in the engine's equilibrated units, how
+tightly the simplex holds each constraint, so that what the engine accepts and what the guard
+accepts agree wherever double precision allows (rows are scaled by a power of two, so a flat
+`EPS` on a slack would tolerate `EPS / row_scale` in user units — `5e-5` on a row with a
+`1e6` coefficient — far outside the contract); `prune_epsilon` decides *tree* questions.
+They are close in magnitude, but govern distinct layers and must not be conflated.
 
 ---
 
@@ -582,7 +596,7 @@ magnitude, but govern distinct layers and must not be conflated.
 | Node LP infeasible | prune (correct) |
 | Node LP unbounded | impossible when the node is bounded → `InternalError` |
 | Singular LU (or any other non-`Infeasible`/`Unbounded` error) in a node LP, or an exactly-integral candidate that fails the feasibility guard | retry once from the slack basis; then propagate |
-| Phase about to end on drifted values (row residual above `REBUILD_RESIDUAL_TOL`) | refactorize, recompute values from the original data, re-examine; at most `MAX_TERMINAL_RESTARTS` per phase |
+| Phase about to end on drifted values (a row residual beyond `REBUILD_RESIDUAL_FACTOR` × the row's tolerance) | refactorize, recompute values from the original data, re-examine; at most `MAX_TERMINAL_RESTARTS` per phase |
 | Phases still trading `EPS`-level infeasibilities after `MAX_PHASE_ROUNDS` | accept the point as it stands, `warn!` |
 | `load_basis` failure on a jump | load the slack basis (infallible) and solve the node from scratch |
 | Phase-1 stall (“no entering column”) | refresh the basis (fresh LU + recomputed values) and retry once per stall; declare `Infeasible` only if it survives the refresh |

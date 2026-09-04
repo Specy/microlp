@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod regression_tests {
-    use crate::{ComparisonOp, OptimizationDirection, Problem};
+    use crate::{ComparisonOp, OptimizationDirection, Problem, SolveOptions};
 
     /// <https://github.com/Specy/microlp/issues/3>: a huge but *finite* variable
     /// bound (`f64::MAX`, `f32::MAX`, `i64::MAX`, …) must behave like
@@ -208,5 +208,88 @@ mod regression_tests {
                 "tiny={tiny:e} big={big:e}: got obj={obj:e} x1={v1:e} x2={v2:e}"
             );
         }
+    }
+
+    /// Build the second model from issue #44 (reported on the fix PR): `x`
+    /// is pinned to zero by `-2e-4·k·x − 1e3·k·y = 0` with `y` fixed at zero.
+    fn issue_44_scaled_row_model(
+        k: f64,
+        integer: bool,
+    ) -> (Problem, crate::Variable, crate::Variable) {
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x = problem.add_var(-1.0, (-1.0, 0.0));
+        let y = problem.add_var(-1.0, (0.0, 0.0));
+        if integer {
+            problem.add_integer_var(-1.0, (0, 0));
+        }
+        problem.add_constraint([(x, -1e4)], ComparisonOp::Le, 1.0);
+        problem.add_constraint([(x, -2e-4 * k), (y, -1e3 * k)], ComparisonOp::Eq, 0.0);
+        (problem, x, y)
+    }
+
+    /// `x = y = i = 0` satisfies every bound and both rows for every `k`,
+    /// and each `k` only scales the second row, so all five are the same
+    /// problem. The engine equilibrates rows by a power of two and compared
+    /// basic values to their bounds with a flat `EPS`, so its effective
+    /// tolerance in the user's units grew with the row's largest coefficient:
+    /// the vertex `x = -1e-4` violates the second row by `2e-8·k`, which the
+    /// engine could not see, the MIP guard rejected for `k ≥ 10`
+    /// (`InternalError`), and the LP path returned silently. Slacks now carry
+    /// a tolerance derived from `Tolerances::feasibility` and the row's scale.
+    #[test]
+    fn issue_44_scaled_row_solves_for_every_scale() {
+        for k in [1.0, 2.0, 0.5, 10.0, 1000.0] {
+            for integer in [true, false] {
+                let (problem, x, y) = issue_44_scaled_row_model(k, integer);
+                let sol = problem
+                    .solve()
+                    .unwrap_or_else(|e| {
+                        panic!("k={k} integer={integer}: {e:?} on a feasible model")
+                    })
+                    .into_solution()
+                    .unwrap();
+                let row2 = (-2e-4 * k * sol[x] - 1e3 * k * sol[y]).abs();
+                assert!(
+                    row2 <= 1e-7,
+                    "k={k} integer={integer}: second row off by {row2:e} (x={:e})",
+                    sol[x]
+                );
+                // Once the wrong vertex violates the row by more than the
+                // tolerance, only the exact one is left.
+                if 2e-4 * k * 1e-4 > 1e-7 {
+                    assert!(
+                        sol[x].abs() < 1e-9 && sol.objective().abs() < 1e-9,
+                        "k={k} integer={integer}: x={:e} objective={:e}, expected 0",
+                        sol[x],
+                        sol.objective()
+                    );
+                }
+            }
+        }
+    }
+
+    /// `Tolerances::feasibility` is the tolerance the engine works to. At the
+    /// default `1e-7` the `k = 1` model may legitimately stop at `x = -1e-4`
+    /// (its row is off by `2e-8`); asking for `1e-9` yields the exact vertex.
+    #[test]
+    fn feasibility_tolerance_drives_the_engine() {
+        let (problem, x, y) = issue_44_scaled_row_model(1.0, false);
+        let sol = problem.solve().unwrap().into_solution().unwrap();
+        assert!((-2e-4 * sol[x] - 1e3 * sol[y]).abs() <= 1e-7);
+
+        let mut options = SolveOptions::default();
+        options.tolerances.feasibility = 1e-9;
+        let (problem, x, _) = issue_44_scaled_row_model(1.0, false);
+        let sol = problem
+            .solve_with(options)
+            .unwrap()
+            .into_solution()
+            .unwrap();
+        assert!(
+            sol[x].abs() < 1e-9 && sol.objective().abs() < 1e-9,
+            "feasibility 1e-9: x={:e} objective={:e}, expected the exact vertex 0",
+            sol[x],
+            sol.objective()
+        );
     }
 }

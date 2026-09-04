@@ -62,6 +62,72 @@ mod tests_general {
         );
     }
 
+    /// Found in review of the per-row slack tolerances: a basic value carries
+    /// round-off proportional to its row's activity (about one ulp of `1.9e5`
+    /// here), so a tolerance below that floor made pricing chase a phantom
+    /// violation the refresh could not remove — a period-2 cycle that never
+    /// ended. `x0 = x1 = 1e5` satisfies every row exactly; a hang shows up as
+    /// `Interrupted` rather than a stuck test run. (The flat-`EPS` engine
+    /// passes this too; it guards the floor.)
+    #[test]
+    fn large_activity_rows_terminate_and_solve() {
+        init();
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x0 = problem.add_var(-1.5, (0.0, 1e5));
+        let x1 = problem.add_var(-1.25, (0.0, 1e5));
+        problem.add_constraint([(x0, 2.5e5), (x1, -1.75e6)], ComparisonOp::Le, -1.5e11);
+        problem.add_constraint([(x0, -1.25e6), (x1, -7.5e5)], ComparisonOp::Ge, -2e11);
+        problem.add_constraint([(x0, -1.5e6), (x1, 2e6)], ComparisonOp::Le, 5e10);
+        problem.add_constraint([(x0, 2.5e5), (x1, -2.5e5)], ComparisonOp::Ge, 0.0);
+        problem.set_time_limit(Duration::from_secs(30));
+        let sol = solution(problem.solve().unwrap());
+        assert!(
+            (sol.objective() + 275_000.0).abs() < 1e-6,
+            "objective {}",
+            sol.objective()
+        );
+    }
+
+    /// Same floor, other exit: with a tolerance under the row's round-off an
+    /// exactly feasible model (`x0 = x1 = 1e5`) was declared infeasible — and
+    /// dividing every row by `1e9` made it solve, so the verdict depended on
+    /// the units the rows were written in.
+    #[test]
+    fn large_activity_rows_are_feasible_in_any_units() {
+        init();
+        for unit in [1.0, 1e-3, 1e-9] {
+            let mut problem = Problem::new(OptimizationDirection::Maximize);
+            let x0 = problem.add_var(-1.25, (0.0, 1e5));
+            let x1 = problem.add_var(-1.0, (0.0, 1e5));
+            problem.add_constraint([(x0, 1e9 * unit)], ComparisonOp::Le, 1e14 * unit);
+            problem.add_constraint(
+                [(x0, 2.5e8 * unit), (x1, -7.5e8 * unit)],
+                ComparisonOp::Le,
+                -5e13 * unit,
+            );
+            problem.add_constraint(
+                [(x0, -1.75e9 * unit), (x1, 5e8 * unit)],
+                ComparisonOp::Le,
+                -1.25e14 * unit,
+            );
+            problem.set_time_limit(Duration::from_secs(30));
+            let sol = solution(
+                problem
+                    .solve()
+                    .unwrap_or_else(|e| panic!("rows scaled by {unit:e}: {e:?}")),
+            );
+            assert!(
+                (sol.objective() + 225_000.0).abs() < 1e-6
+                    && (sol[x0] - 1e5).abs() < 1e-6
+                    && (sol[x1] - 1e5).abs() < 1e-6,
+                "rows scaled by {unit:e}: obj={} x0={} x1={}",
+                sol.objective(),
+                sol[x0],
+                sol[x1]
+            );
+        }
+    }
+
     #[test]
     fn optimize() {
         init();

@@ -447,15 +447,23 @@ fn timed_lp_call<T>(
 }
 
 impl Problem {
-    pub(crate) fn build_solver(&self, deadline: solver::Deadline) -> Result<Solver, Error> {
-        Solver::try_new(
+    /// Build the engine for this problem, holding every row to `feasibility`
+    /// (see [`Tolerances::feasibility`]).
+    pub(crate) fn build_solver(
+        &self,
+        deadline: solver::Deadline,
+        feasibility: f64,
+    ) -> Result<Solver, Error> {
+        let mut solver = Solver::try_new(
             &self.obj_coeffs,
             &self.var_mins,
             &self.var_maxs,
             &self.constraints,
             &self.var_domains,
             deadline,
-        )
+        )?;
+        solver.set_feasibility_tolerance(feasibility);
+        Ok(solver)
     }
 
     /// Tries to solve the problem using the default options.
@@ -501,7 +509,7 @@ impl Problem {
         } else {
             let started = Instant::now();
             let deadline = options.time_limit.map(|duration| started + duration);
-            let mut solver = self.build_solver(deadline)?;
+            let mut solver = self.build_solver(deadline, options.tolerances.feasibility)?;
             solver.operation_time_limit = options.time_limit;
             let stop = solver.initial_solve()?;
             solver.elapsed += started.elapsed();

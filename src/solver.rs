@@ -27,10 +27,48 @@ type CsMat = sprs::CsMatI<f64, usize>;
 /// explodes. The flip side of running this tight — round-off noise being
 /// promoted into phantom infeasibilities — is handled where it bites, by
 /// the refresh valve in [`Solver::restore_feasibility`] and by the terminal
-/// rebuild gated by [`REBUILD_RESIDUAL_TOL`].
+/// rebuild gated by [`REBUILD_RESIDUAL_FACTOR`]. Slack variables are held to
+/// their own tolerance — tighter than this on heavily scaled rows, looser
+/// where the row's round-off demands it — see [`contract_tol`] and
+/// [`Solver::var_tol`]. Structural variables keep this flat value, which is
+/// below one ulp for values past ~1e6: a known limitation (such models are
+/// best posed with rescaled variables).
 pub const EPS: f64 = 1e-10;
 
-/// Largest absolute equilibrated-row residual a simplex phase may end on.
+/// Default `Tolerances::feasibility`, shared with the MIP layer: the absolute
+/// row and bound tolerance, in the user's units, that solutions are validated
+/// against and that the engine itself works to (see [`contract_tol`]).
+pub(crate) const DEFAULT_FEASIBILITY_TOL: f64 = 1e-7;
+
+/// A slack variable's *contract* tolerance in the engine's row-equilibrated
+/// units: the user's absolute row tolerance expressed in the row's own units,
+/// never looser than `EPS`.
+///
+/// Rows are scaled by a power of two so their largest coefficient is O(1),
+/// and basic values are compared to their bounds with an absolute tolerance —
+/// so a flat `EPS` on a row's slack tolerates `EPS / row_scale` in the user's
+/// units: `8e-7` on a row whose largest coefficient is `1e4`, `5e-5` at `1e6`,
+/// `5e-2` at `1e9`. The public contract (`Tolerances::feasibility`, absolute
+/// in user units) promises much less, and the MIP layer's guard enforces it,
+/// so the engine would end a phase on a point the guard then rejects — the
+/// second model of issue #44: a row `-2e-4·k·x − 1e3·k·y = 0` pinning `x` to
+/// zero, where the engine left `x = -1e-4` (off the row by `2e-8·k`) for
+/// every `k`, an `InternalError` for `k ≥ 10` and a silently wrong LP answer
+/// otherwise. Each slack is therefore held to `feasibility × row_scale`,
+/// capped at `EPS` so that well-scaled rows stay at the engine's resolution
+/// instead of loosening to the user's tolerance. What arithmetic can deliver
+/// is a separate,
+/// point-dependent floor — see [`Solver::var_tol`] — never a constant: a
+/// basic value carries round-off proportional to its row's activity, and a
+/// constant floor (`1e-12` was tried) is below the noise on rows with
+/// activities around `1e5`, where pricing then chases a phantom violation no
+/// refresh can remove, or declares a feasible model infeasible.
+fn contract_tol(feasibility: f64, row_scale: f64) -> f64 {
+    (feasibility * row_scale).min(EPS)
+}
+
+/// A simplex phase may end only when every row's residual `|a·x − b|` is
+/// within this multiple of the row's own tolerance ([`Solver::var_tol`]).
 ///
 /// Basic values are updated incrementally pivot after pivot, and a pivot on a
 /// small element (the ratio tests accept anything above `EPS`) multiplies
@@ -39,24 +77,28 @@ pub const EPS: f64 = 1e-10;
 /// values against their *bounds*, so such a point can pass as feasible while
 /// no longer satisfying the rows it was derived from (issue #44: a perfectly
 /// conditioned final basis whose exact solution is `0`, reported as `2^-26`).
-/// Before a phase is allowed to end, every row's residual `|a·x − b|` (on the
-/// equilibrated row, so coefficients are O(1)) is compared against this
-/// tolerance; anything larger discards the incremental values, refactorizes,
-/// recomputes them from the original data, and re-examines. Rows whose
-/// residual is already within [`REBUILD_NOISE_FLOOR`] of their own activity
-/// are exempt — a fresh factorization could not do better there — so this
-/// fires only on drift a rebuild can remove, and it is bounded per phase
-/// ([`MAX_TERMINAL_RESTARTS`]) so it cannot loop. `1e-9` is one order above
-/// `EPS`: a smaller inconsistency is below the resolution of the engine's own
-/// bound comparisons anyway. The tolerance is absolute, like the MIP layer's
-/// row guard (`check_constraints`), not relative: a relative one stays silent
-/// on large-activity rows, exactly where an absolute guard bites hardest.
-pub(crate) const REBUILD_RESIDUAL_TOL: f64 = 1e-9;
+/// Before a phase is allowed to end, every row's residual is measured against
+/// the tolerance that row is held to; anything beyond this factor discards the
+/// incremental values, refactorizes, recomputes them from the original data,
+/// and re-examines. Every row's tolerance is at least its own round-off floor
+/// ([`REBUILD_NOISE_FLOOR`]), so this fires only on drift a rebuild can
+/// remove, and it is bounded per phase ([`MAX_TERMINAL_RESTARTS`]) so it
+/// cannot loop. One order above the tolerance: a smaller inconsistency
+/// is below the resolution of the engine's own bound comparisons anyway.
+pub(crate) const REBUILD_RESIDUAL_FACTOR: f64 = 10.0;
 
-/// Round-off floor of a row residual, per unit of the row's activity
-/// magnitude `1 + |b| + Σ|aᵢxᵢ|`: a few hundred ulps, which is what an LU
-/// solve with threshold pivoting itself leaves behind. A residual under this
-/// floor is not drift, and rebuilding would not reduce it.
+/// Relative drift of the incrementally-updated objective above which a
+/// mid-phase refresh replaces it with the exact value; see `refresh_values`.
+const OBJECTIVE_DRIFT_TOL: f64 = 1e-9;
+
+/// Round-off floor of a row's value, per unit of the row's activity magnitude
+/// `1 + |b| + Σ|aᵢxᵢ|`: a few hundred ulps, which is what an LU solve with
+/// threshold pivoting can leave behind. It is the floor of every slack's
+/// tolerance — a basic value cannot be held closer to its bound than its own
+/// round-off, see [`Solver::var_tol`] — and, for the same reason, the level
+/// below which a row residual is not drift and a rebuild would not reduce it.
+/// Re-derived from the current values whenever they are rebuilt, so it
+/// follows the point rather than a static bound.
 pub(crate) const REBUILD_NOISE_FLOOR: f64 = 1e-13;
 
 /// Upper bound on the times one phase may re-examine its terminal stall after
@@ -69,8 +111,9 @@ const MAX_TERMINAL_RESTARTS: usize = 4;
 
 /// Upper bound on dual/primal phase alternations in [`Solver::run_phases`].
 /// Each phase ends by measuring the flag the other phase owns, so one round is
-/// the norm and two the exception. The Harris ratio tests relax by `EPS` *in
-/// the step*, so a basic value whose column coefficient dwarfs the binding
+/// the norm and two the exception. The Harris ratio tests relax *in the
+/// step* (by the row's tolerance on the primal side, `EPS` on the dual), so a
+/// basic value whose column coefficient dwarfs the binding
 /// one can end a phase violated by a multiple of `EPS`, and the other phase
 /// then pays for the repair with fresh `EPS`-level infeasibility on its side:
 /// on rows with a large coefficient spread the two can trade tolerance-level
@@ -270,6 +313,10 @@ pub(crate) struct Solver {
     orig_obj_coeffs: Vec<f64>,
     orig_var_mins: Vec<f64>,
     orig_var_maxs: Vec<f64>,
+    /// Per total variable, its *contract* tolerance: `EPS` for structural
+    /// variables, [`contract_tol`] for each row's slack. The tolerance actually
+    /// applied is [`Self::var_tol`].
+    orig_var_tols: Vec<f64>,
     pub(crate) orig_var_domains: Vec<VarDomain>,
     orig_constraints: CsMat, // excluding rhs
     orig_constraints_csc: CsMat,
@@ -278,6 +325,13 @@ pub(crate) struct Solver {
     /// these internally; validation multiplies its absolute user tolerance by
     /// the same factor so the public feasibility contract stays unscaled.
     row_scales: Vec<f64>,
+    /// Per row, in the engine's units: [`REBUILD_NOISE_FLOOR`] times the row's
+    /// activity magnitude at the last rebuild — the round-off floor of its
+    /// slack's tolerance. See [`Self::var_tol`] and [`Self::measure_rows`].
+    row_noise: Vec<f64>,
+    /// The absolute row tolerance, in user units, the slack tolerances are
+    /// derived from; see [`Self::set_feasibility_tolerance`].
+    feasibility_tol: f64,
 
     enable_primal_steepest_edge: bool,
     enable_dual_steepest_edge: bool,
@@ -302,6 +356,8 @@ pub(crate) struct Solver {
     basic_var_vals: Vec<f64>,
     basic_var_mins: Vec<f64>,
     basic_var_maxs: Vec<f64>,
+    /// [`Self::var_tol`] of the basic variable in each position.
+    basic_var_tols: Vec<f64>,
     dual_edge_sq_norms: Vec<f64>,
 
     /// Remaining variables. (idx -> var), 'nb' means 'non-basic'
@@ -450,6 +506,8 @@ impl Solver {
         let mut basic_var_vals = vec![];
         let mut basic_var_mins = vec![];
         let mut basic_var_maxs = vec![];
+        let mut basic_var_tols = vec![];
+        let mut orig_var_tols = vec![EPS; num_vars];
 
         for (coeffs, cmp_op, rhs) in constraints {
             let Some(PreparedRow {
@@ -472,6 +530,10 @@ impl Solver {
 
             basic_var_mins.push(slack_var_min);
             basic_var_maxs.push(slack_var_max);
+
+            let tol = contract_tol(DEFAULT_FEASIBILITY_TOL, row_scale);
+            orig_var_tols.push(tol);
+            basic_var_tols.push(tol);
 
             let cur_slack_var = var_states.len();
             var_states.push(VarState::Basic(basic_vars.len()));
@@ -565,15 +627,18 @@ impl Solver {
 
         let nb_var_is_fixed = vec![false; nb_vars.len()];
 
-        let res = Self {
+        let mut res = Self {
             num_vars,
             orig_obj_coeffs,
             orig_var_mins,
             orig_var_maxs,
+            orig_var_tols,
             orig_constraints,
             orig_constraints_csc,
             orig_rhs,
+            row_noise: vec![0.0; row_scales.len()],
             row_scales,
+            feasibility_tol: DEFAULT_FEASIBILITY_TOL,
             deadline,
             operation_time_limit: None,
             lp_iterations: 0,
@@ -596,6 +661,7 @@ impl Solver {
             basic_var_vals,
             basic_var_mins,
             basic_var_maxs,
+            basic_var_tols,
             dual_edge_sq_norms,
             nb_vars,
             nb_var_obj_coeffs,
@@ -618,8 +684,69 @@ impl Solver {
             res.is_dual_feasible,
             res.orig_constraints.nnz(),
         );
+        res.measure_rows();
 
         Ok(res)
+    }
+
+    /// Set the absolute row tolerance, in the user's units, that the engine
+    /// holds every constraint row to (`Tolerances::feasibility`). Each slack's
+    /// tolerance in the engine's own units follows from it and the row's
+    /// equilibration factor — see [`contract_tol`] and [`Self::var_tol`];
+    /// structural variables keep `EPS`.
+    pub(crate) fn set_feasibility_tolerance(&mut self, feasibility: f64) {
+        self.feasibility_tol = feasibility;
+        for (r, &scale) in self.row_scales.iter().enumerate() {
+            self.orig_var_tols[self.num_vars + r] = contract_tol(feasibility, scale);
+        }
+        self.measure_rows();
+    }
+
+    /// The tolerance a variable's value is held to its bounds with: `EPS` for
+    /// a structural variable; for a row's slack, the contract tolerance
+    /// ([`contract_tol`]) or the row's round-off floor, whichever is larger.
+    /// The floor follows the current point (`row_noise`, re-derived at every
+    /// rebuild): a basic value carries round-off proportional to its row's
+    /// activity, and demanding less than that makes pricing chase a phantom
+    /// violation that no refresh can remove.
+    fn var_tol(&self, var: usize) -> f64 {
+        if var < self.num_vars {
+            EPS
+        } else {
+            self.orig_var_tols[var].max(self.row_noise[var - self.num_vars])
+        }
+    }
+
+    /// Re-derive every row's round-off floor from the current values (and the
+    /// tolerances that depend on it), and return the largest row residual
+    /// `|a·x − b|` as a multiple of that row's tolerance — the terminal
+    /// rebuild gate, see [`REBUILD_RESIDUAL_FACTOR`]. A basic solution
+    /// satisfies every row exactly in exact arithmetic, so a residual beyond
+    /// the tolerance is drift of the incremental pivot updates. Non-finite
+    /// values report `INFINITY`. O(nnz).
+    fn measure_rows(&mut self) -> f64 {
+        let mut worst: f64 = 0.0;
+        for (r, row) in self.orig_constraints.outer_iterator().enumerate() {
+            let mut activity = 0.0;
+            let mut magnitude = 0.0;
+            for (var, &coeff) in row.iter() {
+                let term = coeff * *self.get_value(var);
+                activity += term;
+                magnitude += term.abs();
+            }
+            let rhs = self.orig_rhs[r];
+            let residual = (activity - rhs).abs();
+            if !residual.is_finite() {
+                worst = f64::INFINITY;
+                continue;
+            }
+            self.row_noise[r] = REBUILD_NOISE_FLOOR * (1.0 + rhs.abs() + magnitude);
+            worst = worst.max(residual / self.var_tol(self.num_vars + r));
+        }
+        for i in 0..self.basic_vars.len() {
+            self.basic_var_tols[i] = self.var_tol(self.basic_vars[i]);
+        }
+        worst
     }
 
     pub(crate) fn get_value(&self, var: usize) -> &f64 {
@@ -705,7 +832,8 @@ impl Solver {
                 self.basic_var_mins[row] = min;
                 self.basic_var_maxs[row] = max;
                 let val = self.basic_var_vals[row];
-                if val < min - EPS || val > max + EPS {
+                let tol = self.basic_var_tols[row];
+                if val < min - tol || val > max + tol {
                     self.is_primal_feasible = false;
                 }
             }
@@ -850,6 +978,7 @@ impl Solver {
         self.basic_vars.clear();
         self.basic_var_mins.clear();
         self.basic_var_maxs.clear();
+        self.basic_var_tols.clear();
         self.nb_vars.clear();
         self.nb_var_vals.clear();
         self.nb_var_states.clear();
@@ -862,6 +991,7 @@ impl Solver {
                     self.basic_vars.push(var);
                     self.basic_var_mins.push(self.orig_var_mins[var]);
                     self.basic_var_maxs.push(self.orig_var_maxs[var]);
+                    self.basic_var_tols.push(self.orig_var_tols[var]);
                 }
                 ref status => {
                     let min = self.orig_var_mins[var];
@@ -919,6 +1049,7 @@ impl Solver {
 
         self.recalc_basic_var_vals()?;
         self.recalc_obj_coeffs()?;
+        self.measure_rows();
 
         self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
         self.is_dual_feasible = self.calc_dual_infeasibility().0 == 0;
@@ -1041,12 +1172,12 @@ impl Solver {
                 pivoted_since_recalc = true;
             } else {
                 if terminal_restarts < MAX_TERMINAL_RESTARTS {
-                    let residual = self.primal_residual();
-                    let re_examine = if residual > REBUILD_RESIDUAL_TOL {
+                    let excess = self.measure_rows();
+                    let re_examine = if excess > REBUILD_RESIDUAL_FACTOR {
                         debug!(
-                            "optimize iter {}: terminal residual {:e} exceeds {:e}; \
-                             rebuilding before declaring optimality",
-                            iter, residual, REBUILD_RESIDUAL_TOL,
+                            "optimize iter {}: terminal residual is {:.1}x a row's tolerance \
+                             (limit {}); rebuilding before declaring optimality",
+                            iter, excess, REBUILD_RESIDUAL_FACTOR,
                         );
                         self.rebuild()?;
                         true
@@ -1154,16 +1285,28 @@ impl Solver {
                 // mid-search hazard `refresh_values` describes — measured on
                 // miplib/gt2 as 50 ms → 3.9 min with a full `rebuild()`.
                 if !rebuilt_since_pivot && terminal_restarts < MAX_TERMINAL_RESTARTS {
-                    let residual = self.primal_residual();
-                    if residual > REBUILD_RESIDUAL_TOL {
+                    let excess = self.measure_rows();
+                    if excess > REBUILD_RESIDUAL_FACTOR {
                         debug!(
-                            "restore feasibility iter {}: terminal residual {:e} exceeds {:e}; \
-                             rebuilding the basic values before ending the phase",
-                            iter, residual, REBUILD_RESIDUAL_TOL,
+                            "restore feasibility iter {}: terminal residual is {:.1}x a row's \
+                             tolerance (limit {}); rebuilding the basic values before ending the phase",
+                            iter, excess, REBUILD_RESIDUAL_FACTOR,
                         );
                         self.refresh_values()?;
                         terminal_restarts += 1;
                         rebuilt_since_pivot = true;
+                        continue;
+                    }
+                    // `measure_rows` re-derived the round-off floors from the
+                    // current values; a basic value the stale tolerance accepted
+                    // can lie outside the fresh one. Price again before ending.
+                    if self.calc_primal_infeasibility().0 != 0 {
+                        debug!(
+                            "restore feasibility iter {}: fresh tolerances expose a violation; \
+                             continuing",
+                            iter,
+                        );
+                        terminal_restarts += 1;
                         continue;
                     }
                 }
@@ -1177,7 +1320,9 @@ impl Solver {
             }
         }
 
-        self.is_primal_feasible = true;
+        // Measured on the tolerances now in force: the loop above exits only
+        // when pricing finds nothing, but its re-examinations are bounded.
+        self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
         // The Harris ratio test trades bounded dual infeasibility for pivot
         // size: report what is actually there instead of assuming the flag
         // still holds. (The artificial objective is never dual feasible.)
@@ -1210,10 +1355,14 @@ impl Solver {
         self.orig_obj_coeffs.push(0.0);
         self.orig_var_mins.push(slack_var_min);
         self.orig_var_maxs.push(slack_var_max);
+        let tol = contract_tol(self.feasibility_tol, row_scale);
+        self.orig_var_tols.push(tol);
+        self.row_noise.push(0.0);
         self.var_states.push(VarState::Basic(self.basic_vars.len()));
         self.basic_vars.push(slack_var);
         self.basic_var_mins.push(slack_var_min);
         self.basic_var_maxs.push(slack_var_max);
+        self.basic_var_tols.push(tol);
 
         let mut lhs_val = 0.0;
         for (var, &coeff) in coeffs.iter() {
@@ -1261,6 +1410,7 @@ impl Solver {
             }
         }
 
+        self.measure_rows();
         self.is_primal_feasible = false;
         self.reoptimize()
     }
@@ -1269,16 +1419,17 @@ impl Solver {
     fn calc_primal_infeasibility(&self) -> (usize, f64) {
         let mut num_vars = 0;
         let mut infeasibility = 0.0;
-        for ((&val, &min), &max) in self
+        for (((&val, &min), &max), &tol) in self
             .basic_var_vals
             .iter()
             .zip(&self.basic_var_mins)
             .zip(&self.basic_var_maxs)
+            .zip(&self.basic_var_tols)
         {
-            if val < min - EPS {
+            if val < min - tol {
                 num_vars += 1;
                 infeasibility += min - val;
-            } else if val > max + EPS {
+            } else if val > max + tol {
                 num_vars += 1;
                 infeasibility += val - max;
             }
@@ -1420,7 +1571,7 @@ impl Solver {
 
             // By which amount can we change the entering variable so that the limit on this
             // basic var is not violated. The var with the minimum such amount becomes leaving.
-            let cur_step = (get_leaving_var_step(r, coeff) + EPS) / coeff_abs;
+            let cur_step = (get_leaving_var_step(r, coeff) + self.basic_var_tols[r]) / coeff_abs;
             if cur_step < max_step {
                 max_step = cur_step;
             }
@@ -1490,11 +1641,12 @@ impl Solver {
             .iter()
             .zip(&self.basic_var_mins)
             .zip(&self.basic_var_maxs)
+            .zip(&self.basic_var_tols)
             .enumerate()
-            .filter_map(|(r, ((&val, &min), &max))| {
-                if val < min - EPS {
+            .filter_map(|(r, (((&val, &min), &max), &tol))| {
+                if val < min - tol {
                     Some((r, min - val))
-                } else if val > max + EPS {
+                } else if val > max + tol {
                     Some((r, val - max))
                 } else {
                     None
@@ -1691,6 +1843,7 @@ impl Solver {
 
         self.basic_var_mins[pivot_elem.row] = self.orig_var_mins[entering_var];
         self.basic_var_maxs[pivot_elem.row] = self.orig_var_maxs[entering_var];
+        self.basic_var_tols[pivot_elem.row] = self.var_tol(entering_var);
 
         if self.enable_dual_steepest_edge {
             self.update_dual_sq_norms(pivot_elem.row, pivot_coeff);
@@ -1816,36 +1969,6 @@ impl Solver {
         }
     }
 
-    /// Largest absolute residual `|a·x − b|` over the equilibrated rows, on the
-    /// current basic and non-basic values, ignoring rows whose residual is
-    /// within [`REBUILD_NOISE_FLOOR`] of their own activity magnitude
-    /// `1 + |b| + Σ|aᵢxᵢ|` (a fresh factorization could not improve them). A
-    /// basic solution satisfies every row exactly in exact arithmetic, so what
-    /// remains is how far the incremental pivot updates have drifted from the
-    /// basis equations; see [`REBUILD_RESIDUAL_TOL`]. Non-finite values report
-    /// `INFINITY`. O(nnz).
-    fn primal_residual(&self) -> f64 {
-        let mut worst: f64 = 0.0;
-        for (r, row) in self.orig_constraints.outer_iterator().enumerate() {
-            let mut activity = 0.0;
-            let mut magnitude = 0.0;
-            for (var, &coeff) in row.iter() {
-                let term = coeff * *self.get_value(var);
-                activity += term;
-                magnitude += term.abs();
-            }
-            let rhs = self.orig_rhs[r];
-            let residual = (activity - rhs).abs();
-            if !residual.is_finite() {
-                return f64::INFINITY;
-            }
-            if residual > REBUILD_NOISE_FLOOR * (1.0 + rhs.abs() + magnitude) {
-                worst = worst.max(residual);
-            }
-        }
-        worst
-    }
-
     /// Refactorize the current basis and recompute the basic values from the
     /// original data, discarding the drift the incremental pivot updates
     /// accumulated. The reduced costs are deliberately left incremental: this
@@ -1861,6 +1984,7 @@ impl Solver {
         self.basis_solver
             .reset(&self.orig_constraints_csc, &self.basic_vars)?;
         self.recalc_basic_var_vals()?;
+        self.measure_rows();
         // The incrementally updated objective is refreshed only when it has
         // drifted materially. It feeds the branch-and-bound's node bounds and
         // pseudocosts, and on a degenerate tree replacing it with an exact
@@ -1871,7 +1995,7 @@ impl Solver {
         // below any pruning slack. Real drift is caught; noise is left alone.
         if !self.artificial_obj {
             let exact = self.exact_obj_val();
-            if (exact - self.cur_obj_val).abs() > REBUILD_RESIDUAL_TOL * (1.0 + exact.abs()) {
+            if (exact - self.cur_obj_val).abs() > OBJECTIVE_DRIFT_TOL * (1.0 + exact.abs()) {
                 self.cur_obj_val = exact;
             }
         }
@@ -2564,10 +2688,10 @@ mod tests {
         .unwrap();
         assert_eq!(solver.initial_solve().unwrap(), StopReason::Finished);
 
-        let residual = solver.primal_residual();
+        let excess = solver.measure_rows();
         assert!(
-            residual <= REBUILD_RESIDUAL_TOL,
-            "terminal residual {residual:e} exceeds {REBUILD_RESIDUAL_TOL:e}"
+            excess <= REBUILD_RESIDUAL_FACTOR,
+            "terminal residual is {excess:.1}x a row's tolerance (limit {REBUILD_RESIDUAL_FACTOR})"
         );
         for var in 0..3 {
             let value = *solver.get_value(var);
@@ -2598,24 +2722,71 @@ mod tests {
         assert_eq!(solver.initial_solve().unwrap(), StopReason::Finished);
         assert_eq!(solver.basic_vars, vec![0]);
         assert!((solver.basic_var_vals[0] - 1.0).abs() < 1e-12);
-        assert!(solver.primal_residual() <= REBUILD_RESIDUAL_TOL);
+        assert!(solver.measure_rows() <= REBUILD_RESIDUAL_FACTOR);
 
         // Far beyond EPS, still inside [0, 3]: invisible to the bound checks.
         solver.basic_var_vals[0] -= 1e-6;
         assert!(
-            solver.primal_residual() > REBUILD_RESIDUAL_TOL,
+            solver.measure_rows() > REBUILD_RESIDUAL_FACTOR,
             "planted drift must show up as a row residual"
         );
         solver.is_primal_feasible = false;
         assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
 
-        assert!(solver.primal_residual() <= REBUILD_RESIDUAL_TOL);
+        assert!(solver.measure_rows() <= REBUILD_RESIDUAL_FACTOR);
         assert!(
             (solver.basic_var_vals[0] - 1.0).abs() < 1e-12,
             "drifted value {} was not rebuilt",
             solver.basic_var_vals[0]
         );
         assert!((solver.cur_obj_val + 7.0).abs() < 1e-12);
+    }
+
+    /// Each row's slack is held to the user's absolute tolerance expressed in
+    /// the row's own equilibrated units, capped at `EPS`, and never below the
+    /// row's own round-off floor.
+    #[test]
+    fn slack_tolerance_follows_the_row_scale() {
+        init();
+        let rows = |c: f64| (to_sparse(&[c]), ComparisonOp::Le, 1.0);
+        let mut solver = Solver::try_new(
+            &[1.0],
+            &[0.0],
+            &[1.0],
+            &[rows(1.0), rows(1.0e2), rows(1.0e4), rows(1.0e9)],
+            &[VarDomain::Real],
+            None,
+        )
+        .unwrap();
+        // structural var, then one slack per row: scales 1, 2^-6, 2^-13, 2^-29
+        assert_eq!(solver.orig_var_tols[0], EPS);
+        assert_eq!(solver.orig_var_tols[1], EPS);
+        assert_eq!(
+            solver.orig_var_tols[2], EPS,
+            "1e-7 * 2^-6 exceeds EPS: capped"
+        );
+        assert_eq!(solver.orig_var_tols[3], 1e-7 * 2f64.powi(-13));
+        assert_eq!(solver.orig_var_tols[4], 1e-7 * 2f64.powi(-29));
+        // What is applied never drops below the row's round-off floor: the
+        // 1e9 row's contract (1.9e-16) is unreachable, its floor is not.
+        let floor_1e9 = solver.var_tol(4);
+        assert!(
+            floor_1e9 >= REBUILD_NOISE_FLOOR && floor_1e9 < 1e-12,
+            "1e9 row held to its round-off floor, got {floor_1e9:e}"
+        );
+        assert_eq!(solver.var_tol(3), 1e-7 * 2f64.powi(-13));
+        for (i, &var) in solver.basic_vars.iter().enumerate() {
+            assert_eq!(solver.basic_var_tols[i], solver.var_tol(var));
+        }
+
+        solver.set_feasibility_tolerance(1e-9);
+        assert_eq!(solver.orig_var_tols[0], EPS);
+        assert_eq!(solver.orig_var_tols[2], 1e-9 * 2f64.powi(-6));
+        assert_eq!(solver.orig_var_tols[3], 1e-9 * 2f64.powi(-13));
+        assert!(solver.var_tol(3) >= REBUILD_NOISE_FLOOR);
+        for (i, &var) in solver.basic_vars.iter().enumerate() {
+            assert_eq!(solver.basic_var_tols[i], solver.var_tol(var));
+        }
     }
 
     #[test]

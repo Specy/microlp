@@ -155,13 +155,22 @@ impl ResumeOptions {
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct Tolerances {
-    /// Uused to validate a rounded-to-integer
-    /// candidate solution before it is accepted as the incumbent.
-    /// Applied to each variable's distance
-    /// outside its bounds and to each row's distance outside its feasible
-    /// range. Also used, identically, by the post-edit warm-start
-    /// pre-filter that decides whether a previous incumbent survives a
-    /// [`crate::Solution`] edit.
+    /// Absolute tolerance, in the units of the model as written, on each
+    /// variable's distance outside its bounds and each row's distance outside
+    /// its feasible range.
+    ///
+    /// It is the tolerance a rounded-to-integer candidate is validated
+    /// against before it is accepted as the incumbent, the one the post-edit
+    /// warm-start pre-filter applies when deciding whether a previous
+    /// incumbent survives a [`crate::Solution`] edit, and the row tolerance
+    /// the simplex engine itself works to: every constraint row is held to it
+    /// in the row's own units, capped at the engine's resolution (`1e-10` on
+    /// the equilibrated row — raising this above that changes validation, not
+    /// the engine) and floored at the round-off of the row's value (a few
+    /// hundred ulps of its activity: rows with huge coefficients or huge
+    /// values are held as tightly as arithmetic allows, which can be looser
+    /// than this). A tighter value yields sharper vertices at the cost of
+    /// pivots; `0.0` means "as tight as arithmetic allows".
     /// Must be finite and non-negative. Default `1e-7`.
     pub feasibility: f64,
     /// Distance from the nearest integer within which an integer/boolean
@@ -183,7 +192,7 @@ pub struct Tolerances {
 impl Default for Tolerances {
     fn default() -> Self {
         Self {
-            feasibility: 1e-7,
+            feasibility: crate::solver::DEFAULT_FEASIBILITY_TOL,
             integrality_rounding: 1e-5,
             prune_epsilon: 1e-9,
         }
@@ -298,7 +307,7 @@ pub(crate) struct MipRun {
 
 fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Error> {
     let deadline = options.time_limit.map(|d| Instant::now() + d);
-    let solver = problem.build_solver(deadline)?;
+    let solver = problem.build_solver(deadline, options.tolerances.feasibility)?;
     let root_bounds = problem
         .var_mins
         .iter()
@@ -591,7 +600,7 @@ enum IntegralCandidate {
 /// the LP point itself is exactly integral. If an exactly integral point fails
 /// the independent feasibility guard, retry once from the all-slack basis.
 /// The engine already ends every phase on values rebuilt from the original
-/// data (`solver::REBUILD_RESIDUAL_TOL`), so this is not about drift: the
+/// data (`solver::REBUILD_RESIDUAL_FACTOR`), so this is not about drift: the
 /// guard is absolute in *user* units while the engine works on equilibrated
 /// rows, and on a row with huge coefficients a generic vertex cannot meet the
 /// guard in floating point at all. A re-solve from scratch can land on an
