@@ -30,7 +30,9 @@ type CsMat = sprs::CsMatI<f64, usize>;
 /// rebuild gated by [`REBUILD_RESIDUAL_FACTOR`]. Slack variables are held to
 /// their own tolerance — tighter than this on heavily scaled rows, looser
 /// where the row's round-off demands it — see [`contract_tol`] and
-/// [`Solver::var_tol`]. Structural variables keep this flat value, which is
+/// [`Solver::var_tol`]; and each non-basic column's reduced cost is priced
+/// with its own round-off floor, never below this — see [`Solver::col_tol`].
+/// Structural variables keep this flat value, which is
 /// below one ulp for values past ~1e6: a known limitation (such models are
 /// best posed with rescaled variables).
 pub const EPS: f64 = 1e-10;
@@ -107,6 +109,15 @@ pub(crate) const REBUILD_RESIDUAL_FACTOR: f64 = 1.0;
 /// Relative drift of the incrementally-updated objective above which a
 /// mid-phase refresh replaces it with the exact value; see `refresh_values`.
 const OBJECTIVE_DRIFT_TOL: f64 = 1e-9;
+
+/// Number of incremental reduced-cost updates after which a refactorization
+/// also recomputes the reduced costs from the original data (a phase end
+/// always does). Their drift grows with the length of the incremental chain,
+/// not with the eta file that triggers refactorizations — on small problems
+/// that is every few pivots, where an extra transposed solve each time buys
+/// nothing measurable — so the two are decoupled. Values are recomputed at
+/// every refactorization regardless: the terminal residual gate relies on it.
+const REDUCED_COST_UPDATE_LIMIT: u64 = 50;
 
 /// Round-off floor of a row's value, per unit of the row's activity magnitude
 /// `1 + |b| + Σ|aᵢxᵢ|`: a few hundred ulps, which is what an LU solve with
@@ -256,13 +267,15 @@ fn prepare_row(
 }
 
 /// Whether a non-basic column's reduced cost is dual feasible for its current
-/// position: at its lower bound it must not pay to increase, at its upper it
-/// must not pay to decrease, and a free column (at neither bound) is feasible
-/// only when its reduced cost is zero within `EPS`. Without that last clause a
-/// free zero-cost column counts as infeasible forever, and the primal phase it
-/// triggers picks it as entering with an infinite step.
-fn nb_dual_feasible(state: &NonBasicVarState, obj_coeff: f64) -> bool {
-    state.at_min && obj_coeff > -EPS || state.at_max && obj_coeff < EPS || obj_coeff.abs() < EPS
+/// position, within the tolerance `tol` the column is priced with
+/// ([`Solver::col_tol`]): at its lower bound it must not pay to increase, at
+/// its upper it must not pay to decrease, and a free column (at neither
+/// bound) is feasible only when its reduced cost is zero within `tol`.
+/// Without that last clause a free zero-cost column counts as infeasible
+/// forever, and the primal phase it triggers picks it as entering with an
+/// infinite step.
+fn nb_dual_feasible(state: &NonBasicVarState, obj_coeff: f64, tol: f64) -> bool {
+    state.at_min && obj_coeff > -tol || state.at_max && obj_coeff < tol || obj_coeff.abs() < tol
 }
 
 pub(crate) fn float_eq(a: f64, b: f64) -> bool {
@@ -355,6 +368,10 @@ pub(crate) struct Solver {
     /// activity magnitude at the last rebuild — the round-off floor of its
     /// slack's tolerance. See [`Self::var_tol`] and [`Self::measure_rows`].
     row_noise: Vec<f64>,
+    /// Per row, `|yᵢ|` of the multipliers `y = Bᵀ⁻¹ c_B` at the last exact
+    /// reduced-cost recomputation: the magnitudes a column's reduced cost is
+    /// computed from, hence its round-off floor. See [`Self::col_tol`].
+    multiplier_abs: Vec<f64>,
     /// The absolute row tolerance, in user units, the slack tolerances are
     /// derived from; see [`Self::set_feasibility_tolerance`].
     feasibility_tol: f64,
@@ -389,6 +406,12 @@ pub(crate) struct Solver {
     /// Remaining variables. (idx -> var), 'nb' means 'non-basic'
     nb_vars: Vec<usize>,
     nb_var_obj_coeffs: Vec<f64>,
+    /// [`Self::col_tol`] of the non-basic variable in each position: the
+    /// tolerance its reduced cost is priced with.
+    nb_var_tols: Vec<f64>,
+    /// Incremental reduced-cost updates since the last exact recomputation;
+    /// see [`REDUCED_COST_UPDATE_LIMIT`].
+    reduced_cost_updates: u64,
     nb_var_vals: Vec<f64>,
     nb_var_states: Vec<NonBasicVarState>,
     nb_var_is_fixed: Vec<bool>,
@@ -652,6 +675,12 @@ impl Solver {
         let lu_factors_transp = lu_factors.transpose();
 
         let nb_var_is_fixed = vec![false; nb_vars.len()];
+        // The slack basis has zero multipliers, so a reduced cost is its own
+        // objective coefficient and carries that magnitude's round-off.
+        let nb_var_tols: Vec<f64> = nb_vars
+            .iter()
+            .map(|&var| EPS.max(REBUILD_NOISE_FLOOR * orig_obj_coeffs[var].abs()))
+            .collect();
 
         let mut res = Self {
             num_vars,
@@ -663,6 +692,7 @@ impl Solver {
             orig_constraints_csc,
             orig_rhs,
             row_noise: vec![0.0; row_scales.len()],
+            multiplier_abs: vec![0.0; row_scales.len()],
             row_scales,
             feasibility_tol: DEFAULT_FEASIBILITY_TOL,
             deadline,
@@ -691,6 +721,8 @@ impl Solver {
             dual_edge_sq_norms,
             nb_vars,
             nb_var_obj_coeffs,
+            nb_var_tols,
+            reduced_cost_updates: 0,
             nb_var_vals,
             nb_var_states,
             nb_var_is_fixed,
@@ -741,6 +773,24 @@ impl Solver {
         } else {
             self.orig_var_tols[var].max(self.row_noise[var - self.num_vars])
         }
+    }
+
+    /// The tolerance a non-basic column's reduced cost is priced with: `EPS`,
+    /// or the reduced cost's own round-off floor when that is larger —
+    /// [`REBUILD_NOISE_FLOOR`] times the magnitude of the terms it is computed
+    /// from, `|c_j| + Σᵢ |aᵢⱼ yᵢ|`, with `|y|` from the last exact
+    /// recomputation. A reduced cost, like a basic value, is only as accurate
+    /// as the magnitudes behind it: on a column with large coefficients an
+    /// exact recomputation can show a `1e-10` infeasibility that is pure
+    /// round-off, and pricing it forces a degenerate pivot that moves the
+    /// vertex for nothing (measured on miplib/gt2 as a re-routed search).
+    fn col_tol(&self, var: usize) -> f64 {
+        let mut magnitude = self.orig_obj_coeffs[var].abs();
+        //guaranteed to be a valid index
+        for (r, &coeff) in self.orig_constraints_csc.outer_view(var).unwrap().iter() {
+            magnitude += (coeff * self.multiplier_abs[r]).abs();
+        }
+        EPS.max(REBUILD_NOISE_FLOOR * magnitude)
     }
 
     /// Re-derive every row's round-off floor from the current values (and the
@@ -907,7 +957,11 @@ impl Solver {
                 };
                 // A var at a loosened bound may no longer justify its reduced cost.
                 self.is_dual_feasible = self.is_dual_feasible
-                    && nb_dual_feasible(&self.nb_var_states[col], self.nb_var_obj_coeffs[col]);
+                    && nb_dual_feasible(
+                        &self.nb_var_states[col],
+                        self.nb_var_obj_coeffs[col],
+                        self.nb_var_tols[col],
+                    );
             }
         }
         Ok(())
@@ -1000,12 +1054,17 @@ impl Solver {
     /// `INFINITY` for a non-finite reduced cost).
     fn max_dual_excess(&self) -> f64 {
         let mut worst: f64 = 0.0;
-        for (&obj_coeff, var_state) in self.nb_var_obj_coeffs.iter().zip(&self.nb_var_states) {
+        for ((&obj_coeff, var_state), &tol) in self
+            .nb_var_obj_coeffs
+            .iter()
+            .zip(&self.nb_var_states)
+            .zip(&self.nb_var_tols)
+        {
             if !obj_coeff.is_finite() {
                 return f64::INFINITY;
             }
-            if !nb_dual_feasible(var_state, obj_coeff) {
-                worst = worst.max(obj_coeff.abs() / EPS);
+            if !nb_dual_feasible(var_state, obj_coeff, tol) {
+                worst = worst.max(obj_coeff.abs() / tol);
             }
         }
         worst
@@ -1083,6 +1142,7 @@ impl Solver {
         self.nb_var_vals.clear();
         self.nb_var_states.clear();
         self.nb_var_is_fixed.clear();
+        // `nb_var_tols` and `nb_var_obj_coeffs` are rebuilt by `recalc_obj_coeffs`.
 
         for var in 0..n {
             match basis.0[var] {
@@ -1251,7 +1311,6 @@ impl Solver {
         // values that still satisfy the rows. Bounded per phase, and the
         // reduced-cost recomputation is skipped when nothing pivoted since the
         // last exact one (the caller installs exact reduced costs on entry).
-        let mut pivoted_since_recalc = false;
         let mut terminal_restarts = 0;
         for iter in 0.. {
             if iter % DEADLINE_CHECK_INTERVAL == 0 {
@@ -1269,7 +1328,6 @@ impl Solver {
             if let Some(pivot_info) = self.choose_pivot()? {
                 self.pivot(&pivot_info)?;
                 self.lp_iterations += 1;
-                pivoted_since_recalc = true;
             } else {
                 if terminal_restarts >= MAX_TERMINAL_RESTARTS {
                     self.warn_if_terminal_residual_remains("optimize", iter);
@@ -1283,7 +1341,7 @@ impl Solver {
                         );
                         self.rebuild()?;
                         true
-                    } else if pivoted_since_recalc {
+                    } else if self.reduced_cost_updates > 0 {
                         // Reduced costs drift the same way the values do, and
                         // recomputing them through the current factorization
                         // is one transposed solve: re-examine on exact ones
@@ -1295,7 +1353,6 @@ impl Solver {
                     };
                     if re_examine {
                         terminal_restarts += 1;
-                        pivoted_since_recalc = false;
                         continue;
                     }
                 }
@@ -1366,7 +1423,7 @@ impl Solver {
                              refreshing basis before declaring infeasibility",
                             iter, row,
                         );
-                        self.refresh_values()?;
+                        self.rebuild()?;
                         rebuilt_since_pivot = true;
                         continue;
                     }
@@ -1383,9 +1440,6 @@ impl Solver {
                 // leave every value inside its bounds yet off the basis
                 // equations by far more than `EPS` (issue #44). End the phase
                 // only on a point a fresh factorization would also produce.
-                // Values only: recomputing the reduced costs here is the same
-                // mid-search hazard `refresh_values` describes — measured on
-                // miplib/gt2 as 50 ms → 3.9 min with a full `rebuild()`.
                 if !rebuilt_since_pivot && terminal_restarts >= MAX_TERMINAL_RESTARTS {
                     self.warn_if_terminal_residual_remains("restore feasibility", iter);
                 } else if !rebuilt_since_pivot {
@@ -1396,7 +1450,7 @@ impl Solver {
                              tolerance (limit {}); rebuilding the basic values before ending the phase",
                             iter, excess, REBUILD_RESIDUAL_FACTOR,
                         );
-                        self.refresh_values()?;
+                        self.rebuild()?;
                         terminal_restarts += 1;
                         rebuilt_since_pivot = true;
                         continue;
@@ -1429,7 +1483,12 @@ impl Solver {
         self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
         // The Harris ratio test trades bounded dual infeasibility for pivot
         // size: report what is actually there instead of assuming the flag
-        // still holds. (The artificial objective is never dual feasible.)
+        // still holds — on reduced costs recomputed from the original data,
+        // since the incremental ones drift exactly like the values do. (The
+        // artificial objective is never dual feasible.)
+        if self.reduced_cost_updates > 0 && !self.artificial_obj {
+            self.recalc_obj_coeffs()?;
+        }
         self.is_dual_feasible = self.is_dual_feasible && self.calc_dual_infeasibility().0 == 0;
         Ok(StopReason::Finished)
     }
@@ -1490,6 +1549,8 @@ impl Solver {
 
         self.orig_rhs.push(rhs);
         self.row_scales.push(row_scale);
+        // The new row's slack is basic with zero cost: its multiplier is zero.
+        self.multiplier_abs.push(0.0);
 
         self.orig_constraints = new_orig_constraints;
         self.orig_constraints_csc = self.orig_constraints.to_csc();
@@ -1545,8 +1606,13 @@ impl Solver {
     fn calc_dual_infeasibility(&self) -> (usize, f64) {
         let mut num_vars = 0;
         let mut infeasibility = 0.0;
-        for (&obj_coeff, var_state) in self.nb_var_obj_coeffs.iter().zip(&self.nb_var_states) {
-            if !nb_dual_feasible(var_state, obj_coeff) {
+        for ((&obj_coeff, var_state), &tol) in self
+            .nb_var_obj_coeffs
+            .iter()
+            .zip(&self.nb_var_states)
+            .zip(&self.nb_var_tols)
+        {
+            if !nb_dual_feasible(var_state, obj_coeff, tol) {
                 num_vars += 1;
                 infeasibility += obj_coeff.abs();
             }
@@ -1587,11 +1653,12 @@ impl Solver {
                 .nb_var_obj_coeffs
                 .iter()
                 .zip(&self.nb_var_states)
+                .zip(&self.nb_var_tols)
                 .enumerate()
-                .filter_map(|(col, (&obj_coeff, var_state))| {
+                .filter_map(|(col, ((&obj_coeff, var_state), &tol))| {
                     // Choose only among non-basic vars that can be changed
                     // with objective decreasing.
-                    if nb_dual_feasible(var_state, obj_coeff) {
+                    if nb_dual_feasible(var_state, obj_coeff, tol) {
                         None
                     } else {
                         Some((col, obj_coeff))
@@ -1855,7 +1922,7 @@ impl Solver {
             }
 
             let obj_coeff = clamp_obj_coeff(self.nb_var_obj_coeffs[c], var_state);
-            let cur_step = (obj_coeff.abs() + EPS) / coeff.abs();
+            let cur_step = (obj_coeff.abs() + self.nb_var_tols[c]) / coeff.abs();
             if cur_step < max_step {
                 max_step = cur_step;
             }
@@ -1863,7 +1930,8 @@ impl Solver {
 
         // Second, we choose among the variables satisfying the relaxed step bound
         // the one with the biggest pivot coefficient. This allows for a much more
-        // numerically stable basis at the price of slight infeasibility in dual variables.
+        // numerically stable basis at the price of slight infeasibility in dual
+        // variables (within each column's own tolerance).
         let mut entering_c = None;
         let mut pivot_coeff_abs = f64::NEG_INFINITY;
         let mut pivot_coeff = 0.0;
@@ -1958,6 +2026,7 @@ impl Solver {
         let leaving_var = self.basic_vars[pivot_elem.row];
 
         self.nb_var_vals[pivot_info.col] = pivot_elem.leaving_new_val;
+        self.nb_var_tols[pivot_info.col] = self.col_tol(leaving_var);
         let leaving_var_state = &mut self.nb_var_states[pivot_info.col];
         leaving_var_state.at_min =
             float_eq(pivot_elem.leaving_new_val, self.orig_var_mins[leaving_var]);
@@ -1972,6 +2041,7 @@ impl Solver {
                 self.nb_var_obj_coeffs[c] -= pivot_obj * coeff;
             }
         }
+        self.reduced_cost_updates += 1;
 
         if self.enable_primal_steepest_edge {
             self.update_primal_sq_norms(pivot_info.col, pivot_coeff);
@@ -1991,11 +2061,13 @@ impl Solver {
         if eta_matrices_nnz < self.basis_solver.lu_factors.nnz() {
             self.basis_solver
                 .push_eta_matrix(&self.col_coeffs, pivot_elem.row, pivot_coeff);
-        } else {
+        } else if self.reduced_cost_updates >= REDUCED_COST_UPDATE_LIMIT {
             // Refactorizing anyway: also replace the incrementally-updated
-            // basic values with ones computed from the original data, so
-            // value drift never outlives a factorization. The reduced costs
-            // stay incremental on purpose — see `refresh_values`.
+            // basic values — and, past `REDUCED_COST_UPDATE_LIMIT`, the
+            // reduced costs — with ones computed from the original data, so
+            // neither kind of drift outlives a long incremental chain.
+            self.rebuild()?;
+        } else {
             self.refresh_values()?;
         }
         Ok(())
@@ -2075,15 +2147,9 @@ impl Solver {
 
     /// Refactorize the current basis and recompute the basic values from the
     /// original data, discarding the drift the incremental pivot updates
-    /// accumulated. The reduced costs are deliberately left incremental: this
-    /// runs *mid-phase* (the phase-1 stall valve and every eta-file
-    /// refactorization), and recomputing them there exposes noise-level
-    /// (~1e-10) dual infeasibilities on large-coefficient columns which the
-    /// dual ratio test's clamp turns into forced degenerate pivots — a
-    /// different vertex, and a different branch-and-bound path after it.
-    /// Measured on miplib/gt2: 50 ms with values-only refreshes, 2.6 min
-    /// with the reduced costs recomputed at each refactorization. Phase exits
-    /// use [`Self::rebuild`], which recomputes both.
+    /// accumulated. The reduced costs are left alone here: [`Self::rebuild`]
+    /// recomputes both, and `pivot` chooses between the two by
+    /// [`REDUCED_COST_UPDATE_LIMIT`].
     fn refresh_values(&mut self) -> Result<(), Error> {
         self.basis_solver
             .reset(&self.orig_constraints_csc, &self.basic_vars)?;
@@ -2107,11 +2173,17 @@ impl Solver {
     }
 
     /// Refactorize and recompute the basic values — and, unless the phase-1
-    /// artificial objective is in force, the reduced costs and objective
-    /// value — from the original data. For the primal phase's terminal stall
-    /// only, where optimality is about to be declared on those reduced costs;
-    /// see [`Self::refresh_values`] for why every other refresh leaves them
-    /// alone.
+    /// artificial objective is in force, the reduced costs — from the original
+    /// data: at both phases' terminal stalls, the phase-1 stall valve, and
+    /// refactorizations past [`REDUCED_COST_UPDATE_LIMIT`]. Recomputing
+    /// reduced costs mid-phase was once avoided: exact ones expose noise-level
+    /// dual infeasibilities on large-coefficient columns that a flat `EPS`
+    /// then priced into forced degenerate pivots (measured on miplib/gt2 as a
+    /// re-routed search, 50 ms to minutes). Each column is now priced with its
+    /// own round-off floor ([`Self::col_tol`]), which is what makes exact
+    /// reduced costs safe to use anywhere. The objective value is refreshed
+    /// only on real drift ([`OBJECTIVE_DRIFT_TOL`]) for the reason given in
+    /// [`Self::refresh_values`].
     fn rebuild(&mut self) -> Result<(), Error> {
         self.refresh_values()?;
         if !self.artificial_obj {
@@ -2150,17 +2222,38 @@ impl Solver {
             self.basis_solver.solve_transp_dense_with_etas(&mut rhs);
             rhs
         };
+        self.multiplier_abs.clear();
+        self.multiplier_abs
+            .extend(multipliers.iter().map(|y| y.abs()));
 
         self.nb_var_obj_coeffs.clear();
+        self.nb_var_tols.clear();
         for &var in &self.nb_vars {
             //guaranteed to be a valid index
             let col = self.orig_constraints_csc.outer_view(var).unwrap();
-            let dot_prod: f64 = col.iter().map(|(r, val)| val * multipliers[r]).sum();
+            let mut dot_prod = 0.0;
+            let mut magnitude = self.orig_obj_coeffs[var].abs();
+            for (r, val) in col.iter() {
+                let term = val * multipliers[r];
+                dot_prod += term;
+                magnitude += term.abs();
+            }
             self.nb_var_obj_coeffs
                 .push(self.orig_obj_coeffs[var] - dot_prod);
+            self.nb_var_tols
+                .push(EPS.max(REBUILD_NOISE_FLOOR * magnitude));
         }
 
-        self.cur_obj_val = self.exact_obj_val();
+        self.reduced_cost_updates = 0;
+        // Leaving the phase-1 artificial objective, the real objective value
+        // is installed; otherwise the incremental one is kept unless it has
+        // drifted — see `refresh_values` for why a last-bit change matters.
+        let exact = self.exact_obj_val();
+        if self.artificial_obj
+            || (exact - self.cur_obj_val).abs() > OBJECTIVE_DRIFT_TOL * (1.0 + exact.abs())
+        {
+            self.cur_obj_val = exact;
+        }
         self.artificial_obj = false;
         Ok(())
     }
@@ -2948,6 +3041,60 @@ mod tests {
             solver.accept_exhausted_point(),
             Err(Error::InternalError(_))
         ));
+    }
+
+    /// A column's reduced cost is priced with `EPS` or its own round-off
+    /// floor, whichever is larger: `1e-13` times the magnitude of the terms it
+    /// is computed from. A wrong-signed reduced cost below that floor is
+    /// noise, not a dual infeasibility, so pricing leaves it alone.
+    #[test]
+    fn column_tolerance_follows_the_reduced_cost_magnitude() {
+        init();
+        // minimize 1e4 x + y, x + y >= 1, x, y in [0, 10]: y = 1 basic, x at 0.
+        let mut solver = Solver::try_new(
+            &[1e4, 1.0],
+            &[0.0, 0.0],
+            &[10.0, 10.0],
+            &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 1.0)],
+            &[VarDomain::Real, VarDomain::Real],
+            None,
+        )
+        .unwrap();
+        assert_eq!(solver.initial_solve().unwrap(), StopReason::Finished);
+        assert_eq!(solver.basic_vars, vec![1]);
+        for (c, &var) in solver.nb_vars.iter().enumerate() {
+            assert_eq!(solver.nb_var_tols[c], solver.col_tol(var));
+        }
+        let col_x = solver.nb_vars.iter().position(|&v| v == 0).unwrap();
+        let col_s = solver.nb_vars.iter().position(|&v| v == 2).unwrap();
+        // The phase ended on exact reduced costs: the multiplier of the row
+        // is y's cost, 1, so x's reduced cost is 1e4 - 1, computed from
+        // magnitudes 1e4 + 1, and the slack's from 0 + 1.
+        assert!((solver.nb_var_obj_coeffs[col_x] - 9999.0).abs() < 1e-9);
+        assert!((solver.nb_var_tols[col_x] - REBUILD_NOISE_FLOOR * 10001.0).abs() < 1e-25);
+        assert_eq!(solver.nb_var_tols[col_s], EPS);
+
+        // Wrong-signed by 5 EPS but under the column's floor: not priced.
+        assert!(solver.nb_var_states[col_x].at_min);
+        solver.nb_var_obj_coeffs[col_x] = -5.0 * EPS;
+        assert_eq!(solver.calc_dual_infeasibility().0, 0);
+        assert_eq!(solver.max_dual_excess(), 0.0);
+        assert!(solver.choose_pivot().unwrap().is_none());
+        // Five times the floor: a real dual infeasibility.
+        solver.nb_var_obj_coeffs[col_x] = -5.0 * solver.nb_var_tols[col_x];
+        assert_eq!(solver.calc_dual_infeasibility().0, 1);
+        assert!((solver.max_dual_excess() - 5.0).abs() < 1e-9);
+        // The same magnitude on the slack column, whose floor is EPS, is
+        // priced.
+        solver.nb_var_obj_coeffs[col_x] = 9999.0;
+        let wrong_sign = if solver.nb_var_states[col_s].at_min {
+            -1.0
+        } else {
+            assert!(solver.nb_var_states[col_s].at_max);
+            1.0
+        };
+        solver.nb_var_obj_coeffs[col_s] = wrong_sign * 5.0 * EPS;
+        assert_eq!(solver.calc_dual_infeasibility().0, 1);
     }
 
     /// Each row's slack is held to the user's absolute tolerance expressed in

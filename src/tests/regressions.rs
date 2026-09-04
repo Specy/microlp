@@ -281,7 +281,11 @@ mod regression_tests {
     fn huge_coefficient_row_validates_within_round_off() {
         let (a0, a1, a2) = (233961702.1092298, -38659774.0504899, -132943028.20165081);
         let rhs = 5.839427392501522e9;
-        let (c0, c1, c2) = (-0.5093205118777648, -1.9993457673342485, -0.9845099835842941);
+        let (c0, c1, c2) = (
+            -0.5093205118777648,
+            -1.9993457673342485,
+            -0.9845099835842941,
+        );
         let x1_max = 68.6087643341415;
 
         let mut problem = Problem::new(OptimizationDirection::Minimize);

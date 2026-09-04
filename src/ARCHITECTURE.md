@@ -310,9 +310,10 @@ tolerance itself (`REBUILD_RESIDUAL_FACTOR`, one — a first cut used ten, which
 in which the engine could end on a residual the MIP guard then rejected) it refactorizes,
 recomputes the values from the original data, and re-examines. The dual phase also prices once more on the freshly derived
 tolerances before it ends, since a value the stale tolerance accepted can lie outside the
-fresh one. The primal phase — the one about to declare optimality on its reduced costs —
-also recomputes those before ending, whether the residual fired or it merely pivoted since the
-last exact recomputation; the dual phase leaves them incremental for the reason given below. Both re-examinations are bounded per phase
+fresh one. Both phases also recompute the reduced costs before ending — the primal phase
+because it is about to declare optimality on them, the dual phase because it measures dual
+feasibility on them — whether the residual fired or they merely pivoted since the last exact
+recomputation. Both re-examinations are bounded per phase
 (`MAX_TERMINAL_RESTARTS`): exact recomputation can expose noise-level infeasibilities that a
 degenerate pivot "fixes" and the next incremental update hides again, a cycle with no
 objective progress to break it; a phase that uses up its re-examinations and still fails the
@@ -328,11 +329,20 @@ solve fails with `InternalError` rather than certifying the point. Refactorizati
 growth, and the phase-1 stall valve, recompute the *values* as well (and the objective
 value, but only when it has drifted by more than `1e-9` relative — on a degenerate tree a
 last-bit change to the node bound is enough to re-route the whole search), so value drift
-never outlives a factorization — but they leave the reduced costs
-incremental on purpose: recomputing those mid-phase exposes noise-level dual infeasibilities
-on large-coefficient columns that the dual ratio test's clamp turns into forced degenerate
+never outlives a factorization. The reduced costs are recomputed from the original data at
+every phase end and, mid-phase, once `REDUCED_COST_UPDATE_LIMIT` incremental updates have
+accumulated: their drift grows with the length of the incremental chain, not with the eta
+file that triggers refactorizations, which on small problems fills every few pivots, where an
+extra transposed solve each time buys nothing measurable (recomputing at every
+refactorization cost 6–7% on the mwis cases for the same accuracy). What makes exact reduced
+costs safe to use mid-phase at all is that each non-basic column is priced with its own
+round-off floor (`col_tol`: `REBUILD_NOISE_FLOOR` × (|c_j| + Σ|a_ij y_i|), never below `EPS`),
+since a reduced cost, like a basic value, is only as accurate as the magnitudes it is computed
+from. With a flat `EPS` an exact recomputation exposed noise-level dual infeasibilities on
+large-coefficient columns that the dual ratio test's clamp turned into forced degenerate
 pivots, changing the vertex and with it the whole search (measured on miplib/gt2: 50 ms →
-2.6 min). Reduced costs are recomputed only where a phase ends.
+2.6 min) — which is why an earlier revision left the reduced costs incremental between phase
+ends, and measured the dual phase's exit on incremental values.
 
 ### 5.4 Incumbents and the rounded-feasibility guard
 
@@ -574,13 +584,17 @@ definition):** `SCORE_EPS`, `PSEUDOCOST_INIT_EPS`, `BRANCH_FRAC_GUARD` (all `1e-
 the public default is defined from; each slack is held to `feasibility × row_scale` in
 equilibrated units, capped at `EPS`), `REBUILD_NOISE_FLOOR` (`1e-13` per unit of a row's
 activity magnitude: the round-off floor of a basic value, re-derived from the current point
-at every rebuild — the floor of every slack's tolerance, the level below which a row
-residual is not drift, and the floor of the validation guard's tolerance via `row_tolerance`)
+at every rebuild — the floor of every slack's tolerance, of every non-basic column's
+reduced-cost tolerance (`col_tol`, from the magnitudes behind the reduced cost), the level
+below which a row residual is not drift, and the floor of the validation guard's tolerance
+via `row_tolerance`)
 and `REBUILD_RESIDUAL_FACTOR` (`1`: a phase rebuilds its terminal values when a row's
 residual exceeds the row's tolerance — §5.3), `MAX_TERMINAL_RESTARTS` (`4`) and
 `MAX_PHASE_ROUNDS` (`8`: the bounds on terminal re-examination and on phase alternation —
 §5.3), `PHASE_ACCEPT_FACTOR` (`10`: the multiple of the tolerances within which an exhausted
-alternation is accepted rather than failed — §5.3), `OBJECTIVE_DRIFT_TOL` (`1e-9`, relative), and
+alternation is accepted rather than failed — §5.3), `REDUCED_COST_UPDATE_LIMIT` (`50`
+incremental reduced-cost updates before a refactorization also recomputes the reduced costs;
+every phase end does — §5.3), `OBJECTIVE_DRIFT_TOL` (`1e-9`, relative), and
 the simplex pivot tolerance `EPS` (`1e-10`) — the resolution of every other float comparison
 in the engine.
 
