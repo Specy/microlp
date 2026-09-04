@@ -436,7 +436,10 @@ pub(crate) fn incumbent_feasible(
         if !lhs.is_finite() {
             return false;
         }
-        let tol = crate::solver::row_tolerance(tolerances.feasibility, *rhs, magnitude);
+        // The row is in the user's units; one of the engine's equilibrated
+        // units is `1 / row_scale` of them, so the floor matches the guard's.
+        let unit = 1.0 / crate::solver::equilibration_scale(coeffs, *rhs);
+        let tol = crate::solver::row_tolerance(tolerances.feasibility, unit, *rhs, lhs, magnitude);
         let ok = match op {
             ComparisonOp::Eq => (lhs - rhs).abs() <= tol,
             ComparisonOp::Le => lhs <= rhs + tol,
@@ -1472,6 +1475,38 @@ mod tests {
             &[1000.0 + 5e-5],
             &tolerances
         ));
+    }
+
+    /// The guard checks the equilibrated row, the pre-filter the user's row;
+    /// both derive their round-off floor from the same magnitudes, so they
+    /// agree on what is round-off and what is a violation.
+    #[test]
+    fn incumbent_prefilter_and_guard_share_the_round_off_floor() {
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let x = p.add_var(1.0, (0.0, 10.0));
+        let y = p.add_var(1.0, (0.0, 10.0));
+        p.add_constraint(&[(x, 1e9), (y, -1e9)], ComparisonOp::Eq, 0.0);
+        let state = build_state(&p, SolveOptions::default()).unwrap();
+        let fixed = BTreeMap::new();
+        let tolerances = Tolerances::default();
+        // The floor is about 5e-4 in user units for both (2 x 1e-13 x ~2.5e9).
+        let cases: [([f64; 2], bool); 2] =
+            [([1.0, 1.0 + 1e-13], true), ([1.0, 1.0 + 3e-12], false)];
+        for (values, expected) in cases {
+            let violation = (1e9 * values[0] - 1e9 * values[1]).abs();
+            assert_eq!(
+                state
+                    .solver
+                    .check_constraints(&values, tolerances.feasibility),
+                expected,
+                "guard on a violation of {violation:e}"
+            );
+            assert_eq!(
+                incumbent_feasible(&p, &fixed, &values, &tolerances),
+                expected,
+                "pre-filter on a violation of {violation:e}"
+            );
+        }
     }
 
     #[test]

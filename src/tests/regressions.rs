@@ -295,7 +295,9 @@ mod regression_tests {
         problem.add_constraint([(x0, a0), (x1, a1), (x2, a2)], ComparisonOp::Eq, rhs);
         let sol = problem
             .solve()
-            .unwrap_or_else(|e| panic!("feasible model (60, 47, 48) must solve, got {e:?}"))
+            .unwrap_or_else(|e| {
+                panic!("feasible model ((60, 47, 48) satisfies it) must solve, got {e:?}")
+            })
             .into_solution()
             .unwrap();
 
