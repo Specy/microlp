@@ -2,6 +2,7 @@
 /.idea
 /.vscode
 **/*.rs.bk
+/.hegel
 
 # Design documents and agent task ledgers
 /docs/superpowers/
