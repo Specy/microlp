@@ -155,13 +155,22 @@ impl ResumeOptions {
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct Tolerances {
-    /// Uused to validate a rounded-to-integer
-    /// candidate solution before it is accepted as the incumbent.
-    /// Applied to each variable's distance
-    /// outside its bounds and to each row's distance outside its feasible
-    /// range. Also used, identically, by the post-edit warm-start
-    /// pre-filter that decides whether a previous incumbent survives a
-    /// [`crate::Solution`] edit.
+    /// Absolute tolerance, in the units of the model as written, on each
+    /// variable's distance outside its bounds and each row's distance outside
+    /// its feasible range.
+    ///
+    /// It is the tolerance a rounded-to-integer candidate is validated
+    /// against before it is accepted as the incumbent, the one the post-edit
+    /// warm-start pre-filter applies when deciding whether a previous
+    /// incumbent survives a [`crate::Solution`] edit, and the row tolerance
+    /// the simplex engine itself works to: every constraint row is held to it
+    /// in the row's own units, capped at the engine's resolution (`1e-10` on
+    /// the equilibrated row — raising this above that changes validation, not
+    /// the engine) and floored at the round-off of the row's value (a few
+    /// hundred ulps of its activity: rows with huge coefficients or huge
+    /// values are held as tightly as arithmetic allows, which can be looser
+    /// than this). A tighter value yields sharper vertices at the cost of
+    /// pivots; `0.0` means "as tight as arithmetic allows".
     /// Must be finite and non-negative. Default `1e-7`.
     pub feasibility: f64,
     /// Distance from the nearest integer within which an integer/boolean
@@ -183,7 +192,7 @@ pub struct Tolerances {
 impl Default for Tolerances {
     fn default() -> Self {
         Self {
-            feasibility: 1e-7,
+            feasibility: crate::solver::DEFAULT_FEASIBILITY_TOL,
             integrality_rounding: 1e-5,
             prune_epsilon: 1e-9,
         }
@@ -298,7 +307,7 @@ pub(crate) struct MipRun {
 
 fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Error> {
     let deadline = options.time_limit.map(|d| Instant::now() + d);
-    let solver = problem.build_solver(deadline)?;
+    let solver = problem.build_solver(deadline, options.tolerances.feasibility)?;
     let root_bounds = problem
         .var_mins
         .iter()
@@ -420,11 +429,17 @@ pub(crate) fn incumbent_feasible(
         return false;
     }
     for (coeffs, op, rhs) in &base.constraints {
-        let lhs: f64 = coeffs.iter().map(|(i, c)| c * values[i]).sum();
+        let (lhs, magnitude) = coeffs.iter().fold((0.0, 0.0), |(lhs, mag), (i, c)| {
+            let term = c * values[i];
+            (lhs + term, mag + term.abs())
+        });
         if !lhs.is_finite() {
             return false;
         }
-        let tol = tolerances.feasibility;
+        // The row is in the user's units; one of the engine's equilibrated
+        // units is `1 / row_scale` of them, so the floor matches the guard's.
+        let unit = 1.0 / crate::solver::equilibration_scale(coeffs, *rhs);
+        let tol = crate::solver::row_tolerance(tolerances.feasibility, unit, *rhs, lhs, magnitude);
         let ok = match op {
             ComparisonOp::Eq => (lhs - rhs).abs() <= tol,
             ComparisonOp::Le => lhs <= rhs + tol,
@@ -584,55 +599,19 @@ fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
 enum IntegralCandidate {
     Closed,
     Branch(usize),
-    Limit,
 }
 
 /// Adopt a feasible rounded candidate, but close the current subtree only when
-/// the LP point itself is exactly integral. If an exactly integral point fails
-/// the independent feasibility guard, retry once from the all-slack basis:
-/// large coefficients can leave an eta-updated continuous value just outside
-/// the absolute guard even though a clean factorization recovers the vertex.
+/// the LP point itself is exactly integral. An exactly integral point that
+/// fails the independent feasibility guard is an internal error: the engine
+/// ends every phase on values that satisfy the rows to the same tolerance the
+/// guard checks (`solver::row_tolerance`, round-off floor included), so there
+/// is no honest way to accept the point, and a retry from another basis — the
+/// earlier fallback — would only hide the inconsistency it reveals.
 fn process_integral_candidate(
     state: &mut MipState,
     domains: &[VarDomain],
-    int_tol: f64,
 ) -> Result<IntegralCandidate, Error> {
-    let adopted = try_adopt_incumbent(state)?;
-    if let Some(var) = branching::choose_branch_var(&state.solver, domains, 0.0, &state.pseudocosts)
-    {
-        return Ok(IntegralCandidate::Branch(var));
-    }
-    if adopted {
-        return Ok(IntegralCandidate::Closed);
-    }
-
-    debug!("exactly integral candidate failed guard; retrying from slack basis");
-    let slack = state.solver.slack_basis();
-    state
-        .solver
-        .load_basis(&slack)
-        .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
-    match solve_node_lp(state)? {
-        NodeLp::Limit => return Ok(IntegralCandidate::Limit),
-        NodeLp::Infeasible => {
-            return Err(Error::InternalError(
-                "integral candidate became infeasible after slack-basis retry".to_string(),
-            ))
-        }
-        NodeLp::Solved => {}
-    }
-
-    if !branching::is_integral(&state.solver, domains, int_tol) {
-        return branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts)
-            .map(IntegralCandidate::Branch)
-            .ok_or_else(|| {
-                Error::InternalError(
-                    "slack-basis retry produced a non-integral point with no branchable variable"
-                        .to_string(),
-                )
-            });
-    }
-
     let adopted = try_adopt_incumbent(state)?;
     if let Some(var) = branching::choose_branch_var(&state.solver, domains, 0.0, &state.pseudocosts)
     {
@@ -641,8 +620,7 @@ fn process_integral_candidate(
         Ok(IntegralCandidate::Closed)
     } else {
         Err(Error::InternalError(
-            "exactly integral solution failed feasibility validation after slack-basis retry"
-                .to_string(),
+            "exactly integral solution failed feasibility validation".to_string(),
         ))
     }
 }
@@ -971,14 +949,10 @@ fn initialize_root(
     };
     let int_tol = state.options.int_tol;
     if branching::is_integral(&state.solver, domains, int_tol) {
-        match process_integral_candidate(state, domains, int_tol)? {
+        match process_integral_candidate(state, domains)? {
             IntegralCandidate::Branch(var) => branch(state, &root, var),
             IntegralCandidate::Closed => {
                 return Ok(Some(TerminationReason::ProvenOptimal));
-            }
-            IntegralCandidate::Limit => {
-                state.root_solved = false;
-                return Ok(Some(TerminationReason::TimeLimit));
             }
         }
     } else {
@@ -1053,17 +1027,11 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
 
     let int_tol = state.options.int_tol;
     if branching::is_integral(&state.solver, domains, int_tol) {
-        match process_integral_candidate(state, domains, int_tol)? {
+        match process_integral_candidate(state, domains)? {
             IntegralCandidate::Branch(var) => branch(state, &node, var),
             IntegralCandidate::Closed => {
                 state.last_solved_id = None;
                 state.diving = false;
-            }
-            IntegralCandidate::Limit => {
-                return Ok(NodeVisit::Interrupted {
-                    node,
-                    lp_solved: true,
-                })
             }
         }
         return Ok(NodeVisit::Solved);
@@ -1507,6 +1475,38 @@ mod tests {
             &[1000.0 + 5e-5],
             &tolerances
         ));
+    }
+
+    /// The guard checks the equilibrated row, the pre-filter the user's row;
+    /// both derive their round-off floor from the same magnitudes, so they
+    /// agree on what is round-off and what is a violation.
+    #[test]
+    fn incumbent_prefilter_and_guard_share_the_round_off_floor() {
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let x = p.add_var(1.0, (0.0, 10.0));
+        let y = p.add_var(1.0, (0.0, 10.0));
+        p.add_constraint(&[(x, 1e9), (y, -1e9)], ComparisonOp::Eq, 0.0);
+        let state = build_state(&p, SolveOptions::default()).unwrap();
+        let fixed = BTreeMap::new();
+        let tolerances = Tolerances::default();
+        // The floor is about 5e-4 in user units for both (2 x 1e-13 x ~2.5e9).
+        let cases: [([f64; 2], bool); 2] =
+            [([1.0, 1.0 + 1e-13], true), ([1.0, 1.0 + 3e-12], false)];
+        for (values, expected) in cases {
+            let violation = (1e9 * values[0] - 1e9 * values[1]).abs();
+            assert_eq!(
+                state
+                    .solver
+                    .check_constraints(&values, tolerances.feasibility),
+                expected,
+                "guard on a violation of {violation:e}"
+            );
+            assert_eq!(
+                incumbent_feasible(&p, &fixed, &values, &tolerances),
+                expected,
+                "pre-filter on a violation of {violation:e}"
+            );
+        }
     }
 
     #[test]

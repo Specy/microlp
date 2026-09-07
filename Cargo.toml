@@ -9,7 +9,6 @@ edition = "2021"
 license = "Apache-2.0"
 description = "A linear programming solver for real, integer, and boolean variables."
 repository = "https://github.com/Specy/microlp/"
-readme = "README.md"
 keywords = ["linear-programming", "optimization"]
 categories = ["mathematics", "science"]
 exclude = ["tests/suite/data", "benchmark", "BENCHMARK.md"]
@@ -35,6 +34,7 @@ mps = { version = "1.0.1", default-features = false }
 lp_parser_rs = "4.1.0"
 flate2 = "1.1.9"
 bit-set = { version = "0.11.1", default-features = false }
+hegel = { package = "hegeltest", version = "0.39.2" }
 
 # The benchmark harness lives in its own workspace member so that its solver
 # dependencies (SCIP, Clarabel, and friends) never enter the library's
