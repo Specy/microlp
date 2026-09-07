@@ -11,3 +11,5 @@ mod resume;
 mod regressions;
 
 mod mip_api;
+
+mod feasibility;
