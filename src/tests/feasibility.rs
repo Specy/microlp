@@ -202,4 +202,83 @@ mod tests_feasibility {
             panic!("into_solution() returned {err:?} with no time or node limit set");
         }
     }
+
+    /// The first counterexample the property above found. `x0` and `x2` are
+    /// fixed at zero by their bounds, so the first row reads `-0.001 x1 = 0`
+    /// and the only feasible point is the origin. The solve reports
+    /// `InternalError`; a correct answer is a solution whose rows hold within
+    /// the documented feasibility tolerance (which here allows `|x1|` up to
+    /// `1e-4`).
+    #[test]
+    fn property_counterexample_with_a_guard_tolerance_below_eps() {
+        use crate::tests::oracle::{assert_solves_within_contract, Model, Row, Var};
+        let real = |obj, lo, hi| Var {
+            obj,
+            lo,
+            hi,
+            integer: false,
+        };
+        assert_solves_within_contract(&Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, -0.0, 0.0),
+                real(-1.0, -1.0, 0.0),
+                real(-1.0, -0.0, 0.0),
+                Var {
+                    obj: 1.0,
+                    lo: 0.0,
+                    hi: 0.0,
+                    integer: true,
+                },
+            ],
+            rows: vec![
+                Row {
+                    terms: vec![(0, -10000.0), (1, -0.001)],
+                    op: ComparisonOp::Eq,
+                    rhs: 0.0,
+                },
+                Row {
+                    terms: vec![(1, -10000.0)],
+                    op: ComparisonOp::Le,
+                    rhs: 2.0,
+                },
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 0.0],
+        });
+    }
+
+    /// The second counterexample. Only the origin is feasible; the row
+    /// `-20000 x0 + 0.0001 x2 = 0` pairs coefficients eight orders of
+    /// magnitude apart, and the solve answers `Infeasible`.
+    #[test]
+    fn property_counterexample_with_a_genuine_sub_eps_pivot() {
+        use crate::tests::oracle::{assert_solves_within_contract, Model, Row, Var};
+        let real = |obj, lo, hi| Var {
+            obj,
+            lo,
+            hi,
+            integer: false,
+        };
+        assert_solves_within_contract(&Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(-1.0, -1.0, 0.0),
+                real(-1.0, -0.0, 0.0),
+                real(1.0, -2.0, 0.0),
+            ],
+            rows: vec![
+                Row {
+                    terms: vec![(0, -1.0), (1, -100.0)],
+                    op: ComparisonOp::Eq,
+                    rhs: 0.0,
+                },
+                Row {
+                    terms: vec![(0, -20000.0), (2, 0.0001)],
+                    op: ComparisonOp::Eq,
+                    rhs: 0.0,
+                },
+            ],
+            xstar: vec![0.0, 0.0, 0.0],
+        });
+    }
 }
