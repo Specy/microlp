@@ -127,11 +127,16 @@ The engine exposes a small contract surface; everything the B&B does goes throug
 **`set_var_bounds(var, min, max) -> Result<(), Error>`** — change a variable's bounds in
 place. Basic variable: update the row's bound mirrors, flag primal-infeasible if its value
 fell outside. Non-basic variable: clamp its value to the new range, propagate the delta into
-the basic values through the variable's column (same mechanism as `fix_var`), recompute its
+the basic values through the variable's column, recompute its
 at-bound flags, and downgrade `is_dual_feasible` if the move broke the reduced-cost/bound
 pairing. Crossing bounds (`min > max`) or either bound being NaN returns
 `Err(Infeasible)` with state untouched. Infinite bounds remain valid. It does **not** run
-simplex — callers decide when to reoptimize.
+simplex — callers decide when to reoptimize. The public `Solution::fix_var` /
+`unfix_var` pair on a pure-LP solution is built on it: a fix is `set_var_bounds(var, val,
+val)` with the pre-fix bounds saved per variable, and an unfix restores them; both then
+`reoptimize`. Because a fix is just a bound, it survives `load_basis` and never needs to
+force a basic variable out of the basis (which is impossible on a row whose other columns
+are all fixed, e.g. an equality row holding only that variable and its slack — issue #47).
 
 *Why this is the branching primitive:* tightening a bound leaves every reduced cost
 untouched, so the current basis stays **dual feasible** — re-solving is a short dual-simplex

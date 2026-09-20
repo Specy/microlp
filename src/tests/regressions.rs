@@ -89,4 +89,102 @@ mod regression_tests {
             }
         }
     }
+
+    /// <https://github.com/Specy/microlp/issues/47>: fixing a variable to the
+    /// value `solve` just reported for it must keep the model feasible. It
+    /// used to return `Infeasible` whenever the variable appeared in an
+    /// equality row: the LP path forced the (basic) variable out of the basis
+    /// with a dual pivot, but the only other column of the row was the
+    /// equality slack, itself fixed at zero and therefore never eligible to
+    /// enter. The same row as `Le` was accepted.
+    #[test]
+    fn issue_47_fix_var_to_reported_value_on_equality_row() {
+        for (op, rhs, hi) in [
+            (ComparisonOp::Eq, 0.0, 1.0),
+            (ComparisonOp::Le, 0.0, 1.0),
+            (ComparisonOp::Eq, 1.0, 2.0),
+        ] {
+            let mut problem = Problem::new(OptimizationDirection::Minimize);
+            let x = problem.add_var(-1.0, (0.0, hi));
+            problem.add_constraint([(x, 1.0)], op, rhs);
+            let solution = problem.solve().unwrap().into_solution().unwrap();
+            let value = solution.var_value(x);
+            assert!(
+                (value - rhs).abs() < 1e-9,
+                "{op:?} {rhs}: solve gave {value}"
+            );
+
+            let fixed = solution
+                .fix_var(x, value)
+                .unwrap_or_else(|e| {
+                    panic!("x in [0, {hi}], x {op:?} {rhs}: fix_var(x, {value}) = Err({e:?})")
+                })
+                .into_solution()
+                .unwrap();
+            assert!((fixed.var_value(x) - value).abs() < 1e-9);
+            assert!((fixed.objective() - -rhs).abs() < 1e-9);
+
+            // Releasing the fix returns to the same optimum.
+            let (restored, was_fixed) = fixed.unfix_var(x).unwrap();
+            assert!(was_fixed);
+            let restored = restored.into_solution().unwrap();
+            assert!((restored.var_value(x) - value).abs() < 1e-9);
+        }
+    }
+
+    /// Companion to the issue #47 fix: an equality row must still reject a
+    /// fix to a value it cannot satisfy, on a variable that is basic in the
+    /// solved basis.
+    #[test]
+    fn issue_47_fix_var_off_the_equality_value_is_infeasible() {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_var(-1.0, (0.0, 2.0));
+        problem.add_constraint([(x, 1.0)], ComparisonOp::Eq, 1.0);
+        let solution = problem.solve().unwrap().into_solution().unwrap();
+        assert!((solution.var_value(x) - 1.0).abs() < 1e-9);
+
+        assert!(matches!(
+            solution.fix_var(x, 0.5),
+            Err(crate::Error::Infeasible)
+        ));
+    }
+
+    /// Companion to the issue #47 fix: fixes are applied as bounds internally,
+    /// so re-fixing must still validate against the variable's *original*
+    /// bounds (not the pinned ones), and unfixing must restore the original
+    /// bounds regardless of how many times the variable was re-fixed.
+    #[test]
+    fn issue_47_refix_validates_against_original_bounds_and_unfix_restores() {
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x = problem.add_var(1.0, (0.0, 3.0));
+        let y = problem.add_var(2.0, (0.0, 3.0));
+        problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
+        let solution = problem.solve().unwrap().into_solution().unwrap();
+        assert!((solution.objective() - 7.0).abs() < 1e-9);
+
+        // Fix x = 0.5, then re-fix x = 2.0 (inside the original [0, 3]).
+        let fixed = solution.fix_var(x, 0.5).unwrap().into_solution().unwrap();
+        assert!((fixed.var_value(x) - 0.5).abs() < 1e-9);
+        assert!((fixed.objective() - 6.5).abs() < 1e-9);
+        let refixed = fixed.fix_var(x, 2.0).unwrap().into_solution().unwrap();
+        assert!((refixed.var_value(x) - 2.0).abs() < 1e-9);
+        assert!((refixed.var_value(y) - 2.0).abs() < 1e-9);
+        assert!((refixed.objective() - 6.0).abs() < 1e-9);
+
+        // A value outside the original bounds is still rejected while fixed.
+        assert!(matches!(
+            refixed.clone().fix_var(x, 3.5),
+            Err(crate::Error::Infeasible)
+        ));
+
+        // Unfix restores [0, 3] and the original optimum in one step.
+        let (restored, was_fixed) = refixed.unfix_var(x).unwrap();
+        assert!(was_fixed);
+        let restored = restored.into_solution().unwrap();
+        assert!((restored.var_value(x) - 1.0).abs() < 1e-9);
+        assert!((restored.var_value(y) - 3.0).abs() < 1e-9);
+        assert!((restored.objective() - 7.0).abs() < 1e-9);
+        let (_, was_fixed_again) = restored.unfix_var(x).unwrap();
+        assert!(!was_fixed_again);
+    }
 }

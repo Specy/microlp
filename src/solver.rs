@@ -241,8 +241,13 @@ pub(crate) struct Solver {
     nb_var_obj_coeffs: Vec<f64>,
     nb_var_vals: Vec<f64>,
     nb_var_states: Vec<NonBasicVarState>,
-    nb_var_is_fixed: Vec<bool>,
     primal_edge_sq_norms: Vec<f64>,
+
+    /// For each structural var pinned by [`Self::fix_var`], the bounds it had
+    /// before the fix; `None` when the var is not fixed. A fix is applied as
+    /// the degenerate bounds `[val, val]` in `orig_var_mins`/`orig_var_maxs`,
+    /// so it survives basis reloads and works whether the var is basic or not.
+    fixed_var_saved_bounds: Vec<Option<(f64, f64)>>,
 
     pub(crate) cur_obj_val: f64,
 
@@ -495,7 +500,7 @@ impl Solver {
         )?;
         let lu_factors_transp = lu_factors.transpose();
 
-        let nb_var_is_fixed = vec![false; nb_vars.len()];
+        let fixed_var_saved_bounds = vec![None; num_vars];
 
         let res = Self {
             num_vars,
@@ -532,8 +537,8 @@ impl Solver {
             nb_var_obj_coeffs,
             nb_var_vals,
             nb_var_states,
-            nb_var_is_fixed,
             primal_edge_sq_norms,
+            fixed_var_saved_bounds,
             cur_obj_val,
             col_coeffs: SparseVec::new(),
             sq_norms_update_helper,
@@ -645,7 +650,7 @@ impl Solver {
                 let new_val = cur.clamp(min, max);
                 if new_val != cur {
                     // Shift the non-basic var to the nearest bound and propagate the
-                    // delta into basic values (same mechanism as fix_var's non-basic arm).
+                    // delta into basic values.
                     self.calc_col_coeffs(col);
                     let diff = new_val - cur;
                     for (r, coeff) in self.col_coeffs.iter() {
@@ -759,7 +764,6 @@ impl Solver {
         self.nb_vars.clear();
         self.nb_var_vals.clear();
         self.nb_var_states.clear();
-        self.nb_var_is_fixed.clear();
 
         for var in 0..n {
             match basis.0[var] {
@@ -809,7 +813,6 @@ impl Solver {
                         at_min: float_eq(val, min),
                         at_max: float_eq(val, max),
                     });
-                    self.nb_var_is_fixed.push(false);
                 }
             }
         }
@@ -831,65 +834,40 @@ impl Solver {
         Ok(())
     }
 
+    /// Pin a structural var to `val` and re-solve.
+    ///
+    /// The fix is applied as the degenerate bounds `[val, val]`: a non-basic var
+    /// is shifted to `val`, a basic var keeps its row and is driven to `val` by
+    /// the dual simplex if its current value differs. Forcing a basic var out of
+    /// the basis eagerly would fail on rows whose other columns are all fixed
+    /// (e.g. an equality row holding only the var and its slack), even though
+    /// the fix is trivially feasible (issue #47).
+    ///
+    /// Fixing an already fixed var replaces its value; `val` is validated
+    /// against the bounds the var had before it was first fixed. Returns
+    /// `Err(Infeasible)` with state untouched if `val` is NaN or outside those
+    /// bounds.
     pub(crate) fn fix_var(&mut self, var: usize, val: f64) -> Result<StopReason, Error> {
-        if val < self.orig_var_mins[var] || val > self.orig_var_maxs[var] {
+        let (min, max) =
+            self.fixed_var_saved_bounds[var].unwrap_or_else(|| self.get_var_bounds(var));
+        // Written so that a NaN `val` is rejected too.
+        if !(val >= min && val <= max) {
             return Err(Error::Infeasible);
         }
-
-        let col = match self.var_states[var] {
-            VarState::Basic(row) => {
-                // if var was basic, remove it.
-                self.calc_row_coeffs(row);
-                let pivot_info = self.choose_entering_col_dual(row, val)?;
-                self.calc_col_coeffs(pivot_info.col);
-                self.pivot(&pivot_info)?;
-                pivot_info.col
-            }
-
-            VarState::NonBasic(col) => {
-                self.calc_col_coeffs(col);
-
-                let diff = val - self.nb_var_vals[col];
-                for (r, coeff) in self.col_coeffs.iter() {
-                    self.basic_var_vals[r] -= diff * coeff;
-                }
-                self.cur_obj_val += diff * self.nb_var_obj_coeffs[col];
-                self.nb_var_vals[col] = val;
-
-                col
-            }
-        };
-
-        self.nb_var_states[col] = NonBasicVarState {
-            at_min: true,
-            at_max: true,
-        };
-        self.nb_var_is_fixed[col] = true;
-
-        self.is_primal_feasible = false;
-        self.restore_feasibility()
+        self.set_var_bounds(var, val, val)?;
+        self.fixed_var_saved_bounds[var] = Some((min, max));
+        self.reoptimize()
     }
 
     /// Return whether the var was really unset and whether reoptimization
     /// finished within the active deadline.
     pub(crate) fn unfix_var(&mut self, var: usize) -> Result<(bool, StopReason), Error> {
-        if let VarState::NonBasic(col) = self.var_states[var] {
-            if !std::mem::replace(&mut self.nb_var_is_fixed[col], false) {
-                return Ok((false, StopReason::Finished));
-            }
-
-            let cur_val = self.nb_var_vals[col];
-            self.nb_var_states[col] = NonBasicVarState {
-                at_min: float_eq(cur_val, self.orig_var_mins[var]),
-                at_max: float_eq(cur_val, self.orig_var_maxs[var]),
-            };
-
-            self.is_dual_feasible = false;
-            let stop = self.optimize()?;
-            Ok((true, stop))
-        } else {
-            Ok((false, StopReason::Finished))
-        }
+        let Some((min, max)) = self.fixed_var_saved_bounds[var].take() else {
+            return Ok((false, StopReason::Finished));
+        };
+        self.set_var_bounds(var, min, max)?;
+        let stop = self.reoptimize()?;
+        Ok((true, stop))
     }
 
     pub(crate) fn num_constraints(&self) -> usize {
