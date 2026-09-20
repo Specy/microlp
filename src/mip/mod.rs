@@ -6,8 +6,9 @@
 pub(crate) mod branching;
 pub(crate) mod node;
 pub(crate) mod params;
+pub(crate) mod sos;
 
-use crate::solver::{check_deadline, Deadline, Solver};
+use crate::solver::{check_deadline, Basis, Deadline, Solver};
 use crate::{ComparisonOp, Error, OptimizationDirection, Problem, StopReason, VarDomain, Variable};
 use core::time::Duration;
 use node::{effective_bounds, Node};
@@ -155,13 +156,16 @@ impl ResumeOptions {
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct Tolerances {
-    /// Uused to validate a rounded-to-integer
+    /// Used to validate a rounded-to-integer
     /// candidate solution before it is accepted as the incumbent.
     /// Applied to each variable's distance
     /// outside its bounds and to each row's distance outside its feasible
     /// range. Also used, identically, by the post-edit warm-start
     /// pre-filter that decides whether a previous incumbent survives a
-    /// [`crate::Solution`] edit.
+    /// [`crate::Solution`] edit, and as the zero threshold of special
+    /// ordered set members: a member within this distance of zero counts
+    /// as zero and is reported as exactly `0.0` when that keeps every row
+    /// within tolerance.
     /// Must be finite and non-negative. Default `1e-7`.
     pub feasibility: f64,
     /// Distance from the nearest integer within which an integer/boolean
@@ -410,14 +414,28 @@ pub(crate) fn incumbent_feasible(
     values: &[f64],
     tolerances: &Tolerances,
 ) -> bool {
-    if !candidate_variables_feasible(values, &base.var_domains, tolerances, |v| {
+    let bounds = |v: usize| {
         fixed
             .get(&v)
             .map_or((base.var_mins[v], base.var_maxs[v]), |&value| {
                 (value, value)
             })
-    }) {
+    };
+    if !candidate_variables_feasible(values, &base.var_domains, tolerances, bounds) {
         return false;
+    }
+    if !base.sos.is_empty() {
+        let fixed_to_zero = |v: usize| bounds(v) == (0.0, 0.0);
+        let mut snapped = values.to_vec();
+        sos::snap_members(
+            &base.sos,
+            &mut snapped,
+            tolerances.feasibility,
+            &fixed_to_zero,
+        );
+        if !sos::all_satisfied(&base.sos, &|v| snapped[v], &fixed_to_zero) {
+            return false;
+        }
     }
     for (coeffs, op, rhs) in &base.constraints {
         let lhs: f64 = coeffs.iter().map(|(i, c)| c * values[i]).sum();
@@ -547,18 +565,31 @@ fn cutoff(incumbent_obj: f64, prune_epsilon: f64) -> f64 {
 fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
     let tolerances = &state.options.tolerances;
     let solver = &state.solver;
-    let n = solver.num_vars;
     let domains = &solver.orig_var_domains;
-    let mut values: Vec<f64> = (0..n).map(|v| *solver.get_value(v)).collect();
-    for (val, dom) in values.iter_mut().zip(domains.iter()) {
-        if matches!(dom, VarDomain::Integer | VarDomain::Boolean) {
-            *val = val.round();
+    let fixed_to_zero = sos::solver_fixed_to_zero(solver);
+    let accept = |vals: &[f64]| {
+        candidate_variables_feasible(vals, domains, tolerances, |v| state.root_bounds[v])
+            && solver.check_constraints(vals, tolerances.feasibility)
+    };
+    let mut values = candidate_values(state, tolerances.feasibility);
+    if !accept(&values) {
+        // Snapping a set member that a row depends on (a λ of 1e-7 against a
+        // breakpoint of 10) can break that row although the LP point holds
+        // it. Fall back to the exact point: only [0, 0] members snapped. It
+        // must then satisfy every set exactly, otherwise the strict re-branch
+        // in `process_integral_candidate` fixes the offending member.
+        if state.base.sos.is_empty() {
+            debug!("integral-within-tol solution rejected: rounded values infeasible");
+            return Ok(false);
         }
-    }
-    if !candidate_variables_feasible(&values, domains, tolerances, |v| state.root_bounds[v])
-        || !solver.check_constraints(&values, tolerances.feasibility)
-    {
-        debug!("integral-within-tol solution rejected: rounded values infeasible");
+        let exact = candidate_values(state, 0.0);
+        if !sos::all_satisfied(&state.base.sos, &|v| exact[v], &fixed_to_zero) || !accept(&exact) {
+            debug!("integral-within-tol solution rejected: rounded values infeasible");
+            return Ok(false);
+        }
+        values = exact;
+    } else if !sos::all_satisfied(&state.base.sos, &|v| values[v], &fixed_to_zero) {
+        debug!("integral-within-tol solution rejected: a special ordered set is violated");
         return Ok(false);
     }
     let objective = solver.objective_of(&values);
@@ -581,11 +612,91 @@ fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
     }
 }
 
+/// The solver's current point as a candidate assignment: integer-domained
+/// variables rounded, and special-ordered-set members within `zero_tol` of
+/// zero (or fixed to `[0, 0]`) snapped to exactly `0.0`. Models without SOS
+/// sets see only the rounding.
+fn candidate_values(state: &MipState, zero_tol: f64) -> Vec<f64> {
+    let solver = &state.solver;
+    let mut values: Vec<f64> = (0..solver.num_vars).map(|v| *solver.get_value(v)).collect();
+    for (val, dom) in values.iter_mut().zip(solver.orig_var_domains.iter()) {
+        if matches!(dom, VarDomain::Integer | VarDomain::Boolean) {
+            *val = val.round();
+        }
+    }
+    sos::snap_members(
+        &state.base.sos,
+        &mut values,
+        zero_tol,
+        &sos::solver_fixed_to_zero(solver),
+    );
+    values
+}
+
+/// Whether the solver's current point may be adopted as an incumbent: every
+/// integer variable within `int_tol` of an integer and every special ordered
+/// set satisfied once members within `zero_tol` of zero count as zero.
+fn is_candidate(state: &MipState, domains: &[VarDomain], int_tol: f64, zero_tol: f64) -> bool {
+    if !branching::is_integral(&state.solver, domains, int_tol) {
+        return false;
+    }
+    if state.base.sos.is_empty() {
+        return true;
+    }
+    let values = candidate_values(state, zero_tol);
+    sos::all_satisfied(
+        &state.base.sos,
+        &|v| values[v],
+        &sos::solver_fixed_to_zero(&state.solver),
+    )
+}
+
+/// A branching decision at a solved node.
+enum Branch {
+    /// Split an integer variable at its fractional value.
+    Var(usize),
+    /// Split a violated special ordered set.
+    Sos(sos::Split),
+}
+
+/// Choose what to branch on: a fractional integer variable first (pseudocost
+/// score), otherwise the first violated special ordered set. `None` when the
+/// point is a candidate, or when the only fractional integer variables are
+/// fixed and no set is violated.
+fn choose_branch(
+    state: &MipState,
+    domains: &[VarDomain],
+    int_tol: f64,
+    zero_tol: f64,
+) -> Option<Branch> {
+    if let Some(var) =
+        branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts)
+    {
+        return Some(Branch::Var(var));
+    }
+    if state.base.sos.is_empty() {
+        return None;
+    }
+    let values = candidate_values(state, zero_tol);
+    sos::first_violated(
+        &state.base.sos,
+        &|v| values[v],
+        &sos::solver_fixed_to_zero(&state.solver),
+    )
+    .map(Branch::Sos)
+}
+
 enum IntegralCandidate {
     Closed,
-    Branch(usize),
+    Branch(Branch),
     Limit,
 }
+
+/// Zero threshold of the post-adoption re-branch on special ordered sets: a
+/// member the simplex itself cannot tell from zero (below its pivot tolerance)
+/// is not worth an exact-fixing branch, one above it is, exactly as a rounded
+/// integer keeps its node open until the children fix it.
+const STRICT_ZERO_TOL: f64 = crate::solver::EPS;
 
 /// Adopt a feasible rounded candidate, but close the current subtree only when
 /// the LP point itself is exactly integral. If an exactly integral point fails
@@ -598,9 +709,8 @@ fn process_integral_candidate(
     int_tol: f64,
 ) -> Result<IntegralCandidate, Error> {
     let adopted = try_adopt_incumbent(state)?;
-    if let Some(var) = branching::choose_branch_var(&state.solver, domains, 0.0, &state.pseudocosts)
-    {
-        return Ok(IntegralCandidate::Branch(var));
+    if let Some(branch) = choose_branch(state, domains, 0.0, STRICT_ZERO_TOL) {
+        return Ok(IntegralCandidate::Branch(branch));
     }
     if adopted {
         return Ok(IntegralCandidate::Closed);
@@ -622,21 +732,21 @@ fn process_integral_candidate(
         NodeLp::Solved => {}
     }
 
-    if !branching::is_integral(&state.solver, domains, int_tol) {
-        return branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts)
+    let zero_tol = state.options.tolerances.feasibility;
+    if !is_candidate(state, domains, int_tol, zero_tol) {
+        return choose_branch(state, domains, int_tol, zero_tol)
             .map(IntegralCandidate::Branch)
             .ok_or_else(|| {
                 Error::InternalError(
-                    "slack-basis retry produced a non-integral point with no branchable variable"
+                    "slack-basis retry produced a non-candidate point with nothing to branch on"
                         .to_string(),
                 )
             });
     }
 
     let adopted = try_adopt_incumbent(state)?;
-    if let Some(var) = branching::choose_branch_var(&state.solver, domains, 0.0, &state.pseudocosts)
-    {
-        Ok(IntegralCandidate::Branch(var))
+    if let Some(branch) = choose_branch(state, domains, 0.0, STRICT_ZERO_TOL) {
+        Ok(IntegralCandidate::Branch(branch))
     } else if adopted {
         Ok(IntegralCandidate::Closed)
     } else {
@@ -675,9 +785,75 @@ fn apply_node_bounds(state: &mut MipState, node: &Node) -> bool {
     true
 }
 
+/// Branch at the solver's current (just solved) optimum: push the two children
+/// carrying the parent's basis and objective bound.
+fn branch(state: &mut MipState, parent: &Node, decision: Branch) {
+    match decision {
+        Branch::Var(var) => branch_var(state, parent, var),
+        Branch::Sos(split) => branch_sos(state, parent, split),
+    }
+}
+
+/// Split a violated special ordered set: each child fixes one side of the
+/// split to zero. Fixings use the node's CURRENT bounds, `(max(lo, 0),
+/// min(hi, 0))`, so a member whose bounds exclude zero yields crossed bounds
+/// and that child is pruned without an LP. Children carry no branch variable:
+/// pseudocosts are a per-variable statistic and a set fixing is not one.
+fn branch_sos(state: &mut MipState, parent: &Node, split: sos::Split) {
+    let z = state.solver.cur_obj_val;
+    let zero_changes = |members: &[usize]| -> Vec<(usize, f64, f64)> {
+        members
+            .iter()
+            .map(|&v| {
+                let (lo, hi) = state.solver.get_var_bounds(v);
+                (v, lo.max(0.0), hi.min(0.0))
+            })
+            .collect()
+    };
+    let left_fix = zero_changes(&split.left_zero);
+    let right_fix = zero_changes(&split.right_zero);
+    debug_assert!(
+        !left_fix.is_empty() && !right_fix.is_empty(),
+        "an SOS split must fix a free member on each side"
+    );
+
+    state.node_seq += 1;
+    let id = state.node_seq;
+    state.last_solved_id = Some(id);
+    let basis = state.solver.snapshot_basis();
+
+    let child = |fixes: Vec<(usize, f64, f64)>, basis: Basis| {
+        let mut changes = parent.bound_changes.clone();
+        changes.extend(fixes);
+        Node {
+            bound_changes: changes,
+            basis,
+            lp_bound: z,
+            depth: parent.depth + 1,
+            parent_id: id,
+            branch_var: None,
+            branch_up: false,
+            branch_frac: 1.0,
+        }
+    };
+    let left = child(left_fix, basis.clone());
+    let right = child(right_fix, basis);
+
+    // Dive first into the child that keeps more of the current point's mass:
+    // it is the more likely to stay feasible and close quickly.
+    if split.left_mass >= split.right_mass {
+        state.open.push(right);
+        state.open.push(left);
+    } else {
+        state.open.push(left);
+        state.open.push(right);
+    }
+    state.diving = true;
+}
+
 /// Branch on `var` at the solver's current (just solved) optimum: push the two
 /// children carrying the parent's basis and objective bound.
-fn branch(state: &mut MipState, parent: &Node, var: usize) {
+fn branch_var(state: &mut MipState, parent: &Node, var: usize) {
     let z = state.solver.cur_obj_val;
     let val = *state.solver.get_value(var);
     let (lo, hi) = state.solver.get_var_bounds(var);
@@ -877,7 +1053,9 @@ fn try_warm_start(
     if ok {
         match state.solver.reoptimize() {
             Ok(StopReason::Finished) => {
-                if branching::is_integral(&state.solver, &domains, state.options.int_tol) {
+                let int_tol = state.options.int_tol;
+                let zero_tol = state.options.tolerances.feasibility;
+                if is_candidate(state, &domains, int_tol, zero_tol) {
                     // Rounded-incumbent feasibility guard: never bypass it for a hint.
                     // If it rejects the completion, drop the hint — do not branch
                     // below-tolerance vars here, that fallback is only for the main
@@ -970,9 +1148,10 @@ fn initialize_root(
         branch_frac: 1.0,
     };
     let int_tol = state.options.int_tol;
-    if branching::is_integral(&state.solver, domains, int_tol) {
+    let zero_tol = state.options.tolerances.feasibility;
+    if is_candidate(state, domains, int_tol, zero_tol) {
         match process_integral_candidate(state, domains, int_tol)? {
-            IntegralCandidate::Branch(var) => branch(state, &root, var),
+            IntegralCandidate::Branch(decision) => branch(state, &root, decision),
             IntegralCandidate::Closed => {
                 return Ok(Some(TerminationReason::ProvenOptimal));
             }
@@ -982,8 +1161,8 @@ fn initialize_root(
             }
         }
     } else {
-        match branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts) {
-            Some(var) => branch(state, &root, var),
+        match choose_branch(state, domains, int_tol, zero_tol) {
+            Some(decision) => branch(state, &root, decision),
             // Fractional integer variables fixed to a non-integer value cannot
             // produce an integer point or a useful branch.
             None => return Err(Error::Infeasible),
@@ -1052,9 +1231,10 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
     }
 
     let int_tol = state.options.int_tol;
-    if branching::is_integral(&state.solver, domains, int_tol) {
+    let zero_tol = state.options.tolerances.feasibility;
+    if is_candidate(state, domains, int_tol, zero_tol) {
         match process_integral_candidate(state, domains, int_tol)? {
-            IntegralCandidate::Branch(var) => branch(state, &node, var),
+            IntegralCandidate::Branch(decision) => branch(state, &node, decision),
             IntegralCandidate::Closed => {
                 state.last_solved_id = None;
                 state.diving = false;
@@ -1069,8 +1249,8 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
         return Ok(NodeVisit::Solved);
     }
 
-    match branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts) {
-        Some(var) => branch(state, &node, var),
+    match choose_branch(state, domains, int_tol, zero_tol) {
+        Some(decision) => branch(state, &node, decision),
         None => {
             state.last_solved_id = None;
             state.diving = false;

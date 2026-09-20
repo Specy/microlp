@@ -275,6 +275,8 @@ pub struct Problem {
     var_maxs: Vec<f64>,
     var_domains: Vec<VarDomain>,
     constraints: Vec<(CsVec, ComparisonOp, f64)>,
+    /// Special ordered sets, enforced by branching (see `mip::sos`).
+    sos: Vec<mip::sos::SosSet>,
     time_limit: Option<Duration>,
 }
 
@@ -285,6 +287,7 @@ impl std::fmt::Debug for Problem {
             .field("direction", &self.direction)
             .field("num_vars", &self.obj_coeffs.len())
             .field("num_constraints", &self.constraints.len())
+            .field("num_sos", &self.sos.len())
             .finish()
     }
 }
@@ -312,6 +315,7 @@ impl Problem {
             var_maxs: vec![],
             var_domains: vec![],
             constraints: vec![],
+            sos: vec![],
             time_limit: None,
         }
     }
@@ -352,6 +356,12 @@ impl Problem {
         self.var_domains
             .iter()
             .any(|v| *v == VarDomain::Integer || *v == VarDomain::Boolean)
+    }
+
+    /// Whether solving needs the branch & bound driver: integer variables or
+    /// special ordered sets (which are enforced by branching).
+    pub(crate) fn needs_branching(&self) -> bool {
+        self.has_integer_vars() || !self.sos.is_empty()
     }
 
     /// Adds a variable restricted to `0` or `1`.
@@ -423,6 +433,114 @@ impl Problem {
             rhs,
         ));
     }
+
+    /// Adds a special ordered set of type 1: at most one member may be nonzero.
+    ///
+    /// `members` pairs each variable with a weight, given like the terms of a
+    /// constraint (a slice, an iterator, or a [`LinearExpr`]). Weights order
+    /// the set; for SOS1 they only guide branching and may repeat. Members may
+    /// be real, integer or boolean, and must have finite bounds on both sides.
+    ///
+    /// A set with fewer than two members constrains nothing and is ignored.
+    /// Special ordered sets make the problem solve through branch & bound even
+    /// when it has no integer variables.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a member is repeated, refers to a variable outside this
+    /// problem, has an infinite bound, or if a weight is not finite.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use microlp::*;
+    /// let mut problem = Problem::new(OptimizationDirection::Maximize);
+    /// let x = problem.add_var(3.0, (0.0, 10.0));
+    /// let y = problem.add_var(2.0, (0.0, 10.0));
+    /// problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 15.0);
+    /// // Only one of x, y may be nonzero.
+    /// problem.add_sos1_constraint([(x, 1.0), (y, 2.0)]);
+    /// let solution = problem.solve().unwrap().into_solution().unwrap();
+    /// assert_eq!(solution.var_value(x), 10.0);
+    /// assert_eq!(solution.var_value(y), 0.0);
+    /// ```
+    pub fn add_sos1_constraint(&mut self, members: impl Into<LinearExpr>) {
+        self.add_sos(mip::sos::SosKind::Sos1, members.into());
+    }
+
+    /// Adds a special ordered set of type 2: at most two members may be
+    /// nonzero, and they must be adjacent in weight order.
+    ///
+    /// `members` pairs each variable with a weight, given like the terms of a
+    /// constraint. Weights must be finite and distinct: adjacency is defined
+    /// by their order. Members may be real, integer or boolean, and must have
+    /// finite bounds on both sides.
+    ///
+    /// A set with fewer than three members constrains nothing and is ignored.
+    /// Special ordered sets make the problem solve through branch & bound even
+    /// when it has no integer variables.
+    ///
+    /// The classic use is a piecewise-linear function `f` of one variable:
+    /// with breakpoints `t_i`, convex-combination variables `λ_i ∈ [0, 1]`,
+    /// `Σ λ_i = 1`, `x = Σ t_i λ_i` and `f(x) = Σ f(t_i) λ_i`, an SOS2 over the
+    /// `λ_i` (weights `t_i`) restricts `x` to one segment at a time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a member is repeated, refers to a variable outside this
+    /// problem, has an infinite bound, or if a weight is not finite or repeats.
+    pub fn add_sos2_constraint(&mut self, members: impl Into<LinearExpr>) {
+        self.add_sos(mip::sos::SosKind::Sos2, members.into());
+    }
+
+    fn add_sos(&mut self, kind: mip::sos::SosKind, expr: LinearExpr) {
+        let num_vars = self.obj_coeffs.len();
+        let mut order: Vec<usize> = (0..expr.vars.len()).collect();
+        for (&v, &w) in expr.vars.iter().zip(&expr.coeffs) {
+            assert!(
+                v < num_vars,
+                "special ordered set refers to variable {v}, but the problem has {num_vars}"
+            );
+            assert!(
+                w.is_finite(),
+                "special ordered set weight for variable {v} is not finite"
+            );
+            assert!(
+                self.var_mins[v].is_finite() && self.var_maxs[v].is_finite(),
+                "special ordered set member {v} must have finite bounds"
+            );
+        }
+        // Stable sort by weight: ties keep insertion order.
+        order.sort_by(|&i, &j| expr.coeffs[i].total_cmp(&expr.coeffs[j]));
+        let members: Vec<usize> = order.iter().map(|&i| expr.vars[i]).collect();
+        let weights: Vec<f64> = order.iter().map(|&i| expr.coeffs[i]).collect();
+        let min_members = match kind {
+            mip::sos::SosKind::Sos1 => 2,
+            mip::sos::SosKind::Sos2 => 3,
+        };
+        if members.len() < min_members {
+            return;
+        }
+        {
+            let mut sorted = members.clone();
+            sorted.sort_unstable();
+            assert!(
+                sorted.windows(2).all(|w| w[0] != w[1]),
+                "special ordered set repeats a variable"
+            );
+        }
+        if kind == mip::sos::SosKind::Sos2 {
+            assert!(
+                weights.windows(2).all(|w| w[0] != w[1]),
+                "SOS2 weights must be distinct: they define adjacency"
+            );
+        }
+        self.sos.push(mip::sos::SosSet {
+            kind,
+            members,
+            weights,
+        });
+    }
 }
 
 pub use mip::{ResumeOptions, SolutionStatus, SolveOptions, Stats, TerminationReason, Tolerances};
@@ -489,7 +607,7 @@ impl Problem {
     pub fn solve_with(&self, options: SolveOptions) -> Result<SolveOutcome, Error> {
         options.validate()?;
         let num_vars = self.obj_coeffs.len();
-        if self.has_integer_vars() {
+        if self.needs_branching() {
             let run = mip::run(self, options.clone())?;
             let resume_options = ResumeOptions::from(&options);
             Ok(SolveOutcome::from_mip_run(
