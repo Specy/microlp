@@ -69,7 +69,14 @@ Three principles shape everything:
 ## 2. Problem representation
 
 `Problem` stores the model in original user terms: objective coefficients, per-variable
-bounds and domains (`Real`, `Integer`, `Boolean`), and constraint rows.
+bounds and domains (`Real`, `Integer`, `Boolean`), constraint rows, and special ordered
+sets (`mip::sos::SosSet`: SOS1 "at most one member nonzero" or SOS2 "at most two, adjacent
+in weight order", each a list of structural variables sorted by weight). Sets never reach
+the simplex engine; they are enforced by branching (§5.4b) and travel with every clone of
+the problem, so `MipState::base`, post-solve edits and unboundedness classification all
+keep them. Members must have finite bounds (see §5.4b for why), and a set too small to
+constrain anything is dropped at insertion. A problem with a set but no integer variable is
+routed through the branch & bound driver (`Problem::needs_branching`).
 
 Two normalizations happen at the boundary and hold everywhere inside:
 
@@ -186,8 +193,9 @@ state, they are trivially storable, resumable, and cheap (a basis is `total_vars
 bound-change list is `depth` entries).
 
 The optional branch variable is a correctness distinction: the root has no creating branch
-and therefore must never record a pseudocost observation. Every child stores the variable
-and direction that created it.
+and therefore must never record a pseudocost observation. Every child of a variable branch
+stores the variable and direction that created it; children of a special-ordered-set branch
+carry `None` too, since a set fixing is not a per-variable statistic.
 
 `MipState` is the complete, resumable search:
 
@@ -335,6 +343,55 @@ tolerance (`1e-7·|rhs|`) evaluates to ~100 on a 1e9-scale row and would swallow
 violations the guard exists to catch. A false *rejection* from the absolute check is benign
 (extra exact-fixing branching); a false acceptance would be a wrong answer.
 
+### 5.4b Special ordered sets: candidates and branching
+
+A solved node is a *candidate* (`is_candidate`) when every integer variable is within
+`int_tol` of an integer AND every special ordered set holds on the **candidate vector**:
+integer variables rounded, and set members with `|x| ≤ tolerances.feasibility` — or whose
+current bounds are `[0, 0]` — snapped to exactly `0.0` (`candidate_values`). The same vector
+feeds `try_adopt_incumbent`, so the row guard validates the snapped point and the user reads
+exact zeros; models without sets see only the rounding.
+
+Branching is one decision (`choose_branch`): a fractional integer variable first, chosen by
+pseudocost as before, otherwise the first violated set. Integer branching keeps priority
+because per-variable branching plus pseudocost learning measured better than set branching
+on packing rows; set branching is only what remains when no integrality is left to exploit.
+
+A violated set splits Beale–Tomlin style (`mip::sos`). With the counted nonzero members at
+positions `a..=b` and the weighted mean of their weights choosing `r`: SOS1 takes
+`a ≤ r < b`, the left child zeroes positions `> r` and the right child `≤ r`; SOS2 takes
+`a < r < b`, the left child zeroes `> r` and the right child `< r`, position `r` staying
+free in both. Either way the left child zeroes `b` and the right child zeroes `a`, so both
+exclude the current point. Two rules make this terminate independently of tolerances:
+
+- A member whose current bounds are `[0, 0]` is zero *by definition* and is never counted
+  nor re-fixed. Every child therefore fixes at least one member that was still free, and the
+  number of free members strictly decreases along any path.
+- Zero-fixings use the node's CURRENT bounds, `(max(lo, 0), min(hi, 0))`, appended to the
+  cumulative list (later wins). A member whose bounds exclude zero yields crossed bounds and
+  that child is pruned by `apply_node_bounds` without an LP; a member already tightened by an
+  earlier integer branch keeps that tightening instead of being widened back.
+
+Snapping is a best effort, not a precondition: a member of `1e-7` against a breakpoint of
+`10` moves its row by `2e-6`, so the snapped vector can fail the row guard although the LP
+point holds it. `try_adopt_incumbent` then falls back to the exact point (only `[0, 0]`
+members snapped), which must satisfy every set exactly to be adopted; the incumbent may
+therefore carry a member at `|x| ≤ tolerances.feasibility` instead of an exact zero.
+
+After adoption, `process_integral_candidate` re-runs `choose_branch` with `int_tol = 0` and the
+simplex pivot tolerance `EPS` as zero threshold: exactly as a rounded integer keeps the node
+open, a member the simplex can distinguish from zero that still shares its set with another
+nonzero member keeps the node open until the children fix it exactly. A set whose single
+nonzero member is below the threshold is closed with that member snapped — no "≠ 0" child
+exists as a bound — which is feasible within `tolerances.feasibility` by the row guard, the
+same contract as integer rounding.
+
+Members need finite bounds because of §5.1's unboundedness classification: it proves
+unboundedness from one feasible point plus the relaxation's ray, and a ray has zero
+components on bounded variables, so it cannot switch a member on. With an unbounded member
+the ray could, and the proof would be wrong (`x − y = 0`, SOS1 `{x, y}`, minimize `−x − y`:
+the relaxation is unbounded but the only set-feasible point is the origin).
+
 ### 5.5 Node selection, bound, and gap
 
 - **Plunging DFS with best-bound jumps** (`pop_node`): while the last processed node
@@ -465,6 +522,8 @@ let mut problem = Problem::new(OptimizationDirection::Minimize);
 let x = problem.add_integer_var(3.0, (0, 10));
 let y = problem.add_var(4.0, (0.0, 10.0));
 problem.add_constraint(&[(x, 1.0), (y, 2.0)], ComparisonOp::Ge, 5.0);
+let z = problem.add_var(1.0, (0.0, 10.0));
+problem.add_sos1_constraint(&[(y, 1.0), (z, 2.0)]); // at most one of y, z nonzero
 
 let mut options = SolveOptions::default();
 options.time_limit = Some(Duration::from_secs(10));
@@ -517,7 +576,7 @@ Two homes, by audience:
 |---|---|---|
 | `int_tol` | `1e-6` | "is this LP value integral?" — a rounded feasible point may be adopted, but branching continues until its LP point is exact. Must be finite and in `[0, 0.5)`. |
 | `mip_gap` | `0.0` | early-stop proof quality (relative gap) |
-| `tolerances.feasibility` | `1e-7` **absolute** | the rounded-incumbent guard and the post-edit incumbent pre-filter (§5.4 explains why absolute) |
+| `tolerances.feasibility` | `1e-7` **absolute** | the rounded-incumbent guard and the post-edit incumbent pre-filter (§5.4 explains why absolute); also the zero threshold for special-ordered-set members (§5.4b) |
 | `tolerances.integrality_rounding` | `1e-5` | integrality check in the edit pre-filter; `var_value`'s sanity assert pins the *default* deliberately |
 | `tolerances.prune_epsilon` | `1e-9` | the pruning cutoff slack |
 
@@ -641,9 +700,10 @@ incumbent dives a specific home:
 - **Primal heuristics.** A bounded dive can run after a valid root or node LP. It must restore
   the search bounds/basis bookkeeping and submit a completed solver point through
   `try_adopt_incumbent(state)`; heuristic candidates receive no validation shortcut.
-- **SOS1/SOS2.** Detection fits naturally in presolve. `Node.bound_changes` already supports
-  multi-variable bound decisions, but propagation and basis bookkeeping must still obey the
-  node-visit contracts above.
+- **Implicit SOS1 detection.** Explicit sets are implemented (§5.4b). Recognising
+  `Σ binaries ≤ 1` rows as sets fits naturally in presolve, but a measured attempt at set
+  branching on such rows was slower than variable branching with pseudocosts; any detector
+  must be re-measured rather than assumed.
 - **Basis aging / node memory**, **heap-based best-bound selection**, and an anti-cycling
   fallback remain independent engine/search-policy improvements; see §10.
 

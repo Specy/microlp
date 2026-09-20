@@ -23,6 +23,7 @@ The sections below show how to use microlp directly.
 
 * Pure Rust. Runs on WebAssembly.
 * Real, integer and boolean variables.
+* Special ordered sets (SOS1 and SOS2), for example for piecewise-linear functions.
 * Time limits and MIP gap, with possibility to edit and resume the solve.
 * Warm starts from a known solution.
 * Handles problems with hundreds of thousands of variables and constraints.
@@ -84,6 +85,40 @@ let mut lhs = LinearExpr::empty();
 lhs.add(x, 1.0);
 lhs.add(z, -3.0);
 problem.add_constraint(lhs, ComparisonOp::Eq, 0.0);
+```
+
+### Special ordered sets
+
+A special ordered set restricts which of its members may be nonzero at the
+same time. `add_sos1_constraint` allows at most one nonzero member;
+`add_sos2_constraint` allows at most two, and they must be adjacent in the
+order given by the weights. Members can be real, integer or boolean and must
+have finite bounds. The sets are enforced by branching, so a problem with a
+special ordered set goes through branch & bound even without integer
+variables.
+
+The classic use of SOS2 is a piecewise-linear function without binary
+variables: with breakpoints `t_i`, values `f(t_i)`, and convex-combination
+variables `λ_i` summing to one, an SOS2 over the `λ_i` (weights `t_i`) keeps
+`x = Σ t_i λ_i` on a single segment.
+
+```rust
+use microlp::{ComparisonOp, OptimizationDirection, Problem};
+
+// Minimize the nonconvex piecewise-linear f with breakpoints t = 0, 1, 2, 3
+// and values f(t) = 0, 3, 1, 4 at x = 1.5.
+let t = [0.0, 1.0, 2.0, 3.0];
+let f = [0.0, 3.0, 1.0, 4.0];
+let mut problem = Problem::new(OptimizationDirection::Minimize);
+let lambda: Vec<_> = (0..4).map(|i| problem.add_var(f[i], (0.0, 1.0))).collect();
+problem.add_constraint(lambda.iter().map(|&l| (l, 1.0)), ComparisonOp::Eq, 1.0);
+problem.add_constraint(lambda.iter().zip(t).map(|(&l, ti)| (l, ti)), ComparisonOp::Eq, 1.5);
+problem.add_sos2_constraint(lambda.iter().zip(t).map(|(&l, ti)| (l, ti)));
+
+// Without the set the solver would mix λ_0 and λ_2 (f = 0.75); the set forces
+// the segment [1, 2], where f(1.5) = 2.
+let solution = problem.solve().unwrap().into_solution().unwrap();
+assert!((solution.objective() - 2.0).abs() < 1e-9);
 ```
 
 ## Solving and reading the solution
