@@ -281,4 +281,44 @@ mod tests_feasibility {
             xstar: vec![0.0, 0.0, 0.0],
         });
     }
+
+    /// The third counterexample, and the one that showed a continuous var's
+    /// bound tolerance had to be capped by its rows just as an integer var's
+    /// already was (see [`crate::solver::structural_tol`]).
+    ///
+    /// The engine used to return `x0 = -5.0000000000000004e-8`. That is inside
+    /// `x0`'s bound tolerance — its lower bound is `-0.0` and a continuous var
+    /// was allowed the full `1e-7` there — but row 1 is `-2 x0 <= 0`, so the
+    /// slack reached the row multiplied by two, as `1.0000000000000001e-7`
+    /// against a row tolerance of exactly `1e-7`. Over by one ulp, and the
+    /// acceptance guard rejected the engine's own answer as an `InternalError`.
+    /// Now `x0`'s tolerance is capped at the share of the row's budget its
+    /// coefficient can carry, so the point is never produced in the first place.
+    #[test]
+    fn property_counterexample_with_bound_slack_one_ulp_over_the_row_budget() {
+        use crate::tests::oracle::{assert_solves_within_contract, Model, Row, Var};
+        let real = |obj, lo, hi| Var {
+            obj,
+            lo,
+            hi,
+            integer: false,
+        };
+        assert_solves_within_contract(&Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![real(1.0, -0.0, 1.0), real(-1.0, -1.0, 1.0)],
+            rows: vec![
+                Row {
+                    terms: vec![(0, -200.0), (1, 1e-5)],
+                    op: ComparisonOp::Eq,
+                    rhs: 0.0,
+                },
+                Row {
+                    terms: vec![(0, -2.0)],
+                    op: ComparisonOp::Le,
+                    rhs: 0.0,
+                },
+            ],
+            xstar: vec![0.0, 0.0],
+        });
+    }
 }

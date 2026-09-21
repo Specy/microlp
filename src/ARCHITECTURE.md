@@ -17,18 +17,24 @@ them:
 
 ```mermaid
 graph TD
-    subgraph API["Public API (src/lib.rs)"]
-        P[Problem] -->|solve / solve_with| S[Solution]
-        O[SolveOptions + Tolerances]
+    subgraph API["Public API (crate root)"]
+        P[problem.rs: Problem] -->|solve / solve_with| S[solution.rs: Solution]
+        O[outcome.rs: SolveOutcome<br/>expr.rs / error.rs]
     end
     subgraph MIP["MIP layer (src/mip/)"]
-        D[driver: mod.rs<br/>search loop, MipState] --> B[branching.rs<br/>pseudocosts]
-        D --> N[node.rs<br/>plain-data tree nodes]
-        D --> PR[params.rs<br/>internal constants]
+        D[driver: mod.rs<br/>lifecycle, entry points] --> SE[search.rs<br/>nodes, branching, loop]
+        D --> ST[state.rs<br/>MipState]
+        D --> O2[options.rs<br/>public option types]
+        SE --> B[branching/<br/>pseudocosts]
+        SE --> N[node.rs<br/>plain-data tree nodes]
+        SE --> PR[params.rs<br/>internal constants]
     end
-    subgraph LP["LP engine (src/solver.rs)"]
-        SV[Solver: bounded-variable simplex] --> LU[lu.rs: LU factorization]
-        SV --> SP[sparse.rs / ordering.rs]
+    subgraph LP["LP engine (src/solver/)"]
+        SV[mod.rs: Solver<br/>bounded-variable simplex] --> TOL[tolerances.rs<br/>the tolerance model]
+        SV --> SC[scaling.rs<br/>row/column scaling, seeding]
+        SV --> BA[basis.rs<br/>BasisSolver, pivots]
+        SV --> LU[lu/: LU factorization]
+        SV --> SP[sparse/ · ordering/]
     end
     P --> D
     D -->|one persistent instance| SV
@@ -55,12 +61,19 @@ Three principles shape everything:
 
 | File | Responsibility |
 |---|---|
-| `src/lib.rs` | Public API: `Problem`, `SolveOutcome`, `Solution`, `InterruptedSolve`, and re-exports of solve options, statuses, reasons, and statistics. Owns solve/edit timing and the `Problem::build_solver` model-to-engine seam. |
-| `src/solver.rs` | The simplex engine (`Solver`): bounded-variable primal/dual simplex, shared row preparation, basis management, and the small contract surface the MIP layer uses. |
-| `src/lu.rs`, `src/sparse.rs`, `src/ordering.rs` | LU factorization with eta-file updates, sparse containers, fill-reducing ordering. |
-| `src/mip/mod.rs` | The branch & bound driver: `MipState`, root initialization, single-node visits, outer search policy, interruption/resume, candidates, warm starts, edits, and bound/gap accounting. |
+| `src/lib.rs` | Crate root: the module wiring and the `pub use` re-exports that define the public API's paths. Every public item lives in a sibling module and is re-exported here, so `microlp::Problem` and friends are unaffected by where the code sits. |
+| `src/problem.rs` | `Problem`, `VarDomain`, and the solve entry points. Owns solve/edit timing and the pure-LP model-to-engine seam in `Problem::solve_with` (presolve, then `Solver::try_new`). |
+| `src/solution.rs`, `src/outcome.rs` | `Solution` (a validated assignment, its read-out and its post-solve edits) and `SolveOutcome` / `InterruptedSolve` (what a call returns and how it is resumed). |
+| `src/expr.rs`, `src/error.rs` | The model vocabulary (`OptimizationDirection`, `Variable`, `LinearExpr`, `ComparisonOp`) and the `Error` type. |
+| `src/presolve/` | Presolve: activity-based bound tightening, forcing / singleton / redundant-row elimination, variable fixing and substitution, and in MIP mode integer bound rounding, binary coefficient tightening and dual fixing — all on the original variable indices, so there is no postsolve (§2, §7). `mod.rs` holds the contract and the entry point, `work.rs` the reduction passes, `model.rs` the data, `params.rs` the constants. |
+| `src/solver/` | The simplex engine. `mod.rs` is `Solver` itself (bounded-variable primal/dual simplex, basis management, and the small contract surface the MIP layer uses); `tolerances.rs` is the tolerance model of §7; `scaling.rs` turns a user problem into the scaled representation and seeds the starting vertex; `basis.rs` is the basis inverse and the pivot descriptions. |
+| `src/lu/`, `src/sparse/`, `src/ordering/` | LU factorization with eta-file updates, sparse containers, fill-reducing ordering (`ordering/colamd.rs`, `ordering/matching.rs`, `ordering/cols_queue.rs`). |
+| `src/mip/mod.rs` | The branch & bound lifecycle: building a search from a `Problem`, starting / resuming / re-editing it, bound and gap accounting, and validating a candidate against the user's original rows. |
+| `src/mip/search.rs` | The search itself: node visits, warm starts, branching, pruning, and the outer search loop. |
+| `src/mip/state.rs` | `MipState` (the complete, resumable search state) and `MipRun`. |
+| `src/mip/options.rs` | The public option and report types: `SolveOptions`, `ResumeOptions`, `Tolerances`, `Stats`, `SolutionStatus`, `TerminationReason`. |
 | `src/mip/node.rs` | `Node` (plain-data tree node) and `effective_bounds` (bound-change collapsing). |
-| `src/mip/branching.rs` | Integrality checks and branch-variable selection (pseudocosts). |
+| `src/mip/branching/` | Integrality checks and branch-variable selection (pseudocosts). |
 | `src/mip/params.rs` | Named, documented internal constants (see §7). |
 | `tests/suite/` | The problem-based correctness suite (see §9) — the safety net for all of this. |
 
@@ -82,17 +95,36 @@ Two normalizations happen at the boundary and hold everywhere inside:
   with `s ∈ [0, +∞)`; `≥` gives `s ∈ (−∞, 0]`; `=` gives `s ∈ [0,0]`. So the `Solver`'s
   variable universe is `num_vars` *structural* variables followed by one slack per row
   ("total vars"), and every constraint is an equality against the basis matrix. A row's
-  original sense is recoverable from its slack's bounds — `Solver::check_constraints`
+  original sense is recoverable from its slack's bounds — `Solver::first_violated_row`
   exploits exactly this.
-- **Rows are equilibrated by powers of two.** Before the simplex engine sees a model, each
-  non-empty row is multiplied by an exact power-of-two factor that brings its largest
-  structural coefficient near one. This prevents equivalent rows at `1e-6` and `1e6` scales
-  from producing structurally necessary tableau coefficients below the absolute pivot
-  threshold, which would otherwise mis-declare a feasible model infeasible.
-  `Solver::check_constraints` multiplies the caller's absolute feasibility tolerance by the
-  same per-row factor, so the user-space acceptance contract is unchanged. Pure-LP and MIP
-  models are equilibrated alike (the exactness of power-of-two scaling means the reported
-  optimum is unaffected; only internal conditioning improves).
+- **The matrix is scaled by powers of two, rows and columns.** Before the simplex engine
+  sees a model, `column_scales` derives a power-of-two factor per structural column (the
+  rounded geometric mean of the column's extreme coefficients, iterated against row factors
+  in the Curtis–Reid manner; skipped entirely when every coefficient already lies within
+  `[1/8, 8]`, and never for a fixed column), and each row is then equilibrated so that its
+  largest coefficient of a var that can move lies in `[1, 2)`. The engine works on
+  `x'_j = x_j / s_j`; powers of two mean no datum is rounded, integrality of `s_j x'_j` is
+  exact, and a bound change in user units maps to exactly one internal bound. Everything
+  that crosses the `Solver` boundary — values, bounds, the objective, the row checks — is
+  converted, so the MIP layer and the public API only ever see user units. A coefficient
+  that is tiny only because its row or column is written in awkward units thereby becomes
+  of order one, which is what makes the pivot tolerances below meaningful.
+
+- **Presolve runs before the engine sees the model** (`src/presolve/`, on by default,
+  `SolveOptions::presolve`). It never changes the variable set: a variable it removes is
+  fixed by `lo == hi` bounds (the engine prices such vars out natively) and its value is
+  substituted out of every row for presolve's own deductions; rows may be dropped or
+  rewritten freely because nothing outside the `Solver` addresses them by index. That is
+  what makes a postsolve layer unnecessary — solution read-out, resume, warm starts and
+  post-solve edits all work off original indices, and the MIP search's root bounds are the
+  presolved bounds. Surviving rows are emitted as the user wrote them, fixed terms included
+  (a row keeps the tolerance of its full magnitude only with them in it); only a row whose
+  coefficients were rewritten is rebuilt. `Mode::Lp` (the pure-LP path) applies only
+  feasible-set-exact reductions, so the live solver stays sound under every later edit;
+  `Mode::Mip` adds reductions that preserve the integer feasible set or merely some
+  optimum, sound because MILP edits re-solve from the untouched base problem and incumbents
+  are validated against the original rows. Every presolve decision is made against the
+  engine's tolerance contract (§7).
 
 `prepare_row` is the single row-normalization contract used by both `Solver::try_new` and
 incremental `Solver::add_constraint`. It classifies empty rows, computes the power-of-two
@@ -102,7 +134,7 @@ versus extending a live matrix and repairing the current basis.
 
 ---
 
-## 3. The LP engine (`src/solver.rs`)
+## 3. The LP engine (`src/solver/`)
 
 The simplex core is the minilp lineage: a **bounded-variable
 revised simplex** with both primal and dual iterations, steepest-edge pricing, the Harris
@@ -158,11 +190,19 @@ scratch, LU refactorized, feasibility flags recomputed honestly. Two contracts m
   load. `slack_basis()` (all slacks basic = identity basis matrix) always loads successfully
   and is the designated recovery everywhere.
 
-**`check_constraints(values, tol)` / `objective_of(values)`** — evaluate an explicit
-structural-variable vector against the stored, scaled rows (sense recovered from slack
-bounds) within the correspondingly scaled **absolute** tolerance, and compute its objective.
-Non-finite row activity is infeasible. These exist for the rounded-incumbent guard (§5.4)
-and are deliberately independent of the current basis values.
+**`reported_values()`** — the verified point in user units, fixed vars at their value: what
+every read-out and every candidate starts from.
+
+**`first_violated_row(values)` / `first_violated_bound(values)` / `objective_of(values)`** —
+evaluate an explicit structural-variable vector (user units) against the stored rows (sense
+recovered from slack bounds) and bounds within the **absolute** user tolerance floored at
+the round-off of the row or bound (`row_tolerance`, through `outside`), and compute its
+objective. Non-finite row activity is infeasible. These are the contract check: the
+rounded-incumbent guard (§5.4) and the pure-LP path (`SolveOutcome::from_lp_stop`) apply
+them. They evaluate a row exactly as the engine's own verification does (`row_activity`,
+term for term in the same order), so a point the engine has verified passes them by
+construction, and they are independent of the current basis values, so a rounded candidate
+is judged on its own merits.
 
 ---
 
@@ -209,13 +249,13 @@ incremental editing cheap).
 
 ---
 
-## 5. The branch & bound search (`src/mip/mod.rs`)
+## 5. The branch & bound search (`src/mip/`)
 
 ### 5.1 Lifecycle
 
 ```mermaid
 flowchart TD
-    A[run: build_state via Problem::build_solver] --> L{{search_loop}}
+    A[run: build_state — presolve, then Solver::try_new] --> L{{search_loop}}
     L --> R[initialize_root]
     R --> RS[initial_solve root relaxation]
     RS -->|Limit| I1((Interrupted<br/>resume re-enters initialize_root))
@@ -281,16 +321,15 @@ cost of the visit: **is the solver already sitting at this node's parent's optim
   search returns `Interrupted`. Nothing uses the coherent but non-optimal state as a solved
   node: the next visit starts from its own bounds + basis data.
 
-One more valve lives inside the engine itself, in `restore_feasibility` (the dual phase-1):
-"no eligible entering column for a violated row" proves infeasibility only in exact
-arithmetic. Deep in an eta-file chain, accumulated round-off can promote a phantom bound
-violation into a leaving row whose (equally drifted) pivot row blocks every candidate — a
-*false* `Infeasible`. Before an infeasibility declaration can stand, the engine refactorizes
-the basis, recomputes basic values from the original data, and re-examines the row: a
-phantom violation dissolves, while a real infeasibility survives. The valve is armed once
-per stall and any successful pivot re-arms it, so it cannot loop. `EPS` remains tight
-because the big-M correctness models require basic integer values to resolve sharply onto
-their bounds (see the `EPS` docs in `solver.rs`).
+Inside the engine, `run_phases` alternates the dual phase (`restore_feasibility`) and the
+primal phase (`optimize`) until a state passes verification (§7): a phase's own exit test
+runs on incrementally updated numbers, so a phase may end on drifted values, and only a
+verified state is reported as `Finished`. One valve lives in `restore_feasibility`: "no
+eligible entering column for a violated row" proves infeasibility only in exact arithmetic,
+so before an infeasibility declaration can stand the engine rebuilds (fresh factorization,
+values, reduced costs) and re-examines the row; a phantom violation dissolves, a real one
+survives. The valve is armed once per stall and any successful pivot re-arms it, so it
+cannot loop.
 
 ### 5.4 Incumbents and the rounded-feasibility guard
 
@@ -300,8 +339,8 @@ rounds integer variables and applies one validation funnel:
 
 1. `candidate_variables_feasible` rejects malformed lengths, non-finite values, invalid
    bounds, bound violations, and domain violations.
-2. `Solver::check_constraints` validates the vector against the active solver's scaled rows
-   using the correspondingly scaled absolute `Tolerances::feasibility` (default `1e-7`).
+2. `Solver::first_violated_row` validates the vector against the rows within the absolute
+   `Tolerances::feasibility` (default `1e-7`) floored at each row's round-off (§7).
 3. `objective_of` must produce a finite objective before the incumbent can change.
 
 Post-edit warm-start filtering deliberately remains separate: `incumbent_feasible` checks
@@ -320,10 +359,10 @@ tolerance. The guard makes this impossible to adopt:
   the proof.
 - Guard **fails** → do not adopt; **branch on the offending below-tolerance variable**
   (children `⌊v⌋` / `⌊v⌋+1` fix it exactly, and the dive resolves the truth).
-- Degenerate fallback: if every integer variable is *exactly* integral yet the check failed,
-  retry once from the all-slack basis. This removes eta-chain drift on big-M rows; if the
-  independently checked point is still invalid, return an internal error rather than
-  force-accepting a potentially infeasible answer.
+- If every integer variable is *exactly* integral yet the check failed, that is a
+  contradiction — the engine reported `Finished` only after verifying the same point through
+  the same evaluation, with half the contract to spare — and it is returned as an internal
+  error rather than force-accepted.
 
 During zero-objective unboundedness classification, the same funnel runs first; only a valid
 integer point returns `Err(Unbounded)`. If classification is interrupted before an incumbent
@@ -355,7 +394,7 @@ violations the guard exists to catch. A false *rejection* from the absolute chec
   `ε = Tolerances::prune_epsilon` (default 1e-9), applied twice per node: against the stored
   parent bound *before* any LP work, and against the fresh objective after.
 
-### 5.6 Pseudocost branching (`src/mip/branching.rs`)
+### 5.6 Pseudocost branching (`src/mip/branching/`)
 
 The driver learns **pseudocosts**: per variable and direction, the average objective
 degradation per unit of fractionality observed across solved child nodes.
@@ -429,8 +468,8 @@ limited re-solve remains typed explicitly.
 
 Timing is centralized without hiding the entry points' different policies:
 
-- A pure LP's initial timer starts before `Problem::build_solver`, so construction and the
-  initial simplex solve share one deadline. `SolveOutcome::resume_with` uses its explicitly
+- A pure LP's initial timer starts before presolve and `Solver::try_new`, so construction and
+  the initial simplex solve share one deadline. `SolveOutcome::resume_with` uses its explicitly
   supplied fresh budget; LP edits use the current operation time limit. `timed_lp_call` always accumulates
   elapsed time, including calls that return an error.
 - A MILP's initial run and each post-edit rebuild use its `SolveOptions`. `resume_with`
@@ -515,22 +554,116 @@ Two homes, by audience:
 
 | Knob | Default | Gates |
 |---|---|---|
+| `presolve` | `true` | run the reductions of `src/presolve/` before the solve (§2); off, the engine gets the model as written |
 | `int_tol` | `1e-6` | "is this LP value integral?" — a rounded feasible point may be adopted, but branching continues until its LP point is exact. Must be finite and in `[0, 0.5)`. |
 | `mip_gap` | `0.0` | early-stop proof quality (relative gap) |
 | `tolerances.feasibility` | `1e-7` **absolute** | the rounded-incumbent guard and the post-edit incumbent pre-filter (§5.4 explains why absolute) |
 | `tolerances.integrality_rounding` | `1e-5` | integrality check in the edit pre-filter; `var_value`'s sanity assert pins the *default* deliberately |
 | `tolerances.prune_epsilon` | `1e-9` | the pruning cutoff slack |
 
-**Internal — `src/mip/params.rs` and `src/solver.rs` consts (each documented at its
+`tolerances.feasibility` reaches presolve and the engine: `Problem::solve_with` and the MIP
+`build_state` pass it to `presolve` and `Solver::try_new`, the engine holds every row to it
+(see below) and presolve decides against it, so what presolve assumes, what the engine
+reports and what the guard accepts are the same contract.
+
+**Internal — `src/mip/params.rs` and `src/solver/tolerances.rs` consts (each documented at its
 definition):** `SCORE_EPS`, `PSEUDOCOST_INIT_EPS`, `BRANCH_FRAC_GUARD` (all `1e-6`),
 `GAP_DENOM_GUARD` (`1e-10`), `HINT_BOUNDS_SLACK` (`1e-9`), `DEADLINE_CHECK_INTERVAL`
-(`1000` pivots), `LU_STABILITY_THRESHOLD` (`0.1`), and the simplex pivot tolerance
-`EPS` (`1e-10`) — the one number the whole engine's float comparisons are built on.
+(`1000` pivots), `LU_STABILITY_THRESHOLD` (`0.1`), and the engine's tolerance model in
+`solver/tolerances.rs`, which is one rule applied to three kinds of comparison — every tolerance is
+either the user's contract or a property of the arithmetic, and every comparison of a
+computed quantity is floored at that quantity's round-off:
 
-The layering rule: `EPS` decides *simplex* questions (is this coefficient zero, is this
-value at its bound); `int_tol` decides *integrality* questions; `feasibility` decides
-*solution acceptance*; `prune_epsilon` decides *tree* questions. They are close in
-magnitude, but govern distinct layers and must not be conflated.
+| Comparison | Tolerance | Constants |
+|---|---|---|
+| Is a basic slack (row) within its bounds? | `slack_tol`: the engine's share (`ROW_BUDGET_SHARE`, ½) of the contract `row_tolerance(feasibility × r, m)` in the row's scaled units, at the row's magnitude `m = |b| + Σ|a_j x_j|` at the current values (refreshed whenever the rows are checked). The other half is the reserve: for the snap of an integer or fixed var, and for evaluating the row in another order of operations. | `ROUNDOFF_FLOOR = 1e-14`, `ROW_BUDGET_SHARE = 0.5` |
+| Is a structural var within / at its bounds? | `structural_tol`: the user contract in user units, but never more than any of its rows can absorb when the value is snapped to the bound (`snap_budget`: the row's reserve over the var's scaled coefficient, minimised over its rows), floored at the round-off of the bound magnitude. One rule for every var: it keeps a big-M row within contract when its binary is rounded, and a fixed var's report at its value within the rows presolve substituted it out of. | |
+| Is a reduced cost zero? | `dual_tol`: `EPS` floored at the round-off of `|c_j| + Σ|a_ij y_i|`, refreshed with the multipliers. | `EPS = 1e-10` |
+| Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it (`ENTRY_ROUNDOFF` relative to the larger of its own terms and the row's largest entry), and at least `PIVOT_REL_TOL` of the largest genuine entry among the vars that could enter (rows that could block, in the primal test). | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7` |
+| Do the row and column computations of the pivot element agree? | to `PIVOT_AGREEMENT_TOL` relatively or to `ENTRY_ROUNDOFF` of the computations' scale; else rebuild (stale factorization) or exclude the entry as noise (fresh one). | `PIVOT_AGREEMENT_TOL = 1e-7` |
+| Is the LU pivot column singular? | eligible part below `LU_SINGULAR_REL` of the column's largest transformed entry. | `= ROUNDOFF_FLOOR` |
+
+Two rules complete the model. **Absorption:** when no var can enter a violated row's pivot
+regularly, a non-basic continuous var or slack may enter by crossing its bound (or its
+fixed value) by no more than its own tolerance — "at a bound" means within tolerance
+everywhere, so it is still at its bound afterwards; this is how a round-off-level violation
+that a tightly held var cannot carry is handed to a row or var that can. Integer vars never
+absorb. **Verified termination:** a phase reports `Finished` only after `verify_primal` and exact
+reduced costs (recomputed only when pivots have updated them incrementally since); a dual
+infeasibility whose only primal step is degenerate and would land the entering var outside
+its tolerance is not an improving direction (`PivotChoice::Unexploitable`). `verify_primal`
+runs `check_rows`: every basic slack is re-derived from its row, `s = b − Σ a_j x_j` at the
+current structural values, so that a row's violation lives in its slack's value where the
+dual simplex sees it; the slack tolerances are refreshed from the rows' magnitudes; and the
+residual of every row whose slack is non-basic (how far the basic structural values are from
+solving it) must lie within the row's tolerance, else the values are refined through the
+factorization, then through a fresh one, then reported as a loud `InternalError` (the basis
+cannot represent its vertex). Values within tolerance are not refined: the contract asks no
+more, and moving last bits steers the branch & bound. The objective is always recomputed from
+the values. What is reported (`reported_values`) is the verified point itself, with fixed
+vars at their value; the checks at the boundary (`first_violated_row`, the MIP guard) repeat
+`check_rows`' evaluation of a row term for term on that point (`row_activity`), against the
+full contract, so a verified point passes them with the reserve to spare. Periodic
+refactorization (`refactorize`) renews the factorization and, once per full basis turnover
+of pivots, checks the rows and recomputes the values if they drifted; the eta file stores
+`1/pivot`. A recompute is not a verification: on an ill-conditioned basis a solve through
+the factorization can leave a residual above a row's tolerance, so recomputed values stay
+unverified until the next phase exit checks and, if needed, refines them.
+
+**Presolve** (`src/presolve/`, module docs) makes its decisions with the same model, in
+user units: a row is held to the engine's *budget*, `ROW_BUDGET_SHARE` of
+`row_tolerance(feasibility, m)` at the magnitude `m` of the corner the decision is about
+(never over the whole box, so a bound of `f64::MAX` cannot inflate a tolerance); a
+continuous var may sit outside its emitted bounds by its bound tolerance, so every activity
+range is widened by `Σ|a_j|·bound_tol_j` before a verdict is drawn or a row dropped;
+equality (a forcing row) is judged within `ROUNDOFF_FLOOR` of the sum; a bound implied by a
+row is relaxed by the row's budget over the coefficient, so it never cuts a point the engine
+may return — a tiny coefficient is thereby a weak witness, exactly as the engine treats it.
+A row becomes bounds only where a bound describes it at least as well as the engine would
+hold the row: forcing rows are judged over the emitted bounds, require every term's range to
+be resolvable above the row's round-off (a term below it is invisible to the row and cannot
+be forced) and fix vars at those exact values, a singleton row is converted only when the
+engine's bound tolerance keeps the row
+within budget or when it fixes the var, and a conversion is skipped when the round-off it
+moves into the var, amplified by the var's coefficient in another row, would exceed that
+row's budget (the two rows disagree at the level of their own round-off; only the simplex,
+which balances both, resolves that). Infeasibility is declared only when no point the
+engine could accept exists.
+
+The layering rule: the engine's tolerances decide *simplex* questions; `int_tol` decides
+*integrality* questions; `feasibility` is the contract presolve, the engine and *solution
+acceptance* all hold to; `prune_epsilon` decides *tree* questions.
+
+What makes this one contract rather than several checks: the engine, the MIP guard, the
+pure-LP validation and presolve share `row_tolerance` (the rule), `bound_tolerance` (its
+instance for a var's bounds) and `outside` (the one comparison, written the way the engine
+tests a basic var, `value < lo − tol || value > hi + tol`, which in `f64` is not the same
+test as `value − hi > tol`). The engine holds a row to half the contract and caps every var's
+bound tolerance by its rows' reserve, so the point it verifies passes the same evaluation at
+the boundary with the other half to spare. Each counterexample the property tests found
+before this model was a disagreement between two of those checks — a continuous var's bound
+slack reaching a row through a coefficient above one, a fixed var's drift reaching a row
+presolve had dropped, a residual counted once by the engine and once more by the guard — and
+each is pinned as a regression test (for example
+`property_counterexample_with_bound_slack_one_ulp_over_the_row_budget`).
+
+Known limitation: a feasible region reachable only through a pivot within the round-off
+of its row (coefficient chains spanning some twelve to fifteen orders of magnitude within
+one row and column) is beyond what the ratio test can resolve in `f64`: the entry is a few
+ulps of the row's largest and is rightly refused as noise, so the model is reported
+`Infeasible`. It is a limit of the LP engine whether or not the model has integer vars; a
+bound-flipping ratio test would resolve the pinned instance.
+
+This limitation is *pinned by a test*, not merely described. The exact model that trips it
+is committed in `src/tests/magnitudes.rs` as a `#[should_panic]` test named
+`..._is_a_known_limitation`: it passes while the limitation stands and **fails as soon as a
+change fixes it**, which is the signal to drop the attribute and keep the model as an
+ordinary regression test. The wide-coefficient MILP property in `src/tests/scaling.rs` that
+searches for more such models is `#[ignore]`d for the same reason (a random search cannot
+assert its own failure); run it with `cargo test --lib -- --ignored`. Two models were pinned
+this way before and turned out to be bugs, which the convention exposed as designed: a
+presolve forcing rule that fixed a var its row could not resolve, and a recompute of the
+basic values that counted as a verification. Both are ordinary regression tests now.
 
 ---
 
@@ -541,9 +674,11 @@ magnitude, but govern distinct layers and must not be conflated.
 | Root LP unbounded on a MILP | run a resumable zero-objective integer-feasibility search; any integer point proves `Unbounded`, exhaustion proves `Infeasible` |
 | Node LP infeasible | prune (correct) |
 | Node LP unbounded | impossible when the node is bounded → `InternalError` |
-| Singular LU or an exactly-integral candidate with guard-breaking drift | retry once from the slack basis; then propagate |
+| Singular LU during a node LP | retry once from the slack basis; then propagate |
+| Exactly-integral candidate failing the guard | `InternalError` (the engine verified the same point; see §5.4) |
+| Verified state unreachable (`MAX_PHASE_ROUNDS` alternations, or a basis that cannot represent its vertex) | `InternalError`, never an unverified optimum |
 | `load_basis` failure on a jump | load the slack basis (infallible) and solve the node from scratch |
-| Phase-1 stall (“no entering column”) | refresh the basis (fresh LU + recomputed values) and retry once per stall; declare `Infeasible` only if it survives the refresh |
+| Phase-1 stall (“no entering column”) | rebuild (fresh LU + recomputed values and reduced costs) and retry once per stall; declare `Infeasible` only if it survives the rebuild |
 | Deadline mid-LP | requeue the node unsolved; return `Interrupted` |
 | Limit with no incumbent | `SolveOutcome::Interrupted`; only reason, stats, and resume are exposed |
 | Search exhausted, no incumbent | `Err(Infeasible)` |
@@ -563,10 +698,12 @@ Three rings, innermost first:
 
 1. **Unit tests** in each module: the solver primitives (bound changes vs fresh solves,
    basis round-trips, slack-basis recovery), driver behaviors (optimum finding, infeasible
-   detection, deterministic node-limit interruption/resume, exact-exhaustion status), and
-   pseudocost/selection arithmetic. Several encode adversarially verified invariants
+   detection, deterministic node-limit interruption/resume, exact-exhaustion status),
+   pseudocost/selection arithmetic, and each presolve reduction with the tolerance policy
+   it follows (`src/presolve/`; `src/tests/presolve_api.rs` checks the reductions
+   end to end through the public API, edits and resumes included). Several encode adversarially verified invariants
    (e.g. the warm-start liveness test *fails if the hint wiring is disconnected*).
-2. **Public-API integration tests** (`src/tests/mip_api.rs`, `src/tests/resume.rs`):
+2. **Public-API integration tests** (`src/tests/mip_api/`, `src/tests/resume.rs`):
    status semantics, panics, sign handling, edit composition, warm starts, sliced resumes
    equal unlimited solves value-for-value.
 3. **The correctness suite** (`tests/suite`, `cargo test --release --test suite`) — a
@@ -619,18 +756,19 @@ error, but proving optimality there needs the phase-4 items below.
 
 ## 11. Extension points (rough order of payoff)
 
-The current seams give presolve, node propagation, reduced-cost fixing, root cuts, and
-incumbent dives a specific home:
+The current seams give node propagation, reduced-cost fixing, root cuts, and incumbent
+dives a specific home:
 
-- **Presolve and postsolve mapping.** `Problem::build_solver` is the single raw-model to
-  simplex boundary. A presolver belongs immediately before it and must return both the
-  transformed model and enough mapping data to reconstruct original variable values and
-  objectives. Pure-LP incremental edits either need reductions that remain valid under the
-  live edit API or a deliberate rebuild policy; they cannot silently reuse a stale mapping.
+- **More presolve.** `src/presolve/` keeps the variable set and works on original
+  indices (§2), so new reductions need no mapping layer — but a reduction that removed or
+  aggregated variables would, and it would have to stay valid under the live pure-LP edit
+  API or come with a deliberate rebuild policy. Any new reduction must decide against the
+  tolerance contract of §7 the way the existing ones do.
 - **Node propagation.** Propagation belongs inside `visit_node`, after target bounds are
   applied and before `solve_node_lp`. Deduced bounds must be stored on the `Node` so children
   inherit them, and `state.applied` must mirror every partial tightening even when a
-  contradiction prunes the node.
+  contradiction prunes the node. The activity arithmetic and its tolerance rules already
+  live in `src/presolve/`.
 - **Reduced-cost fixing.** This belongs after a node LP solves and before candidate/branch
   inspection. Any bound change requires a reoptimization before integrality or branching
   reads the solver values.

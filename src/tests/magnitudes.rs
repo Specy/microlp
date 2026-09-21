@@ -4,7 +4,17 @@
 //! every row within the documented tolerance, and every bound is finite, so
 //! `solve()` must return an optimal solution whose rows hold within that
 //! tolerance and whose objective is no worse than at `x*` — the contract in
-//! `oracle.rs`. All but the first fail today.
+//! `oracle.rs`.
+//!
+//! The fixtures pass, except the one marked KNOWN LIMITATION, which is
+//! `#[should_panic]`: it records an answer the engine gets wrong today, so
+//! that fixing it shows up as a FAILING test rather than passing unnoticed.
+//! When it fails, delete the attribute — the body already asserts the right
+//! answer — and it becomes an ordinary regression test. See §7 of
+//! `ARCHITECTURE.md` for the mechanism behind it. Two more fixtures were
+//! pinned the same way when they were found and turned out to be ordinary
+//! bugs (a presolve forcing rule and a skipped verification); they are plain
+//! regression tests now, which is exactly what the convention is for.
 
 #[cfg(test)]
 mod regression_tests {
@@ -280,5 +290,119 @@ mod regression_tests {
             (objective - 1e11).abs() <= 1e-6 * 1e11,
             "objective {objective:e}, expected 1e11 (x is bounded by the 1e-11 coefficient)"
         );
+    }
+
+    /// `x0` is pinned to `2^28` by an equality whose other coefficient is
+    /// `1e-7`, so one row's terms span fifteen orders of magnitude, and
+    /// `x* = [268435456, 0]` satisfies both rows exactly.
+    ///
+    /// Once pinned as a known limitation, this was a presolve bug: the row's
+    /// round-off is `5e-6` while `x1`'s whole term range is `2.5e-8`, so the
+    /// minimum activity equals the bound to round-off wherever `x1` sits. The
+    /// forcing rule read that as "every var at its extreme" and fixed `x1` at
+    /// `0.25`, which made row 1 (`-x1 = 0`) inconsistent; the engine solves
+    /// the model exactly with presolve off. Forcing now requires every term
+    /// to be resolvable above the row's round-off (`Work::terms_resolvable`).
+    ///
+    /// Found by the wide-coefficient LP property in `scaling.rs`; committed
+    /// here because that property's counterexamples otherwise live only in
+    /// the gitignored `.hegel/` corpus.
+    #[test]
+    fn wide_coefficients_pinning_a_variable_at_2e8() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![real(0.0, 268435455.0, 268435456.0), real(0.0, 0.0, 0.25)],
+            rows: vec![
+                row(&[(0, -1.0), (1, -1e-7)], ComparisonOp::Eq, -268435456.0),
+                row(&[(1, -1.0)], ComparisonOp::Eq, -0.0),
+            ],
+            xstar: vec![268435456.0, 0.0],
+        });
+    }
+
+    /// KNOWN LIMITATION (`ARCHITECTURE.md` §7). Five variables (one integer,
+    /// two fixed) under three rows whose coefficients run from `1e-8` to
+    /// `1e4`; `x* = 0` satisfies all three exactly, yet `solve()` answers
+    /// `Infeasible`, with presolve on or off. The start puts `x2` at its
+    /// lower bound `-1e6`, and the only tableau entry that could carry it back
+    /// to `0` is `1.5e-15` against a row maximum of `1.95`: eight ulps,
+    /// indistinguishable from round-off, so the ratio test rightly refuses
+    /// it. A bound-flipping ratio test would take the flip instead. The
+    /// integer var plays no part; the limit is the LP engine's.
+    ///
+    /// Found by the wide-coefficient MILP property in `scaling.rs`.
+    /// `#[should_panic]` records today's behaviour: the test is green while
+    /// the limitation stands and turns RED the moment a change fixes it —
+    /// then delete the attribute, since the body already asserts the right
+    /// answer.
+    #[test]
+    #[should_panic(expected = "solve() returned Infeasible on a feasible, bounded model")]
+    fn wide_coefficients_with_an_integer_variable_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(0.0, 0, 0),
+                real(0.0, 0.0, 0.0),
+                real(0.0, -1000001.0, 0.0),
+                real(0.0, 0.0, 1.0),
+                real(0.0, -1.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(3, 1000.0), (4, 1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(2, -1.0), (4, -1e-5)], ComparisonOp::Ge, -0.0),
+                row(
+                    &[(2, 1e-6), (3, -1e-8), (4, 10000.0)],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 0.0, 0.0],
+        });
+    }
+
+    /// Variable magnitudes are around `8e6` and row 1's terms reach `1.3e8`.
+    /// The exactly integral optimum the engine finds must be reported, not
+    /// rejected by its own feasibility guard as an `InternalError`.
+    ///
+    /// Once pinned as a known limitation, this was a bookkeeping bug in the
+    /// verified termination: the sixth dual pivot filled the eta file, the
+    /// periodic refactorization recomputed the basic values, and the
+    /// recompute marked them verified. `verify_primal` then skipped its
+    /// residual check although the recomputed values missed row 2 by four
+    /// times its tolerance, and the guard caught what verification should
+    /// have refined. A recompute no longer counts as a verification. Found
+    /// by the narrow-coefficient MILP property in `scaling.rs`.
+    #[test]
+    fn exactly_integral_optimum_at_1e8_is_verified_before_it_is_reported() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(-1.0, 0, 0),
+                real(-1.0, 0.0, 0.0),
+                real(1.0, 0.0, 68282.0),
+                real(1.0, 7962362.0, 8516698.0),
+                real(-1.0, 0.0, 0.0),
+                real(0.0, -1.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(3, 1.0), (5, -1.0)], ComparisonOp::Ge, 7962362.0),
+                row(
+                    &[(2, -0.1), (3, -16.25), (5, 1.0)],
+                    ComparisonOp::Ge,
+                    -129648946.5,
+                ),
+                row(
+                    &[(2, -0.5), (3, 0.15000000000000002), (5, -20.0)],
+                    ComparisonOp::Eq,
+                    1194354.3000000003,
+                ),
+                row(
+                    &[(2, 1.0), (3, -1.0), (5, -1.0)],
+                    ComparisonOp::Le,
+                    -7962362.0,
+                ),
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 7962362.0, 0.0, 0.0],
+        });
     }
 }

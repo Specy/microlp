@@ -2,307 +2,76 @@
 //!
 //! Owns exactly one [`Solver`] per search. Branching changes variable bounds in
 //! place.
+//!
+//! This file is the lifecycle: how a search is built from a [`Problem`], how it
+//! is started, resumed and re-edited, and how a candidate is judged against the
+//! user's original rows. The pieces beside it:
+//!
+//! * [`options`] — the public option and report types.
+//! * [`state`] — [`MipState`], the resumable state a search carries.
+//! * [`search`] — node visiting, branching and the search loop.
+//! * [`branching`] / [`node`] / [`params`] — pseudocosts, tree nodes, constants.
 
 pub(crate) mod branching;
 pub(crate) mod node;
+mod options;
 pub(crate) mod params;
+mod search;
+mod state;
 
-use crate::solver::{check_deadline, Deadline, Solver};
-use crate::{ComparisonOp, Error, OptimizationDirection, Problem, StopReason, VarDomain, Variable};
-use core::time::Duration;
-use node::{effective_bounds, Node};
+pub use options::{
+    ResumeOptions, SolutionStatus, SolveOptions, Stats, TerminationReason, Tolerances,
+};
+pub(crate) use state::{MipRun, MipState};
+
+use crate::solver::Solver;
+use crate::{ComparisonOp, Error, OptimizationDirection, Problem, VarDomain, Variable};
+use search::search_loop;
 use std::collections::BTreeMap;
 use web_time::Instant;
 
-/// Whether a usable solution is proven optimal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SolutionStatus {
-    /// The solver completed the optimality proof.
-    Optimal,
-    /// A valid incumbent is available, but exact optimality was not proven.
-    Feasible,
-}
-
-/// Why a solve or resume call returned.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TerminationReason {
-    /// The LP or branch-and-bound optimality proof completed.
-    ProvenOptimal,
-    /// The configured relative MIP gap was reached before exact proof completed.
-    MipGap,
-    /// The wall-clock budget for this call was exhausted.
-    TimeLimit,
-    /// The branch-and-bound node budget for this call was exhausted.
-    NodeLimit,
-}
-
-/// Options controlling a solve. Construct with [`SolveOptions::default`] and
-/// mutate the fields you need.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct SolveOptions {
-    /// Wall-clock budget for this call (`None` = unlimited). On expiry the search
-    /// and can be resumed.
-    pub time_limit: Option<Duration>,
-    /// Maximum number of branch & bound nodes to solve in this call
-    /// (`None` = unlimited). Deterministic alternative to `time_limit`; the
-    /// budget applies per call, so [`crate::SolveOutcome::resume`] reapplies it
-    /// as a fresh budget. The root relaxation does not count as a node.
-    pub node_limit: Option<u64>,
-    /// Relative MIP gap at which the search may stop with a feasible incumbent.
-    /// Such a stop reports [`SolutionStatus::Feasible`] and
-    /// [`TerminationReason::MipGap`]. Must be finite and non-negative. Default
-    /// `0.0` (prove exact optimality).
-    pub mip_gap: f64,
-    /// Integrality tolerance: a value within this distance of an integer counts
-    /// as integral. Default `1e-6`. A very loose `int_tol` mainly causes extra
-    /// exact-fixing branching rather than admitting an infeasible point.
-    /// Must be finite and in the half-open range `[0, 0.5)`.
-    pub int_tol: f64,
-    /// Optional (partial) starting assignment used to seed the incumbent.
-    /// An infeasible or incomplete hint is ignored. Default `None`.
-    pub warm_start: Option<Vec<(Variable, f64)>>,
-    /// Edit the tolerances used by the solver, most callers
-    /// should leave this at [`Tolerances::default`]; override an individual
-    /// field only once you understand the correctness/permissiveness
-    /// trade-off documented on it.
-    pub tolerances: Tolerances,
-}
-
-impl Default for SolveOptions {
-    fn default() -> Self {
-        Self {
-            time_limit: None,
-            node_limit: None,
-            mip_gap: 0.0,
-            int_tol: 1e-6,
-            warm_start: None,
-            tolerances: Tolerances::default(),
-        }
-    }
-}
-
-impl SolveOptions {
-    pub(crate) fn validate(&self) -> Result<(), Error> {
-        if !self.mip_gap.is_finite() || self.mip_gap < 0.0 {
-            return Err(Error::InvalidOptions(
-                "invalid SolveOptions.mip_gap: expected a finite non-negative value".to_string(),
-            ));
-        }
-        if !self.int_tol.is_finite() || !(0.0..0.5).contains(&self.int_tol) {
-            return Err(Error::InvalidOptions(
-                "invalid SolveOptions.int_tol: expected a finite value in [0, 0.5)".to_string(),
-            ));
-        }
-        if !self.tolerances.feasibility.is_finite() || self.tolerances.feasibility < 0.0 {
-            return Err(Error::InvalidOptions(
-                "invalid SolveOptions.tolerances.feasibility: expected a finite non-negative value"
-                    .to_string(),
-            ));
-        }
-        if !self.tolerances.integrality_rounding.is_finite()
-            || !(0.0..0.5).contains(&self.tolerances.integrality_rounding)
-        {
-            return Err(Error::InvalidOptions(
-                "invalid SolveOptions.tolerances.integrality_rounding: expected a finite value in [0, 0.5)"
-                    .to_string(),
-            ));
-        }
-        if !self.tolerances.prune_epsilon.is_finite() || self.tolerances.prune_epsilon < 0.0 {
-            return Err(Error::InvalidOptions(
-                "invalid SolveOptions.tolerances.prune_epsilon: expected a finite non-negative value"
-                    .to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Overrides for the solver settings used for a subsequent search/resume call.
-///
-/// These fields override the ones defined in the previous call to
-/// [`Problem::solve`] or [`Problem::resume`].
-#[derive(Clone, Debug, Default, PartialEq)]
-#[non_exhaustive]
-pub struct ResumeOptions {
-    /// New wall-clock budget (`None` = unlimited).
-    pub time_limit: Option<Duration>,
-    /// New branch-and-bound node budget (`None` = unlimited).
-    pub node_limit: Option<u64>,
-    /// New relative MIP gap (`None` = no MIP gap / exact optimality `0.0`).
-    pub mip_gap: Option<f64>,
-}
-
-impl ResumeOptions {
-    pub(crate) fn validate(&self) -> Result<(), Error> {
-        if let Some(mip_gap) = self.mip_gap {
-            if !mip_gap.is_finite() || mip_gap < 0.0 {
-                return Err(Error::InvalidOptions(
-                    "invalid ResumeOptions.mip_gap: expected a finite non-negative value"
-                        .to_string(),
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Numeric tolerances for a solve (see [`SolveOptions::tolerances`]).
-///
-/// This options override the solver's tolerances when solving the problem.
-/// Only edit those if you are sure of the impact of changing those values.
-#[derive(Clone, Copy, Debug)]
-#[non_exhaustive]
-pub struct Tolerances {
-    /// Uused to validate a rounded-to-integer
-    /// candidate solution before it is accepted as the incumbent.
-    /// Applied to each variable's distance
-    /// outside its bounds and to each row's distance outside its feasible
-    /// range. Also used, identically, by the post-edit warm-start
-    /// pre-filter that decides whether a previous incumbent survives a
-    /// [`crate::Solution`] edit.
-    /// Must be finite and non-negative. Default `1e-7`.
-    pub feasibility: f64,
-    /// Distance from the nearest integer within which an integer/boolean
-    /// variable's value is still treated as exactly that integer. Used by
-    /// the post-edit warm-start pre-filter's integrality check.
-    /// Must be finite and in the half-open range `[0, 0.5)`. Default `1e-5`.
-    pub integrality_rounding: f64,
-    /// Relative slack subtracted from the incumbent objective to form the
-    /// branch & bound pruning cutoff: a node whose bound is not strictly
-    /// better than `incumbent - max(prune_epsilon, prune_epsilon *
-    /// |incumbent|)` is pruned. Guards against continuing to explore or
-    /// retain nodes that could only ever match the incumbent to within
-    /// float noise.
-    ///
-    /// Must be finite and non-negative. Default `1e-9`.
-    pub prune_epsilon: f64,
-}
-
-impl Default for Tolerances {
-    fn default() -> Self {
-        Self {
-            feasibility: 1e-7,
-            integrality_rounding: 1e-5,
-            prune_epsilon: 1e-9,
-        }
-    }
-}
-
-/// Statistics of a solve, available via [`crate::Solution::stats`].
-#[derive(Clone, Copy, Debug, Default)]
-#[non_exhaustive]
-pub struct Stats {
-    /// Branch & bound nodes whose LP was solved (0 for pure-LP problems).
-    pub nodes_solved: u64,
-    /// Total simplex pivots across the whole solve (including the root LP).
-    pub lp_iterations: u64,
-    /// Wall-clock time spent inside the solver, accumulated across resumes.
-    pub elapsed: Duration,
-    /// Best proven bound on the objective, in user space. `None` until an
-    /// incumbent or an open node exists to derive one from.
-    pub best_bound: Option<f64>,
-    /// Relative gap between incumbent and best bound. `None` until both are
-    /// known; `Some(0.0)` once optimality is proven.
-    pub gap: Option<f64>,
-}
-
-/// A feasible integer assignment, in internal (minimize) objective space.
-#[derive(Clone, Debug)]
-pub(crate) struct Incumbent {
-    /// Values of the structural variables (length = Problem var count).
-    pub values: Vec<f64>,
-    pub objective: f64,
-}
-
-/// The complete, resumable state of a branch & bound search.
-#[derive(Clone)]
-pub(crate) struct MipState {
-    pub solver: Solver,
-    /// Original bounds of the structural vars (to reset when jumping between nodes).
-    pub root_bounds: Vec<(f64, f64)>,
-    /// Bound changes currently applied to `solver` (collapsed, sorted by var).
-    pub applied: Vec<(usize, f64, f64)>,
-    pub open: Vec<Node>,
-    /// Pop policy toggle for `pop_node`: `true` while the most recently processed
-    /// node pushed children (keep plunging via LIFO pop); `false` once a dive dies
-    /// out with no children pushed, or once a node is requeued unsolved by an
-    /// interruption — the next pop then jumps to the open node with the best
-    /// (lowest) bound instead of blindly continuing the old dive.
-    pub diving: bool,
-    pub incumbent: Option<Incumbent>,
-    /// Sequence counter for branchings; children carry it as `parent_id`.
-    pub node_seq: u64,
-    /// `Some(id)` iff `solver` currently holds the optimal basis + bounds of the
-    /// branching with that id — its children can skip the basis load (warm dive).
-    pub last_solved_id: Option<u64>,
-    pub root_solved: bool,
-    pub stats: Stats,
-    pub options: SolveOptions,
-    pub deadline: Deadline,
-    /// Consumed by `fill_bound_stats` to report `best_bound`/`gap` in user space.
-    pub direction: OptimizationDirection,
-    /// Learned per-variable branching degradation estimates, updated after each
-    /// node LP solve and consulted by `branching::choose_branch_var`.
-    pub pseudocosts: branching::PseudoCosts,
-    /// Clean copy of the user's problem, including post-solve edits — never
-    /// contains branching artifacts. Post-solve edits re-solve from this.
-    pub base: Problem,
-    /// User-level fix_var overlay on `base` (var → fixed value).
-    pub fixed: BTreeMap<usize, f64>,
-    /// True while a zero-objective search classifies an unbounded LP
-    /// relaxation as either integer-feasible (the original MILP is unbounded)
-    /// or integer-infeasible.
-    pub classifying_unbounded: bool,
-}
-
-impl std::fmt::Debug for MipState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MipState")
-            .field("open_nodes", &self.open.len())
-            .field("has_incumbent", &self.incumbent.is_some())
-            .field("stats", &self.stats)
-            .field("diving", &self.diving)
-            .field(
-                "pseudocost_observations",
-                &self.pseudocosts.observation_count(),
-            )
-            .field("classifying_unbounded", &self.classifying_unbounded)
-            .finish()
-    }
-}
-
-impl MipState {
-    /// Objective of the solution exposed through the public value accessors.
-    /// Unboundedness classification uses a zero-objective solver, so a working
-    /// point without an incumbent is evaluated against the original model.
-    pub(crate) fn current_objective(&self) -> f64 {
-        if let Some(incumbent) = &self.incumbent {
-            return incumbent.objective;
-        }
-        self.base
-            .obj_coeffs
-            .iter()
-            .enumerate()
-            .map(|(v, &coefficient)| coefficient * self.solver.get_value(v))
-            .sum()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct MipRun {
-    pub reason: TerminationReason,
-    pub state: MipState,
-}
-
 fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Error> {
     let deadline = options.time_limit.map(|d| Instant::now() + d);
-    let solver = problem.build_solver(deadline)?;
-    let root_bounds = problem
-        .var_mins
+    // Presolve the search problem. `state.base` below stays the user's
+    // untouched problem, so post-solve edits keep composing against it; the
+    // presolved bounds become the ROOT bounds (branching resets to them).
+    // Dual fixing is optimum-preserving but not feasible-point-preserving,
+    // so it is disabled when a warm-start hint must be honored.
+    let presolved = if options.presolve {
+        Some(crate::presolve::presolve(
+            &problem.obj_coeffs,
+            &problem.var_mins,
+            &problem.var_maxs,
+            &problem.constraints,
+            &problem.var_domains,
+            crate::presolve::Mode::Mip,
+            options.tolerances.feasibility,
+            options.int_tol,
+            options.warm_start.is_none(),
+        )?)
+    } else {
+        None
+    };
+    let (var_mins, var_maxs, constraints) = match &presolved {
+        Some(p) => (&p.var_mins[..], &p.var_maxs[..], &p.constraints[..]),
+        None => (
+            &problem.var_mins[..],
+            &problem.var_maxs[..],
+            &problem.constraints[..],
+        ),
+    };
+    let solver = Solver::try_new(
+        &problem.obj_coeffs,
+        var_mins,
+        var_maxs,
+        constraints,
+        &problem.var_domains,
+        deadline,
+        options.tolerances.feasibility,
+    )?;
+    let root_bounds = var_mins
         .iter()
-        .zip(&problem.var_maxs)
+        .zip(var_maxs)
         .map(|(&lo, &hi)| (lo, hi))
         .collect();
     let pseudocosts = branching::PseudoCosts::new(&problem.obj_coeffs, problem.obj_coeffs.len());
@@ -379,7 +148,7 @@ pub(crate) fn effective_problem(base: &Problem, fixed: &BTreeMap<usize, f64>) ->
     p
 }
 
-fn candidate_variables_feasible(
+pub(crate) fn candidate_variables_feasible(
     values: &[f64],
     domains: &[VarDomain],
     tolerances: &Tolerances,
@@ -390,12 +159,14 @@ fn candidate_variables_feasible(
     }
     values.iter().enumerate().all(|(v, &value)| {
         let (lo, hi) = bounds(v);
+        // The contract on a bound, the same rule and the same comparison as
+        // the engine's and the LP path's.
+        let tol = crate::solver::bound_tolerance(tolerances.feasibility, lo, hi);
         value.is_finite()
             && !lo.is_nan()
             && !hi.is_nan()
             && lo <= hi
-            && value >= lo - tolerances.feasibility
-            && value <= hi + tolerances.feasibility
+            && !crate::solver::outside(value, lo, hi, tol)
             && (!matches!(domains[v], VarDomain::Integer | VarDomain::Boolean)
                 || (value - value.round()).abs() <= tolerances.integrality_rounding)
     })
@@ -410,6 +181,17 @@ pub(crate) fn incumbent_feasible(
     values: &[f64],
     tolerances: &Tolerances,
 ) -> bool {
+    first_violation(base, fixed, values, tolerances).is_none()
+}
+
+/// [`incumbent_feasible`] with the first offending bound or row described,
+/// for error messages.
+pub(crate) fn first_violation(
+    base: &Problem,
+    fixed: &BTreeMap<usize, f64>,
+    values: &[f64],
+    tolerances: &Tolerances,
+) -> Option<String> {
     if !candidate_variables_feasible(values, &base.var_domains, tolerances, |v| {
         fixed
             .get(&v)
@@ -417,24 +199,37 @@ pub(crate) fn incumbent_feasible(
                 (value, value)
             })
     }) {
-        return false;
+        return Some(format!(
+            "a variable value violates its bounds or domain: {values:?}"
+        ));
     }
-    for (coeffs, op, rhs) in &base.constraints {
-        let lhs: f64 = coeffs.iter().map(|(i, c)| c * values[i]).sum();
+    for (row, (coeffs, op, rhs)) in base.constraints.iter().enumerate() {
+        let mut lhs = 0.0;
+        let mut magnitude = rhs.abs();
+        for (i, c) in coeffs.iter() {
+            let term = c * values[i];
+            lhs += term;
+            magnitude += term.abs();
+        }
         if !lhs.is_finite() {
-            return false;
+            return Some(format!("row {row} has a non-finite activity"));
         }
-        let tol = tolerances.feasibility;
-        let ok = match op {
-            ComparisonOp::Eq => (lhs - rhs).abs() <= tol,
-            ComparisonOp::Le => lhs <= rhs + tol,
-            ComparisonOp::Ge => lhs >= *rhs - tol,
+        // The contract on a row, as `Solver::first_violated_row` applies it:
+        // the slack the row implies, against the slack bounds its sense
+        // encodes.
+        let tol = crate::solver::row_tolerance(tolerances.feasibility, magnitude);
+        let (smin, smax) = match op {
+            ComparisonOp::Eq => (0.0, 0.0),
+            ComparisonOp::Le => (0.0, f64::INFINITY),
+            ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
         };
-        if !ok {
-            return false;
+        if crate::solver::outside(rhs - lhs, smin, smax, tol) {
+            return Some(format!(
+                "row {row} ({op:?} {rhs:e}) has activity {lhs:e}, tolerance {tol:e}, at {values:?}"
+            ));
         }
     }
-    true
+    None
 }
 
 /// After a user edit: drop the open tree, carry the incumbent as a warm-start
@@ -493,7 +288,7 @@ fn resume_run_with_deadline(state: &mut MipState) -> Result<TerminationReason, E
 /// Best proven lower bound (internal space) on the optimum: the min over open-node
 /// bounds and the incumbent. `None` while nothing is known (no nodes, no incumbent).
 /// Only valid BETWEEN nodes (a popped node's subtree is otherwise unaccounted).
-fn global_bound_internal(state: &MipState) -> Option<f64> {
+pub(crate) fn global_bound_internal(state: &MipState) -> Option<f64> {
     if !state.root_solved {
         return None;
     }
@@ -511,7 +306,7 @@ fn global_bound_internal(state: &MipState) -> Option<f64> {
 }
 
 /// Relative gap between incumbent and bound, internal space (0.0 when they meet).
-fn relative_gap(incumbent_obj: f64, bound: f64) -> f64 {
+pub(crate) fn relative_gap(incumbent_obj: f64, bound: f64) -> f64 {
     (incumbent_obj - bound).max(0.0) / incumbent_obj.abs().max(params::GAP_DENOM_GUARD)
 }
 
@@ -522,7 +317,7 @@ fn to_user_space(direction: OptimizationDirection, internal: f64) -> f64 {
     }
 }
 
-fn fill_bound_stats(state: &mut MipState) {
+pub(crate) fn fill_bound_stats(state: &mut MipState) {
     if state.classifying_unbounded {
         state.stats.best_bound = None;
         state.stats.gap = None;
@@ -537,1033 +332,9 @@ fn fill_bound_stats(state: &mut MipState) {
 }
 
 /// Prune threshold: a node whose lower bound is ≥ this cannot improve the incumbent.
-fn cutoff(incumbent_obj: f64, prune_epsilon: f64) -> f64 {
+pub(crate) fn cutoff(incumbent_obj: f64, prune_epsilon: f64) -> f64 {
     incumbent_obj - f64::max(prune_epsilon, prune_epsilon * incumbent_obj.abs())
 }
 
-/// Validate and adopt the solver's current solution using integer-rounded
-/// values. `Ok(false)` means rounding produced an invalid candidate and the
-/// caller must branch. A valid candidate completes unboundedness classification.
-fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
-    let tolerances = &state.options.tolerances;
-    let solver = &state.solver;
-    let n = solver.num_vars;
-    let domains = &solver.orig_var_domains;
-    let mut values: Vec<f64> = (0..n).map(|v| *solver.get_value(v)).collect();
-    for (val, dom) in values.iter_mut().zip(domains.iter()) {
-        if matches!(dom, VarDomain::Integer | VarDomain::Boolean) {
-            *val = val.round();
-        }
-    }
-    if !candidate_variables_feasible(&values, domains, tolerances, |v| state.root_bounds[v])
-        || !solver.check_constraints(&values, tolerances.feasibility)
-    {
-        debug!("integral-within-tol solution rejected: rounded values infeasible");
-        return Ok(false);
-    }
-    let objective = solver.objective_of(&values);
-    if !objective.is_finite() {
-        debug!("integral-within-tol solution rejected: objective is non-finite");
-        return Ok(false);
-    }
-    let better = match &state.incumbent {
-        Some(inc) => objective < inc.objective,
-        None => true,
-    };
-    if better {
-        debug!("new incumbent, internal obj: {:.6}", objective);
-        state.incumbent = Some(Incumbent { values, objective });
-    }
-    if state.classifying_unbounded {
-        Err(Error::Unbounded)
-    } else {
-        Ok(true)
-    }
-}
-
-enum IntegralCandidate {
-    Closed,
-    Branch(usize),
-    Limit,
-}
-
-/// Adopt a feasible rounded candidate, but close the current subtree only when
-/// the LP point itself is exactly integral. If an exactly integral point fails
-/// the independent feasibility guard, retry once from the all-slack basis:
-/// large coefficients can leave an eta-updated continuous value just outside
-/// the absolute guard even though a clean factorization recovers the vertex.
-fn process_integral_candidate(
-    state: &mut MipState,
-    domains: &[VarDomain],
-    int_tol: f64,
-) -> Result<IntegralCandidate, Error> {
-    let adopted = try_adopt_incumbent(state)?;
-    if let Some(var) = branching::choose_branch_var(&state.solver, domains, 0.0, &state.pseudocosts)
-    {
-        return Ok(IntegralCandidate::Branch(var));
-    }
-    if adopted {
-        return Ok(IntegralCandidate::Closed);
-    }
-
-    debug!("exactly integral candidate failed guard; retrying from slack basis");
-    let slack = state.solver.slack_basis();
-    state
-        .solver
-        .load_basis(&slack)
-        .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
-    match solve_node_lp(state)? {
-        NodeLp::Limit => return Ok(IntegralCandidate::Limit),
-        NodeLp::Infeasible => {
-            return Err(Error::InternalError(
-                "integral candidate became infeasible after slack-basis retry".to_string(),
-            ))
-        }
-        NodeLp::Solved => {}
-    }
-
-    if !branching::is_integral(&state.solver, domains, int_tol) {
-        return branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts)
-            .map(IntegralCandidate::Branch)
-            .ok_or_else(|| {
-                Error::InternalError(
-                    "slack-basis retry produced a non-integral point with no branchable variable"
-                        .to_string(),
-                )
-            });
-    }
-
-    let adopted = try_adopt_incumbent(state)?;
-    if let Some(var) = branching::choose_branch_var(&state.solver, domains, 0.0, &state.pseudocosts)
-    {
-        Ok(IntegralCandidate::Branch(var))
-    } else if adopted {
-        Ok(IntegralCandidate::Closed)
-    } else {
-        Err(Error::InternalError(
-            "exactly integral solution failed feasibility validation after slack-basis retry"
-                .to_string(),
-        ))
-    }
-}
-
-/// Apply `node`'s bounds to the solver, diffing against what is currently applied.
-/// Returns false (node pruned, solver untouched) if the node's bounds cross.
-fn apply_node_bounds(state: &mut MipState, node: &Node) -> bool {
-    let target = effective_bounds(&node.bound_changes);
-    if target.iter().any(|&(_, lo, hi)| lo > hi) {
-        return false;
-    }
-    // Reset vars that are currently changed but absent from the target.
-    for &(v, _, _) in &state.applied {
-        if target.binary_search_by_key(&v, |t| t.0).is_err() {
-            let (rlo, rhi) = state.root_bounds[v];
-            state
-                .solver
-                .set_var_bounds(v, rlo, rhi)
-                .expect("root bounds cannot cross");
-        }
-    }
-    // Apply the target bounds (validated above, cannot fail).
-    for &(v, lo, hi) in &target {
-        state
-            .solver
-            .set_var_bounds(v, lo, hi)
-            .expect("validated bounds cannot cross");
-    }
-    state.applied = target;
-    true
-}
-
-/// Branch on `var` at the solver's current (just solved) optimum: push the two
-/// children carrying the parent's basis and objective bound.
-fn branch(state: &mut MipState, parent: &Node, var: usize) {
-    let z = state.solver.cur_obj_val;
-    let val = *state.solver.get_value(var);
-    let (lo, hi) = state.solver.get_var_bounds(var);
-    // The split point k (children: x ≤ k and x ≥ k + 1) must be
-    // noise-robust: a raw `val.floor()` of a within-tolerance-integral value
-    // is catastrophic — floor(−8e-16) = −1 makes the up child
-    // (max(0, lo), hi) reproduce the parent VERBATIM and the search
-    // descends forever. Reachable through the rounding-rejected re-branch
-    // path (`choose_branch_var` at int_tol = 0) whenever LP noise puts an
-    // integer var a hair below an integer. Snap near-integral values to
-    // their integer first, then clamp k into [lo, hi − 1] so BOTH children
-    // strictly tighten the parent's [lo, hi] whenever hi − lo ≥ 1
-    // (integral bounds — guaranteed for branchable vars).
-    let floor = {
-        let near = val.round();
-        let k = if (val - near).abs() <= state.options.int_tol {
-            near
-        } else {
-            val.floor()
-        };
-        k.clamp(lo, (hi - 1.0).max(lo))
-    };
-    let f_down = (val - floor).clamp(0.0, 1.0);
-
-    state.node_seq += 1;
-    let id = state.node_seq;
-    state.last_solved_id = Some(id);
-    let basis = state.solver.snapshot_basis();
-
-    let mut down_changes = parent.bound_changes.clone();
-    down_changes.push((var, lo, floor));
-    let mut up_changes = parent.bound_changes.clone();
-    up_changes.push((var, floor + 1.0, hi));
-
-    let down_node = Node {
-        bound_changes: down_changes,
-        basis: basis.clone(),
-        lp_bound: z,
-        depth: parent.depth + 1,
-        parent_id: id,
-        branch_var: Some(var),
-        branch_up: false,
-        branch_frac: f_down,
-    };
-    let up_node = Node {
-        bound_changes: up_changes,
-        basis,
-        lp_bound: z,
-        depth: parent.depth + 1,
-        parent_id: id,
-        branch_var: Some(var),
-        branch_up: true,
-        branch_frac: 1.0 - f_down,
-    };
-
-    // Estimate-ordered dive: push the child with the LARGER estimated degradation
-    // first, so the cheaper (more promising) direction is popped/dived first.
-    let est_down = state.pseudocosts.estimate(var, false) * f_down;
-    let est_up = state.pseudocosts.estimate(var, true) * (1.0 - f_down);
-    if est_down > est_up {
-        // up is cheaper → push it last so it is dived first
-        state.open.push(down_node);
-        state.open.push(up_node);
-    } else {
-        state.open.push(up_node);
-        state.open.push(down_node);
-    }
-    // Children were pushed: keep plunging (LIFO pop) into this subtree.
-    state.diving = true;
-}
-
-/// Outcome of solving one branch & bound node's LP relaxation.
-enum NodeLp {
-    /// The solver now holds this node's optimal basis and objective.
-    Solved,
-    /// The node's LP is infeasible under its current bounds.
-    Infeasible,
-    /// A limit interrupted the solve (possibly during the slack retry); the
-    /// solver's unfinished, non-optimal state must not be used as a node result.
-    Limit,
-}
-
-/// Solve the current node's LP relaxation. Bounds and (if needed) the warm basis
-/// are already loaded into the solver by the caller.
-///
-/// Robustness valve: if the first `reoptimize` fails with an internal error class
-/// — anything that is neither [`Error::Infeasible`] nor [`Error::Unbounded`], e.g.
-/// a singular LU produced by numerical degradation during pivoting — fall back
-/// ONCE to the all-slack basis (which is documented to always load) and re-solve
-/// the node from scratch, then take that retry's outcome as final. The retry
-/// cannot loop: it is attempted at most once and its own internal error is
-/// propagated rather than retried again.
-fn solve_node_lp(state: &mut MipState) -> Result<NodeLp, Error> {
-    state.solver.deadline = state.deadline;
-    let err = match state.solver.reoptimize() {
-        Ok(StopReason::Finished) => return Ok(NodeLp::Solved),
-        Ok(StopReason::Limit) => return Ok(NodeLp::Limit),
-        Err(Error::Infeasible) => return Ok(NodeLp::Infeasible),
-        Err(Error::Unbounded) => {
-            return Err(Error::InternalError(
-                "bounded B&B node reported unbounded".to_string(),
-            ))
-        }
-        // Internal/singular error class: fall through to the one-shot slack retry.
-        Err(e) => e,
-    };
-
-    debug!(
-        "node LP reoptimize failed ({}); retrying from slack basis",
-        err
-    );
-    let slack = state.solver.slack_basis();
-    state
-        .solver
-        .load_basis(&slack)
-        .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
-    match state.solver.reoptimize() {
-        Ok(StopReason::Finished) => Ok(NodeLp::Solved),
-        Ok(StopReason::Limit) => Ok(NodeLp::Limit),
-        Err(Error::Infeasible) => Ok(NodeLp::Infeasible),
-        Err(Error::Unbounded) => Err(Error::InternalError(
-            "bounded B&B node reported unbounded".to_string(),
-        )),
-        // The retry also failed internally: propagate the error this time.
-        Err(e) => Err(e),
-    }
-}
-
-/// Pop policy: keep diving (DFS) while the last processed node produced children;
-/// when a dive dies out, jump to the open node with the best (lowest) bound. Ties
-/// in `lp_bound` resolve to the first (lowest-index) such node in `open` — the
-/// scan uses strict `<`, so `best` only moves for a strictly smaller bound.
-fn pop_node(state: &mut MipState) -> Option<Node> {
-    if state.open.is_empty() {
-        return None;
-    }
-    if state.diving {
-        state.open.pop()
-    } else {
-        let mut best = 0;
-        for (i, n) in state.open.iter().enumerate() {
-            if n.lp_bound < state.open[best].lp_bound {
-                best = i;
-            }
-        }
-        Some(state.open.swap_remove(best))
-    }
-}
-
-/// Evaluate a warm-start hint: fix hinted vars, LP-complete the rest, and if the
-/// completion is feasible and integral adopt it as the initial incumbent.
-/// Advisory by design — every failure path just drops the hint. Always restores
-/// the solver to the root optimum before returning.
-///
-/// Returns `Ok(None)` on the normal path (the caller proceeds to build the root
-/// node). Returns `Ok(Some(TerminationReason::TimeLimit))` only when the restore
-/// of the root basis fails AND the deadline strikes mid-restore: rather than let the
-/// caller read an unfinished `cur_obj_val` as the root bound, it un-sets
-/// `root_solved` so a resume re-enters `initial_solve` and continues honestly from
-/// the solver's feasibility flags.
-fn try_warm_start(
-    state: &mut MipState,
-    hints: &[(crate::Variable, f64)],
-) -> Result<Option<TerminationReason>, Error> {
-    let domains = state.solver.orig_var_domains.clone();
-    let root_basis = state.solver.snapshot_basis();
-    let mut applied: Vec<usize> = Vec::new();
-    let mut ok = true;
-    let mut pending_error = None;
-
-    for &(var, val) in hints {
-        let v = var.idx();
-        if v >= state.solver.num_vars || !val.is_finite() {
-            ok = false;
-            break;
-        }
-        let val = if matches!(
-            domains.get(v),
-            Some(VarDomain::Integer | VarDomain::Boolean)
-        ) {
-            val.round()
-        } else {
-            val
-        };
-        let (lo, hi) = state.root_bounds[v];
-        if val < lo - params::HINT_BOUNDS_SLACK || val > hi + params::HINT_BOUNDS_SLACK {
-            ok = false;
-            break;
-        }
-        state
-            .solver
-            .set_var_bounds(v, val, val)
-            .expect("fixing to [val, val] cannot cross");
-        applied.push(v);
-    }
-
-    if ok {
-        match state.solver.reoptimize() {
-            Ok(StopReason::Finished) => {
-                if branching::is_integral(&state.solver, &domains, state.options.int_tol) {
-                    // Rounded-incumbent feasibility guard: never bypass it for a hint.
-                    // If it rejects the completion, drop the hint — do not branch
-                    // below-tolerance vars here, that fallback is only for the main
-                    // search loop.
-                    match try_adopt_incumbent(state) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            debug!("warm-start hint rejected by feasibility guard; ignored");
-                        }
-                        Err(error) => pending_error = Some(error),
-                    }
-                } else {
-                    debug!("warm-start hint LP-completed fractionally; ignored");
-                }
-            }
-            Ok(StopReason::Limit) | Err(Error::Infeasible) => {
-                debug!("warm-start hint infeasible or out of time; ignored");
-            }
-            Err(error) => pending_error = Some(error),
-        }
-    } else {
-        debug!(
-            "warm-start hint invalid (unknown variable, non-finite value, or out of bounds); ignored"
-        );
-    }
-
-    // Restore the root state exactly: bounds back, then the optimal root basis
-    // (load_basis recomputes everything, discarding the hint solve).
-    for v in applied {
-        let (lo, hi) = state.root_bounds[v];
-        state
-            .solver
-            .set_var_bounds(v, lo, hi)
-            .expect("root bounds cannot cross");
-    }
-    if state.solver.load_basis(&root_basis).is_err() {
-        let slack = state.solver.slack_basis();
-        state
-            .solver
-            .load_basis(&slack)
-            .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
-        if state.solver.reoptimize()? == StopReason::Limit {
-            // A limit during the root re-solve leaves `cur_obj_val` unsuitable
-            // as a root bound. Mark the root unsolved and return Interrupted;
-            // `initialize_root` continues `initial_solve` from the solver's
-            // feasibility flags on resume.
-            state.root_solved = false;
-            if let Some(error) = pending_error {
-                return Err(error);
-            }
-            return Ok(Some(TerminationReason::TimeLimit));
-        }
-    }
-    if let Some(error) = pending_error {
-        return Err(error);
-    }
-    Ok(None)
-}
-
-/// Solve or resume the root relaxation, restore any advisory warm start, and
-/// either close the problem or seed the open tree. `None` means node processing
-/// can begin; `Some` is a completed or interrupted root outcome.
-fn initialize_root(
-    state: &mut MipState,
-    domains: &[VarDomain],
-) -> Result<Option<TerminationReason>, Error> {
-    if state.root_solved {
-        return Ok(None);
-    }
-
-    if state.solver.initial_solve()? == StopReason::Limit {
-        return Ok(Some(TerminationReason::TimeLimit));
-    }
-    state.root_solved = true;
-
-    if let Some(hints) = state.options.warm_start.take() {
-        if let Some(outcome) = try_warm_start(state, &hints)? {
-            return Ok(Some(outcome));
-        }
-    }
-
-    let root = Node {
-        bound_changes: Vec::new(),
-        basis: state.solver.snapshot_basis(),
-        lp_bound: state.solver.cur_obj_val,
-        depth: 0,
-        parent_id: 0,
-        branch_var: None,
-        branch_up: false,
-        branch_frac: 1.0,
-    };
-    let int_tol = state.options.int_tol;
-    if branching::is_integral(&state.solver, domains, int_tol) {
-        match process_integral_candidate(state, domains, int_tol)? {
-            IntegralCandidate::Branch(var) => branch(state, &root, var),
-            IntegralCandidate::Closed => {
-                return Ok(Some(TerminationReason::ProvenOptimal));
-            }
-            IntegralCandidate::Limit => {
-                state.root_solved = false;
-                return Ok(Some(TerminationReason::TimeLimit));
-            }
-        }
-    } else {
-        match branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts) {
-            Some(var) => branch(state, &root, var),
-            // Fractional integer variables fixed to a non-integer value cannot
-            // produce an integer point or a useful branch.
-            None => return Err(Error::Infeasible),
-        }
-    }
-
-    Ok(None)
-}
-
-enum NodeVisit {
-    /// The node was discarded before an LP solve, so it consumes no node budget.
-    Pruned,
-    /// One node LP completed, including an infeasible relaxation.
-    Solved,
-    /// The node must be restored to the frontier. `lp_solved` distinguishes an
-    /// interrupted initial LP from an interrupted retry after a completed LP.
-    Interrupted { node: Node, lp_solved: bool },
-}
-
-/// Reconstruct and process one node selected by the outer search policy.
-fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result<NodeVisit, Error> {
-    if !apply_node_bounds(state, &node) {
-        state.diving = false;
-        return Ok(NodeVisit::Pruned);
-    }
-
-    let warm = state.last_solved_id == Some(node.parent_id);
-    if !warm && state.solver.load_basis(&node.basis).is_err() {
-        debug!("basis load failed; falling back to slack basis");
-        let slack = state.solver.slack_basis();
-        state
-            .solver
-            .load_basis(&slack)
-            .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
-    }
-
-    match solve_node_lp(state)? {
-        NodeLp::Solved => {}
-        NodeLp::Infeasible => {
-            state.last_solved_id = None;
-            state.diving = false;
-            return Ok(NodeVisit::Solved);
-        }
-        NodeLp::Limit => {
-            return Ok(NodeVisit::Interrupted {
-                node,
-                lp_solved: false,
-            })
-        }
-    }
-
-    let objective = state.solver.cur_obj_val;
-    if let Some(var) = node.branch_var {
-        state.pseudocosts.record(
-            var,
-            node.branch_up,
-            (objective - node.lp_bound).max(0.0) / node.branch_frac.max(params::BRANCH_FRAC_GUARD),
-        );
-    }
-    if let Some(incumbent) = &state.incumbent {
-        if objective >= cutoff(incumbent.objective, state.options.tolerances.prune_epsilon) {
-            state.last_solved_id = None;
-            state.diving = false;
-            return Ok(NodeVisit::Solved);
-        }
-    }
-
-    let int_tol = state.options.int_tol;
-    if branching::is_integral(&state.solver, domains, int_tol) {
-        match process_integral_candidate(state, domains, int_tol)? {
-            IntegralCandidate::Branch(var) => branch(state, &node, var),
-            IntegralCandidate::Closed => {
-                state.last_solved_id = None;
-                state.diving = false;
-            }
-            IntegralCandidate::Limit => {
-                return Ok(NodeVisit::Interrupted {
-                    node,
-                    lp_solved: true,
-                })
-            }
-        }
-        return Ok(NodeVisit::Solved);
-    }
-
-    match branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts) {
-        Some(var) => branch(state, &node, var),
-        None => {
-            state.last_solved_id = None;
-            state.diving = false;
-        }
-    }
-    Ok(NodeVisit::Solved)
-}
-
-fn search_loop(state: &mut MipState) -> Result<TerminationReason, Error> {
-    let domains = state.solver.orig_var_domains.clone();
-    state.solver.deadline = state.deadline;
-
-    if let Some(outcome) = initialize_root(state, &domains)? {
-        return Ok(outcome);
-    }
-
-    let mut nodes_this_run: u64 = 0;
-
-    loop {
-        // Tree exhausted → the proof is COMPLETE: fall through to the post-loop
-        // incumbent-vs-Infeasible verdict. Checked before the gap/deadline/node
-        // limit tests so a limit that lands on the exact iteration the tree empties
-        // never masks a finished proof as Interrupted/Feasible. (The loop is only
-        // entered with `root_solved` true; the bottom `pop_node → None → break`
-        // remains a safety net for any other path that empties `open` mid-body.)
-        if state.open.is_empty() {
-            break;
-        }
-
-        // Proof-quality stops: exact incumbent/bound equality wins; otherwise
-        // an incumbent within `mip_gap` is a valid feasible result. Checked
-        // first so proof quality takes priority over limit interruptions.
-        if state.options.mip_gap > 0.0 {
-            if let (Some(inc), Some(bound)) = (&state.incumbent, global_bound_internal(state)) {
-                // The open tree may still contain nodes whose stored bounds
-                // equal the incumbent. Equality of the incumbent and global
-                // bound is nevertheless a complete proof, so it must not be
-                // weakened to a gap-satisfied feasible result.
-                if bound >= inc.objective {
-                    state.open.clear();
-                    break;
-                }
-                if relative_gap(inc.objective, bound) <= state.options.mip_gap {
-                    return Ok(TerminationReason::MipGap);
-                }
-            }
-        }
-
-        // Global limits are checked between nodes; no unfinished node result is consulted.
-        if check_deadline(&state.deadline) == StopReason::Limit {
-            return Ok(TerminationReason::TimeLimit);
-        }
-        let node = match pop_node(state) {
-            Some(n) => n,
-            None => break,
-        };
-
-        // Prune with the stored parent bound before any LP work.
-        if let Some(inc) = &state.incumbent {
-            if node.lp_bound >= cutoff(inc.objective, state.options.tolerances.prune_epsilon) {
-                state.diving = false;
-                continue;
-            }
-        }
-
-        // A node budget limits LP solves, not free bookkeeping. Pop and apply
-        // the stored-bound prune first so hitting the exact solve count can
-        // still finish a proof whose remaining nodes are already dominated by
-        // the incumbent.
-        if let Some(nl) = state.options.node_limit {
-            if nodes_this_run >= nl {
-                state.open.push(node);
-                state.diving = false;
-                return Ok(TerminationReason::NodeLimit);
-            }
-        }
-
-        match visit_node(state, node, &domains)? {
-            NodeVisit::Pruned => continue,
-            NodeVisit::Solved => {
-                state.stats.nodes_solved += 1;
-                nodes_this_run += 1;
-            }
-            NodeVisit::Interrupted { node, lp_solved } => {
-                if lp_solved {
-                    state.stats.nodes_solved += 1;
-                }
-                state.open.push(node);
-                state.last_solved_id = None;
-                state.diving = false;
-                return Ok(TerminationReason::TimeLimit);
-            }
-        }
-    }
-
-    if state.incumbent.is_some() {
-        Ok(TerminationReason::ProvenOptimal)
-    } else {
-        Err(Error::Infeasible)
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ComparisonOp, OptimizationDirection, Problem};
-
-    fn int_2var_problem() -> Problem {
-        // minimize 3a + 4b s.t. a + 2b >= 5, 3a + b >= 4; a,b integer in [0,10].
-        // LP relaxation: a=0.6, b=2.2, obj 10.6. Integer optimum: a=1, b=2, obj 11.
-        let mut p = Problem::new(OptimizationDirection::Minimize);
-        let a = p.add_integer_var(3.0, (0, 10));
-        let b = p.add_integer_var(4.0, (0, 10));
-        p.add_constraint(&[(a, 1.0), (b, 2.0)], ComparisonOp::Ge, 5.0);
-        p.add_constraint(&[(a, 3.0), (b, 1.0)], ComparisonOp::Ge, 4.0);
-        p
-    }
-
-    fn binary_knapsack() -> Problem {
-        // maximize 8x + 11y + 6z + 4w s.t. 5x + 7y + 4z + 3w <= 14, binaries.
-        // Optimum: y + z + w = 21 (weight 14).
-        let mut p = Problem::new(OptimizationDirection::Maximize);
-        let x = p.add_binary_var(8.0);
-        let y = p.add_binary_var(11.0);
-        let z = p.add_binary_var(6.0);
-        let w = p.add_binary_var(4.0);
-        p.add_constraint(
-            &[(x, 5.0), (y, 7.0), (z, 4.0), (w, 3.0)],
-            ComparisonOp::Le,
-            14.0,
-        );
-        p
-    }
-
-    fn incumbent_obj(state: &MipState) -> f64 {
-        state.incumbent.as_ref().unwrap().objective
-    }
-
-    #[test]
-    fn driver_finds_integer_optimum() {
-        let run = run(&int_2var_problem(), SolveOptions::default()).unwrap();
-        assert_eq!(run.reason, TerminationReason::ProvenOptimal);
-        // Internal space == user space for Minimize.
-        assert!((incumbent_obj(&run.state) - 11.0).abs() < 1e-6);
-        let inc = run.state.incumbent.as_ref().unwrap();
-        assert!((inc.values[0] - 1.0).abs() < 1e-6);
-        assert!((inc.values[1] - 2.0).abs() < 1e-6);
-        assert!(run.state.stats.nodes_solved > 0);
-    }
-
-    #[test]
-    fn driver_binary_knapsack_maximize() {
-        let run = run(&binary_knapsack(), SolveOptions::default()).unwrap();
-        assert_eq!(run.reason, TerminationReason::ProvenOptimal);
-        // Maximize is negated internally: internal optimum is -21.
-        assert!((incumbent_obj(&run.state) + 21.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn driver_no_integer_point_is_infeasible() {
-        // 2x == 1 with x integer in [0,10]: LP-feasible (x=0.5), integer-infeasible.
-        let mut p = Problem::new(OptimizationDirection::Minimize);
-        let x = p.add_integer_var(1.0, (0, 10));
-        p.add_constraint(&[(x, 2.0)], ComparisonOp::Eq, 1.0);
-        assert_eq!(
-            run(&p, SolveOptions::default()).unwrap_err(),
-            crate::Error::Infeasible
-        );
-    }
-
-    #[test]
-    fn driver_exact_node_exhaustion_reports_infeasible_not_interrupted() {
-        // Same infeasible fixture (2x == 1, x int in [0,10]): the root LP is
-        // fractional (x=0.5) and branches into x<=0 and x>=1, both LP-infeasible.
-        // The tree is therefore exactly two nodes: node_limit=1 interrupts and
-        // node_limit=2 exhausts it. At the exact exhaustion count, the empty-open
-        // check precedes the node-limit check and must report Infeasible.
-        let mut p = Problem::new(OptimizationDirection::Minimize);
-        let x = p.add_integer_var(1.0, (0, 10));
-        p.add_constraint(&[(x, 2.0)], ComparisonOp::Eq, 1.0);
-        let mut options = SolveOptions::default();
-        options.node_limit = Some(2);
-        assert_eq!(run(&p, options).unwrap_err(), crate::Error::Infeasible);
-    }
-
-    #[test]
-    fn driver_node_limit_equal_to_exhaustion_count_reports_optimal() {
-        // int_2var_problem is proven optimal in exactly 2 B&B nodes (deterministic:
-        // the unlimited solve reports nodes_solved == 2; node_limit=1 -> Interrupted,
-        // node_limit=2 -> Optimal). Setting the node limit to that exact count must
-        // report Optimal, not Interrupted: when the tree empties on the same
-        // iteration the limit would fire, the empty-`open` check at the loop top
-        // wins and the finished proof is reported honestly.
-        assert_eq!(
-            run(&int_2var_problem(), SolveOptions::default())
-                .unwrap()
-                .state
-                .stats
-                .nodes_solved,
-            2,
-            "node count must stay deterministic; update the limit below if it changes"
-        );
-        let mut options = SolveOptions::default();
-        options.node_limit = Some(2);
-        let r = run(&int_2var_problem(), options).unwrap();
-        assert_eq!(r.reason, TerminationReason::ProvenOptimal);
-        assert!((incumbent_obj(&r.state) - 11.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn driver_node_limit_interrupts_and_resumes_to_same_optimum() {
-        let mut options = SolveOptions::default();
-        options.node_limit = Some(1);
-        let mut r = run(&int_2var_problem(), options).unwrap();
-        let mut guard = 0;
-        while r.reason != TerminationReason::ProvenOptimal {
-            guard += 1;
-            assert!(guard < 10_000, "resume loop did not terminate");
-            r.reason = resume_run(&mut r.state, ResumeOptions::default()).unwrap();
-        }
-        assert!(guard >= 1, "node_limit=1 should interrupt at least once");
-        assert!((incumbent_obj(&r.state) - 11.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn open_children_have_branch_metadata() {
-        let mut options = SolveOptions::default();
-        options.node_limit = Some(0);
-        let run = run(&int_2var_problem(), options).unwrap();
-
-        assert_eq!(run.reason, TerminationReason::NodeLimit);
-        assert_eq!(run.state.open.len(), 2);
-        assert!(run.state.open.iter().all(|node| node.branch_var.is_some()));
-    }
-
-    #[test]
-    fn driver_zero_time_limit_interrupts_cleanly_then_resumes() {
-        let mut options = SolveOptions::default();
-        options.time_limit = Some(Duration::ZERO);
-        let mut r = run(&binary_knapsack(), options).unwrap();
-        assert_eq!(r.reason, TerminationReason::TimeLimit);
-        assert!(r.state.incumbent.is_none());
-        let resume_options = ResumeOptions {
-            time_limit: Some(Duration::from_secs(10)),
-            ..ResumeOptions::default()
-        };
-        let reason = resume_run(&mut r.state, resume_options).unwrap();
-        assert_eq!(reason, TerminationReason::ProvenOptimal);
-        assert!((incumbent_obj(&r.state) + 21.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn optimal_solve_reports_zero_gap_and_matching_bound() {
-        let r = run(&int_2var_problem(), SolveOptions::default()).unwrap();
-        assert_eq!(r.reason, TerminationReason::ProvenOptimal);
-        assert_eq!(r.state.stats.gap, Some(0.0));
-        // User space == internal for Minimize.
-        assert!((r.state.stats.best_bound.unwrap() - 11.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn unsolved_root_with_incumbent_has_no_proven_bound_or_gap() {
-        let problem = binary_knapsack();
-        let mut state = build_state(&problem, SolveOptions::default()).unwrap();
-        state.incumbent = Some(Incumbent {
-            values: vec![0.0; problem.obj_coeffs.len()],
-            objective: 0.0,
-        });
-        state.root_solved = false;
-        state.open.clear();
-
-        fill_bound_stats(&mut state);
-
-        assert_eq!(state.stats.best_bound, None);
-        assert_eq!(state.stats.gap, None);
-    }
-
-    #[test]
-    fn maximize_bound_is_in_user_space() {
-        let r = run(&binary_knapsack(), SolveOptions::default()).unwrap();
-        assert_eq!(r.reason, TerminationReason::ProvenOptimal);
-        // Internally -21; user-facing bound must be +21.
-        assert!((r.state.stats.best_bound.unwrap() - 21.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn mip_gap_stops_early_with_consistent_bound() {
-        let mut options = SolveOptions::default();
-        options.mip_gap = 0.5;
-        let r = run(&binary_knapsack(), options).unwrap();
-        assert_eq!(r.reason, TerminationReason::MipGap);
-        let inc = -incumbent_obj(&r.state); // user space (Maximize)
-        let bound = r.state.stats.best_bound.unwrap();
-        // Incumbent within 50% of the proven bound, and never better than it.
-        assert!(inc <= bound + 1e-9);
-        assert!((bound - inc) / bound.abs().max(1e-10) <= 0.5 + 1e-9);
-    }
-
-    #[test]
-    fn feasible_interrupt_reports_gap() {
-        let mut options = SolveOptions::default();
-        options.node_limit = Some(2);
-        let mut r = run(&binary_knapsack(), options).unwrap();
-        // Resume with node budget until an incumbent exists but the search isn't done.
-        let mut guard = 0;
-        while r.reason == TerminationReason::NodeLimit && r.state.incumbent.is_none() {
-            guard += 1;
-            assert!(guard < 10_000);
-            r.reason = resume_run(
-                &mut r.state,
-                ResumeOptions {
-                    node_limit: Some(2),
-                    ..ResumeOptions::default()
-                },
-            )
-            .unwrap();
-        }
-        if r.reason == TerminationReason::NodeLimit {
-            // Feasible-but-unproven: a gap must be reported.
-            assert!(r.state.stats.gap.unwrap() >= 0.0);
-            assert!(r.state.stats.best_bound.is_some());
-        }
-    }
-
-    #[test]
-    fn plunge_and_jump_selection_preserves_optima() {
-        // Same optima as plain DFS on all driver test problems, plus interrupt/resume.
-        let r = run(&int_2var_problem(), SolveOptions::default()).unwrap();
-        assert!((incumbent_obj(&r.state) - 11.0).abs() < 1e-6);
-
-        let r = run(&binary_knapsack(), SolveOptions::default()).unwrap();
-        assert!((incumbent_obj(&r.state) + 21.0).abs() < 1e-6);
-
-        let mut options = SolveOptions::default();
-        options.node_limit = Some(1);
-        let mut r = run(&binary_knapsack(), options).unwrap();
-        let mut guard = 0;
-        while r.reason != TerminationReason::ProvenOptimal {
-            guard += 1;
-            assert!(guard < 10_000);
-            r.reason = resume_run(&mut r.state, ResumeOptions::default()).unwrap();
-        }
-        assert!((incumbent_obj(&r.state) + 21.0).abs() < 1e-6);
-        // After a best-bound jump the pop is NOT the last-pushed node at least once
-        // on this instance; correctness above is the real assertion.
-    }
-
-    #[test]
-    fn tolerances_default_matches_documented_values() {
-        let t = Tolerances::default();
-        assert_eq!(
-            t.feasibility, 1e-7,
-            "see Tolerances::feasibility's doc default"
-        );
-        assert_eq!(
-            t.integrality_rounding, 1e-5,
-            "see Tolerances::integrality_rounding's doc default"
-        );
-        assert_eq!(
-            t.prune_epsilon, 1e-9,
-            "see Tolerances::prune_epsilon's doc default"
-        );
-    }
-
-    #[test]
-    fn try_adopt_incumbent_respects_custom_feasibility_tolerance() {
-        // Derived from the big-M fixture `tests_general::solve_big_m` (same
-        // m = 1e9 shape: `x - m*b == 10`, minimize x). Pin b to a value that
-        // is integral-within-`int_tol` (5e-7, well inside the default 1e-6)
-        // but not exactly 0; the rounded-incumbent guard then re-checks the
-        // ROUNDED point (b -> 0) against the ORIGINAL row, which is off by
-        // exactly m * 5e-7 = 500 — precisely the "big-M trap"
-        // `tolerances.feasibility` exists to catch, in absolute terms.
-        let m = 1.0e9;
-        let mut p = Problem::new(OptimizationDirection::Minimize);
-        let x = p.add_var(1.0, (0.0, f64::INFINITY));
-        let b = p.add_binary_var(0.0);
-        p.add_constraint(&[(x, 1.0), (b, -m)], ComparisonOp::Eq, 10.0);
-
-        let mut solved = run(&p, SolveOptions::default()).unwrap();
-        let state = &mut solved.state;
-
-        // Force the relaxation to a specific near-zero fractional b: pin its
-        // bounds to [5e-7, 5e-7] and re-solve. The equality row then forces x
-        // to exactly 10 + m*5e-7 = 510, deterministically — no dependence on
-        // which vertex the simplex would otherwise have picked.
-        state.solver.set_var_bounds(b.idx(), 5e-7, 5e-7).unwrap();
-        assert_eq!(
-            state.solver.reoptimize().unwrap(),
-            crate::StopReason::Finished
-        );
-        assert!((*state.solver.get_value(x.idx()) - 510.0).abs() < 1e-6);
-
-        // Default tolerance (1e-7): the rounded point (x=510, b=0) misses the
-        // original `x - m*b == 10` row by 500 — must be rejected.
-        state.options.tolerances.feasibility = Tolerances::default().feasibility;
-        assert!(
-            !try_adopt_incumbent(state).unwrap(),
-            "a 500-unit rounding-induced violation must be rejected at the default feasibility tolerance"
-        );
-
-        // Absurdly loosened tolerance: the same 500-unit violation is now
-        // within bounds — the guard must accept it.
-        state.options.tolerances.feasibility = 1e6;
-        assert!(
-            try_adopt_incumbent(state).unwrap(),
-            "the same violation must be accepted once tolerances.feasibility is loosened past it"
-        );
-    }
-
-    #[test]
-    fn incumbent_feasible_row_tolerance_is_absolute_not_relative_to_rhs() {
-        // `incumbent_feasible` uses the same absolute feasibility tolerance
-        // as the rounded-incumbent guard, regardless of row magnitude.
-        let mut p = Problem::new(OptimizationDirection::Minimize);
-        let x = p.add_var(1.0, (0.0, f64::INFINITY));
-        p.add_constraint(&[(x, 1.0)], ComparisonOp::Le, 1000.0);
-        let fixed = std::collections::BTreeMap::new();
-        let tolerances = Tolerances::default();
-
-        // Within the absolute tolerance (5e-8 < 1e-7): accepted.
-        assert!(incumbent_feasible(
-            &p,
-            &fixed,
-            &[1000.0 + 5e-8],
-            &tolerances
-        ));
-
-        // A `5e-5` violation exceeds the `1e-7` absolute tolerance even though
-        // it is small relative to this row's right-hand side.
-        assert!(!incumbent_feasible(
-            &p,
-            &fixed,
-            &[1000.0 + 5e-5],
-            &tolerances
-        ));
-    }
-
-    #[test]
-    fn candidate_validation_rejects_non_finite_and_malformed_values() {
-        let mut problem = Problem::new(OptimizationDirection::Minimize);
-        problem.add_integer_var(1.0, (0, 10));
-        let fixed = BTreeMap::new();
-        let tolerances = Tolerances::default();
-
-        assert!(!incumbent_feasible(&problem, &fixed, &[], &tolerances));
-        assert!(!incumbent_feasible(
-            &problem,
-            &fixed,
-            &[f64::NAN],
-            &tolerances
-        ));
-        assert!(!incumbent_feasible(
-            &problem,
-            &fixed,
-            &[f64::INFINITY],
-            &tolerances
-        ));
-
-        let mut overflowing_row = Problem::new(OptimizationDirection::Minimize);
-        let x = overflowing_row.add_var(0.0, (0.0, f64::INFINITY));
-        overflowing_row.add_constraint(&[(x, 1.0e308)], ComparisonOp::Le, 1.0e308);
-        assert!(!incumbent_feasible(
-            &overflowing_row,
-            &fixed,
-            &[1.0e308],
-            &tolerances
-        ));
-    }
-
-    #[test]
-    fn valid_candidate_completes_unbounded_classification() {
-        let mut problem = Problem::new(OptimizationDirection::Minimize);
-        problem.add_integer_var(1.0, (0, 10));
-        let mut state = build_state(&problem, SolveOptions::default()).unwrap();
-        assert_eq!(state.solver.initial_solve().unwrap(), StopReason::Finished);
-        state.classifying_unbounded = true;
-
-        assert_eq!(try_adopt_incumbent(&mut state), Err(Error::Unbounded));
-    }
-
-    #[test]
-    fn warm_start_restores_bounds_before_unbounded_verdict() {
-        let mut problem = Problem::new(OptimizationDirection::Minimize);
-        let x = problem.add_integer_var(0.0, (0, 10));
-        let mut state = build_state(&problem, SolveOptions::default()).unwrap();
-        assert_eq!(state.solver.initial_solve().unwrap(), StopReason::Finished);
-        state.classifying_unbounded = true;
-
-        assert_eq!(
-            try_warm_start(&mut state, &[(x, 5.0)]),
-            Err(Error::Unbounded)
-        );
-        assert_eq!(state.solver.get_var_bounds(x.idx()), (0.0, 10.0));
-    }
-}
+mod tests;
