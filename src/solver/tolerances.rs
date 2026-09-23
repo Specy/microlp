@@ -4,7 +4,7 @@
 //! The contract (ARCHITECTURE §7): a value may leave its range by the user's
 //! absolute `feasibility` tolerance, or by the round-off of the quantities it
 //! was computed from if that is larger. [`row_tolerance`] is that rule,
-//! [`bound_tolerance`] its instance for a var's bounds, and [`outside`] the
+//! [`bound_tolerance`] its instance for a var's bound, and [`outside`] the
 //! one comparison every check makes. The engine holds each row to
 //! [`ROW_BUDGET_SHARE`] of the contract ([`slack_tol`]) and caps a var's
 //! bound tolerance by what its rows can absorb ([`structural_tol`]), so that
@@ -13,6 +13,8 @@
 //! a snapped integer or fixed value and for evaluating the row in another
 //! order. Everything else here is a property of `f64` and of the
 //! factorization, not of the contract.
+
+use crate::{ComparisonOp, CsVec};
 
 /// The absolute part of the reduced-cost tolerance ([`dual_tol`]) and of
 /// [`float_eq`], in the engine's scaled units, where quantities are of order
@@ -29,19 +31,38 @@ pub(crate) const ROUNDOFF_FLOOR: f64 = 1e-14;
 /// relative to the largest entry of its row or column: about ten ulps of
 /// `f64`. An entry below this fraction of its neighbours is indistinguishable
 /// from the round-off of computing it, and two computations of the same
-/// entry (through the row and through the column) agree to about this much.
-/// Tighter than [`ROUNDOFF_FLOOR`], which allows for a sum over a row's
-/// many terms.
+/// entry (through the row and through the column) agree to about this much. Tighter than [`ROUNDOFF_FLOOR`], which allows
+/// for a sum over a row's many terms.
 pub(crate) const ENTRY_ROUNDOFF: f64 = 1e-15;
 
+/// A column of the basis whose largest eligible pivot, in the LU
+/// factorization, is below this fraction of the column's largest
+/// transformed entry is treated as singular: the eligible part is then
+/// within the round-off of the elimination that produced it, i.e. the column
+/// is dependent on the previous ones as far as `f64` can tell. Relative to
+/// the column's own scale rather than absolute, so the test does not depend
+/// on the units the column happens to be written in; an ill-conditioned but
+/// non-singular basis is judged by the verification of the values it
+/// produces, not by a threshold on its pivots.
+///
+/// The ratio tests hold a pivot element within this fraction of the scale
+/// of its row and column to more than the factorization can resolve: its
+/// two computations must agree relatively, not just within their round-off
+/// (see `Solver::pivots_agree`), since at this size a round-off entry agrees
+/// with anything of its own size.
+pub(crate) const LU_SINGULAR_REL: f64 = ROUNDOFF_FLOOR;
+
 /// Relative pivot tolerance of both ratio tests: an entry of the pivot row
-/// (dual simplex) or pivot column (primal simplex) is a candidate pivot only
+/// (dual simplex) or pivot column (primal simplex) is a preferred pivot only
 /// if its magnitude is at least this fraction of the largest entry scanned.
 /// A pivot seven orders of magnitude below its neighbours amplifies the
-/// round-off of the update by the same factor; with the matrix scaled, an
-/// entry that small relative to its row or column is noise or as good as
-/// noise. The largest entry is always a candidate, so this can never turn a
-/// feasible model infeasible or a bounded one unbounded on its own.
+/// round-off of the update by the same factor, so it is taken only when no
+/// larger entry will do: the largest entry of a dual row is always a
+/// candidate, and in the primal test a smaller entry still bounds the step
+/// (its basic var is held to its tolerance like any other) and is the pivot
+/// when it is what blocks the step. So this never turns a feasible model
+/// infeasible or a bounded one unbounded, and never lets a step leave a
+/// basic var outside its tolerance.
 pub(crate) const PIVOT_REL_TOL: f64 = 1e-7;
 
 /// Relative disagreement between the pivot element computed through the
@@ -82,34 +103,148 @@ pub(crate) fn row_tolerance(tol: f64, magnitude: f64) -> f64 {
     tol.max(ROUNDOFF_FLOOR * magnitude)
 }
 
-/// The larger finite magnitude of two bounds (zero when both are infinite).
-pub(crate) fn bound_magnitude(lo: f64, hi: f64) -> f64 {
-    [lo.abs(), hi.abs()]
-        .into_iter()
-        .filter(|m| m.is_finite())
-        .fold(0.0, f64::max)
+/// The contract on one bound of a var: [`row_tolerance`] at the magnitude of
+/// that bound. Each bound has its own, since comparing a value with a bound
+/// resolves it to the round-off of that bound, not of the other one (the
+/// larger of the two gave a var in `[0, f64::MAX]` a tolerance of 1e294 at
+/// zero, and a var in `[0, 1e10]` one of 1e-4). An infinite bound compares
+/// with nothing; its tolerance is the absolute part alone.
+pub(crate) fn bound_tolerance(feasibility: f64, bound: f64) -> f64 {
+    if bound.is_finite() {
+        row_tolerance(feasibility, bound.abs())
+    } else {
+        feasibility
+    }
 }
 
-/// The contract on a var's bounds: [`row_tolerance`] at the magnitude of
-/// the bound.
-pub(crate) fn bound_tolerance(feasibility: f64, lo: f64, hi: f64) -> f64 {
-    row_tolerance(feasibility, bound_magnitude(lo, hi))
+/// Whether `value` violates the var bounds `[lo, hi]` beyond the contract:
+/// [`outside`] against each bound with that bound's own tolerance
+/// ([`bound_tolerance`]).
+pub(crate) fn outside_bounds(value: f64, lo: f64, hi: f64, feasibility: f64) -> bool {
+    outside(value, lo, f64::INFINITY, bound_tolerance(feasibility, lo))
+        || outside(
+            value,
+            f64::NEG_INFINITY,
+            hi,
+            bound_tolerance(feasibility, hi),
+        )
+}
+
+/// A var's tolerances at its lower and upper bound, in the engine's units
+/// (see [`structural_tol`]; a slack's two are equal).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BoundTols {
+    pub(crate) lo: f64,
+    pub(crate) hi: f64,
+}
+
+impl BoundTols {
+    pub(crate) fn uniform(tol: f64) -> Self {
+        Self { lo: tol, hi: tol }
+    }
+
+    /// The tolerance at the bound a value moving up (`true`) or down meets.
+    #[inline]
+    pub(crate) fn toward(&self, up: bool) -> f64 {
+        if up {
+            self.hi
+        } else {
+            self.lo
+        }
+    }
 }
 
 /// Whether `value` lies outside `[lo, hi]` by more than `tol`: the one
 /// comparison of the contract, written the way the engine tests a basic var
 /// against its bounds, so that every check computes the same bits from the
-/// same numbers (`value - hi > tol` is not the same test in `f64`). A NaN is
-/// outside.
+/// same numbers (`value - hi > tol` is not the same test in `f64`). A value
+/// that is not finite is outside whatever the range: the contract is about
+/// points, and a point is finite (an infinite value would otherwise pass an
+/// infinite bound, and its row an infinite tolerance).
 #[inline]
 pub(crate) fn outside(value: f64, lo: f64, hi: f64, tol: f64) -> bool {
-    value.is_nan() || value < lo - tol || value > hi + tol
+    !value.is_finite() || value < lo - tol || value > hi + tol
+}
+
+/// The range a row of sense `op` allows for `rhs - activity`, i.e. the
+/// bounds of its slack var: `[0, ∞)` for `≤`, `(-∞, 0]` for `≥`, `[0, 0]`
+/// for `=`.
+pub(crate) fn slack_bounds(op: ComparisonOp) -> (f64, f64) {
+    match op {
+        ComparisonOp::Le => (0.0, f64::INFINITY),
+        ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
+        ComparisonOp::Eq => (0.0, 0.0),
+    }
+}
+
+/// How far the user-unit row `coeffs op rhs` is from holding at `values`,
+/// if it violates the contract there (`row_tolerance(feasibility, m)` at
+/// the row's magnitude `m = |rhs| + Σ|a_j x_j|`); `None` if it holds. This
+/// is the check of a row as the user wrote it, for rows the engine does not
+/// hold itself (see `Solver::first_violated_row`).
+pub(crate) fn row_violation(
+    coeffs: &CsVec,
+    op: ComparisonOp,
+    rhs: f64,
+    values: &[f64],
+    feasibility: f64,
+) -> Option<f64> {
+    let mut lhs = 0.0;
+    let mut magnitude = rhs.abs();
+    for (v, &coeff) in coeffs.iter() {
+        let term = coeff * values[v];
+        lhs += term;
+        magnitude += term.abs();
+    }
+    let (smin, smax) = slack_bounds(op);
+    let implied = rhs - lhs;
+    outside(implied, smin, smax, row_tolerance(feasibility, magnitude))
+        .then(|| excursion(implied, smin, smax))
+}
+
+/// What a row says before any point is looked at: `Some(false)` when no
+/// point can satisfy it (a coefficient or right-hand side that is not a
+/// number, an infinite coefficient, an infinite right-hand side on the
+/// side the row constrains, an empty row whose right-hand side the contract
+/// does not allow at activity zero), `Some(true)` when every point does (an
+/// infinite right-hand side on the side the row leaves open, an empty row
+/// within the contract), and `None` when its terms decide. An empty row is
+/// judged by the same comparison as every other row: its activity is
+/// exactly zero, and its magnitude is that of its right-hand side.
+pub(crate) fn trivial_row_verdict(
+    coeffs: &CsVec,
+    op: ComparisonOp,
+    rhs: f64,
+    feasibility: f64,
+) -> Option<bool> {
+    if rhs.is_nan() || coeffs.data().iter().any(|c| !c.is_finite()) {
+        return Some(false);
+    }
+    let (smin, smax) = slack_bounds(op);
+    if rhs.is_infinite() {
+        // `rhs - activity` is infinite for every finite point: inside the
+        // slack range only if that range is unbounded on rhs's side.
+        return Some(if rhs > 0.0 {
+            smax == f64::INFINITY
+        } else {
+            smin == f64::NEG_INFINITY
+        });
+    }
+    if coeffs.indices().is_empty() {
+        return Some(!outside(
+            rhs,
+            smin,
+            smax,
+            row_tolerance(feasibility, rhs.abs()),
+        ));
+    }
+    None
 }
 
 /// How far `value` lies outside `[lo, hi]` (zero inside, infinite for a
-/// NaN), for reports.
+/// value that is not finite, as [`outside`] has it), for reports.
 pub(crate) fn excursion(value: f64, lo: f64, hi: f64) -> f64 {
-    if value.is_nan() {
+    if !value.is_finite() {
         f64::INFINITY
     } else {
         (lo - value).max(value - hi).max(0.0)
@@ -134,26 +269,28 @@ pub(crate) fn snap_budget(feasibility: f64, row_scale: f64, coeff: f64) -> f64 {
     (1.0 - ROW_BUDGET_SHARE) * feasibility * row_scale / coeff.abs()
 }
 
-/// Tolerance within which a structural var (column factor `scale`, scaled
-/// bounds `min..max`) counts as at or within its bounds: the user's
+/// Tolerances within which a structural var (column factor `scale`, scaled
+/// bounds `min..max`) counts as at or within each bound: the user's
 /// tolerance in user units, `feasibility / scale` in the engine's units, but
 /// never more than any of its rows can absorb when the value is snapped to
 /// the bound (`row_budget`, the smallest [`snap_budget`] over the var's
 /// rows; infinite for a var in no row), and never finer than the round-off
-/// of the bound. One rule for every var: the cap is what keeps a big-M row
-/// within contract when its binary is rounded, and a fixed var's report at
-/// its value within the rows presolve substituted it out of.
+/// of that bound ([`bound_tolerance`]). One rule for every var: the cap is
+/// what keeps a big-M row within contract when its binary is rounded, and a
+/// fixed var's report at its value within the rows presolve substituted it
+/// out of.
 pub(crate) fn structural_tol(
     scale: f64,
     min: f64,
     max: f64,
     feasibility: f64,
     row_budget: f64,
-) -> f64 {
-    row_tolerance(
-        (feasibility / scale).min(row_budget),
-        bound_magnitude(min, max),
-    )
+) -> BoundTols {
+    let base = (feasibility / scale).min(row_budget);
+    BoundTols {
+        lo: bound_tolerance(base, min),
+        hi: bound_tolerance(base, max),
+    }
 }
 
 /// Tolerance within which a reduced cost counts as zero, given the magnitude

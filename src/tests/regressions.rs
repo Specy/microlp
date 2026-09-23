@@ -1,5 +1,5 @@
-//! Tests reproducing reported issues. The closed ones guard against the bug
-//! returning; the open ones (#44, #47, #48) fail until it is fixed.
+//! Tests reproducing reported issues, each guarding against its bug
+//! returning.
 
 #[cfg(test)]
 mod regression_tests {
@@ -45,6 +45,59 @@ mod regression_tests {
                 "objective wrong for upper={upper:e}: got {}",
                 sol.objective()
             );
+        }
+    }
+
+    /// Issue #3 from the other side: a huge upper bound must not loosen the
+    /// LOWER bound. The round-off floor of a var's bound tolerance was taken
+    /// from the larger of its bounds, so `x ∈ [0, f64::MAX]` could sit at
+    /// `-5` (a tolerance of 1e294 at zero) and an infeasible model came back
+    /// Optimal; with an upper bound of infinity it was correctly Infeasible.
+    /// Each bound now has the round-off floor of its own magnitude.
+    #[test]
+    fn issue_3_huge_upper_bound_does_not_loosen_the_lower_bound() {
+        for upper in [f64::MAX, f32::MAX as f64, 1e10, f64::INFINITY] {
+            for presolve in [true, false] {
+                let mut problem = Problem::new(OptimizationDirection::Minimize);
+                let x = problem.add_var(1.0, (0.0, upper));
+                let y = problem.add_var(1.0, (0.0, 10.0));
+                problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Eq, -5.0);
+                let got = problem.solve_with(crate::SolveOptions {
+                    presolve,
+                    ..crate::SolveOptions::default()
+                });
+                assert_eq!(
+                    got.map(|_| "solved"),
+                    Err(crate::Error::Infeasible),
+                    "upper {upper:e}, presolve {presolve}"
+                );
+            }
+        }
+        // And a lower bound of zero is held to within the absolute tolerance,
+        // not to the round-off of the upper bound: min y with y ≥ 1 + 1e6 x
+        // wants x as low as it may go, and x = -1e-6 (inside a tolerance of
+        // 1e-2, the round-off of 1e12) would give y = 0 instead of 1.
+        for upper in [f64::MAX, 1e12, f64::INFINITY] {
+            for presolve in [true, false] {
+                let mut problem = Problem::new(OptimizationDirection::Minimize);
+                let x = problem.add_var(0.0, (0.0, upper));
+                let y = problem.add_var(1.0, (0.0, 10.0));
+                problem.add_constraint([(y, 1.0), (x, -1e6)], ComparisonOp::Ge, 1.0);
+                let sol = problem
+                    .solve_with(crate::SolveOptions {
+                        presolve,
+                        ..crate::SolveOptions::default()
+                    })
+                    .unwrap()
+                    .into_solution()
+                    .unwrap();
+                assert!(
+                    sol[x] >= -1e-7 && (sol.objective() - 1.0).abs() < 1e-6,
+                    "upper {upper:e}, presolve {presolve}: x = {:e}, objective {}",
+                    sol[x],
+                    sol.objective()
+                );
+            }
         }
     }
 
@@ -233,6 +286,101 @@ mod regression_tests {
             assert!(
                 (fixed_value - value).abs() < 1e-9,
                 "x in [0, {hi}], x {op:?} {rhs}: after fix_var(x, {value:?}) x = {fixed_value:?}"
+            );
+        }
+    }
+
+    /// Issue #47 in general: a value `solve` reports may sit outside the
+    /// var's bounds by round-off, within the contract (here
+    /// `0.2999999999999998` on `[0.3, 5.3]`), and `fix_var` compared it with
+    /// the bounds exactly and refused it as `Infeasible`, on the LP and the
+    /// MIP path alike. So did a value within tolerance of a bound presolve
+    /// had tightened (`2 x = 6` fixes `x` at 3). A value within the bound
+    /// tolerance fixes the var at that bound; one beyond it is refused.
+    #[test]
+    fn issue_47_fix_var_accepts_a_value_within_the_bound_tolerance() {
+        for milp in [false, true] {
+            let mut problem = Problem::new(OptimizationDirection::Maximize);
+            let x0 = problem.add_var(0.2, (0.3, 5.3));
+            let x1 = problem.add_var(1.3, (-2.0, 0.0));
+            if milp {
+                problem.add_integer_var(0.0, (0, 1));
+            }
+            problem.add_constraint([(x0, 0.7), (x1, 0.3)], ComparisonOp::Le, 0.21);
+            let solution = problem.solve().unwrap().into_solution().unwrap();
+            let value = solution.var_value(x0);
+            let refixed = solution
+                .clone()
+                .fix_var(x0, value)
+                .unwrap_or_else(|e| panic!("milp {milp}: fix_var(x0, {value:?}) gave {e:?}"))
+                .into_solution()
+                .unwrap();
+            assert!((refixed.var_value(x0) - 0.3).abs() < 1e-7, "milp {milp}");
+            assert!(
+                matches!(solution.fix_var(x0, 0.29), Err(crate::Error::Infeasible)),
+                "milp {milp}: a value 0.01 below the bound must be refused"
+            );
+        }
+        for presolve in [true, false] {
+            let mut problem = Problem::new(OptimizationDirection::Minimize);
+            let x = problem.add_var(1.0, (0.0, 10.0));
+            let y = problem.add_var(1.0, (0.0, 10.0));
+            problem.add_constraint([(x, 2.0)], ComparisonOp::Eq, 6.0);
+            problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 4.0);
+            let solution = problem
+                .solve_with(crate::SolveOptions {
+                    presolve,
+                    ..crate::SolveOptions::default()
+                })
+                .unwrap()
+                .into_solution()
+                .unwrap();
+            let refixed = solution
+                .fix_var(x, 3.000000001)
+                .unwrap_or_else(|e| {
+                    panic!("presolve {presolve}: fix_var(x, 3.000000001) gave {e:?}")
+                })
+                .into_solution()
+                .unwrap();
+            assert!(
+                (refixed.objective() - 4.0).abs() < 1e-6,
+                "presolve {presolve}"
+            );
+        }
+    }
+
+    /// Fixing an integer var: a value within the integrality tolerance of an
+    /// integer fixes it there; any other value is incompatible with its
+    /// domain (`Infeasible`, as `fix_var` documents). A fix at `2.0000005`
+    /// used to end in an `InternalError` with presolve off (the fixed var is
+    /// not integral, and branching skips a var whose range is under half a
+    /// unit) and in a silently different value with presolve on.
+    #[test]
+    fn fix_var_on_an_integer_var_respects_its_domain() {
+        for presolve in [true, false] {
+            let mut problem = Problem::new(OptimizationDirection::Maximize);
+            let x = problem.add_integer_var(1.0, (0, 10));
+            let y = problem.add_var(1.0, (0.0, 1.0));
+            problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 5.5);
+            let options = crate::SolveOptions {
+                presolve,
+                ..crate::SolveOptions::default()
+            };
+            let solution = problem
+                .solve_with(options)
+                .unwrap()
+                .into_solution()
+                .unwrap();
+            let fixed = solution
+                .clone()
+                .fix_var(x, 2.0000005)
+                .unwrap_or_else(|e| panic!("presolve {presolve}: fix_var(x, 2.0000005) gave {e:?}"))
+                .into_solution()
+                .unwrap();
+            assert_eq!(fixed.var_value(x), 2.0, "presolve {presolve}");
+            assert!(
+                matches!(solution.fix_var(x, 2.4), Err(crate::Error::Infeasible)),
+                "presolve {presolve}: 2.4 is not an integer"
             );
         }
     }

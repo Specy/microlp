@@ -25,7 +25,7 @@ pub use options::{
 pub(crate) use state::{MipRun, MipState};
 
 use crate::solver::Solver;
-use crate::{ComparisonOp, Error, OptimizationDirection, Problem, VarDomain, Variable};
+use crate::{Error, OptimizationDirection, Problem, VarDomain, Variable};
 use search::search_loop;
 use std::collections::BTreeMap;
 use web_time::Instant;
@@ -60,7 +60,7 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
             &problem.constraints[..],
         ),
     };
-    let solver = Solver::try_new(
+    let mut solver = Solver::try_new(
         &problem.obj_coeffs,
         var_mins,
         var_maxs,
@@ -74,6 +74,11 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
         .zip(var_maxs)
         .map(|(&lo, &hi)| (lo, hi))
         .collect();
+    // Incumbents are held to the rows as written, the ones presolve dropped
+    // or rewrote included (the guard checks them through the solver).
+    if let Some(presolved) = presolved {
+        solver.set_validation_rows(presolved.validation_rows);
+    }
     let pseudocosts = branching::PseudoCosts::new(&problem.obj_coeffs, problem.obj_coeffs.len());
     Ok(MipState {
         solver,
@@ -161,75 +166,36 @@ pub(crate) fn candidate_variables_feasible(
         let (lo, hi) = bounds(v);
         // The contract on a bound, the same rule and the same comparison as
         // the engine's and the LP path's.
-        let tol = crate::solver::bound_tolerance(tolerances.feasibility, lo, hi);
         value.is_finite()
             && !lo.is_nan()
             && !hi.is_nan()
             && lo <= hi
-            && !crate::solver::outside(value, lo, hi, tol)
+            && !crate::solver::outside_bounds(value, lo, hi, tolerances.feasibility)
             && (!matches!(domains[v], VarDomain::Integer | VarDomain::Boolean)
                 || (value - value.round()).abs() <= tolerances.integrality_rounding)
     })
 }
 
 /// Cheap feasibility check of a value vector against base + fixes: bounds,
-/// domains, and every user-scale constraint row. This is a warm-start prefilter;
-/// adoption re-validates the candidate against the active solver's scaled rows.
+/// domains, and every user-scale constraint row, under the same contract the
+/// solver's boundary applies ([`crate::solver::row_violation`]). This is a
+/// warm-start prefilter; adoption re-validates the candidate through the
+/// active solver.
 pub(crate) fn incumbent_feasible(
     base: &Problem,
     fixed: &BTreeMap<usize, f64>,
     values: &[f64],
     tolerances: &Tolerances,
 ) -> bool {
-    first_violation(base, fixed, values, tolerances).is_none()
-}
-
-/// [`incumbent_feasible`] with the first offending bound or row described,
-/// for error messages.
-pub(crate) fn first_violation(
-    base: &Problem,
-    fixed: &BTreeMap<usize, f64>,
-    values: &[f64],
-    tolerances: &Tolerances,
-) -> Option<String> {
-    if !candidate_variables_feasible(values, &base.var_domains, tolerances, |v| {
+    candidate_variables_feasible(values, &base.var_domains, tolerances, |v| {
         fixed
             .get(&v)
             .map_or((base.var_mins[v], base.var_maxs[v]), |&value| {
                 (value, value)
             })
-    }) {
-        return Some(format!(
-            "a variable value violates its bounds or domain: {values:?}"
-        ));
-    }
-    for (row, (coeffs, op, rhs)) in base.constraints.iter().enumerate() {
-        let mut lhs = 0.0;
-        let mut magnitude = rhs.abs();
-        for (i, c) in coeffs.iter() {
-            let term = c * values[i];
-            lhs += term;
-            magnitude += term.abs();
-        }
-        if !lhs.is_finite() {
-            return Some(format!("row {row} has a non-finite activity"));
-        }
-        // The contract on a row, as `Solver::first_violated_row` applies it:
-        // the slack the row implies, against the slack bounds its sense
-        // encodes.
-        let tol = crate::solver::row_tolerance(tolerances.feasibility, magnitude);
-        let (smin, smax) = match op {
-            ComparisonOp::Eq => (0.0, 0.0),
-            ComparisonOp::Le => (0.0, f64::INFINITY),
-            ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
-        };
-        if crate::solver::outside(rhs - lhs, smin, smax, tol) {
-            return Some(format!(
-                "row {row} ({op:?} {rhs:e}) has activity {lhs:e}, tolerance {tol:e}, at {values:?}"
-            ));
-        }
-    }
-    None
+    }) && base.constraints.iter().all(|(coeffs, op, rhs)| {
+        crate::solver::row_violation(coeffs, *op, *rhs, values, tolerances.feasibility).is_none()
+    })
 }
 
 /// After a user edit: drop the open tree, carry the incumbent as a warm-start

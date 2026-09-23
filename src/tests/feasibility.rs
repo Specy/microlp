@@ -14,11 +14,15 @@ mod tests_feasibility {
 
     use hegel::generators as gs;
 
-    /// A million cases, sized for the search rather than for anything in
+    /// Half a million cases, sized for the search rather than for anything in
     /// microlp's contract: the numerical states this property reaches are
-    /// thin, and shallower runs mostly miss them.
+    /// thin, and shallower runs mostly miss them. The ceiling is memory: hegel
+    /// keeps about 7.7 KB per case until the run ends (the solves themselves
+    /// keep nothing), so a run peaks near 3.9 GB, and 4.7 GB in CI's
+    /// `RUST_LOG=trace` step, which also holds the captured logs. A million
+    /// cases needed 7.7 GB, and CI's macOS runner has 7 GB in all.
     fn settings() -> hegel::Settings {
-        hegel::Settings::new().test_cases(1_000_000)
+        hegel::Settings::new().test_cases(500_000)
     }
 
     /// Indices are positions in `Model::reals`, so a row never mentions the
@@ -275,6 +279,46 @@ mod tests_feasibility {
                 Row {
                     terms: vec![(0, -20000.0), (2, 0.0001)],
                     op: ComparisonOp::Eq,
+                    rhs: 0.0,
+                },
+            ],
+            xstar: vec![0.0, 0.0, 0.0],
+        });
+    }
+
+    /// The counterexample CI's derandomized run of the property finds (hegel
+    /// seeds a CI run from the test's name). The primal ratio test left x2's
+    /// row out of its step bound because x2's entry, 1e-7 of the column's
+    /// largest, fell an ulp under the relative pivot floor; the step walked
+    /// the FIXED x2 to 1.25e-8, twenty-five times its tolerance, the phase
+    /// exit rejected the point, the dual phase pivoted back on that very
+    /// entry, and after eight rounds of this the solve gave up with
+    /// `InternalError`. An entry too small to pivot on still bounds the step.
+    #[test]
+    fn property_counterexample_with_a_blocking_entry_below_the_pivot_floor() {
+        use crate::tests::oracle::{assert_solves_within_contract, Model, Row, Var};
+        let real = |obj, lo, hi| Var {
+            obj,
+            lo,
+            hi,
+            integer: false,
+        };
+        assert_solves_within_contract(&Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(-1.0, -0.0, 1.0),
+                real(-1.0, -1.0, 1.0),
+                real(-1.0, -0.0, 0.0),
+            ],
+            rows: vec![
+                Row {
+                    terms: vec![(0, 10.0), (1, 1.2499999999999999e-6), (2, -100.0)],
+                    op: ComparisonOp::Eq,
+                    rhs: 0.0,
+                },
+                Row {
+                    terms: vec![(0, -1.0), (1, -10000.0)],
+                    op: ComparisonOp::Le,
                     rhs: 0.0,
                 },
             ],

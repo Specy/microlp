@@ -43,6 +43,64 @@ mod tests_presolve_api {
         with
     }
 
+    /// The answer is held to every row as the user wrote it, the ones
+    /// presolve dropped included, on every path: the MIP search, the pure-LP
+    /// solve, and an LP resumed after an interrupt. Presolve drops
+    /// `-10 x3 >= 0` here, and the engine may leave x3 above its bound of 0 by
+    /// its bound tolerance, which the dropped row sees ten times over
+    /// (1.13e-7 against 1e-7). The MIP path used to return that point as
+    /// Optimal, and so did an LP after a resume: only the first pure-LP
+    /// solve checked the rows as written. (Presolve no longer drops that row:
+    /// the engine's bound tolerance of x3, ten times over, is more than the
+    /// row can take, so it stays a row.)
+    #[test]
+    fn answers_satisfy_the_rows_presolve_dropped_on_every_path() {
+        init();
+        let build = |milp: bool| {
+            let mut p = Problem::new(OptimizationDirection::Maximize);
+            if milp {
+                p.add_integer_var(0.0, (0, 0));
+            }
+            let x1 = p.add_var(0.0, (-8388610.0, 0.0));
+            let _x2 = p.add_var(0.0, (0.0, 0.0));
+            let x3 = p.add_var(0.0, (-1.0, 0.0));
+            p.add_constraint([(x3, -10.0)], ComparisonOp::Ge, -0.0);
+            p.add_constraint(
+                [(x1, -1.0), (x3, 1.0745249307680744)],
+                ComparisonOp::Eq,
+                0.0,
+            );
+            p.add_constraint([(x1, 1.0), (x3, -1.0)], ComparisonOp::Eq, 0.0);
+            (p, x3)
+        };
+        let check = |what: &str, result: Result<SolveOutcome, Error>, x3: Variable| {
+            let sol = solution(result);
+            assert_eq!(sol.status(), SolutionStatus::Optimal, "{what}");
+            let activity = -10.0 * sol[x3];
+            assert!(
+                activity >= -1e-7,
+                "{what}: the row -10 x3 >= 0 has activity {activity:e}"
+            );
+        };
+        for milp in [true, false] {
+            let (p, x3) = build(milp);
+            check(&format!("milp {milp}"), p.solve(), x3);
+        }
+        let (p, x3) = build(false);
+        let interrupted = p
+            .solve_with(SolveOptions {
+                time_limit: Some(std::time::Duration::ZERO),
+                ..SolveOptions::default()
+            })
+            .unwrap();
+        assert!(interrupted.solution().is_none());
+        check(
+            "resumed LP",
+            interrupted.resume_with(ResumeOptions::default()),
+            x3,
+        );
+    }
+
     /// LP with a redundant row, a singleton row and a forcing structure: the
     /// presolved solver ends with zero rows, and the optimum must not move.
     #[test]
@@ -315,5 +373,138 @@ mod tests_presolve_api {
         // row2 loosely (-1 >= -3): objective 6 + 6 = 12. Pushing x lower
         // caps y harder (x = -4 -> y <= 1, obj 11; x = -5 crosses row2).
         assert_eq!(sol.objective(), 12.0);
+    }
+
+    /// An implied bound is computed by cancellation (`rest = activity − own
+    /// term`), and at a bound of `i32::MIN` (the documented "no bound" of an
+    /// integer var) the own term is 2^31: the rest carried a round-off of
+    /// 2e-7 that the bound's relaxation, sized for the rest alone, did not
+    /// cover, and `floor` turned it into a whole unit. `x ≤ 3.4 − 0.4 y` with
+    /// `y ≥ 1` became `x ≤ 2`: a wrong optimum (2 for 3), and with the row as
+    /// an equality, `Infeasible`.
+    #[test]
+    fn implied_integer_bound_survives_cancellation_against_a_huge_bound() {
+        init();
+        for op in [ComparisonOp::Le, ComparisonOp::Eq] {
+            let mut p = Problem::new(OptimizationDirection::Maximize);
+            let x = p.add_integer_var(1.0, (i32::MIN, 10));
+            let y = p.add_integer_var(0.0, (1, 5));
+            p.add_constraint(&[(x, 1.0), (y, 0.4)], op, 3.4);
+            let sol = assert_same_objective(&p);
+            assert_eq!(sol.objective(), 3.0, "{op:?}");
+            assert_eq!(sol.var_value(x), 3.0, "{op:?}");
+        }
+    }
+
+    /// A forcing row may fix its vars at their extremes only when that cuts
+    /// nothing a var could resolve: here the row's minimum falls 1.5e-5 short
+    /// of its bound, within the round-off of a magnitude of 4e9, but that
+    /// sliver is a real range of 0.015 for `y`. Presolve fixed `y = 0` and
+    /// reported an optimum of 0 for one of 15.02.
+    #[test]
+    fn forcing_row_does_not_cut_a_range_a_var_can_resolve() {
+        init();
+        let mut p = Problem::new(OptimizationDirection::Maximize);
+        let x = p.add_var(0.0, (-2e9, 0.0));
+        let y = p.add_var(1000.0, (0.0, 1000.0));
+        p.add_constraint(&[(x, 1.0), (y, 0.001)], ComparisonOp::Le, -2e9 + 1.5e-5);
+        let sol = assert_same_objective(&p);
+        assert!(
+            (sol.objective() - 15.02).abs() < 1e-3,
+            "{}",
+            sol.objective()
+        );
+    }
+
+    /// A singleton row is a bound only as loose as the row: `0.01 x = 0.01 +
+    /// 1e-9` accepts `x` within 1e-5 of 1.0000001, and fixing `x` there made
+    /// the row `x = 1`, which the model meets within 1e-9, look inconsistent
+    /// (`Infeasible`, but only with the rows in this order).
+    #[test]
+    fn singleton_row_keeps_the_tolerance_of_the_row() {
+        init();
+        for swap in [false, true] {
+            let mut p = Problem::new(OptimizationDirection::Minimize);
+            let x = p.add_var(1.0, (0.0, 10.0));
+            let rows = [(0.01, 0.01 + 1e-9), (1.0, 1.0)];
+            let order = if swap { [1, 0] } else { [0, 1] };
+            for i in order {
+                let (a, b) = rows[i];
+                p.add_constraint(&[(x, a)], ComparisonOp::Eq, b);
+            }
+            let sol = assert_same_objective(&p);
+            assert!((sol[x] - 1.0).abs() < 1e-7, "swap {swap}: x = {}", sol[x]);
+        }
+    }
+
+    /// A singleton row must not be dropped as implied by its var's bound when
+    /// the engine's bound tolerance, times the row's coefficient, breaks the
+    /// row: `-20 x1 >= 0` with `x1 <= 0` let x1 sit 1e-8 above zero, which
+    /// the dropped row saw as 2e-7 against 1e-7. (The model is feasible at
+    /// the origin.)
+    #[test]
+    fn singleton_row_tighter_than_its_bound_tolerance_is_kept() {
+        init();
+        for obj in [0.0, 1.0] {
+            let mut p = Problem::new(OptimizationDirection::Maximize);
+            let x0 = p.add_var(-obj, (-1.0, 1.0));
+            let x1 = p.add_var(obj, (-1.0, 0.0));
+            p.add_constraint(&[(x0, -1.0), (x1, -1.0)], ComparisonOp::Le, 1.0);
+            p.add_constraint(&[(x0, -1e-8), (x1, -1.0)], ComparisonOp::Eq, -0.0);
+            p.add_constraint(&[(x1, -20.0)], ComparisonOp::Ge, -0.0);
+            let sol = assert_same_objective(&p);
+            assert!(-20.0 * sol[x1] >= -1e-7, "obj {obj}: x1 = {:e}", sol[x1]);
+        }
+    }
+
+    /// Integer points are held to the full contract (the incumbent guard's),
+    /// so presolve's integer rounding may not cut one that meets it: `x + y
+    /// = 4 + 6e-8` holds within 1e-7 at (4, 0), but rounding against half
+    /// the tolerance moved each bound by a unit per pass until they crossed.
+    #[test]
+    fn integer_rounding_keeps_points_the_guard_accepts() {
+        init();
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let x = p.add_integer_var(1.0, (0, 10));
+        let y = p.add_integer_var(1.0, (0, 10));
+        p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Eq, 4.0 + 6e-8);
+        let sol = assert_same_objective(&p);
+        assert_eq!(sol.objective(), 4.0);
+    }
+
+    /// A row whose vars are all fixed is judged at the magnitude the engine
+    /// sees, that of the right-hand side as written plus the fixed terms:
+    /// `x + y = 2e9 + 1.5e-5` at `x = y = 1e9` is within the round-off of
+    /// its magnitude of 4e9, but presolve measured the right-hand side left
+    /// after substitution (1.5e-5) and declared the model infeasible.
+    #[test]
+    fn all_substituted_row_is_judged_at_its_full_magnitude() {
+        init();
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let x = p.add_var(1.0, (1e9, 1e9));
+        let y = p.add_var(1.0, (1e9, 1e9));
+        let z = p.add_var(1.0, (0.0, 1.0));
+        p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Eq, 2e9 + 1.5e-5);
+        p.add_constraint(&[(z, 1.0), (x, 1e-9)], ComparisonOp::Ge, 1.0);
+        let sol = assert_same_objective(&p);
+        assert_eq!(sol[x], 1e9);
+    }
+
+    /// Found by the wide-coefficient LP property: an equality at 1.34e8 with
+    /// a 1e-8 coefficient. The engine solves it; presolve declared it
+    /// infeasible.
+    #[test]
+    fn equality_at_1e8_with_a_tiny_coefficient_is_feasible() {
+        init();
+        for obj in [0.0, 1.0] {
+            let mut p = Problem::new(OptimizationDirection::Maximize);
+            let x0 = p.add_var(-obj, (13421773.0, 13421774.0));
+            let x1 = p.add_var(0.0, (-268.0, 1.0));
+            let _x2 = p.add_var(obj, (0.0, 0.0));
+            p.add_constraint(&[(x1, 1.0)], ComparisonOp::Le, 0.0);
+            p.add_constraint(&[(x0, -10.0), (x1, 1e-8)], ComparisonOp::Eq, -134217730.0);
+            let sol = assert_same_objective(&p);
+            assert!((sol[x0] - 13421773.0).abs() < 1e-6, "x0 = {}", sol[x0]);
+        }
     }
 }

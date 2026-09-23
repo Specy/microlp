@@ -18,7 +18,10 @@
 
 #[cfg(test)]
 mod regression_tests {
-    use crate::tests::oracle::{assert_solves_within_contract, xstar_is_feasible, Model, Row, Var};
+    use crate::tests::oracle::{
+        assert_solves_feasibly_within_contract, assert_solves_within_contract, xstar_is_feasible,
+        Model, Row, Var,
+    };
     use crate::{ComparisonOp, OptimizationDirection};
 
     fn real(obj: f64, lo: f64, hi: f64) -> Var {
@@ -403,6 +406,168 @@ mod regression_tests {
                 ),
             ],
             xstar: vec![0.0, 0.0, 0.0, 7962362.0, 0.0, 0.0],
+        });
+    }
+
+    /// Variable magnitudes around `8.5e6`, found by the narrow-coefficient LP
+    /// property. Row 2's equality slack sat past its bound within its
+    /// tolerance when the primal simplex took a step that moved it further
+    /// out; the Harris bound granted it its whole tolerance again, measured
+    /// from the bound rather than from where it was, so the step carried it
+    /// to 1.3 times its tolerance. The phase exit rejected the point, the dual
+    /// phase undid the step, and after eight rounds of this the solve gave up
+    /// with `InternalError`.
+    #[test]
+    fn harris_allowance_is_measured_from_where_a_basic_var_sits() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, -43.0, 0.0),
+                real(0.0, 0.0, 1.0),
+                real(-1.0, 0.0, 1.0),
+                real(0.0, -1.0, 0.0),
+                real(1.0, -8470086.0, 125747738.0),
+            ],
+            rows: vec![
+                row(&[(0, 0.1), (4, -1.0)], ComparisonOp::Eq, 8469986.0),
+                row(
+                    &[(1, 0.1), (2, -0.1), (3, -2.0), (4, 10.0)],
+                    ComparisonOp::Eq,
+                    -84699860.0,
+                ),
+                row(
+                    &[(1, 0.1), (2, 1.0), (4, 1.0)],
+                    ComparisonOp::Eq,
+                    -8469986.0,
+                ),
+                row(&[(2, 20.0), (3, 20.0)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 0.0, -8469986.0],
+        });
+    }
+
+    /// Found by the wide-coefficient MILP property: an integer var with a
+    /// coefficient of 1e-8 in an equality may leave the row's solution by up
+    /// to the row's tolerance over that coefficient, ten units here, and
+    /// presolve's integer rounding, holding integer points to the full
+    /// contract, kept the points exactly at it. The guard then evaluated
+    /// the row there a few ulps over the contract, and an exactly integral
+    /// candidate was rejected (`InternalError`). Integer rounding leaves the
+    /// guard the round-off of its own evaluation. (Tolerance leaves these
+    /// models real freedom in the objective, so only feasibility is
+    /// checked.)
+    #[test]
+    fn integer_var_with_a_tiny_coefficient_keeps_the_guards_margin() {
+        let check_feasible = |model: Model| {
+            assert!(xstar_is_feasible(&model), "fixture error");
+            assert_solves_feasibly_within_contract(&model);
+        };
+        check_feasible(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![int(1.0, 1, 11)],
+            rows: vec![row(&[(0, -1e-8)], ComparisonOp::Eq, -1e-8)],
+            xstar: vec![1.0],
+        });
+        check_feasible(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![int(0.0, -1, 0), int(-1.0, 1, 1), real(0.0, 0.0, 0.0)],
+            rows: vec![row(&[(0, -1e-7), (1, 1.0)], ComparisonOp::Eq, 1.0)],
+            xstar: vec![0.0, 1.0, 0.0],
+        });
+    }
+
+    /// Found by the wide-coefficient properties once they kept their
+    /// objective: models whose only feasible region is reached through a
+    /// genuine pivot of 4e-15 to 2e-14 of its column (1e-8 beside 1e4 in a
+    /// row). Both computations of such a pivot agree exactly, which is what
+    /// tells it from a round-off entry of the same size (those come out
+    /// percents apart); refusing every pivot that small, as a threshold on
+    /// size alone did, made all three `Infeasible`.
+    #[test]
+    fn genuine_pivots_near_the_round_off_floor_are_taken() {
+        let check_feasible = |model: Model| {
+            assert!(xstar_is_feasible(&model), "fixture error");
+            assert_solves_feasibly_within_contract(&model);
+        };
+        check_feasible(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, -49411.0, 0.0),
+                real(-1.0, 0.0, 1.0),
+                real(-1.0, 0.0, 0.0),
+                real(0.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(1, -1.0), (2, -10000.0)], ComparisonOp::Eq, -0.0),
+                row(&[(0, 10000.0), (3, -1.0)], ComparisonOp::Le, 0.0),
+                row(&[(1, 10000.0), (3, -1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(0, 1.0), (3, 16250.0)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 0.0],
+        });
+        check_feasible(Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(0.0, 0.0, 1.0),
+                real(0.0, 0.0, 0.0),
+                real(0.0, -6.0, 0.0),
+                real(-1.0, 0.0, 7.0),
+            ],
+            rows: vec![
+                row(&[(2, 1.0), (3, 1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(0, -0.1), (3, -10000.0)], ComparisonOp::Le, 0.0),
+                row(&[(2, 1000.0), (3, -1e-8)], ComparisonOp::Le, 0.0),
+                row(&[(0, -10000.0), (3, -1e-8)], ComparisonOp::Eq, -0.0),
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 0.0],
+        });
+        check_feasible(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(-1.0, 0, 0),
+                real(0.0, -5001.0, 0.0),
+                real(-1.0, -6.0, 0.0),
+                real(0.0, -1.0, 0.0),
+                real(0.0, 0.0, 0.0),
+                real(0.0, 0.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(2, -1e-8), (3, -100.0)], ComparisonOp::Eq, -0.0),
+                row(
+                    &[(1, -1.0), (2, 1000.0), (3, -0.001)],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+                row(&[(1, -10.0), (3, -0.001)], ComparisonOp::Ge, -0.0),
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        });
+    }
+
+    /// Found by the wide-coefficient MILP property. The primal step that
+    /// lowers x3 is bounded both by `-2 x3 <= -1` and, through the Harris
+    /// relaxation, by the equality `x2 + 1e-7 x3 = 1.0000001` at its
+    /// tolerance: the ratio test took the step, the equality's slack ended
+    /// exactly at its tolerance, the phase exit's recomputation landed it an
+    /// ulp past, the dual phase undid the step, and after eight rounds the
+    /// solve gave up (`InternalError`). The Harris allowance leaves the
+    /// round-off of recomputing a var out of its tolerance.
+    #[test]
+    fn harris_step_leaves_the_round_off_of_the_recomputation() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(-1.0, 0, 0),
+                real(-1.0, -1.0, 0.0),
+                real(0.0, 0.0, 1.0),
+                real(-1.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(1, -100.0), (3, 100.0)], ComparisonOp::Eq, 100.0),
+                row(&[(2, 1.0), (3, 1e-7)], ComparisonOp::Eq, 1.0000001),
+                row(&[(3, -2.0)], ComparisonOp::Le, -1.0),
+            ],
+            xstar: vec![0.0, 0.0, 1.0, 1.0],
         });
     }
 }

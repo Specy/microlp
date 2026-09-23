@@ -126,9 +126,13 @@ fn activity(row: &Row, x: &[f64]) -> (f64, f64) {
     (act - row.rhs, mag)
 }
 
-/// How far `x` violates `row` (0 when satisfied).
+/// How far `x` violates `row` (0 when satisfied, infinite when the activity
+/// is not a number, which `f64::max` would otherwise turn into 0).
 pub(crate) fn row_violation(row: &Row, x: &[f64]) -> f64 {
     let (diff, _) = activity(row, x);
+    if diff.is_nan() {
+        return f64::INFINITY;
+    }
     match row.op {
         ComparisonOp::Eq => diff.abs(),
         ComparisonOp::Le => diff.max(0.0),
@@ -163,6 +167,20 @@ pub(crate) fn xstar_is_feasible(model: &Model) -> bool {
 /// Solve `model` with the default options and check the answer against the
 /// contract above. Panics with the model's source on any failure.
 pub(crate) fn assert_solves_within_contract(model: &Model) {
+    check_contract(model, true);
+}
+
+/// [`assert_solves_within_contract`] without the comparison with the
+/// objective at `x*`: for models whose tolerances leave the objective real
+/// freedom (a tiny coefficient lets a var move far within its row's
+/// tolerance), so only status, bounds, rows and the consistency of the
+/// reported objective are asserted. The model is still solved with its
+/// objective, so the optimization runs as it would for a user.
+pub(crate) fn assert_solves_feasibly_within_contract(model: &Model) {
+    check_contract(model, false);
+}
+
+fn check_contract(model: &Model, compare_objective: bool) {
     let (problem, vars) = model.build();
     let outcome = match problem.solve() {
         Ok(outcome) => outcome,
@@ -207,6 +225,16 @@ pub(crate) fn assert_solves_within_contract(model: &Model) {
         );
     }
 
+    let objective = solution.objective();
+    let recomputed = model.objective_at(&x);
+    assert!(
+        (objective - recomputed).abs() <= 1e-9 * (1.0 + objective.abs()),
+        "reported objective {objective:e} does not match the reported values ({recomputed:e}):\n{}",
+        model.source()
+    );
+    if !compare_objective {
+        return;
+    }
     let at_star = model.objective_at(&model.xstar);
     let extent: f64 = model
         .vars
@@ -215,7 +243,6 @@ pub(crate) fn assert_solves_within_contract(model: &Model) {
         .map(|(v, &xj)| v.obj.abs() * (xj.abs() + (v.hi - v.lo)))
         .sum();
     let slack = OBJECTIVE_SLACK * (1.0 + extent);
-    let objective = solution.objective();
     let worse = match model.direction {
         OptimizationDirection::Minimize => objective > at_star + slack,
         OptimizationDirection::Maximize => objective < at_star - slack,
@@ -224,12 +251,6 @@ pub(crate) fn assert_solves_within_contract(model: &Model) {
         !worse,
         "objective {objective:e} is worse than the objective {at_star:e} at the feasible \
          point the model was built around (slack {slack:e}):\n{}",
-        model.source()
-    );
-    let recomputed = model.objective_at(&x);
-    assert!(
-        (objective - recomputed).abs() <= 1e-9 * (1.0 + objective.abs()),
-        "reported objective {objective:e} does not match the reported values ({recomputed:e}):\n{}",
         model.source()
     );
 }

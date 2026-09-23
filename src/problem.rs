@@ -267,32 +267,23 @@ impl Problem {
                 deadline,
                 options.tolerances.feasibility,
             )?;
+            // The contract is on the rows as written: the engine checks the
+            // answer against the ones presolve took over too, on this solve
+            // and on every later edit or resume of it.
+            if let Some(presolved) = presolved {
+                solver.set_validation_rows(presolved.validation_rows);
+            }
             solver.operation_time_limit = options.time_limit;
             let stop = solver.initial_solve()?;
             solver.elapsed += started.elapsed();
             let resume_options = ResumeOptions::from(&options);
-            let outcome = SolveOutcome::from_lp_stop(
+            SolveOutcome::from_lp_stop(
                 self.direction,
                 num_vars,
                 stop,
                 Box::new(solver),
                 resume_options,
-            )?;
-            // The engine validated its own (presolved) rows; the contract is
-            // on the rows as written, so validate those too.
-            if let SolveOutcome::Solution(solution) = &outcome {
-                if let Some(violation) = mip::first_violation(
-                    self,
-                    &std::collections::BTreeMap::new(),
-                    &solution.lp_values,
-                    &options.tolerances,
-                ) {
-                    return Err(Error::InternalError(format!(
-                        "LP solution violates the original problem: {violation}"
-                    )));
-                }
-            }
-            Ok(outcome)
+            )
         }
     }
 }

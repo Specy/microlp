@@ -1,18 +1,7 @@
 use crate::sparse::{Error, Perm, ScatteredVec, SparseMat, TriangleMat};
 use std::cmp::Ordering;
 
-/// A column whose largest eligible pivot is below this fraction of the
-/// column's largest transformed entry is treated as singular: the eligible
-/// part is then within the round-off of the elimination that produced it,
-/// i.e. the column is dependent on the previous ones as far as `f64` can
-/// tell. Relative to the column's own scale rather than absolute, so the
-/// test does not depend on the units the column happens to be written in,
-/// and at round-off level rather than higher so that a basis the ratio tests
-/// were willing to pivot into (they accept entries down to the round-off of
-/// their row or column) is not refused here; an ill-conditioned but
-/// non-singular basis is judged by the verification of the values it
-/// produces, not by a threshold on its pivots.
-const LU_SINGULAR_REL: f64 = crate::solver::ROUNDOFF_FLOOR;
+use crate::solver::LU_SINGULAR_REL;
 
 #[derive(Clone)]
 pub struct LUFactors {

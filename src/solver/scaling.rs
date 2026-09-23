@@ -7,7 +7,7 @@
 
 use crate::{ComparisonOp, CsVec, Error};
 
-use super::tolerances::float_eq;
+use super::tolerances::{float_eq, slack_bounds, trivial_row_verdict};
 
 /// A variable bound whose magnitude is at least this large is treated as
 /// infinite when choosing a non-basic variable's INITIAL value (see
@@ -176,36 +176,28 @@ pub(crate) struct PreparedRow {
     pub(crate) slack_var_max: f64,
 }
 
-/// Validate empty-row semantics and prepare one retained row for storage.
-/// `None` denotes a tautology that does not need a slack variable.
+/// Judge the rows that need no slack var and prepare one retained row for
+/// storage. A row that every point satisfies (an empty row within the
+/// contract, an infinite right-hand side on the open side) is `None`; one
+/// that no point satisfies (see [`trivial_row_verdict`]) is `Infeasible`.
 pub(crate) fn prepare_row(
     mut coeffs: CsVec,
     cmp_op: ComparisonOp,
     rhs: f64,
+    feasibility: f64,
     is_fixed: impl Fn(usize) -> bool,
 ) -> Result<Option<PreparedRow>, Error> {
-    if coeffs.indices().is_empty() {
-        let tautological = match cmp_op {
-            ComparisonOp::Eq => float_eq(rhs, 0.0),
-            ComparisonOp::Le => 0.0 <= rhs,
-            ComparisonOp::Ge => 0.0 >= rhs,
-        };
-        return if tautological {
-            Ok(None)
-        } else {
-            Err(Error::Infeasible)
-        };
+    match trivial_row_verdict(&coeffs, cmp_op, rhs, feasibility) {
+        Some(true) => return Ok(None),
+        Some(false) => return Err(Error::Infeasible),
+        None => {}
     }
 
     let row_scale = equilibration_scale(&coeffs, rhs, is_fixed);
     if row_scale != 1.0 {
         coeffs.map_inplace(|coeff| coeff * row_scale);
     }
-    let (slack_var_min, slack_var_max) = match cmp_op {
-        ComparisonOp::Le => (0.0, f64::INFINITY),
-        ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
-        ComparisonOp::Eq => (0.0, 0.0),
-    };
+    let (slack_var_min, slack_var_max) = slack_bounds(cmp_op);
     Ok(Some(PreparedRow {
         coeffs,
         rhs: rhs * row_scale,

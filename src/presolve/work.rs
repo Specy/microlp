@@ -6,9 +6,7 @@
 //! allocation-free. See the module docs in [`super`] for the working-vs-emitted
 //! bound split and the tolerance model every decision here is made against.
 
-use super::model::{
-    bound_magnitude, is_int_domain, term_range, Activity, Mode, PresolveStats, Row,
-};
+use super::model::{is_int_domain, term_range, Activity, Mode, PresolveStats, Row};
 use super::params::*;
 use crate::solver::{bound_tolerance, row_tolerance, ROUNDOFF_FLOOR, ROW_BUDGET_SHARE};
 use crate::{Error, VarDomain};
@@ -58,14 +56,29 @@ impl Work<'_> {
         ROW_BUDGET_SHARE * row_tolerance(self.feas, magnitude)
     }
 
-    /// Tolerance within which the engine holds var `v` to its emitted
-    /// bounds, in user units (`Solver::first_violated_bound`); zero for an
-    /// integer var, whose adopted values are exactly integral.
-    fn bound_tol(&self, v: usize) -> f64 {
+    /// How far a row of magnitude `magnitude` may be violated at the points
+    /// a bound implied for var `v` must keep: the engine's budget for the
+    /// LP points it returns, and for an integer var, whose values that
+    /// matter are those of incumbents, the full contract the incumbent guard
+    /// holds them to (rounding against the budget alone cut integer points
+    /// the guard accepts, one unit per pass, until the bounds crossed).
+    fn allowance(&self, v: usize, magnitude: f64) -> f64 {
+        if self.is_int(v) {
+            row_tolerance(self.feas, magnitude)
+        } else {
+            self.budget(magnitude)
+        }
+    }
+
+    /// Tolerance within which the engine holds var `v` to its emitted upper
+    /// (`upper`) or lower bound, in user units
+    /// (`Solver::first_violated_bound`); zero for an integer var, whose
+    /// adopted values are exactly integral.
+    fn bound_tol(&self, v: usize, upper: bool) -> f64 {
         if self.is_int(v) {
             0.0
         } else {
-            bound_tolerance(self.feas, self.elo[v], self.ehi[v])
+            bound_tolerance(self.feas, if upper { self.ehi[v] } else { self.elo[v] })
         }
     }
 
@@ -83,7 +96,8 @@ impl Work<'_> {
             ninf_u: 0,
             abs_l: 0.0,
             abs_u: 0.0,
-            slack: 0.0,
+            slack_l: 0.0,
+            slack_u: 0.0,
         };
         for (&v, &a) in row.vars.iter().zip(&row.coeffs) {
             let (cmin, cmax) = term_range(a, lo[v], hi[v]);
@@ -99,7 +113,10 @@ impl Work<'_> {
             } else {
                 act.ninf_u += 1;
             }
-            act.slack += a.abs() * self.bound_tol(v);
+            // At the minimum corner the var sits at its lower bound when
+            // its coefficient is positive, at its upper bound otherwise.
+            act.slack_l += a.abs() * self.bound_tol(v, a < 0.0);
+            act.slack_u += a.abs() * self.bound_tol(v, a > 0.0);
         }
         act
     }
@@ -120,17 +137,32 @@ impl Work<'_> {
         max
     }
 
-    /// Whether fixing every var of row `r` at its extreme, when the row's
-    /// corner falls short of its bound by `sliver` (row units), stays within
-    /// the budget of every other row: each var gives up `sliver / |a|` of
-    /// range, which another row amplifies by its own coefficient.
-    fn sliver_within_budget(&self, rows: &[Row], r: usize, sliver: f64) -> bool {
-        if sliver <= 0.0 {
-            return true;
-        }
+    /// Whether fixing every var of a forcing row at its extreme cuts no
+    /// point a var can resolve. With its corner `sliver` short of its bound,
+    /// the row leaves each var `room / |a|` off its extreme, `room` being the
+    /// sliver plus the engine's share of the absolute tolerance (the
+    /// round-off part of the row's budget is room no evaluation resolves). A
+    /// continuous var's room must lie within its own bound tolerance, and the
+    /// sliver it gives up within what each of its other rows tolerates at its
+    /// coefficient there; an integer var's room must be short of a unit. (A
+    /// sliver within the round-off of a magnitude of 4e9 was a range of 0.015
+    /// for a var with a coefficient of 0.001, and a coefficient of 1e-8 left
+    /// its var a room of 5 on an exactly met row: fixing either cut feasible
+    /// points, the optimum in the first case and every point in the second.)
+    fn forcing_is_exact(&self, rows: &[Row], r: usize, sliver: f64, min_corner: bool) -> bool {
+        let room = (sliver + ROW_BUDGET_SHARE * self.feas).max(0.0);
         let row = &rows[r];
         row.vars.iter().zip(&row.coeffs).all(|(&v, &a)| {
-            self.other_coeff(rows, v, r) * sliver <= ROW_BUDGET_SHARE * self.feas * a.abs()
+            if self.is_int(v) {
+                room / a.abs() < 1.0
+            } else {
+                // The extreme the var is fixed at: its lower bound when its
+                // coefficient pushes the activity towards the corner.
+                let upper = (a < 0.0) == min_corner;
+                room / a.abs() <= self.bound_tol(v, upper)
+                    && self.other_coeff(rows, v, r) * sliver.max(0.0)
+                        <= ROW_BUDGET_SHARE * self.feas * a.abs()
+            }
         })
     }
 
@@ -204,6 +236,7 @@ impl Work<'_> {
                     row.lo -= shift; // -inf and +inf survive the shift intact
                     row.hi -= shift;
                     row.fold_scale += shift.abs();
+                    row.shift += shift;
                     row.folded.push((v, a));
                 }
                 row.vars.swap_remove(i);
@@ -245,7 +278,7 @@ impl Work<'_> {
             let nq = q + relax;
             if nq < self.whi[v] - IMPROVE_REL * nq.abs().max(1.0) {
                 if nq < self.wlo[v] {
-                    if self.wlo[v] - nq > self.bound_tol(v) {
+                    if self.wlo[v] - nq > self.bound_tol(v, false) {
                         debug!(
                             "presolve: var {v} implied upper {nq:e} < lower {:e}",
                             self.wlo[v]
@@ -288,7 +321,7 @@ impl Work<'_> {
             let nq = q - relax;
             if nq > self.wlo[v] + IMPROVE_REL * nq.abs().max(1.0) {
                 if nq > self.whi[v] {
-                    if nq - self.whi[v] > self.bound_tol(v) {
+                    if nq - self.whi[v] > self.bound_tol(v, true) {
                         debug!(
                             "presolve: var {v} implied lower {nq:e} > upper {:e}",
                             self.whi[v]
@@ -311,9 +344,9 @@ impl Work<'_> {
     /// the residual, judged at the magnitude of what was folded.
     fn empty_row_consistent(&self, row: &Row) -> bool {
         let side = if row.lo.is_finite() {
-            row.lo.abs()
+            row.rhs_mag(row.lo)
         } else {
-            row.hi.abs()
+            row.rhs_mag(row.hi)
         };
         let budget = self.budget(side + row.fold_scale);
         row.lo <= budget && row.hi >= -budget
@@ -334,9 +367,9 @@ impl Work<'_> {
     }
 
     /// Singleton row `a·x ∈ [lo, hi]`: fold it into the variable's EMITTED
-    /// bounds and drop it, where a bound describes the row at least as well
-    /// as the engine would hold the row itself (module docs). `other_coeff`
-    /// is the largest |coefficient| of `x` in any other live row. Returns
+    /// bounds and drop it, where bounds describe the row exactly as the
+    /// engine and the boundary would hold it (module docs). `other_coeff` is
+    /// the largest |coefficient| of `x` in any other live row. Returns
     /// whether the row was consumed.
     fn singleton_row(&mut self, row: &mut Row, other_coeff: f64) -> Result<bool, Error> {
         let v = row.vars[0];
@@ -348,21 +381,41 @@ impl Work<'_> {
             (row.hi, row.lo)
         };
         let (qlo, qhi) = (blo / a, bhi / a);
-        // Budget of the row where the given side is tight: `|b| + |a·x| = 2|b|`.
+        // The row's magnitude where the given side is tight: its right-hand
+        // side as written, the var's term there (`|a·q| = |b|`), and the fixed
+        // terms folded out of it.
         let fold = row.fold_scale;
-        let side_budget = |w: &Self, b: f64| w.budget(2.0 * b.abs() + fold);
+        let tight_mag = |b: f64| row.rhs_mag(b) + b.abs() + fold;
 
         if self.is_int(v) {
-            // Exact for integers: the integral points the engine could
-            // adopt are those meeting the row within its budget.
-            let mut new_lo = self.elo[v];
-            let mut new_hi = self.ehi[v];
-            if qlo.is_finite() {
-                new_lo = new_lo.max((qlo - side_budget(self, blo) / a.abs()).ceil());
-            }
-            if qhi.is_finite() {
-                new_hi = new_hi.min((qhi + side_budget(self, bhi) / a.abs()).floor());
-            }
+            // The integral points the incumbent guard accepts are those
+            // meeting the row within its contract. The bounds keep every one
+            // of them, allowing outward for the round-off of the folded
+            // right-hand side; the row is dropped only where the same bounds
+            // come out of the contract less that round-off, i.e. where no
+            // integer point lies within round-off of the contract. Otherwise
+            // the guard, evaluating the row with its own round-off, might
+            // reject a point the bounds admit (an exactly integral candidate
+            // rejected: `InternalError`), so the row stays for the engine and
+            // the guard to judge.
+            let range = |widen: f64| {
+                let side_tol = |b: f64| {
+                    let mag = tight_mag(b);
+                    (row_tolerance(self.feas, mag) + widen * ROUNDOFF_FLOOR * mag).max(0.0)
+                        / a.abs()
+                };
+                let mut new_lo = self.elo[v];
+                let mut new_hi = self.ehi[v];
+                if qlo.is_finite() {
+                    new_lo = new_lo.max((qlo - side_tol(blo)).ceil());
+                }
+                if qhi.is_finite() {
+                    new_hi = new_hi.min((qhi + side_tol(bhi)).floor());
+                }
+                (new_lo, new_hi)
+            };
+            let (new_lo, new_hi) = range(1.0);
+            let unambiguous = range(-1.0) == (new_lo, new_hi);
             if new_lo > new_hi {
                 debug!(
                     "presolve: singleton row {} leaves integer var {v} no value: [{new_lo}, {new_hi}]",
@@ -371,6 +424,9 @@ impl Work<'_> {
                 return Err(Error::Infeasible);
             }
             self.emit_bounds(v, new_lo, new_hi);
+            if !unambiguous {
+                return Ok(false);
+            }
             row.alive = false;
             self.stats.rows_dropped += 1;
             return Ok(true);
@@ -379,54 +435,88 @@ impl Work<'_> {
         // Converting the row moves its round-off into the var, where the
         // var's other rows amplify it by their coefficients: they must stay
         // within budget, or only the simplex can balance the rows.
-        let round_off = ROUNDOFF_FLOOR * (2.0 * bound_magnitude(blo, bhi) + fold);
+        let finite_mag = |b: f64| if b.is_finite() { tight_mag(b) } else { 0.0 };
+        let round_off = ROUNDOFF_FLOOR * finite_mag(blo).max(finite_mag(bhi));
         if other_coeff * round_off > ROW_BUDGET_SHARE * self.feas * a.abs() {
             return Ok(false);
         }
-        let new_lo = self.elo[v].max(qlo);
-        let new_hi = self.ehi[v].min(qhi);
-        if new_lo > new_hi {
-            // The implied interval misses the var's bounds: at the nearest
-            // bound the row is off by |a|·gap. Within budget, that bound is
-            // the answer; beyond budget plus the engine's bound tolerance,
-            // no acceptable point exists; in between, the simplex decides.
-            let (at, gap, budget) = if qlo > self.ehi[v] {
-                (self.ehi[v], qlo - self.ehi[v], side_budget(self, blo))
-            } else {
-                (self.elo[v], self.elo[v] - qhi, side_budget(self, bhi))
-            };
-            if a.abs() * gap <= budget {
-                self.fix(v, at);
-                row.alive = false;
-                self.stats.rows_dropped += 1;
-                return Ok(true);
-            }
-            if a.abs() * (gap - self.bound_tol(v)) > budget {
-                debug!(
-                    "presolve: singleton row {} crosses var {v}'s bounds by {gap:e}",
-                    row.orig
-                );
-                return Err(Error::Infeasible);
-            }
-            return Ok(false);
+
+        // A dropped row accepts `x` within its room (`δ`, see below) of its
+        // implied bounds `qlo`, `qhi`, and the engine holds a bound to within
+        // `btol`. The row becomes the bounds `qlo`, `qhi` themselves: they
+        // keep the vertices the row would make, so the engine returns the
+        // point it would have returned with the row (a bound relaxed into the
+        // row's tolerance zone makes a vertex there, and an objective better
+        // than the model's own). A side the var's bound already implies, with
+        // the tolerances, needs no bound. A side whose `δ` is below `btol`
+        // cannot be a bound, since the engine would leave it by more than the
+        // row allows (a `-10 x ≥ 0` beside `x ≤ 0` was dropped as implied, and
+        // `x` sat `1e-8` above zero), so the row stays. An equality fixes its
+        // var only where it pins it within the var's own tolerance and no
+        // other row of the var tells the pinned range apart; a wider one
+        // stays a row, since a fixing would cut the points its tolerance
+        // accepts, and a row agreeing with it only within their tolerances
+        // (`0.01 x = 0.01 + 1e-9` beside `x = 1`) would look inconsistent.
+        let btol_lo = bound_tolerance(self.feas, self.elo[v].max(qlo));
+        let btol_hi = bound_tolerance(self.feas, self.ehi[v].min(qhi));
+        // The row's room around its implied bound as the engine holds it
+        // (its budget over `|a|`), and as the boundary checks it once it is
+        // dropped: nothing but the var's bound tolerance can move a dropped
+        // singleton row, so it has its whole contract, less the round-off of
+        // evaluating it.
+        let dlo = self.budget(finite_mag(blo)) / a.abs();
+        let dhi = self.budget(finite_mag(bhi)) / a.abs();
+        let dropped_room = |b: f64| {
+            let mag = finite_mag(b);
+            (row_tolerance(self.feas, mag) - ROUNDOFF_FLOOR * mag).max(0.0) / a.abs()
+        };
+        let (drop_lo, drop_hi) = (dropped_room(blo), dropped_room(bhi));
+        let (elo, ehi) = (self.elo[v], self.ehi[v]);
+        // The row's accepted set misses the var's, both taken with their
+        // tolerances: a proof of infeasibility.
+        if qlo - dlo > ehi + btol_hi || qhi + dhi < elo - btol_lo {
+            debug!(
+                "presolve: singleton row {} misses var {v}'s bounds [{elo:e}, {ehi:e}]",
+                row.orig
+            );
+            return Err(Error::Infeasible);
         }
-        if new_lo == new_hi {
-            // A fixed var is exact in the engine (never basic, never moved).
-            self.fix(v, new_lo);
+        if qlo == qhi {
+            if dlo > btol_lo.min(btol_hi)
+                || other_coeff * dlo > ROW_BUDGET_SHARE * self.feas
+                || qlo < elo
+                || qlo > ehi
+            {
+                return Ok(false);
+            }
+            self.fix(v, qlo);
             row.alive = false;
             self.stats.rows_dropped += 1;
             return Ok(true);
         }
-        // A genuine bound: the engine may leave it by the bound tolerance,
-        // which must keep the row within budget on every side the row
-        // provides.
-        let btol = bound_tolerance(self.feas, new_lo, new_hi);
-        if (new_lo > self.elo[v] && a.abs() * btol > side_budget(self, blo))
-            || (new_hi < self.ehi[v] && a.abs() * btol > side_budget(self, bhi))
-        {
+        let (mut lo, mut hi) = (elo, ehi);
+        if qlo.is_finite() && elo - btol_lo < qlo - drop_lo {
+            if drop_lo < btol_lo {
+                return Ok(false);
+            }
+            lo = qlo;
+        }
+        if qhi.is_finite() && ehi + btol_hi > qhi + drop_hi {
+            if drop_hi < btol_hi {
+                return Ok(false);
+            }
+            hi = qhi;
+        }
+        if lo > hi {
+            // Within the tolerances but not within the bounds: only the
+            // simplex, holding both, can find the sliver between them.
             return Ok(false);
         }
-        self.emit_bounds(v, new_lo, new_hi);
+        if lo == hi {
+            self.fix(v, lo);
+        } else {
+            self.emit_bounds(v, lo, hi);
+        }
         row.alive = false;
         self.stats.rows_dropped += 1;
         Ok(true)
@@ -469,23 +559,23 @@ impl Work<'_> {
             // from the corner raises the activity faster than it raises the
             // tolerance, so the corner is the decisive point.
             let budget_l = if hi_side {
-                self.budget(wact.abs_l + row_hi.abs() + fold)
+                self.budget(wact.abs_l + row.rhs_mag(row_hi) + fold)
             } else {
                 0.0
             };
             let budget_u = if lo_side {
-                self.budget(wact.abs_u + row_lo.abs() + fold)
+                self.budget(wact.abs_u + row.rhs_mag(row_lo) + fold)
             } else {
                 0.0
             };
-            if hi_side && wact.l - wact.slack > row_hi + budget_l {
+            if hi_side && wact.l - wact.slack_l > row_hi + budget_l {
                 debug!(
                     "presolve: row {} min activity {:e} > hi {row_hi:e}",
                     row.orig, wact.l
                 );
                 return Err(Error::Infeasible);
             }
-            if lo_side && wact.u + wact.slack < row_lo - budget_u {
+            if lo_side && wact.u + wact.slack_u < row_lo - budget_u {
                 debug!(
                     "presolve: row {} max activity {:e} < lo {row_lo:e}",
                     row.orig, wact.u
@@ -496,20 +586,21 @@ impl Work<'_> {
             // Forcing: judged over the EMITTED bounds, the exact values the
             // reduced problem carries, equal to the row bound within the
             // round-off of the sum. Every feasible point then has each var
-            // at its extreme, and fixing it there is exact. The corner may
+            // at its extreme, and fixing it there is exact, as long as the
+            // room the row's budget leaves each var off its extreme is room
+            // nothing can resolve (see `forcing_is_exact`). The corner may
             // exceed the bound by the budget (the fixed point is then the
-            // best point there is) and fall short of it only by a sliver
-            // every other row of every var tolerates. The working activity,
-            // which dominates the emitted one, is a cheap precheck.
+            // best point there is). The working activity, which dominates
+            // the emitted one, is a cheap precheck.
             let mut eact: Option<Activity> = None;
             if hi_side && wact.l >= row_hi - budget_l {
                 let e = eact.get_or_insert_with(|| self.activity(row, false));
                 if e.ninf_l == 0 {
-                    let mag = e.abs_l + row_hi.abs() + fold;
+                    let mag = e.abs_l + row.rhs_mag(row_hi) + fold;
                     let sliver = row_hi - e.l;
                     if sliver <= ROUNDOFF_FLOOR * mag
                         && -sliver <= self.budget(mag)
-                        && self.sliver_within_budget(rows, r, sliver)
+                        && self.forcing_is_exact(rows, r, sliver, true)
                         && self.terms_resolvable(row, sliver, mag)
                     {
                         let at: Vec<(usize, f64)> = row
@@ -530,11 +621,11 @@ impl Work<'_> {
             if lo_side && wact.u <= row_lo + budget_u {
                 let e = eact.get_or_insert_with(|| self.activity(row, false));
                 if e.ninf_u == 0 {
-                    let mag = e.abs_u + row_lo.abs() + fold;
+                    let mag = e.abs_u + row.rhs_mag(row_lo) + fold;
                     let sliver = e.u - row_lo;
                     if sliver <= ROUNDOFF_FLOOR * mag
                         && -sliver <= self.budget(mag)
-                        && self.sliver_within_budget(rows, r, sliver)
+                        && self.forcing_is_exact(rows, r, sliver, false)
                         && self.terms_resolvable(row, sliver, mag)
                     {
                         let at: Vec<(usize, f64)> = row
@@ -562,29 +653,29 @@ impl Work<'_> {
             // U_e >= U_w), so if the working side already fails there is no
             // need to compute the emitted activity at all.
             let w_lo_red =
-                !row_lo.is_finite() || (wact.ninf_l == 0 && wact.l - wact.slack >= row_lo);
+                !row_lo.is_finite() || (wact.ninf_l == 0 && wact.l - wact.slack_l >= row_lo);
             let w_hi_red =
-                !row_hi.is_finite() || (wact.ninf_u == 0 && wact.u + wact.slack <= row_hi);
+                !row_hi.is_finite() || (wact.ninf_u == 0 && wact.u + wact.slack_u <= row_hi);
             if w_lo_red && w_hi_red {
                 let e = eact.get_or_insert_with(|| self.activity(row, false));
                 let magnitude = e.abs_l
                     + e.abs_u
                     + fold
                     + if row_lo.is_finite() {
-                        row_lo.abs()
+                        row.rhs_mag(row_lo)
                     } else {
                         0.0
                     }
                     + if row_hi.is_finite() {
-                        row_hi.abs()
+                        row.rhs_mag(row_hi)
                     } else {
                         0.0
                     };
                 let red = REDUNDANT_MARGIN * magnitude.max(1.0);
                 let lo_red =
-                    !row_lo.is_finite() || (e.ninf_l == 0 && e.l - e.slack >= row_lo + red);
+                    !row_lo.is_finite() || (e.ninf_l == 0 && e.l - e.slack_l >= row_lo + red);
                 let hi_red =
-                    !row_hi.is_finite() || (e.ninf_u == 0 && e.u + e.slack <= row_hi - red);
+                    !row_hi.is_finite() || (e.ninf_u == 0 && e.u + e.slack_u <= row_hi - red);
                 if lo_red && hi_red {
                     rows[r].alive = false;
                     self.stats.rows_dropped += 1;
@@ -593,11 +684,15 @@ impl Work<'_> {
             }
 
             // Per-term implied bounds from working activities, each relaxed
-            // by the row's budget at the corner where the bound is attained
-            // (this term at the bound, the rest at its extreme) plus the
-            // bound slack, so that it holds for every point the engine may
-            // return. Bounds tightened earlier in this loop are not folded
-            // into `wact`: the stale activity is looser, hence still valid.
+            // by the row's allowance at the corner where the bound is
+            // attained (this term at the bound, the rest at its extreme),
+            // plus the round-off of computing the rest by cancellation
+            // against this term's own range (at a bound of `i32::MIN` the rest
+            // of `x + 0.4 y` carried 2e-7, and `floor` made that a unit), plus
+            // the bound slack, so that it holds for every point the engine may
+            // return (see `allowance`). Bounds tightened earlier in this loop
+            // are not folded into `wact`: the stale activity is looser, hence
+            // still valid.
             for i in 0..row.vars.len() {
                 let (v, a) = (row.vars[i], row.coeffs[i]);
                 let (cmin, cmax) = term_range(a, self.wlo[v], self.whi[v]);
@@ -615,8 +710,11 @@ impl Work<'_> {
                     if let Some(rl) = rest_l {
                         let q = (row_hi - rl) / a;
                         let rest_abs = wact.abs_l - if cmin.is_finite() { cmin.abs() } else { 0.0 };
-                        let mag = row_hi.abs() + rest_abs.max(0.0) + (row_hi - rl).abs() + fold;
-                        let relax = (self.budget(mag) + wact.slack) / a.abs();
+                        let mag =
+                            row.rhs_mag(row_hi) + rest_abs.max(0.0) + (row_hi - rl).abs() + fold;
+                        let relax =
+                            (self.allowance(v, mag) + ROUNDOFF_FLOOR * wact.abs_l + wact.slack_l)
+                                / a.abs();
                         if a > 0.0 {
                             self.tighten_upper(v, q, relax)?;
                         } else {
@@ -628,8 +726,11 @@ impl Work<'_> {
                     if let Some(ru) = rest_u {
                         let q = (row_lo - ru) / a;
                         let rest_abs = wact.abs_u - if cmax.is_finite() { cmax.abs() } else { 0.0 };
-                        let mag = row_lo.abs() + rest_abs.max(0.0) + (row_lo - ru).abs() + fold;
-                        let relax = (self.budget(mag) + wact.slack) / a.abs();
+                        let mag =
+                            row.rhs_mag(row_lo) + rest_abs.max(0.0) + (row_lo - ru).abs() + fold;
+                        let relax =
+                            (self.allowance(v, mag) + ROUNDOFF_FLOOR * wact.abs_u + wact.slack_u)
+                                / a.abs();
                         if a > 0.0 {
                             self.tighten_lower(v, q, relax)?;
                         } else {
@@ -667,12 +768,12 @@ impl Work<'_> {
             // The relaxation of the vacuous branch. `act.abs_*` are left
             // untouched by the incremental updates below, which only makes
             // this more conservative.
-            let nz = act.slack
+            let nz = if le_form { act.slack_u } else { act.slack_l }
                 + ROUNDOFF_FLOOR
                     * if le_form {
-                        act.abs_u + row.hi.abs() + row.fold_scale
+                        act.abs_u + row.rhs_mag(row.hi) + row.fold_scale
                     } else {
-                        act.abs_l + row.lo.abs() + row.fold_scale
+                        act.abs_l + row.rhs_mag(row.lo) + row.fold_scale
                     };
             // Count eligible terms first: the excess (activity bound minus
             // row bound) is invariant under applications, so eligibility is

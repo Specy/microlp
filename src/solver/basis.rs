@@ -27,13 +27,6 @@ pub(crate) enum PivotChoice {
     /// one the entry is noise if `tiny` (relative to the column) and the row
     /// is then excluded, else the factorization itself is unusable.
     Inconsistent { row: usize, tiny: bool },
-    /// The improving column `col` cannot be entered: its only step is
-    /// degenerate, blocked by a basic var sitting past its bound within
-    /// tolerance, and putting that var onto its bound would move the
-    /// entering var by more than its own tolerance, i.e. onto an infeasible
-    /// basis. A primal pivot must keep primal feasibility, so the column is
-    /// not an improving direction at this vertex.
-    Unexploitable(usize),
 }
 
 #[derive(Debug)]

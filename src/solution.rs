@@ -257,6 +257,12 @@ impl Solution {
     /// Returns [`Error::Infeasible`] if `val` is not finite, is outside the
     /// variable's original bounds, is incompatible with its integer or boolean
     /// domain, or leaves the edited problem without a feasible assignment.
+    /// Both checks are made under the solve's tolerances, so a value this
+    /// solution reports is always accepted: a value outside a bound by no more
+    /// than [`Tolerances::feasibility`](crate::Tolerances::feasibility)
+    /// allows fixes the variable at that bound, and a value within
+    /// [`Tolerances::integrality_rounding`](crate::Tolerances::integrality_rounding)
+    /// of an integer fixes an integer variable at that integer.
     ///
     /// # Panics
     ///
@@ -281,8 +287,21 @@ impl Solution {
                 SolveOutcome::from_lp_stop(direction, num_vars, stop, solver, last_options)
             }
             SolveState::Mip(mut state) => {
-                if val < state.base.var_mins[var.0] || val > state.base.var_maxs[var.0] {
+                let (min, max) = (state.base.var_mins[var.0], state.base.var_maxs[var.0]);
+                let tolerances = &state.options.tolerances;
+                if crate::solver::outside_bounds(val, min, max, tolerances.feasibility) {
                     return Err(Error::Infeasible);
+                }
+                let mut val = val.clamp(min, max);
+                if matches!(
+                    state.base.var_domains[var.0],
+                    VarDomain::Integer | VarDomain::Boolean
+                ) {
+                    let integer = val.round();
+                    if (val - integer).abs() > tolerances.integrality_rounding {
+                        return Err(Error::Infeasible);
+                    }
+                    val = integer;
                 }
                 state.fixed.insert(var.0, val);
                 let run = mip::reedit_and_resolve(state)?;
