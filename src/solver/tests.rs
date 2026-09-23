@@ -295,6 +295,36 @@ fn initial_solve() {
     assert_eq!(infeasible.unwrap_err(), Error::Infeasible);
 }
 
+/// `min Σ c_i x_i` over `x ∈ [0, 1]^8` with `Σ x_i ≥ 5` and costs `1..=8`:
+/// the start (every var at its lower bound) is dual feasible, and the one
+/// violated row is repaired by the four cheapest vars moving to their upper
+/// bound and the fifth entering. The dual ratio test passes the breakpoints of
+/// the four (flips, no pivot) and pivots only on the fifth, so the phase takes
+/// one pivot where a ratio test without bound flipping takes five.
+#[test]
+fn dual_step_flips_the_boxed_vars_it_passes() {
+    init();
+    let n = 8;
+    let costs: Vec<f64> = (1..=n).map(|c| c as f64).collect();
+    let mut sol = Solver::try_new(
+        &costs,
+        &vec![0.0; n],
+        &vec![1.0; n],
+        &[(to_sparse(&vec![1.0; n]), ComparisonOp::Ge, 5.0)],
+        &vec![VarDomain::Real; n],
+        Default::default(),
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    sol.initial_solve().unwrap();
+
+    assert_eq!(sol.cur_obj_val, 15.0);
+    let values: Vec<f64> = (0..n).map(|v| sol.get_value(v)).collect();
+    assert_eq!(values, [1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
+    // One pivot, then the check that finds every row within its bounds.
+    assert_eq!(sol.lp_iterations, 2);
+}
+
 #[test]
 fn set_var_bounds_tighten_matches_fresh_solve() {
     init();

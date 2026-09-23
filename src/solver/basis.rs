@@ -48,6 +48,18 @@ pub(crate) struct PivotElem {
     pub(crate) leaving_new_val: f64,
 }
 
+/// Outcome of the dual ratio test for one leaving row: the non-basic vars to
+/// move to their other bound (bound flips, which leave the basis as it is),
+/// then the var that enters, or none when the moves alone bring the leaving
+/// var within its bounds (the last of them then possibly only partway).
+#[derive(Debug)]
+pub(crate) struct DualStep {
+    /// `(col, new_val)`: a non-basic column and the value it moves to.
+    pub(crate) flips: Vec<(usize, f64)>,
+    /// `(col, coeff)`: the entering column and its entry in the leaving row.
+    pub(crate) entering: Option<(usize, f64)>,
+}
+
 /// Stuff related to inversion of the basis matrix
 #[derive(Clone)]
 pub(crate) struct BasisSolver {

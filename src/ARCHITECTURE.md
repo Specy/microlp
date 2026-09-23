@@ -144,8 +144,10 @@ versus extending a live matrix and repairing the current basis.
 
 The simplex core is the minilp lineage: a **bounded-variable
 revised simplex** with both primal and dual iterations, steepest-edge pricing, the Harris
-two-pass ratio test for numerical stability, and an LU-factorized basis updated by eta
-matrices (refactorized when the eta file outgrows the factors).
+two-pass ratio test for numerical stability (in the dual simplex as a bound-flipping ratio
+test: a boxed var the dual step passes is moved to its other bound instead of entering), and
+an LU-factorized basis updated by eta matrices (refactorized when the eta file outgrows the
+factors).
 
 State you need to know when reading it:
 
@@ -589,7 +591,7 @@ computed quantity is floored at that quantity's round-off:
 | Is a basic slack (row) within its bounds? | `slack_tol`: the engine's share (`ROW_BUDGET_SHARE`, ½) of the contract `row_tolerance(feasibility × r, m)` in the row's scaled units, at the row's magnitude `m = |b| + Σ|a_j x_j|` at the current values (refreshed whenever the rows are checked). The other half is the reserve: for the snap of an integer or fixed var, and for evaluating the row in another order of operations. | `ROUNDOFF_FLOOR = 1e-14`, `ROW_BUDGET_SHARE = 0.5` |
 | Is a structural var within / at its bounds? | `structural_tol`: the user contract in user units, but never more than any of its rows can absorb when the value is snapped to the bound (`snap_budget`: the row's reserve over the var's scaled coefficient, minimised over its rows), floored at the round-off of the bound magnitude. One rule for every var: it keeps a big-M row within contract when its binary is rounded, and a fixed var's report at its value within the rows presolve substituted it out of. | |
 | Is a reduced cost zero? | `dual_tol`: `EPS` floored at the round-off of `|c_j| + Σ|a_ij y_i|`, refreshed with the multipliers. | `EPS = 1e-10` |
-| Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it (`ENTRY_ROUNDOFF` relative to its row's or column's largest entry); a genuine entry at least `PIVOT_REL_TOL` of the largest genuine entry among the vars that could enter (rows that could block, in the primal test) is preferred, a smaller one is the pivot only when nothing larger will do. In the primal test every genuine entry bounds the step, with each basic var's tolerance counted from where it sits and less the round-off of recomputing it (its row's for a slack, its bound's for a structural var), so no step leaves a basic var where the phase exit's recomputation could find it outside its tolerance. | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7` |
+| Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it (`ENTRY_ROUNDOFF` relative to its row's or column's largest entry); a genuine entry at least `PIVOT_REL_TOL` of the largest genuine entry among the vars that could enter (rows that could block, in the primal test) is preferred, a smaller one is the pivot only when nothing larger will do. In the primal test every genuine entry bounds the step, with each basic var's tolerance counted from where it sits and less the round-off of recomputing it (its row's for a slack, its bound's for a structural var), so no step leaves a basic var where the phase exit's recomputation could find it outside its tolerance. In the dual test a boxed var the step passes is flipped instead of entering, and an entry below the round-off floor is never a pivot but may move its (boxed) var when that lands the row, checked through the column and at the phase exit (see *Bound flipping* below). | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7` |
 | Do the row and column computations of the pivot element agree? | to `PIVOT_AGREEMENT_TOL` relatively, or to `ENTRY_ROUNDOFF` of the computations' scale for an element above `LU_SINGULAR_REL` of that scale (below it, round-off agrees with anything of its size, so only relative agreement tells a genuine element from noise); else rebuild (stale factorization) or exclude the entry as noise (fresh one). | `PIVOT_AGREEMENT_TOL = 1e-7` |
 | Is the LU pivot column singular? | eligible part below `LU_SINGULAR_REL` of the column's largest transformed entry. | `= ROUNDOFF_FLOOR` |
 
@@ -665,23 +667,47 @@ presolve had dropped, a residual counted once by the engine and once more by the
 each is pinned as a regression test (for example
 `property_counterexample_with_bound_slack_one_ulp_over_the_row_budget`).
 
-Known limitation: a feasible region reachable only through a pivot within the round-off
-of its row (coefficient chains spanning some twelve to fifteen orders of magnitude within
-one row and column) is beyond what the ratio test can resolve in `f64`: the entry is a few
-ulps of the row's largest and is rightly refused as noise, so the model is reported
-`Infeasible`. It is a limit of the LP engine whether or not the model has integer vars; a
-bound-flipping ratio test would resolve the pinned instance.
+**Bound flipping and the infeasibility verdict.** The dual ratio test takes the vars that can
+help a violated row in the order the dual step reaches their breakpoints; a boxed var whose
+flip still leaves the row short is moved to its other bound (no pivot, no basis change) and the
+step passes it, so its reduced cost crosses zero and it is dual feasible where it lands (Maros
+2003; Koberstein 2005). When no var can enter, "no pivot" is not taken for a proof: the row
+declares the model infeasible only if moving every var that can help to its other bound still
+leaves the row short (the row is then a Farkas certificate over the bounds). An entry below
+`ENTRY_ROUNDOFF` is never a pivot, but its var may be flipped, or moved partway, when that
+lands the row: the effect is computed again through the column when applied (a move that
+does not land is undone and excluded for the row) and the phase exit re-derives the row from
+the data (`check_rows`), so a move through round-off is found out. This resolved the models
+once pinned here as a known limitation (coefficient chains spanning twelve to fifteen orders
+of magnitude, whose only repair ran through such an entry); they are the `wide_chain`
+regression tests in `src/tests/magnitudes.rs`.
 
-This limitation is *pinned by a test*, not merely described. The exact model that trips it
-is committed in `src/tests/magnitudes.rs` as a `#[should_panic]` test named
-`..._is_a_known_limitation`: it passes while the limitation stands and **fails as soon as a
-change fixes it**, which is the signal to drop the attribute and keep the model as an
-ordinary regression test. The wide-coefficient MILP property in `src/tests/scaling.rs` that
-searches for more such models is `#[ignore]`d for the same reason (a random search cannot
-assert its own failure); run it with `cargo test --lib -- --ignored`. Two models were pinned
-this way before and turned out to be bugs, which the convention exposed as designed: a
-presolve forcing rule that fixed a var its row could not resolve, and a recompute of the
-basic values that counted as a verification. Both are ordinary regression tests now.
+Known limitations, found by running the wide-coefficient properties of `src/tests/scaling.rs`
+at forty times their case count; all of them predate bound flipping, which removed several of
+the models these searches found and moved one into the second class:
+
+- a feasible model whose only repair is a pivot on an entry below `ENTRY_ROUNDOFF` (a var with
+  an infinite bound in its direction, so no flip can check the entry) is reported
+  `Infeasible`: nothing checks such an entry reliably before the pivot (round-off can come out
+  identical through the row and the column), and pivoting on round-off leaves a basis the
+  factorization rejects;
+- a pivot on a genuine but tiny element can leave a basis the factorization rejects, reported
+  as `InternalError("Singular matrix")`; the engine has no basis repair (replacing the dependent
+  columns by slacks and continuing, as HiGHS and CLP do);
+- a degenerate dual simplex can cycle: there is no cost perturbation and no iteration bound, so
+  without a time limit such a solve does not return;
+- presolve's forcing-row rule can fix a var at a bound its row allows within the row's
+  tolerance while another row pins it elsewhere, reporting a feasible model `Infeasible`.
+
+The convention for such models is to pin each as a `#[should_panic]` test named
+`..._is_a_known_limitation` in `src/tests/magnitudes.rs`: it passes while the limitation stands
+and **fails as soon as a change fixes it**, which is the signal to drop the attribute and keep
+the model as an ordinary regression test. Three models were pinned this way and all three were
+fixed (a presolve forcing rule that fixed a var its row could not resolve, a recompute of the
+basic values that counted as a verification, and the dual ratio test's reading of "no pivot"
+as infeasibility). The wide-coefficient MILP property stays `#[ignore]`d while the classes
+above stand (a random search cannot assert its own failure); run it with
+`cargo test --lib -- --ignored`.
 
 ---
 

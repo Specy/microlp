@@ -169,6 +169,9 @@ pub(crate) struct Solver {
     sq_norms_update_helper: Vec<f64>,
     inv_basis_row_coeffs: SparseVec,
     row_coeffs: ScatteredVec,
+    /// The combined column `Σ Δx_c a_c` of the bound flips of one dual step
+    /// (see [`Self::apply_flips`]).
+    flip_rhs: ScatteredVec,
 }
 
 #[derive(Clone, Debug)]
@@ -543,6 +546,7 @@ impl Solver {
             sq_norms_update_helper,
             inv_basis_row_coeffs: SparseVec::new(),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
+            flip_rhs: ScatteredVec::empty(num_constraints),
         };
 
         debug!(
@@ -790,9 +794,7 @@ impl Solver {
                     at_max: at_bound(new_val, max, tol.hi),
                 };
                 // A var at a loosened bound may no longer justify its reduced cost.
-                self.is_dual_feasible = self.is_dual_feasible
-                    && self.nb_var_states[col]
-                        .is_dual_feasible(self.nb_var_obj_coeffs[col], self.dual_tols[var]);
+                self.downgrade_dual_feasibility(col);
             }
         }
         Ok(())
@@ -1348,9 +1350,13 @@ impl Solver {
         // the basic values recomputed from the original data. See below.
         let mut refreshed_since_pivot = false;
         // Non-basic columns whose entry in the current leaving row proved to
-        // be round-off (see the agreement check below), for that row only.
+        // be round-off (see the agreement check and the flip-only step
+        // below), for that row only.
         let mut excluded_cols: Vec<usize> = Vec::new();
         let mut excluded_row: Option<usize> = None;
+        // Vars a flip-only step has moved in this phase (see
+        // `choose_entering_col_dual`).
+        let mut moved_alone: Vec<usize> = Vec::new();
 
         for iter in 0.. {
             self.lp_iterations += 1;
@@ -1372,40 +1378,81 @@ impl Solver {
                     excluded_cols.clear();
                     excluded_row = Some(row);
                 }
-                let pivot_info =
-                    match self.choose_entering_col_dual(row, leaving_new_val, &excluded_cols) {
-                        Ok(pivot_info) => pivot_info,
-                        Err(Error::Infeasible) if !refreshed_since_pivot => {
-                            // "No eligible entering column" is a proof of primal
-                            // infeasibility only in exact arithmetic. This deep
-                            // in an eta-file chain, the leaving row can be a
-                            // *phantom* violation — basic values drifted by
-                            // accumulated round-off — whose (equally drifted)
-                            // pivot row then blocks every candidate; declaring
-                            // infeasibility here is a wrong answer (netlib/brandy
-                            // did exactly this). Rebuild the factorization and
-                            // everything derived from it and re-examine: a
-                            // phantom dissolves, a real infeasibility survives
-                            // the rebuild and the next declaration stands.
-                            debug!(
-                                "restore feasibility iter {}: no entering column for row {}; \
+                let step = match self.choose_entering_col_dual(
+                    row,
+                    leaving_new_val,
+                    &excluded_cols,
+                    &moved_alone,
+                ) {
+                    Ok(step) => step,
+                    Err(Error::Infeasible) if !refreshed_since_pivot => {
+                        // "No eligible entering column" is a proof of primal
+                        // infeasibility only in exact arithmetic. This deep
+                        // in an eta-file chain, the leaving row can be a
+                        // *phantom* violation — basic values drifted by
+                        // accumulated round-off — whose (equally drifted)
+                        // pivot row then blocks every candidate; declaring
+                        // infeasibility here is a wrong answer (netlib/brandy
+                        // did exactly this). Rebuild the factorization and
+                        // everything derived from it and re-examine: a
+                        // phantom dissolves, a real infeasibility survives
+                        // the rebuild and the next declaration stands.
+                        debug!(
+                            "restore feasibility iter {}: no entering column for row {}; \
                              rebuilding before declaring infeasibility",
-                                iter, row,
-                            );
-                            self.rebuild()?;
-                            refreshed_since_pivot = true;
-                            continue;
+                            iter, row,
+                        );
+                        self.rebuild()?;
+                        refreshed_since_pivot = true;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                let Some((col, a_row)) = step.entering else {
+                    // A flip-only step: the flips alone bring the leaving var
+                    // within its bounds, as its row predicts through entries
+                    // below the row's round-off. Applying them computes their
+                    // effect again, through their columns; if the leaving var
+                    // does not land, those entries were the round-off they
+                    // may be, and the flips are undone and excluded for this
+                    // row.
+                    let undo: Vec<(usize, f64)> = step
+                        .flips
+                        .iter()
+                        .map(|&(c, _)| (c, self.nb_var_vals[c]))
+                        .collect();
+                    self.apply_flips(&step.flips);
+                    if self.basic_var_within_bounds(row) {
+                        trace!(
+                            "dual flip-only step: {} vars to their other bound, var {} of row \
+                             {row} lands at {:e}",
+                            step.flips.len(),
+                            self.basic_vars[row],
+                            self.basic_var_vals[row],
+                        );
+                        for &(c, _) in &step.flips {
+                            moved_alone.push(self.nb_vars[c]);
+                            // No dual step went with the move.
+                            self.downgrade_dual_feasibility(c);
                         }
-                        Err(e) => return Err(e),
-                    };
-                self.calc_col_coeffs(pivot_info.col);
+                        refreshed_since_pivot = false;
+                    } else {
+                        debug!(
+                            "restore feasibility iter {iter}: flips through entries below \
+                             round-off do not land row {row}; undone and excluded"
+                        );
+                        self.apply_flips(&undo);
+                        excluded_cols.extend(step.flips.iter().map(|&(c, _)| c));
+                    }
+                    continue;
+                };
+                self.calc_col_coeffs(col);
                 // The pivot element is known through the row (from the
                 // transposed solve) and through the column (from the forward
                 // solve). A disagreement means one of them is round-off: with
                 // pivots stacked on the factorization, rebuild and redo the
                 // iteration; on a fresh factorization the basis itself is
                 // numerically unusable.
-                let a_row = pivot_info.elem.as_ref().map_or(0.0, |e| e.coeff);
                 let a_col = self.col_coeff_at(row);
                 let scale = self
                     .row_coeffs
@@ -1422,11 +1469,10 @@ impl Solver {
                         self.rebuild()?;
                     } else if a_row.abs() < PIVOT_REL_TOL * scale {
                         debug!(
-                            "restore feasibility iter {iter}: entry {a_row:e} of column {} in row \
-                             {row} is round-off; excluded",
-                            pivot_info.col
+                            "restore feasibility iter {iter}: entry {a_row:e} of column {col} in \
+                             row {row} is round-off; excluded"
                         );
-                        excluded_cols.push(pivot_info.col);
+                        excluded_cols.push(col);
                     } else {
                         return Err(Error::InternalError(
                             "pivot element disagrees between row and column on a fresh factorization"
@@ -1435,13 +1481,38 @@ impl Solver {
                     }
                     continue;
                 }
+                // The flips the step passed come first. They move basic
+                // values, not the basis, so the pivot column stays as
+                // computed; the entering var's step is then measured from
+                // where they leave the leaving var. The pivot is made even if
+                // the flips, computed through their columns, carried the
+                // leaving var up to or past its bound (their row predicted
+                // less): the entering var's step is then tiny or reversed,
+                // and every step with an entering var changes the basis, so
+                // flips cannot alternate without progress. (A reversed step
+                // can leave the entering var outside its bounds; that is a
+                // primal infeasibility like any other, for the next
+                // iterations.)
+                self.apply_flips(&step.flips);
+                let val = self.basic_var_vals[row];
+                let entering_diff = (val - leaving_new_val) / a_row;
+                let pivot_info = PivotInfo {
+                    col,
+                    entering_new_val: self.nb_var_vals[col] + entering_diff,
+                    entering_diff,
+                    elem: Some(PivotElem {
+                        row,
+                        leaving_new_val,
+                        coeff: a_row,
+                    }),
+                };
                 trace!(
-                    "dual pivot: var {} enters (col {}), var {} leaves row {row} to {leaving_new_val:e}, \
-                     element {a_row:e}, entering step {:e}",
-                    self.nb_vars[pivot_info.col],
-                    pivot_info.col,
+                    "dual pivot: var {} enters (col {col}), var {} leaves row {row} to \
+                     {leaving_new_val:e}, element {a_row:e}, entering step {entering_diff:e}, \
+                     {} bound flips",
+                    self.nb_vars[col],
                     self.basic_vars[row],
-                    pivot_info.entering_diff,
+                    step.flips.len(),
                 );
                 self.pivot(&pivot_info)?;
                 // Any successful pivot is progress: re-arm the valve.
@@ -1951,15 +2022,65 @@ impl Solver {
         })
     }
 
+    /// The dual ratio test for the leaving `row`, with bound flipping.
+    ///
+    /// The leaving var must move to `leaving_new_val`. A non-basic var whose
+    /// entry in the row can carry that move does so by entering the basis
+    /// (a pivot) or, when both its bounds are finite, by moving to its other
+    /// bound (a flip, which leaves the basis as it is). The vars are taken
+    /// in the order the dual step brings their reduced costs to zero (their
+    /// breakpoints). While a var's flip still leaves the leaving var beyond
+    /// its bound, the step passes that breakpoint and the var is flipped; the
+    /// first var that can carry the rest of the move stops it, and the
+    /// Harris pass picks the entering var among those near that breakpoint,
+    /// exactly as it does when nothing is flipped. The step passes the
+    /// breakpoint of every var it flips, so each flipped var's reduced cost
+    /// crosses zero and the var is dual feasible at the bound it moved to.
+    /// This is the bound-flipping ("long-step") ratio test of the dual
+    /// simplex (Maros, EJOR 149, 2003; Koberstein, PhD thesis, Paderborn
+    /// 2005): where vars are boxed (binaries) one pivot does the work of
+    /// several.
+    ///
+    /// When no var can enter, the row is the whole argument: "no entering
+    /// var" proves infeasibility only if moving every var that can help to
+    /// its other bound still leaves the leaving var beyond its bound, since
+    /// the row is then a Farkas certificate over the vars' bounds. An entry
+    /// below the round-off of computing the row (`ENTRY_ROUNDOFF`) is never
+    /// a pivot, but moving a non-basic var is not a pivot, and its effect is
+    /// computed again through the column when it is applied:
+    /// [`Self::restore_feasibility`] keeps such a move only if the leaving
+    /// var lands within its bounds, as the row predicts. So the vars with
+    /// such entries are moved, flipped or (the last one, if a flip would
+    /// overshoot) only partway, when that lands the leaving var, and the row
+    /// declares the model infeasible only when even flipping all of them
+    /// cannot reach the bound. (SoPlex's ratio test, `SPxBoundFlippingRT`,
+    /// takes every entry above its zero tolerance as a breakpoint for the
+    /// same reason; HiGHS's filters by its pivot tolerance first, and
+    /// without presolve fails on a feasible model of this kind.) A var with
+    /// such an entry and an infinite bound in its direction could only
+    /// enter, and nothing checks such an entry reliably before the pivot:
+    /// round-off can come out the same through the row and the column (so
+    /// the agreement check passes it), and the pivot then leaves a basis the
+    /// factorization rejects. It counts as the zero it may be. A flip has a
+    /// check a pivot lacks: the phase exit re-derives every row from the
+    /// data ([`Self::check_rows`]), so a flip whose effect was round-off is
+    /// found out there.
+    ///
     /// `excluded` lists non-basic columns judged numerically zero in this row
     /// (their entry disagreed with the column computation on a fresh
-    /// factorization) and therefore not candidates.
+    /// factorization, or their flip did not land the leaving var) and
+    /// therefore not candidates. `moved_alone` lists the vars a flip-only
+    /// step has already moved in this phase, which a flip-only step does not
+    /// move back: two rows that each want the var at a different bound
+    /// disagree at the level of the round-off of its entries, and only a
+    /// pivot resolves that.
     fn choose_entering_col_dual(
         &self,
         row: usize,
         leaving_new_val: f64,
         excluded: &[usize],
-    ) -> Result<PivotInfo, Error> {
+        moved_alone: &[usize],
+    ) -> Result<DualStep, Error> {
         // True if the new obj. coeff. must be nonnegative in a dual-feasible configuration.
         let leaving_diff_sign = leaving_new_val > self.basic_var_vals[row];
 
@@ -2117,38 +2238,197 @@ impl Solver {
             (entering_c, pivot_coeff, pivot_floor)
         };
 
-        // Regular candidates first; vars that could only absorb the move
-        // within their tolerance are a fallback, since their pivot does not
-        // keep dual feasibility by construction (the primal phase repairs
-        // that) while a regular one does.
-        let strict = |_c: usize, coeff: f64, state: &NonBasicVarState| direction_ok(coeff, state);
-        let (mut entering_c, mut pivot_coeff, mut pivot_floor) = select(&strict);
+        // The leaving var's distance from its bound, the tolerance within
+        // which it counts as there, and how far past it a flip-only step may
+        // carry it (to its other bound, within that bound's tolerance).
+        let infeasibility = leaving_move.abs();
+        let leaving_tols = self.var_tols[self.basic_vars[row]];
+        let (target_tol, room_past_target) = if leaving_diff_sign {
+            (
+                leaving_tols.lo,
+                self.basic_var_maxs[row] - leaving_new_val + leaving_tols.hi,
+            )
+        } else {
+            (
+                leaving_tols.hi,
+                leaving_new_val - self.basic_var_mins[row] + leaving_tols.lo,
+            )
+        };
+
+        // Every var that can help, as a breakpoint of the dual step: where
+        // its reduced cost reaches zero (`ratio`, and the Harris-relaxed
+        // ratio), the bound it moves towards, and how far a flip onto that
+        // bound carries the leaving var (infinite for an infinite bound).
+        struct Breakpoint {
+            col: usize,
+            coeff: f64,
+            ratio: f64,
+            relaxed_ratio: f64,
+            bound: f64,
+            capacity: f64,
+        }
+        let breakpoint = |c: usize, coeff: f64| -> Breakpoint {
+            let state = &self.nb_var_states[c];
+            let var = self.nb_vars[c];
+            let up = (coeff > 0.0) != leaving_diff_sign;
+            let bound = if up {
+                self.orig_var_maxs[var]
+            } else {
+                self.orig_var_mins[var]
+            };
+            let cost = clamp_obj_coeff(self.nb_var_obj_coeffs[c], state).abs();
+            Breakpoint {
+                col: c,
+                coeff,
+                ratio: cost / coeff.abs(),
+                relaxed_ratio: (cost + self.dual_tols[var]) / coeff.abs(),
+                bound,
+                capacity: coeff.abs() * (bound - self.nb_var_vals[c]).abs(),
+            }
+        };
+        // The order the step reaches the breakpoints: by ratio, the larger
+        // entry first among equal ratios.
+        let reached_before = |a: &Breakpoint, b: &Breakpoint| {
+            a.ratio
+                .total_cmp(&b.ratio)
+                .then(b.coeff.abs().total_cmp(&a.coeff.abs()))
+        };
+
+        // The row's largest entry (the scale of its round-off) and the
+        // largest among the vars that can help: the pivot floor, as the
+        // two-pass computes it.
+        let (mut row_max_all, mut row_max) = (0.0f64, 0.0f64);
+        for (c, &coeff) in self.row_coeffs.iter() {
+            row_max_all = row_max_all.max(coeff.abs());
+            if direction_ok(coeff, &self.nb_var_states[c]) {
+                row_max = row_max.max(coeff.abs());
+            }
+        }
+        let noise_floor = ENTRY_ROUNDOFF * row_max_all;
+        let pivot_floor = noise_floor.max(PIVOT_REL_TOL * row_max);
+        // The vars that could enter regularly (the two-pass's candidates).
+        let candidate = |c: usize, coeff: f64| {
+            coeff.abs() >= pivot_floor
+                && direction_ok(coeff, &self.nb_var_states[c])
+                && !excluded.contains(&c)
+        };
+
+        // The Harris bound on the step (the smallest relaxed ratio) and the
+        // first breakpoint the step reaches, in one pass.
+        let mut max_step = f64::INFINITY;
+        let mut first: Option<Breakpoint> = None;
+        for (c, &coeff) in self.row_coeffs.iter() {
+            if candidate(c, coeff) {
+                let b = breakpoint(c, coeff);
+                max_step = max_step.min(b.relaxed_ratio);
+                if first.as_ref().is_none_or(|f| reached_before(&b, f).is_lt()) {
+                    first = Some(b);
+                }
+            }
+        }
+
+        // The step takes the breakpoints in order. A var whose flip leaves
+        // the leaving var still beyond its bound is flipped and passed; the
+        // first that can carry the rest stops the step. If that is the first
+        // breakpoint, nothing is flipped and the Harris pass below decides,
+        // exactly as without bound flipping (the common case, found without
+        // sorting); if every var is flipped and the leaving var is still
+        // short, so does the Harris pass (its pivot then carries the entering
+        // var past its other bound, which a later iteration repairs).
+        if first.is_some_and(|f| infeasibility - f.capacity > target_tol) {
+            let mut walk: Vec<Breakpoint> = self
+                .row_coeffs
+                .iter()
+                .filter(|&(c, &coeff)| candidate(c, coeff))
+                .map(|(c, &coeff)| breakpoint(c, coeff))
+                .collect();
+            walk.sort_by(reached_before);
+            let mut flips = Vec::new();
+            let mut remaining = infeasibility;
+            for (k, b) in walk.iter().enumerate() {
+                if remaining - b.capacity > target_tol {
+                    flips.push((b.col, b.bound));
+                    remaining -= b.capacity;
+                    continue;
+                }
+                // The Harris pass over the breakpoints not passed: the
+                // entering var is the one with the largest entry among those
+                // whose ratio is within the smallest relaxed ratio.
+                let rest = &walk[k..];
+                let max_step = rest
+                    .iter()
+                    .map(|b| b.relaxed_ratio)
+                    .fold(f64::INFINITY, f64::min);
+                let mut entering = b;
+                for b in rest {
+                    if b.ratio <= max_step && b.coeff.abs() > entering.coeff.abs() {
+                        entering = b;
+                    }
+                }
+                return Ok(DualStep {
+                    flips,
+                    entering: Some((entering.col, entering.coeff)),
+                });
+            }
+        }
+
+        // The Harris pass: among the candidates whose ratio is within the
+        // bound, the one with the largest entry, for a stable basis at the
+        // price of a slight dual infeasibility (Gill, Murray, Saunders &
+        // Wright 1989, above).
+        let mut entering_c = None;
+        let mut pivot_coeff = 0.0;
+        let mut pivot_coeff_abs = f64::NEG_INFINITY;
+        for (c, &coeff) in self.row_coeffs.iter() {
+            if candidate(c, coeff) {
+                let obj_coeff = clamp_obj_coeff(self.nb_var_obj_coeffs[c], &self.nb_var_states[c]);
+                if obj_coeff.abs() / coeff.abs() <= max_step && coeff.abs() > pivot_coeff_abs {
+                    entering_c = Some(c);
+                    pivot_coeff_abs = coeff.abs();
+                    pivot_coeff = coeff;
+                }
+            }
+        }
+        // Vars that could only absorb the move within their tolerance are a
+        // fallback, since their pivot does not keep dual feasibility by
+        // construction (the primal phase repairs that) while a regular one
+        // does.
         if entering_c.is_none() {
             let relaxed = |c: usize, coeff: f64, state: &NonBasicVarState| {
                 direction_ok(coeff, state) || absorbs(c, coeff)
             };
-            (entering_c, pivot_coeff, pivot_floor) = select(&relaxed);
+            (entering_c, pivot_coeff, _) = select(&relaxed);
+        }
+        if let Some(col) = entering_c {
+            return Ok(DualStep {
+                flips: Vec::new(),
+                entering: Some((col, pivot_coeff)),
+            });
         }
 
-        if let Some(col) = entering_c {
-            let entering_diff = (self.basic_var_vals[row] - leaving_new_val) / pivot_coeff;
-            let entering_new_val = self.nb_var_vals[col] + entering_diff;
-
-            Ok(PivotInfo {
-                col,
-                entering_new_val,
-                entering_diff,
-                elem: Some(PivotElem {
-                    row,
-                    leaving_new_val,
-                    coeff: pivot_coeff,
-                }),
+        // No var can enter. What can still move the leaving var are the flips
+        // of the boxed vars whose entries are below the row's round-off; if
+        // even all of them cannot bring it to its bound, the row proves the
+        // model infeasible (unboxed ones count as the zero they may be: see
+        // the doc above).
+        let sub_noise: Vec<Breakpoint> = self
+            .row_coeffs
+            .iter()
+            .filter(|&(c, &coeff)| {
+                coeff.abs() < noise_floor
+                    && direction_ok(coeff, &self.nb_var_states[c])
+                    && !excluded.contains(&c)
             })
-        } else {
+            .map(|(c, &coeff)| breakpoint(c, coeff))
+            .filter(|b| b.capacity.is_finite())
+            .collect();
+        let reachable: f64 = sub_noise.iter().map(|b| b.capacity).sum();
+        if reachable < infeasibility - target_tol {
             if log::log_enabled!(log::Level::Debug) {
                 debug!(
                     "no entering column for row {row} (basic var {} = {:e}, bounds [{:e}, {:e}], \
-                     leaving to {leaving_new_val:e}, pivot floor {pivot_floor:e}); row entries:",
+                     leaving to {leaving_new_val:e}, pivot floor {pivot_floor:e}, flips below \
+                     round-off reach {reachable:e}); row entries:",
                     self.basic_vars[row],
                     self.basic_var_vals[row],
                     self.basic_var_mins[row],
@@ -2169,8 +2449,105 @@ impl Solver {
                     );
                 }
             }
-            Err(Error::Infeasible)
+            return Err(Error::Infeasible);
         }
+
+        // They can: move them, the largest first, until the leaving var lands.
+        // A var whose flip would carry the leaving var past its other bound
+        // moves only as far as it takes to land it on its bound, and stays
+        // non-basic between its bounds (a state the engine already has: a
+        // bound change can leave a var there).
+        let mut order: Vec<&Breakpoint> = sub_noise
+            .iter()
+            .filter(|b| !moved_alone.contains(&self.nb_vars[b.col]))
+            .collect();
+        order.sort_by(|a, b| b.capacity.total_cmp(&a.capacity));
+        let mut moved = 0.0;
+        let mut moves = Vec::new();
+        for b in order {
+            let need = infeasibility - moved;
+            if need <= target_tol {
+                break;
+            }
+            if b.capacity <= need + room_past_target {
+                moved += b.capacity;
+                moves.push((b.col, b.bound));
+            } else {
+                let cur = self.nb_var_vals[b.col];
+                let step = need / b.coeff.abs();
+                let new_val = if b.bound > cur {
+                    cur + step
+                } else {
+                    cur - step
+                };
+                moved = infeasibility;
+                moves.push((b.col, new_val));
+            }
+        }
+        if infeasibility - moved <= target_tol {
+            return Ok(DualStep {
+                flips: moves,
+                entering: None,
+            });
+        }
+        // Only vars a flip-only step has already moved could close the gap.
+        Err(Error::InternalError(format!(
+            "dual simplex: row {row} can reach its bound only by moving back vars that another \
+             row's entries below round-off (below {noise_floor:e} here) moved; the rows \
+             disagree at the level of that round-off"
+        )))
+    }
+
+    /// Move each non-basic column in `flips` to the value given with it (its
+    /// other bound, or for the last var of a flip-only step a value between
+    /// its bounds; either way the basis stays as it is) and carry the moves
+    /// into the basic values, `x_B -= B^-1 Σ Δx_c a_c`, through one solve
+    /// with the combined column. The objective moves by the reduced costs,
+    /// as in a pivot.
+    fn apply_flips(&mut self, flips: &[(usize, f64)]) {
+        if flips.is_empty() {
+            return;
+        }
+        self.values_dirty = true;
+        self.flip_rhs.clear_and_resize(self.num_constraints());
+        for &(col, new_val) in flips {
+            let var = self.nb_vars[col];
+            let diff = new_val - self.nb_var_vals[col];
+            self.cur_obj_val += self.nb_var_obj_coeffs[col] * diff;
+            self.nb_var_vals[col] = new_val;
+            let tol = self.var_tols[var];
+            self.nb_var_states[col] = NonBasicVarState {
+                at_min: at_bound(new_val, self.orig_var_mins[var], tol.lo),
+                at_max: at_bound(new_val, self.orig_var_maxs[var], tol.hi),
+            };
+            //guaranteed to be a valid index
+            for (r, &coeff) in self.orig_constraints_csc.outer_view(var).unwrap().iter() {
+                *self.flip_rhs.get_mut(r) += diff * coeff;
+            }
+        }
+        let delta = self.basis_solver.solve(self.flip_rhs.iter());
+        for (r, &d) in delta.iter() {
+            self.basic_var_vals[r] -= d;
+        }
+    }
+
+    /// Clear `is_dual_feasible` if the non-basic var at `col` no longer
+    /// justifies its reduced cost at the bound it now sits at: after a move
+    /// that no dual step went with (a bound change, a flip-only step).
+    fn downgrade_dual_feasibility(&mut self, col: usize) {
+        let var = self.nb_vars[col];
+        self.is_dual_feasible = self.is_dual_feasible
+            && self.nb_var_states[col]
+                .is_dual_feasible(self.nb_var_obj_coeffs[col], self.dual_tols[var]);
+    }
+
+    /// Whether the basic var of `row` is within its bounds up to its
+    /// tolerances: the test [`Self::choose_pivot_row_dual`] makes, with a
+    /// value that is not a number counted as outside.
+    fn basic_var_within_bounds(&self, row: usize) -> bool {
+        let val = self.basic_var_vals[row];
+        let tol = self.var_tols[self.basic_vars[row]];
+        val >= self.basic_var_mins[row] - tol.lo && val <= self.basic_var_maxs[row] + tol.hi
     }
 
     fn pivot(&mut self, pivot_info: &PivotInfo) -> Result<(), Error> {
