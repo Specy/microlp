@@ -23,7 +23,10 @@
 //!   tolerance-level differences.
 //! * The reported objective must be the objective of the reported values.
 
-use crate::{ComparisonOp, OptimizationDirection, Problem, SolutionStatus, Tolerances, Variable};
+use crate::{
+    ComparisonOp, OptimizationDirection, Problem, SolutionStatus, SolveOptions, Tolerances,
+    Variable,
+};
 
 /// Relative round-off allowance on a row's or bound's magnitude: about a
 /// hundred ulps of `f64`.
@@ -180,12 +183,29 @@ pub(crate) fn assert_solves_feasibly_within_contract(model: &Model) {
     check_contract(model, false);
 }
 
+/// [`assert_solves_within_contract`] with presolve off: the LP engine on the
+/// model as written.
+pub(crate) fn assert_solves_within_contract_without_presolve(model: &Model) {
+    check_contract_with(model, true, false);
+}
+
 fn check_contract(model: &Model, compare_objective: bool) {
+    check_contract_with(model, compare_objective, true);
+}
+
+fn check_contract_with(model: &Model, compare_objective: bool, presolve: bool) {
     let (problem, vars) = model.build();
-    let outcome = match problem.solve() {
+    let mut options = SolveOptions::default();
+    options.presolve = presolve;
+    let call = if presolve {
+        "solve()"
+    } else {
+        "solve() without presolve"
+    };
+    let outcome = match problem.solve_with(options) {
         Ok(outcome) => outcome,
         Err(err) => panic!(
-            "solve() returned {err:?} on a feasible, bounded model:\n{}",
+            "{call} returned {err:?} on a feasible, bounded model:\n{}",
             model.source()
         ),
     };

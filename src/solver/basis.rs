@@ -44,8 +44,37 @@ pub(crate) struct PivotInfo {
 #[derive(Debug)]
 pub(crate) struct PivotElem {
     pub(crate) row: usize,
+    /// The pivot element as computed through the pivot column
+    /// (`col_coeffs[row]`): the primal step, the eta file and both
+    /// steepest-edge updates use it, so that each is consistent with the
+    /// column they apply it with (the eta then represents exactly the basis
+    /// the column describes). As HiGHS: `theta_primal = .../alpha_col` and
+    /// the factor update's `aq->array[iRow]` (`HEkkDual::updatePrimal`,
+    /// `HFactor::updatePF`), and the steepest-edge updates in scaled space
+    /// with `alpha_col` (`HEkk::updateDualSteepestEdgeWeights`,
+    /// `HEkkPrimal::updatePrimalSteepestEdgeWeights`).
     pub(crate) coeff: f64,
+    /// The element the reduced-cost update divides by (the dual step is
+    /// `d_q / dual_step_coeff` along the pivot row): in the dual simplex the
+    /// element computed through the pivot row, the row the update runs
+    /// along (HiGHS `HEkkDual`: `theta_dual = workDual / workAlpha`); in the
+    /// primal simplex the column element, as `HEkkPrimal::updateDual`
+    /// (`theta_dual = workDual / alpha_col`).
+    pub(crate) dual_step_coeff: f64,
     pub(crate) leaving_new_val: f64,
+}
+
+/// Outcome of the dual ratio test for one leaving row: the non-basic vars to
+/// move to their other bound (bound flips, which leave the basis as it is),
+/// then the var that enters, or none when the moves alone bring the leaving
+/// var within its bounds (the last of them then possibly only partway).
+#[derive(Debug)]
+pub(crate) struct DualStep {
+    /// `(col, new_val)`: a non-basic column and the value it moves to.
+    pub(crate) flips: Vec<(usize, f64)>,
+    /// `(col, coeff)`: the entering column and its entry in the leaving row
+    /// (the element computed through the row).
+    pub(crate) entering: Option<(usize, f64)>,
 }
 
 /// Stuff related to inversion of the basis matrix

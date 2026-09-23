@@ -6,23 +6,23 @@
 //! tolerance and whose objective is no worse than at `x*` — the contract in
 //! `oracle.rs`.
 //!
-//! The fixtures pass, except the one marked KNOWN LIMITATION, which is
-//! `#[should_panic]`: it records an answer the engine gets wrong today, so
-//! that fixing it shows up as a FAILING test rather than passing unnoticed.
-//! When it fails, delete the attribute — the body already asserts the right
-//! answer — and it becomes an ordinary regression test. See §7 of
-//! `ARCHITECTURE.md` for the mechanism behind it. Two more fixtures were
-//! pinned the same way when they were found and turned out to be ordinary
-//! bugs (a presolve forcing rule and a skipped verification); they are plain
-//! regression tests now, which is exactly what the convention is for.
+//! A model the engine gets wrong when it is found, and that cannot be fixed
+//! at once, is pinned here as a KNOWN LIMITATION with `#[should_panic]`: the
+//! test records today's answer, so that fixing it shows up as a FAILING test
+//! rather than passing unnoticed; the attribute is then deleted (the body
+//! already asserts the right answer) and it is an ordinary regression test.
+//! See §7 of `ARCHITECTURE.md`. Three fixtures were pinned this way and all
+//! three were fixed: a presolve forcing rule, a skipped verification, and a
+//! dual ratio test that took "no pivot" for a proof of infeasibility (the
+//! `wide_chain` fixtures). None is pinned today.
 
 #[cfg(test)]
 mod regression_tests {
     use crate::tests::oracle::{
-        assert_solves_feasibly_within_contract, assert_solves_within_contract, xstar_is_feasible,
-        Model, Row, Var,
+        assert_solves_feasibly_within_contract, assert_solves_within_contract,
+        assert_solves_within_contract_without_presolve, xstar_is_feasible, Model, Row, Var,
     };
-    use crate::{ComparisonOp, OptimizationDirection};
+    use crate::{ComparisonOp, Error, OptimizationDirection, SolveOptions};
 
     fn real(obj: f64, lo: f64, hi: f64) -> Var {
         Var {
@@ -323,44 +323,90 @@ mod regression_tests {
         });
     }
 
-    /// KNOWN LIMITATION (`ARCHITECTURE.md` §7). Five variables (one integer,
-    /// two fixed) under three rows whose coefficients run from `1e-8` to
-    /// `1e4`; `x* = 0` satisfies all three exactly, yet `solve()` answers
-    /// `Infeasible`, with presolve on or off. The start puts `x2` at its
-    /// lower bound `-1e6`, and the only tableau entry that could carry it back
-    /// to `0` is `1.5e-15` against a row maximum of `1.95`: eight ulps,
-    /// indistinguishable from round-off, so the ratio test rightly refuses
-    /// it. A bound-flipping ratio test would take the flip instead. The
-    /// integer var plays no part; the limit is the LP engine's.
-    ///
-    /// Found by the wide-coefficient MILP property in `scaling.rs`.
-    /// `#[should_panic]` records today's behaviour: the test is green while
-    /// the limitation stands and turns RED the moment a change fixes it —
-    /// then delete the attribute, since the body already asserts the right
-    /// answer.
-    #[test]
-    #[should_panic(expected = "solve() returned Infeasible on a feasible, bounded model")]
-    fn wide_coefficients_with_an_integer_variable_is_a_known_limitation() {
-        check(Model {
+    /// The wide-coefficient chain of the fixtures below: five variables (one
+    /// integer, two fixed) under three rows whose coefficients run from
+    /// `1e-8` to `1e4`. Rows 0 and 2 tie `x3` to `x2`, `x3 ≈ 1e-13 (x2 -
+    /// shift)`, and `x3` lies in `[0, 1]`, so the rows hold only at `x2 =
+    /// shift` with `x3 = x4 = 0`; `x2`'s bounds are `[lo, hi]`.
+    fn wide_chain(lo: f64, hi: f64, shift: f64) -> Model {
+        Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![
                 int(0.0, 0, 0),
                 real(0.0, 0.0, 0.0),
-                real(0.0, -1000001.0, 0.0),
+                real(0.0, lo, hi),
                 real(0.0, 0.0, 1.0),
                 real(0.0, -1.0, 1.0),
             ],
             rows: vec![
                 row(&[(3, 1000.0), (4, 1.0)], ComparisonOp::Eq, 0.0),
-                row(&[(2, -1.0), (4, -1e-5)], ComparisonOp::Ge, -0.0),
+                row(&[(2, -1.0), (4, -1e-5)], ComparisonOp::Ge, -shift),
                 row(
                     &[(2, 1e-6), (3, -1e-8), (4, 10000.0)],
                     ComparisonOp::Eq,
-                    0.0,
+                    1e-6 * shift,
                 ),
             ],
-            xstar: vec![0.0, 0.0, 0.0, 0.0, 0.0],
-        });
+            xstar: vec![0.0, 0.0, shift, 0.0, 0.0],
+        }
+    }
+
+    /// Once pinned as a known limitation. `x* = 0` satisfies all three rows
+    /// exactly, yet the solve answered `Infeasible` with presolve on or off.
+    /// The start puts `x2` at its lower bound `-1000001`, and the only
+    /// tableau entry that can carry it back is `1.5e-15` against a row
+    /// maximum of `1.95`, below the round-off of computing the row: the dual
+    /// ratio test rightly refused it as a pivot, found no other, and took
+    /// "no pivot" for a proof of infeasibility. Moving `x2` needs no pivot:
+    /// its flip to `0` carries the leaving var of row 0 exactly the
+    /// `1.19e-11` (scaled) it is short. The dual ratio test flips boxed vars
+    /// now, including through such entries when the flip lands the leaving
+    /// var (checked through the column), and declares infeasibility only
+    /// when no flip can reach the bound. The integer var plays no part.
+    /// Found by the wide-coefficient MILP property in `scaling.rs`.
+    #[test]
+    fn wide_coefficients_reached_by_a_bound_flip() {
+        check(wide_chain(-1000001.0, 0.0, 0.0));
+        assert_solves_within_contract_without_presolve(&wide_chain(-1000001.0, 0.0, 0.0));
+    }
+
+    /// [`wide_coefficients_reached_by_a_bound_flip`] shifted so that `x2`'s
+    /// feasible value is the bound farther from zero, where a start at the
+    /// bound nearer zero (HiGHS's rule, which does solve the unshifted model)
+    /// begins: the flip does not depend on where the solve starts.
+    #[test]
+    fn wide_coefficients_reached_by_a_flip_to_the_bound_far_from_zero() {
+        check(wide_chain(0.0, 1000001.0, 1000001.0));
+        assert_solves_within_contract_without_presolve(&wide_chain(0.0, 1000001.0, 1000001.0));
+    }
+
+    /// The chain with `x2`'s feasible value inside its range: the flip would
+    /// carry the leaving var of row 0 past its bound (an equality's), so
+    /// `x2` moves only as far as the row needs and stays non-basic between
+    /// its bounds.
+    #[test]
+    fn wide_coefficients_reached_by_a_partial_move() {
+        check(wide_chain(-2000002.0, 1000001.0, 0.0));
+        assert_solves_within_contract_without_presolve(&wide_chain(-2000002.0, 1000001.0, 0.0));
+    }
+
+    /// The chain with `x2` confined to `[-2e7, -1e7]`: `x3 ≈ 1e-13 x2` is
+    /// then at most `-1e-6`, beyond every tolerance, and even `x2`'s flip to
+    /// `-1e7` leaves row 0 short. With no var to enter and no flip that can
+    /// reach the bound, the row proves the model infeasible, and the answer
+    /// must stay `Infeasible`: moving vars through entries below round-off
+    /// must not turn a proof into a guess.
+    #[test]
+    fn wide_coefficients_beyond_every_flip_are_infeasible() {
+        for presolve in [true, false] {
+            let (problem, _) = wide_chain(-2e7, -1e7, 0.0).build();
+            let mut options = SolveOptions::default();
+            options.presolve = presolve;
+            match problem.solve_with(options) {
+                Err(Error::Infeasible) => {}
+                other => panic!("presolve {presolve}: expected Infeasible, got {other:?}"),
+            }
+        }
     }
 
     /// Variable magnitudes are around `8e6` and row 1's terms reach `1.3e8`.
@@ -569,5 +615,36 @@ mod regression_tests {
             ],
             xstar: vec![0.0, 0.0, 1.0, 1.0],
         });
+    }
+
+    /// A fixed var's huge coefficient must not silence the rest of its row
+    /// (C2-06). `min y` s.t. `1e17 f + y >= 1`, `f` fixed at zero: neither
+    /// scaling touches the row (a fixed column is left out of both), so the
+    /// dual ratio test saw the row `[1e17, 1]`. Its round-off scale was
+    /// taken over every entry, the fixed column's included, which made
+    /// `y`'s exact entry of one "noise", and the row a proof of
+    /// infeasibility, with presolve on (the row is kept as written) and off.
+    /// The scale now leaves out the columns the scalings left out.
+    #[test]
+    fn a_fixed_vars_huge_coefficient_does_not_silence_its_row() {
+        for presolve in [true, false] {
+            let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+            let f = problem.add_var(0.0, (0.0, 0.0));
+            let y = problem.add_var(1.0, (0.0, f64::INFINITY));
+            problem.add_constraint([(f, 1e17), (y, 1.0)], ComparisonOp::Ge, 1.0);
+            let solution = problem
+                .solve_with(SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                })
+                .unwrap_or_else(|e| panic!("presolve {presolve}: {e:?}"))
+                .into_solution()
+                .unwrap();
+            assert_eq!(
+                (solution[f], solution[y], solution.objective()),
+                (0.0, 1.0, 1.0),
+                "presolve {presolve}"
+            );
+        }
     }
 }

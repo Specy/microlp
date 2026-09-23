@@ -295,6 +295,36 @@ fn initial_solve() {
     assert_eq!(infeasible.unwrap_err(), Error::Infeasible);
 }
 
+/// `min Σ c_i x_i` over `x ∈ [0, 1]^8` with `Σ x_i ≥ 5` and costs `1..=8`:
+/// the start (every var at its lower bound) is dual feasible, and the one
+/// violated row is repaired by the four cheapest vars moving to their upper
+/// bound and the fifth entering. The dual ratio test passes the breakpoints of
+/// the four (flips, no pivot) and pivots only on the fifth, so the phase takes
+/// one pivot where a ratio test without bound flipping takes five.
+#[test]
+fn dual_step_flips_the_boxed_vars_it_passes() {
+    init();
+    let n = 8;
+    let costs: Vec<f64> = (1..=n).map(|c| c as f64).collect();
+    let mut sol = Solver::try_new(
+        &costs,
+        &vec![0.0; n],
+        &vec![1.0; n],
+        &[(to_sparse(&vec![1.0; n]), ComparisonOp::Ge, 5.0)],
+        &vec![VarDomain::Real; n],
+        Default::default(),
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    sol.initial_solve().unwrap();
+
+    assert_eq!(sol.cur_obj_val, 15.0);
+    let values: Vec<f64> = (0..n).map(|v| sol.get_value(v)).collect();
+    assert_eq!(values, [1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
+    // One pivot, then the check that finds every row within its bounds.
+    assert_eq!(sol.lp_iterations, 2);
+}
+
 #[test]
 fn set_var_bounds_tighten_matches_fresh_solve() {
     init();
@@ -556,4 +586,256 @@ fn load_basis_rejects_wrong_shape() {
     let slack = solver.slack_basis();
     solver.load_basis(&slack).unwrap();
     assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
+}
+
+/// The single violated row `8 x1 + x2 / 8 >= 10` (equilibrated to
+/// `x1 + x2 / 64 >= 1.25`) with both vars at their lower bound and a zero
+/// cost: their breakpoints tie at a zero dual step. Flipping `x1` (entry 1,
+/// capacity 1) and `x2` (entry 1/64, capacity 1) together carries the row, so
+/// they form one Harris group and the pivot is its largest entry, `x1`, with
+/// nothing flipped, as HiGHS's `chooseFinal` has it (C2-07). A walk over the
+/// breakpoints one at a time flipped `x1` and pivoted on `x2`'s entry, 64
+/// times smaller, and made that flip on a zero dual step, which neither
+/// HiGHS nor SoPlex does (C2-09). The solve ends at the same point either
+/// way.
+#[test]
+fn dual_ratio_test_pivots_on_the_largest_entry_of_a_tied_group() {
+    init();
+    let new_solver = || {
+        Solver::try_new(
+            &[0.0, 0.0],
+            &[0.0, 0.0],
+            &[1.0, 64.0],
+            &[(to_sparse(&[8.0, 0.125]), ComparisonOp::Ge, 10.0)],
+            &[VarDomain::Real, VarDomain::Real],
+            None,
+            crate::Tolerances::default().feasibility,
+        )
+        .unwrap()
+    };
+    let mut sol = new_solver();
+    let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
+    sol.calc_row_coeffs(row);
+    let step = sol
+        .choose_entering_col_dual(row, leaving_new_val, &[], &[])
+        .unwrap();
+    assert!(step.flips.is_empty(), "flips {:?}", step.flips);
+    let (col, coeff) = step.entering.unwrap();
+    assert_eq!((sol.nb_vars[col], coeff), (0, 1.0));
+
+    let mut sol = new_solver();
+    assert_eq!(sol.initial_solve().unwrap(), StopReason::Finished);
+    assert_eq!([sol.get_value(0), sol.get_value(1)], [1.0, 16.0]);
+}
+
+/// The same row with `x2` costing 1: its breakpoint now lies beyond the
+/// first Harris group, which holds `x1` alone and cannot carry the row
+/// (capacity 1 of 1.25). The groups up to `x2`'s can, but the last group's
+/// only entry, 1/64, is below a tenth of the largest grouped entry, so the
+/// pivot steps back to the first group, `x1`, and nothing is flipped (HiGHS
+/// `chooseFinalLargeAlpha`). `x1` then enters past its other bound, and the
+/// next iteration moves the rest of the violation onto `x2`.
+#[test]
+fn dual_ratio_test_steps_back_to_a_group_with_a_stable_pivot() {
+    init();
+    let new_solver = || {
+        Solver::try_new(
+            &[0.0, 1.0],
+            &[0.0, 0.0],
+            &[1.0, 64.0],
+            &[(to_sparse(&[8.0, 0.125]), ComparisonOp::Ge, 10.0)],
+            &[VarDomain::Real, VarDomain::Real],
+            None,
+            crate::Tolerances::default().feasibility,
+        )
+        .unwrap()
+    };
+    let mut sol = new_solver();
+    let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
+    sol.calc_row_coeffs(row);
+    let step = sol
+        .choose_entering_col_dual(row, leaving_new_val, &[], &[])
+        .unwrap();
+    assert!(step.flips.is_empty(), "flips {:?}", step.flips);
+    let (col, coeff) = step.entering.unwrap();
+    assert_eq!((sol.nb_vars[col], coeff), (0, 1.0));
+
+    let mut sol = new_solver();
+    assert_eq!(sol.initial_solve().unwrap(), StopReason::Finished);
+    assert_eq!([sol.get_value(0), sol.get_value(1)], [1.0, 16.0]);
+    assert_eq!(sol.cur_obj_val, 16.0);
+}
+
+/// A column excluded for the row (its entry disagreed with the column
+/// computation on a fresh factorization) no longer sets the pivot floor
+/// (C2-15). Planted row `x0 + 1e-6 x1 + 1e-14 x2` of the violated row
+/// `x0 + x1 + x2 >= 5`: `x0` sits at its upper bound (no help), `x1` is
+/// excluded, and `x2` (unbounded above) is the only var left to repair the
+/// row. With the floor taken over the excluded `x1`, `x2`'s entry was below
+/// it and above the round-off floor, neither a candidate nor a term of the
+/// verdict, and the row was declared infeasible.
+#[test]
+fn excluded_column_does_not_set_the_dual_pivot_floor() {
+    init();
+    let mut sol = Solver::try_new(
+        &[-1.0, 0.0, 0.0],
+        &[0.0, 0.0, 0.0],
+        &[1.0, 1.0, f64::INFINITY],
+        &[(to_sparse(&[1.0, 1.0, 1.0]), ComparisonOp::Ge, 5.0)],
+        &vec![VarDomain::Real; 3],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
+    sol.calc_row_coeffs(row);
+    let col_of = |sol: &Solver, var: usize| sol.nb_vars.iter().position(|&v| v == var).unwrap();
+    let (c0, c1, c2) = (col_of(&sol, 0), col_of(&sol, 1), col_of(&sol, 2));
+    *sol.row_coeffs.get_mut(c0) = 1.0;
+    *sol.row_coeffs.get_mut(c1) = 1e-6;
+    *sol.row_coeffs.get_mut(c2) = 1e-14;
+    let step = sol
+        .choose_entering_col_dual(row, leaving_new_val, &[c1], &[])
+        .unwrap();
+    assert!(step.flips.is_empty());
+    assert_eq!(step.entering, Some((c2, 1e-14)));
+}
+
+/// The dual simplex applies a pivot with the element computed through the
+/// column (C2-23): the eta file stores the column's own pivot, so the updated
+/// factorization maps the entering column exactly onto the unit vector of
+/// its row, and the primal step and the steepest-edge weight use it too,
+/// while the reduced costs, updated along the row, use the row's element.
+/// Planted: the row's element 1e-9 (relative) off the column's, within the
+/// agreement check. With the row's element in the eta, the updated basis had
+/// the entering column `a_q + (a_row - a_col) b_r` instead of `a_q`.
+#[test]
+fn dual_pivot_applies_the_column_element_to_the_eta_file() {
+    init();
+    // min x + y s.t. x + 2y >= 4, 3x + y >= 3, boxes [0, 10]: the start
+    // (both at zero) is dual feasible and violates both rows.
+    let mut sol = Solver::try_new(
+        &[1.0, 1.0],
+        &[0.0, 0.0],
+        &[10.0, 10.0],
+        &[
+            (to_sparse(&[1.0, 2.0]), ComparisonOp::Ge, 4.0),
+            (to_sparse(&[3.0, 1.0]), ComparisonOp::Ge, 3.0),
+        ],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
+    sol.calc_row_coeffs(row);
+    let step = sol
+        .choose_entering_col_dual(row, leaving_new_val, &[], &[])
+        .unwrap();
+    let (col, a_row) = step.entering.unwrap();
+    sol.calc_col_coeffs(col);
+    let a_col = sol.col_coeff_at(row);
+    assert_eq!(
+        a_row, a_col,
+        "fixture: a fresh slack basis computes both alike"
+    );
+    let planted_row = a_col * (1.0 + 1e-9);
+    *sol.row_coeffs.get_mut(col) = planted_row;
+    let entering_var = sol.nb_vars[col];
+    let d_q = sol.nb_var_obj_coeffs[col];
+    let rho_sq_norm = sol.inv_basis_row_coeffs.sq_norm();
+    let entering_diff = (sol.basic_var_vals[row] - leaving_new_val) / a_col;
+    sol.pivot(&PivotInfo {
+        col,
+        entering_new_val: sol.nb_var_vals[col] + entering_diff,
+        entering_diff,
+        elem: Some(PivotElem {
+            row,
+            coeff: a_col,
+            dual_step_coeff: planted_row,
+            leaving_new_val,
+        }),
+    })
+    .unwrap();
+    // The eta file represents the basis the column describes.
+    let a_q: Vec<(usize, f64)> = sol
+        .orig_constraints_csc
+        .outer_view(entering_var)
+        .unwrap()
+        .iter()
+        .map(|(r, &v)| (r, v))
+        .collect();
+    let num_rows = sol.num_constraints();
+    let unit = sol.basis_solver.solve(a_q.iter().map(|(r, v)| (*r, v)));
+    for r in 0..num_rows {
+        let expected = if r == row { 1.0 } else { 0.0 };
+        assert!(
+            (unit.get(r) - expected).abs() <= 1e-15,
+            "B^-1 a_q at row {r}: {:e}",
+            unit.get(r)
+        );
+    }
+    // The leaving var's reduced cost is the dual step along the row.
+    assert_eq!(sol.nb_var_obj_coeffs[col], -d_q / planted_row);
+    // The pivot row's steepest-edge weight is exact for the new basis.
+    assert_eq!(sol.dual_edge_sq_norms[row], rho_sq_norm / (a_col * a_col));
+}
+
+/// KNOWN LIMITATION (ARCHITECTURE §7; C3-11 of the solver review): the
+/// primal ratio test's round-off scale is the largest entry of the whole
+/// column, so a genuine blocking entry below its `ENTRY_ROUNDOFF` share, next
+/// to huge entries in rows that cannot block, counts as noise. Basis: the free
+/// vars `y1`, `y2` of the nearly dependent equalities `y1 + y2 + x/8 = 0` and
+/// `y1 + (1 + 2^-43) y2 + 8x = 0`, which put 7e13 into the column of `x` in
+/// rows that never block, and the slack of `x/8 + 8z <= 1`, whose entry is
+/// 1/64 after equilibration and exact (the basis is block diagonal). Nothing
+/// blocks `x` and `max x` comes back `Unbounded` instead of `x = 8`. Taking
+/// the scale over the rows that can block instead fixes this model but pivots
+/// on round-off elsewhere (an entry of -4.4e-16 in a blocking row beside a
+/// huge one, taken with a step of 5.6e15, left a singular basis on an LP
+/// HiGHS finds unbounded), since the rows of one column share the round-off
+/// of one solve; telling the two apart needs an absolute pivot tolerance and
+/// a refined column, not a relative floor. When a change fixes this, the test
+/// fails: drop the attribute and keep it as a regression test.
+#[test]
+#[should_panic(expected = "Unbounded")]
+fn primal_ratio_test_scale_hides_a_blocking_entry_is_a_known_limitation() {
+    init();
+    let eps = 2.0f64.powi(-43);
+    let mut sol = Solver::try_new(
+        &[0.0, 0.0, -1.0, 0.0],
+        &[f64::NEG_INFINITY, f64::NEG_INFINITY, 0.0, 0.0],
+        &[f64::INFINITY, f64::INFINITY, f64::INFINITY, 1.0],
+        &[
+            (to_sparse(&[1.0, 1.0, 0.125, 0.0]), ComparisonOp::Eq, 0.0),
+            (
+                to_sparse(&[1.0, 1.0 + eps, 8.0, 0.0]),
+                ComparisonOp::Eq,
+                0.0,
+            ),
+            (to_sparse(&[0.0, 0.0, 0.125, 8.0]), ComparisonOp::Le, 1.0),
+        ],
+        &vec![VarDomain::Real; 4],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(sol.col_scales, [1.0; 4], "fixture: no column scaling");
+    let basis = Basis(vec![
+        VarStatus::Basic,
+        VarStatus::Basic,
+        VarStatus::AtLower,
+        VarStatus::AtLower,
+        VarStatus::AtLower,
+        VarStatus::AtLower,
+        VarStatus::Basic,
+    ]);
+    sol.load_basis(&basis).unwrap();
+    assert_eq!(sol.reoptimize().unwrap(), StopReason::Finished);
+    assert!(
+        (sol.get_value(2) - 8.0).abs() < 1e-9,
+        "x = {}",
+        sol.get_value(2)
+    );
+    assert!((sol.cur_obj_val + 8.0).abs() < 1e-9);
 }
