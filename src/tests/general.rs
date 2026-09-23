@@ -769,4 +769,226 @@ mod tests_general {
         assert_eq!([sol.var_value(x), sol.var_value(b)], [5.0, 0.0]);
         assert_eq!(sol.objective().round(), 5.0);
     }
+
+    /// A model from `(objective, lower, upper, integer)` vars and
+    /// `(terms, sense, rhs)` rows, as the differential fuzzing writes them.
+    fn fuzz_model(
+        direction: OptimizationDirection,
+        vars: &[(f64, f64, f64, bool)],
+        rows: &[(&[(usize, f64)], ComparisonOp, f64)],
+    ) -> Problem {
+        let mut problem = Problem::new(direction);
+        let vars: Vec<Variable> = vars
+            .iter()
+            .map(|&(obj, lo, hi, integer)| {
+                if integer {
+                    problem.add_integer_var(obj, (lo as i32, hi as i32))
+                } else {
+                    problem.add_var(obj, (lo, hi))
+                }
+            })
+            .collect();
+        for &(terms, op, rhs) in rows {
+            let terms: Vec<(Variable, f64)> = terms.iter().map(|&(v, a)| (vars[v], a)).collect();
+            problem.add_constraint(&terms[..], op, rhs);
+        }
+        problem
+    }
+
+    /// Infeasible models (HiGHS agrees) whose dual simplex reaches a row
+    /// whose only helping entry is round-off: 1.1e-16, the residue of two
+    /// parallel rows cancelling, beside a slack's entry of 1.05 that cannot
+    /// help. Every entry of a row comes from the same transposed solve, so
+    /// the round-off scale of the row is taken over the entries that cannot
+    /// help too; taken over the helping entries alone, or dropped from the
+    /// fallback to vars that absorb the move, it let the residue through as
+    /// a pivot, with a step of 4.5e15, into a basis the factorization
+    /// refused (`InternalError("Singular matrix")`).
+    #[test]
+    fn infeasible_row_is_not_repaired_through_a_round_off_entry() {
+        init();
+        let inf = f64::INFINITY;
+        use ComparisonOp::{Eq, Ge, Le};
+        let models = [
+            fuzz_model(
+                OptimizationDirection::Maximize,
+                &[
+                    (3.0, -0.20697761674377824, 1.913871936096928, false),
+                    (0.0, -20.234403244297035, -9.584280022528944, false),
+                    (0.0, -9.270817452147654, 9.896834943606258, false),
+                ],
+                &[
+                    (&[(0, 2.302285)], Ge, 2.0886425656280156),
+                    (&[(1, -8.0), (2, 3.8)], Ge, 41.44513386207047),
+                    (
+                        &[(0, 9.917117), (1, -7.564712), (2, 0.0)],
+                        Le,
+                        81.49916805098938,
+                    ),
+                    (&[(0, 4.60457)], Ge, 4.177285131256031),
+                    (&[(0, 8.734751)], Le, 7.454648431432122),
+                    (&[(1, -4.0), (2, 1.9)], Ge, 20.722566931035235),
+                ],
+            ),
+            fuzz_model(
+                OptimizationDirection::Maximize,
+                &[
+                    (-3.0, -inf, -2.0, false),
+                    (-3.0, 0.0, 14.0, false),
+                    (2.0, 0.0, 18.0, false),
+                    (-5.0, -inf, inf, false),
+                    (-4.0, -inf, inf, false),
+                    (1.0, 2.0, 3.0, true),
+                ],
+                &[
+                    (&[(0, 3.0), (2, 2.0), (3, 5.0), (4, 2.0)], Le, 8.0),
+                    (&[(0, -3.0), (1, 3.0), (5, -5.0)], Ge, -8.0),
+                    (
+                        &[(0, 5.0), (2, -4.0), (3, 4.0), (4, -3.0), (5, 2.0)],
+                        Eq,
+                        0.0,
+                    ),
+                    (&[(0, 1.0), (1, -3.0), (3, 5.0), (4, -2.0)], Le, -3.0),
+                    (&[(0, -2.0), (4, -5.0)], Eq, 17.0),
+                    (&[(4, 2.0)], Ge, 7.0),
+                ],
+            ),
+            fuzz_model(
+                OptimizationDirection::Minimize,
+                &[
+                    (-2.0, 0.0, 6.0, false),
+                    (1.0, 4.0, 7.0, false),
+                    (-4.0, 0.0, inf, false),
+                    (3.0, 0.0, inf, false),
+                    (-4.0, 0.0, 18.0, false),
+                    (-1.0, 0.0, inf, false),
+                    (-5.0, 0.0, 4.0, false),
+                    (3.0, 0.0, 13.0, false),
+                ],
+                &[
+                    (
+                        &[
+                            (0, -5.0),
+                            (1, -3.0),
+                            (2, -5.0),
+                            (3, -5.0),
+                            (4, 2.0),
+                            (5, 1.0),
+                            (7, -5.0),
+                        ],
+                        Le,
+                        5.0,
+                    ),
+                    (
+                        &[
+                            (0, -5.0),
+                            (1, -5.0),
+                            (2, 1.0),
+                            (3, -2.0),
+                            (4, 2.0),
+                            (5, -3.0),
+                        ],
+                        Eq,
+                        10.0,
+                    ),
+                    (
+                        &[(0, 5.0), (2, -5.0), (3, -2.0), (4, -2.0), (5, -3.0)],
+                        Ge,
+                        2.0,
+                    ),
+                    (
+                        &[(1, -2.0), (3, 2.0), (4, -1.0), (5, 5.0), (6, 1.0), (7, 2.0)],
+                        Ge,
+                        3.0,
+                    ),
+                    (
+                        &[
+                            (0, -1.0),
+                            (1, 3.0),
+                            (2, -3.0),
+                            (3, 2.0),
+                            (5, -4.0),
+                            (6, 2.0),
+                            (7, -2.0),
+                        ],
+                        Eq,
+                        12.0,
+                    ),
+                    (
+                        &[(1, -5.0), (3, 1.0), (5, -3.0), (6, -5.0), (7, 5.0)],
+                        Le,
+                        -8.0,
+                    ),
+                ],
+            ),
+        ];
+        for (k, problem) in models.iter().enumerate() {
+            for presolve in [true, false] {
+                let got = problem.solve_with(SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                });
+                assert_eq!(
+                    got.map(|_| "solved"),
+                    Err(Error::Infeasible),
+                    "model {k}, presolve {presolve}"
+                );
+            }
+        }
+    }
+
+    /// A MILP whose relaxation is unbounded (HiGHS agrees), where the
+    /// improving column meets the one row whose basic var could block it
+    /// through a round-off entry of -4.4e-16, next to a genuine entry in a
+    /// row that cannot block. The primal ratio test's round-off scale is the
+    /// whole column: taken over the rows that can block alone, the entry was
+    /// a pivot with a step of 5.6e15 into a singular basis.
+    #[test]
+    fn unbounded_relaxation_is_not_blocked_by_a_round_off_entry() {
+        init();
+        let inf = f64::INFINITY;
+        use ComparisonOp::{Eq, Ge};
+        let problem = fuzz_model(
+            OptimizationDirection::Minimize,
+            &[
+                (1.0, -2.0, 6.0, false),
+                (-5.0, 0.0, inf, false),
+                (3.0, 0.0, 10.0, false),
+                (2.0, 0.0, inf, false),
+                (1.0, 0.0, inf, false),
+                (2.0, 5.0, 5.0, false),
+                (3.0, -4.0, 1.0, true),
+            ],
+            &[
+                (
+                    &[
+                        (0, -2.0),
+                        (1, 5.0),
+                        (2, 4.0),
+                        (3, -2.0),
+                        (4, -4.0),
+                        (6, -3.0),
+                    ],
+                    Eq,
+                    13.0,
+                ),
+                (
+                    &[(0, 2.0), (2, 4.0), (3, -2.0), (5, 1.0), (6, 4.0)],
+                    Ge,
+                    16.0,
+                ),
+            ],
+        );
+        for presolve in [true, false] {
+            let got = problem.solve_with(SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            });
+            assert_eq!(
+                got.map(|_| "solved"),
+                Err(Error::Unbounded),
+                "presolve {presolve}"
+            );
+        }
+    }
 }

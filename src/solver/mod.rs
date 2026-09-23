@@ -79,6 +79,13 @@ pub(crate) struct Solver {
     /// or bound that crosses the `Solver` boundary is converted, so callers
     /// only ever see user units.
     col_scales: Vec<f64>,
+    /// Per structural var, whether both scalings left its column out: a var
+    /// fixed when the model entered the engine (see [`column_scales`] and
+    /// the row equilibration), whose column keeps the user's units. Its
+    /// entries are then no measure of the scaled matrix's magnitudes (a
+    /// fixed column of `1e17` stays `1e17`), so the dual ratio test leaves
+    /// them out of its round-off scale.
+    unscaled_cols: Vec<bool>,
     /// The user's absolute feasibility tolerance
     /// ([`crate::Tolerances::feasibility`]), in user units.
     feasibility: f64,
@@ -268,8 +275,10 @@ impl Solver {
             }
         }
 
-        // Everything below works in scaled units: x'_j = x_j / s_j.
+        // Everything below works in scaled units: x'_j = x_j / s_j. A var
+        // fixed here is left out of both scalings.
         let col_scales = column_scales(obj_coeffs, var_mins, var_maxs, constraints);
+        let unscaled_cols: Vec<bool> = (0..num_vars).map(|v| var_mins[v] == var_maxs[v]).collect();
         let mut orig_obj_coeffs: Vec<f64> = obj_coeffs
             .iter()
             .zip(&col_scales)
@@ -287,7 +296,7 @@ impl Solver {
             .collect();
         // Rows in scaled units, prepared up front so that the integer vars'
         // rounding budgets are known before the tolerances are derived.
-        let is_fixed = |var: usize| var_mins[var] == var_maxs[var];
+        let is_fixed = |var: usize| unscaled_cols[var];
         let mut prepared_rows = Vec::with_capacity(constraints.len());
         for (coeffs, cmp_op, rhs) in constraints {
             let coeffs = scale_columns(coeffs.clone(), &col_scales);
@@ -503,6 +512,7 @@ impl Solver {
             orig_rhs,
             row_scales,
             col_scales,
+            unscaled_cols,
             feasibility,
             var_tols,
             dual_tols,
@@ -1487,15 +1497,23 @@ impl Solver {
                 // where they leave the leaving var. The pivot is made even if
                 // the flips, computed through their columns, carried the
                 // leaving var up to or past its bound (their row predicted
-                // less): the entering var's step is then tiny or reversed,
-                // and every step with an entering var changes the basis, so
-                // flips cannot alternate without progress. (A reversed step
-                // can leave the entering var outside its bounds; that is a
-                // primal infeasibility like any other, for the next
-                // iterations.)
+                // less): the entering var's step is then tiny or reversed.
+                // The flips never come with a zero dual step (see
+                // `choose_entering_col_dual`), so the dual objective grows
+                // with every step that flips and flips cannot alternate
+                // without progress. (A reversed step can leave the entering
+                // var outside its bounds; that is a primal infeasibility like
+                // any other, for the next iterations.)
+                //
+                // Now that the two computations agree, each is used where it
+                // belongs (HiGHS `HEkkDual::updatePrimal` and
+                // `updateDual`): the column's element for the primal step,
+                // the eta file and the steepest-edge updates, which apply it
+                // together with the rest of the column, and the row's for the
+                // reduced costs, which are updated along the row.
                 self.apply_flips(&step.flips);
                 let val = self.basic_var_vals[row];
-                let entering_diff = (val - leaving_new_val) / a_row;
+                let entering_diff = (val - leaving_new_val) / a_col;
                 let pivot_info = PivotInfo {
                     col,
                     entering_new_val: self.nb_var_vals[col] + entering_diff,
@@ -1503,13 +1521,14 @@ impl Solver {
                     elem: Some(PivotElem {
                         row,
                         leaving_new_val,
-                        coeff: a_row,
+                        coeff: a_col,
+                        dual_step_coeff: a_row,
                     }),
                 };
                 trace!(
                     "dual pivot: var {} enters (col {col}), var {} leaves row {row} to \
-                     {leaving_new_val:e}, element {a_row:e}, entering step {entering_diff:e}, \
-                     {} bound flips",
+                     {leaving_new_val:e}, element {a_col:e} (row {a_row:e}), entering step \
+                     {entering_diff:e}, {} bound flips",
                     self.nb_vars[col],
                     self.basic_vars[row],
                     step.flips.len(),
@@ -1940,6 +1959,7 @@ impl Solver {
                 elem: Some(PivotElem {
                     row,
                     coeff: pivot_coeff,
+                    dual_step_coeff: pivot_coeff,
                     leaving_new_val,
                 }),
             }))
@@ -2029,17 +2049,26 @@ impl Solver {
     /// (a pivot) or, when both its bounds are finite, by moving to its other
     /// bound (a flip, which leaves the basis as it is). The vars are taken
     /// in the order the dual step brings their reduced costs to zero (their
-    /// breakpoints). While a var's flip still leaves the leaving var beyond
-    /// its bound, the step passes that breakpoint and the var is flipped; the
-    /// first var that can carry the rest of the move stops it, and the
-    /// Harris pass picks the entering var among those near that breakpoint,
-    /// exactly as it does when nothing is flipped. The step passes the
-    /// breakpoint of every var it flips, so each flipped var's reduced cost
-    /// crosses zero and the var is dual feasible at the bound it moved to.
-    /// This is the bound-flipping ("long-step") ratio test of the dual
-    /// simplex (Maros, EJOR 149, 2003; Koberstein, PhD thesis, Paderborn
-    /// 2005): where vars are boxed (binaries) one pivot does the work of
-    /// several.
+    /// breakpoints), in Harris groups as HiGHS's `HEkkDualRow::chooseFinal`
+    /// takes them: while the groups so far still leave the leaving var
+    /// beyond its bound, the step passes the next group; the pivot is the
+    /// largest entry of the last group (or of an earlier one, when the last
+    /// group has no stable entry), and every group before the pivot's is
+    /// flipped. When the first group can carry the move, that is exactly the
+    /// Harris pass with nothing flipped. The step passes the breakpoint of
+    /// every var it flips, so each flipped var's reduced cost crosses zero
+    /// and the var is dual feasible at the bound it moved to; and it flips
+    /// only on a positive dual step. This is the bound-flipping
+    /// ("long-step") ratio test of the dual simplex (Maros, EJOR 149, 2003;
+    /// Koberstein, PhD thesis, Paderborn 2005): where vars are boxed
+    /// (binaries) one pivot does the work of several.
+    ///
+    /// The row's round-off scale is its largest entry over the columns that
+    /// are not excluded and that the scalings made comparable: the entries
+    /// of one row share the round-off of one transposed solve, so a var that
+    /// cannot help still measures it, but the column of a var fixed when the
+    /// model entered the engine keeps the user's units (a fixed `1e17` beside
+    /// a genuine `1`) and measures only its own data.
     ///
     /// When no var can enter, the row is the whole argument: "no entering
     /// var" proves infeasibility only if moving every var that can help to
@@ -2153,6 +2182,28 @@ impl Solver {
             !integer && (leaving_move / coeff).abs() <= tol * (1.0 + ROUNDOFF_FLOOR)
         };
 
+        // The round-off scale of the row: its largest entry over the columns
+        // that are not excluded and that the scalings made comparable (every
+        // column but those of vars fixed when the model entered the engine,
+        // which keep the user's units). The entries of one row all come from
+        // the same transposed solve `rho_r`, whose round-off is spread over
+        // its components in proportion to the largest, so the entry of a var
+        // that cannot help this row still measures it (a helping entry of
+        // 1.1e-16 beside a slack's 1.05 was the residue of two parallel rows
+        // cancelling, and pivoting on it left a singular basis); but an
+        // unscaled fixed column's `1e17` measures its own data, and taken
+        // into the scale it made a genuine entry of one "noise" and the row a
+        // false proof of infeasibility. An entry below `ENTRY_ROUNDOFF` of
+        // this scale is noise, never a pivot (see the verdict below).
+        let mut scale = 0.0f64;
+        for (c, &coeff) in self.row_coeffs.iter() {
+            let var = self.nb_vars[c];
+            if !excluded.contains(&c) && !(var < self.num_vars && self.unscaled_cols[var]) {
+                scale = scale.max(coeff.abs());
+            }
+        }
+        let noise_floor = ENTRY_ROUNDOFF * scale;
+
         // The Harris two-pass ratio test over the vars `can_enter` admits;
         // returns the entering column and its pivot element.
         //
@@ -2163,26 +2214,19 @@ impl Solver {
         // https://link.springer.com/content/pdf/10.1007/BF01589114.pdf
         let select = |can_enter: &dyn Fn(usize, f64, &NonBasicVarState) -> bool| {
             // Entries below the pivot tolerance are not candidate pivots: an
-            // entry within the round-off of computing the row (relative to
-            // its largest entry, see ENTRY_ROUNDOFF: the row vector comes
-            // from a solve whose round-off is spread over its components in
-            // proportion to the largest) is noise, and an entry seven orders
-            // below the largest genuine entry among the vars that could
-            // enter (see PIVOT_REL_TOL) is too unstable while a better
-            // candidate exists. The entry of a var that can never enter,
-            // such as a fixed one, counts for the round-off scale but not
-            // for the candidates'.
-            let (mut row_max_all, mut row_max) = (0.0f64, 0.0f64);
+            // entry within the row's round-off is noise, and an entry seven
+            // orders below the largest entry among the vars that could enter
+            // and are not excluded (see PIVOT_REL_TOL) is too unstable while
+            // a better candidate exists.
+            let mut row_max = 0.0f64;
             for (c, &coeff) in self.row_coeffs.iter() {
-                let abs = coeff.abs();
-                if abs > row_max_all {
-                    row_max_all = abs;
-                }
-                if abs > row_max && can_enter(c, coeff, &self.nb_var_states[c]) {
-                    row_max = abs;
+                if coeff.abs() > row_max
+                    && can_enter(c, coeff, &self.nb_var_states[c])
+                    && !excluded.contains(&c)
+                {
+                    row_max = coeff.abs();
                 }
             }
-            let noise_floor = ENTRY_ROUNDOFF * row_max_all;
             let pivot_floor = noise_floor.max(PIVOT_REL_TOL * row_max);
 
             let is_eligible_var = |c: usize, coeff: f64, var_state: &NonBasicVarState| -> bool {
@@ -2235,7 +2279,7 @@ impl Solver {
                     }
                 }
             }
-            (entering_c, pivot_coeff, pivot_floor)
+            (entering_c, pivot_coeff)
         };
 
         // The leaving var's distance from its bound, the tolerance within
@@ -2286,25 +2330,17 @@ impl Solver {
                 capacity: coeff.abs() * (bound - self.nb_var_vals[c]).abs(),
             }
         };
-        // The order the step reaches the breakpoints: by ratio, the larger
-        // entry first among equal ratios.
-        let reached_before = |a: &Breakpoint, b: &Breakpoint| {
-            a.ratio
-                .total_cmp(&b.ratio)
-                .then(b.coeff.abs().total_cmp(&a.coeff.abs()))
-        };
-
-        // The row's largest entry (the scale of its round-off) and the
-        // largest among the vars that can help: the pivot floor, as the
-        // two-pass computes it.
-        let (mut row_max_all, mut row_max) = (0.0f64, 0.0f64);
+        // The pivot floor: an entry seven orders below the largest entry
+        // among the vars that can enter and are not excluded (see
+        // PIVOT_REL_TOL) is not a candidate while a larger one can take the
+        // step; an excluded column, whose entry proved to be round-off, no
+        // longer sets it. Every candidate is above the noise floor.
+        let mut row_max = 0.0f64;
         for (c, &coeff) in self.row_coeffs.iter() {
-            row_max_all = row_max_all.max(coeff.abs());
-            if direction_ok(coeff, &self.nb_var_states[c]) {
+            if direction_ok(coeff, &self.nb_var_states[c]) && !excluded.contains(&c) {
                 row_max = row_max.max(coeff.abs());
             }
         }
-        let noise_floor = ENTRY_ROUNDOFF * row_max_all;
         let pivot_floor = noise_floor.max(PIVOT_REL_TOL * row_max);
         // The vars that could enter regularly (the two-pass's candidates).
         let candidate = |c: usize, coeff: f64| {
@@ -2313,82 +2349,145 @@ impl Solver {
                 && !excluded.contains(&c)
         };
 
-        // The Harris bound on the step (the smallest relaxed ratio) and the
-        // first breakpoint the step reaches, in one pass.
+        // The Harris bound on the step: the smallest relaxed ratio.
         let mut max_step = f64::INFINITY;
-        let mut first: Option<Breakpoint> = None;
+        for (c, &coeff) in self.row_coeffs.iter() {
+            if candidate(c, coeff) {
+                max_step = max_step.min(breakpoint(c, coeff).relaxed_ratio);
+            }
+        }
+        // The Harris pass: among the candidates whose ratio is within the
+        // bound, the one with the largest entry, for a stable basis at the
+        // price of a slight dual infeasibility (Gill, Murray, Saunders &
+        // Wright 1989, above). These candidates are also the first group of
+        // the bound-flipping walk below, so the same pass measures how far
+        // flipping all of them would carry the leaving var.
+        let mut entering_c = None;
+        let mut pivot_coeff = 0.0;
+        let mut pivot_coeff_abs = f64::NEG_INFINITY;
+        let mut first_group_capacity = 0.0;
+        let mut beyond_first_group = false;
         for (c, &coeff) in self.row_coeffs.iter() {
             if candidate(c, coeff) {
                 let b = breakpoint(c, coeff);
-                max_step = max_step.min(b.relaxed_ratio);
-                if first.as_ref().is_none_or(|f| reached_before(&b, f).is_lt()) {
-                    first = Some(b);
+                if b.ratio <= max_step {
+                    first_group_capacity += b.capacity;
+                    if coeff.abs() > pivot_coeff_abs {
+                        entering_c = Some(c);
+                        pivot_coeff_abs = coeff.abs();
+                        pivot_coeff = coeff;
+                    }
+                } else {
+                    beyond_first_group = true;
                 }
             }
         }
 
-        // The step takes the breakpoints in order. A var whose flip leaves
-        // the leaving var still beyond its bound is flipped and passed; the
-        // first that can carry the rest stops the step. If that is the first
-        // breakpoint, nothing is flipped and the Harris pass below decides,
-        // exactly as without bound flipping (the common case, found without
-        // sorting); if every var is flipped and the leaving var is still
-        // short, so does the Harris pass (its pivot then carries the entering
-        // var past its other bound, which a later iteration repairs).
-        if first.is_some_and(|f| infeasibility - f.capacity > target_tol) {
-            let mut walk: Vec<Breakpoint> = self
+        // Bound flipping, as HiGHS's `HEkkDualRow::chooseFinal`
+        // (`chooseFinalWorkGroupQuad`, `chooseFinalLargeAlpha`,
+        // highs/simplex/HEkkDualRow.cpp). The breakpoints are taken in Harris
+        // groups: the first group is the candidates the Harris pass above
+        // chose from, each next one the remaining candidates whose ratio is
+        // within the smallest relaxed ratio among the remaining, until the
+        // groups so far can carry the leaving var within its tolerance of
+        // its bound (or every candidate is grouped). The pivot is the largest
+        // entry of the last group, unless that group has no entry above a
+        // tenth of the largest grouped entry (or above one): the scan then
+        // steps back to the last group that has one. Every group before the
+        // pivot's is flipped; the pivot's own group and the rest are not.
+        // Ties go to the first entry of the row, as in the Harris pass.
+        //
+        // So when the first group can carry the move, nothing is flipped and
+        // the pivot is exactly the Harris pass's (the common case, found
+        // without collecting anything); and among breakpoints the step
+        // reaches together, the pivot is the largest entry, not whichever a
+        // one-at-a-time walk happened to stop at (which flipped an entry of
+        // 10 and pivoted on one of 1e-6 at the same ratio). A flip also never
+        // comes with a zero dual step, as in both references (HiGHS flips
+        // nothing when `workTheta == 0`, SoPlex's `SPxBoundFlippingRT` only
+        // on a non-degenerate step): a group after the first holds only
+        // ratios above the first group's bound, which exceeds zero by the
+        // reduced-cost tolerance, so the pivot's own ratio, the dual step, is
+        // positive whenever there is a group to flip. If the leaving var is
+        // still short after every group, the pivot's step carries the
+        // entering var past its other bound, which a later iteration
+        // repairs, as in HiGHS.
+        if entering_c.is_some()
+            && beyond_first_group
+            && infeasibility - first_group_capacity > target_tol
+        {
+            let mut pending: Vec<Breakpoint> = self
                 .row_coeffs
                 .iter()
                 .filter(|&(c, &coeff)| candidate(c, coeff))
                 .map(|(c, &coeff)| breakpoint(c, coeff))
                 .collect();
-            walk.sort_by(reached_before);
-            let mut flips = Vec::new();
-            let mut remaining = infeasibility;
-            for (k, b) in walk.iter().enumerate() {
-                if remaining - b.capacity > target_tol {
-                    flips.push((b.col, b.bound));
-                    remaining -= b.capacity;
-                    continue;
+            let mut groups: Vec<Vec<Breakpoint>> = Vec::new();
+            let mut carried = 0.0;
+            let mut bound = max_step;
+            loop {
+                let (group, rest): (Vec<Breakpoint>, Vec<Breakpoint>) =
+                    pending.into_iter().partition(|b| b.ratio <= bound);
+                pending = rest;
+                // The smallest relaxed ratio's own breakpoint always joins
+                // (its ratio is below its relaxed ratio); only a reduced
+                // cost that is not a number joins none, and ends the walk.
+                if group.is_empty() {
+                    break;
                 }
-                // The Harris pass over the breakpoints not passed: the
-                // entering var is the one with the largest entry among those
-                // whose ratio is within the smallest relaxed ratio.
-                let rest = &walk[k..];
-                let max_step = rest
+                carried += group.iter().map(|b| b.capacity).sum::<f64>();
+                groups.push(group);
+                if infeasibility - carried <= target_tol || pending.is_empty() {
+                    break;
+                }
+                bound = pending
                     .iter()
                     .map(|b| b.relaxed_ratio)
                     .fold(f64::INFINITY, f64::min);
-                let mut entering = b;
-                for b in rest {
-                    if b.ratio <= max_step && b.coeff.abs() > entering.coeff.abs() {
-                        entering = b;
+            }
+            let largest = |group: &[Breakpoint]| -> (usize, f64) {
+                let mut best = (group[0].col, group[0].coeff);
+                for b in &group[1..] {
+                    if b.coeff.abs() > best.1.abs() {
+                        best = (b.col, b.coeff);
                     }
                 }
-                return Ok(DualStep {
-                    flips,
-                    entering: Some((entering.col, entering.coeff)),
-                });
-            }
+                best
+            };
+            let largest_grouped = groups
+                .iter()
+                .flatten()
+                .map(|b| b.coeff.abs())
+                .fold(0.0, f64::max);
+            let final_compare = (0.1 * largest_grouped).min(1.0);
+            // The group holding the largest entry always qualifies, so the
+            // backward scan stops there at the latest.
+            let (pivot_group, entering) = (0..groups.len())
+                .rev()
+                .map(|g| (g, largest(&groups[g])))
+                .find(|&(_, (_, coeff))| coeff.abs() > final_compare)
+                .expect("the group of the largest grouped entry qualifies as the pivot's");
+            let flips: Vec<(usize, f64)> = groups[..pivot_group]
+                .iter()
+                .flatten()
+                .map(|b| (b.col, b.bound))
+                .collect();
+            debug_assert!(
+                flips.is_empty() || {
+                    let b = groups[pivot_group]
+                        .iter()
+                        .find(|b| b.col == entering.0)
+                        .expect("the pivot belongs to its group");
+                    b.ratio > 0.0
+                },
+                "bound flips with a zero dual step"
+            );
+            return Ok(DualStep {
+                flips,
+                entering: Some(entering),
+            });
         }
 
-        // The Harris pass: among the candidates whose ratio is within the
-        // bound, the one with the largest entry, for a stable basis at the
-        // price of a slight dual infeasibility (Gill, Murray, Saunders &
-        // Wright 1989, above).
-        let mut entering_c = None;
-        let mut pivot_coeff = 0.0;
-        let mut pivot_coeff_abs = f64::NEG_INFINITY;
-        for (c, &coeff) in self.row_coeffs.iter() {
-            if candidate(c, coeff) {
-                let obj_coeff = clamp_obj_coeff(self.nb_var_obj_coeffs[c], &self.nb_var_states[c]);
-                if obj_coeff.abs() / coeff.abs() <= max_step && coeff.abs() > pivot_coeff_abs {
-                    entering_c = Some(c);
-                    pivot_coeff_abs = coeff.abs();
-                    pivot_coeff = coeff;
-                }
-            }
-        }
         // Vars that could only absorb the move within their tolerance are a
         // fallback, since their pivot does not keep dual feasibility by
         // construction (the primal phase repairs that) while a regular one
@@ -2397,7 +2496,7 @@ impl Solver {
             let relaxed = |c: usize, coeff: f64, state: &NonBasicVarState| {
                 direction_ok(coeff, state) || absorbs(c, coeff)
             };
-            (entering_c, pivot_coeff, _) = select(&relaxed);
+            (entering_c, pivot_coeff) = select(&relaxed);
         }
         if let Some(col) = entering_c {
             return Ok(DualStep {
@@ -2581,6 +2680,9 @@ impl Solver {
         }
         //guaranteed, none variant already handled
         let pivot_elem = pivot_info.elem.as_ref().unwrap();
+        // The element the eta file and the steepest-edge updates apply with
+        // the column must be the column's own (see `PivotElem::coeff`).
+        debug_assert_eq!(pivot_elem.coeff, self.col_coeff_at(pivot_elem.row));
         let pivot_coeff = pivot_elem.coeff;
 
         // Update basic vars stuff
@@ -2618,7 +2720,7 @@ impl Solver {
             leaving_tol.hi,
         );
 
-        let pivot_obj = self.nb_var_obj_coeffs[pivot_info.col] / pivot_coeff;
+        let pivot_obj = self.nb_var_obj_coeffs[pivot_info.col] / pivot_elem.dual_step_coeff;
         for (c, &coeff) in self.row_coeffs.iter() {
             if c == pivot_info.col {
                 self.nb_var_obj_coeffs[c] = -pivot_obj;

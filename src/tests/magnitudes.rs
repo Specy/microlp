@@ -616,4 +616,35 @@ mod regression_tests {
             xstar: vec![0.0, 0.0, 1.0, 1.0],
         });
     }
+
+    /// A fixed var's huge coefficient must not silence the rest of its row
+    /// (C2-06). `min y` s.t. `1e17 f + y >= 1`, `f` fixed at zero: neither
+    /// scaling touches the row (a fixed column is left out of both), so the
+    /// dual ratio test saw the row `[1e17, 1]`. Its round-off scale was
+    /// taken over every entry, the fixed column's included, which made
+    /// `y`'s exact entry of one "noise", and the row a proof of
+    /// infeasibility, with presolve on (the row is kept as written) and off.
+    /// The scale now leaves out the columns the scalings left out.
+    #[test]
+    fn a_fixed_vars_huge_coefficient_does_not_silence_its_row() {
+        for presolve in [true, false] {
+            let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+            let f = problem.add_var(0.0, (0.0, 0.0));
+            let y = problem.add_var(1.0, (0.0, f64::INFINITY));
+            problem.add_constraint([(f, 1e17), (y, 1.0)], ComparisonOp::Ge, 1.0);
+            let solution = problem
+                .solve_with(SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                })
+                .unwrap_or_else(|e| panic!("presolve {presolve}: {e:?}"))
+                .into_solution()
+                .unwrap();
+            assert_eq!(
+                (solution[f], solution[y], solution.objective()),
+                (0.0, 1.0, 1.0),
+                "presolve {presolve}"
+            );
+        }
+    }
 }
