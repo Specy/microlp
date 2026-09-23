@@ -432,20 +432,47 @@ fn set_var_bounds_nan_is_infeasible_and_leaves_state_untouched() {
     assert_eq!(solver.get_var_bounds(0), (f64::NEG_INFINITY, f64::INFINITY));
 }
 
+/// A point is finite: a value or an activity that is not finite violates
+/// every bound and row whatever its sense. It would otherwise pass an
+/// infinite bound, or meet the infinite tolerance an infinite magnitude
+/// gives a row (an overflowing `Ge` activity used to pass, as did an
+/// infinite value of a free var, which let a NaN objective through).
 #[test]
 fn check_constraints_rejects_non_finite_activity() {
-    let solver = Solver::try_new(
-        &[0.0],
-        &[0.0],
-        &[f64::INFINITY],
-        &[(to_sparse(&[1.0e308]), ComparisonOp::Eq, f64::INFINITY)],
-        &[VarDomain::Real],
-        None,
-        crate::Tolerances::default().feasibility,
-    )
-    .unwrap();
-
-    assert!(solver.first_violated_row(&[1.0e308]).is_some());
+    for op in [ComparisonOp::Eq, ComparisonOp::Le, ComparisonOp::Ge] {
+        let solver = Solver::try_new(
+            &[0.0, 0.0],
+            &[f64::NEG_INFINITY, f64::NEG_INFINITY],
+            &[f64::INFINITY, f64::INFINITY],
+            &[(to_sparse(&[1.0, 1.0]), op, 0.0)],
+            &[VarDomain::Real, VarDomain::Real],
+            None,
+            crate::Tolerances::default().feasibility,
+        )
+        .unwrap();
+        for values in [
+            [f64::MAX, f64::MAX],
+            [-f64::MAX, -f64::MAX],
+            [f64::INFINITY, 0.0],
+            [f64::NEG_INFINITY, 0.0],
+            [f64::NAN, 0.0],
+        ] {
+            assert!(
+                solver.first_violated_row(&values).is_some(),
+                "{op:?} row passed at {values:?}"
+            );
+        }
+        for values in [
+            [f64::INFINITY, 0.0],
+            [0.0, f64::NEG_INFINITY],
+            [f64::NAN, 0.0],
+        ] {
+            assert!(
+                solver.first_violated_bound(&values).is_some(),
+                "free vars passed at {values:?}"
+            );
+        }
+    }
 }
 
 #[test]

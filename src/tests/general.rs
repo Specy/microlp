@@ -91,6 +91,331 @@ mod tests_general {
         assert_eq!(sol.objective(), 6.0);
     }
 
+    /// Rows whose data alone decide them get the same verdict on every path
+    /// into the engine (pure LP and MIP, presolve on and off, and added to a
+    /// solved LP), under the one contract: an empty row has activity zero
+    /// and is held to the feasibility tolerance like any row; an infinite
+    /// right-hand side on the side a row leaves open is no constraint, and
+    /// on the side it constrains, one no point meets; a coefficient or
+    /// right-hand side that is not a number, or an infinite coefficient,
+    /// makes a row no point satisfies. (Presolve used to drop NaN rows and
+    /// rows bounded by an infinity, the engine accepted `x ≤ -∞` under an
+    /// infinite tolerance, and the two disagreed on empty rows.)
+    #[test]
+    fn rows_whose_data_decide_them_get_one_verdict_on_every_path() {
+        init();
+        let nan = f64::NAN;
+        let inf = f64::INFINITY;
+        // (coefficient of x, or none for an empty row; sense; rhs; holds)
+        let cases = [
+            (None, ComparisonOp::Eq, 1e-9, true),
+            (None, ComparisonOp::Eq, 0.1 + 0.2 - 0.3, true),
+            (None, ComparisonOp::Le, -5e-8, true),
+            (None, ComparisonOp::Ge, 5e-8, true),
+            (None, ComparisonOp::Eq, 1e-6, false),
+            (None, ComparisonOp::Le, -1e-6, false),
+            (Some(1.0), ComparisonOp::Le, inf, true),
+            (Some(1.0), ComparisonOp::Ge, -inf, true),
+            (Some(1.0), ComparisonOp::Le, -inf, false),
+            (Some(1.0), ComparisonOp::Ge, inf, false),
+            (Some(1.0), ComparisonOp::Eq, inf, false),
+            (Some(1.0), ComparisonOp::Le, nan, false),
+            (Some(nan), ComparisonOp::Le, 1.0, false),
+            (Some(inf), ComparisonOp::Le, 1.0, false),
+        ];
+        for (coeff, op, rhs, holds) in cases {
+            let expected = if holds {
+                Ok(0.0)
+            } else {
+                Err(Error::Infeasible)
+            };
+            let row = |x: Variable| -> LinearExpr {
+                let mut expr = LinearExpr::empty();
+                if let Some(c) = coeff {
+                    expr.add(x, c);
+                }
+                expr
+            };
+            for milp in [false, true] {
+                for presolve in [true, false] {
+                    let mut problem = Problem::new(OptimizationDirection::Minimize);
+                    let x = problem.add_var(1.0, (0.0, 10.0));
+                    if milp {
+                        problem.add_integer_var(1.0, (0, 0));
+                    }
+                    problem.add_constraint(row(x), op, rhs);
+                    let got = problem
+                        .solve_with(SolveOptions {
+                            presolve,
+                            ..SolveOptions::default()
+                        })
+                        .map(|outcome| solution(outcome).objective());
+                    assert_eq!(
+                        got, expected,
+                        "{coeff:?} x {op:?} {rhs}: milp {milp}, presolve {presolve}"
+                    );
+                }
+            }
+            let mut problem = Problem::new(OptimizationDirection::Minimize);
+            let x = problem.add_var(1.0, (0.0, 10.0));
+            let got = solution(problem.solve().unwrap())
+                .add_constraint(row(x), op, rhs)
+                .map(|outcome| solution(outcome).objective());
+            assert_eq!(
+                got, expected,
+                "{coeff:?} x {op:?} {rhs}: added to a solved LP"
+            );
+        }
+
+        // A bound that is not a number: the engine's verdict with presolve too.
+        for milp in [false, true] {
+            for presolve in [true, false] {
+                let mut problem = Problem::new(OptimizationDirection::Minimize);
+                let x = problem.add_var(1.0, (nan, 10.0));
+                if milp {
+                    problem.add_integer_var(1.0, (0, 0));
+                }
+                problem.add_constraint([(x, 1.0)], ComparisonOp::Eq, 3.0);
+                let got = problem.solve_with(SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                });
+                assert_eq!(
+                    got.map(|_| "solved"),
+                    Err(Error::Infeasible),
+                    "NaN bound: milp {milp}, presolve {presolve}"
+                );
+            }
+        }
+    }
+
+    /// A free var whose objective coefficient is zero is optimal wherever it
+    /// sits: no move of it changes the objective. Counting it as dual
+    /// infeasible made the primal simplex enter it along a direction that
+    /// improves nothing, and with no bound in the way the step was infinite:
+    /// a free var in no row made a bounded model `Unbounded`, one in a row
+    /// drove the values to infinity (`InternalError`), and two of them in one
+    /// row swapped in and out of the basis forever.
+    #[test]
+    fn free_variables_with_a_zero_cost_are_optimal_anywhere() {
+        init();
+        let inf = f64::INFINITY;
+        {
+            // In no row: the model is bounded by y alone.
+            let mut problem = Problem::new(OptimizationDirection::Minimize);
+            let _x = problem.add_var(0.0, (-inf, inf));
+            let y = problem.add_var(1.0, (1.0, 10.0));
+            problem.add_constraint([(y, 1.0)], ComparisonOp::Ge, 2.0);
+            assert_eq!(solution(problem.solve().unwrap()).objective(), 2.0);
+        }
+        {
+            // In a row whose slack is unbounded in the direction x can move.
+            let mut problem = Problem::new(OptimizationDirection::Minimize);
+            let x = problem.add_var(0.0, (-inf, inf));
+            let y = problem.add_var(1.0, (1.0, 10.0));
+            problem.add_constraint([(x, 1.0), (y, -1.0)], ComparisonOp::Le, 0.0);
+            let sol = solution(problem.solve().unwrap());
+            assert_eq!(sol.objective(), 1.0);
+            assert!(sol[x].is_finite() && sol[x] <= sol[y] + 1e-9);
+        }
+        {
+            // Linked to another free var by an equality.
+            let mut problem = Problem::new(OptimizationDirection::Maximize);
+            let x = problem.add_var(0.0, (-inf, inf));
+            let y = problem.add_var(1.0, (0.0, 5.0));
+            let z = problem.add_var(0.0, (-inf, inf));
+            problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 7.0);
+            problem.add_constraint([(x, 1.0), (z, -1.0)], ComparisonOp::Eq, 0.0);
+            assert_eq!(solution(problem.solve().unwrap()).objective(), 5.0);
+        }
+        {
+            // Two of them alone in a row: this one never returned.
+            let mut problem = Problem::new(OptimizationDirection::Maximize);
+            let x = problem.add_var(0.0, (-inf, inf));
+            let y = problem.add_var(0.0, (-inf, inf));
+            problem.add_constraint([(x, -4.0), (y, -3.0)], ComparisonOp::Le, 9.0);
+            let mut options = SolveOptions::default();
+            options.time_limit = Some(Duration::from_secs(10));
+            let sol = solution(problem.solve_with(options).unwrap());
+            assert_eq!(sol.objective(), 0.0);
+            assert!(-4.0 * sol[x] - 3.0 * sol[y] <= 9.0 + 1e-9);
+        }
+    }
+
+    /// An unbounded LP (HiGHS agrees) whose improving ray had exactly one
+    /// row that could "block" it, through a round-off entry of 1.4e-15 of the
+    /// column's largest. The primal ratio test took it as the pivot, with a
+    /// step of 1.6e15, into a basis the factorization then refused
+    /// (`InternalError("Singular matrix")`): its row and column computations
+    /// were 2% apart, which the agreement check let through as agreement
+    /// within round-off although the element was itself at that level.
+    #[test]
+    fn unbounded_ray_is_not_blocked_by_a_round_off_entry() {
+        init();
+        let inf = f64::INFINITY;
+        for presolve in [true, false] {
+            let mut p = Problem::new(OptimizationDirection::Minimize);
+            let x1 = p.add_var(2.75, (-inf, 2.009));
+            let x2 = p.add_var(0.0, (-inf, 0.68));
+            let x3 = p.add_var(0.0, (-3.697, inf));
+            let x4 = p.add_var(0.0, (-inf, inf));
+            let x5 = p.add_var(0.0, (-inf, inf));
+            let x7 = p.add_var(0.0, (-inf, inf));
+            p.add_constraint(
+                [(x1, 9.67), (x2, -2.43), (x7, 5.17)],
+                ComparisonOp::Le,
+                -19.978259999999995,
+            );
+            p.add_constraint(
+                [
+                    (x2, -6.77),
+                    (x3, -0.6),
+                    (x4, -6.05),
+                    (x5, -0.12),
+                    (x7, 8.58),
+                ],
+                ComparisonOp::Ge,
+                -11.405089999999994,
+            );
+            p.add_constraint([(x3, -6.9)], ComparisonOp::Ge, 17.6093);
+            p.add_constraint(
+                [(x3, -3.62), (x4, -4.87), (x5, -0.14)],
+                ComparisonOp::Le,
+                4.095199999999999,
+            );
+            p.add_constraint(
+                [
+                    (x1, -8.75),
+                    (x2, 2.39),
+                    (x3, -0.75),
+                    (x4, 6.74),
+                    (x5, 6.99),
+                    (x7, 1.13),
+                ],
+                ComparisonOp::Le,
+                13.954310000000001,
+            );
+            p.add_constraint(
+                [(x1, 4.3), (x2, 0.33), (x4, 1.94), (x5, 7.15)],
+                ComparisonOp::Ge,
+                14.202540000000003,
+            );
+            let got = p.solve_with(SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            });
+            assert_eq!(
+                got.map(|_| "solved"),
+                Err(Error::Unbounded),
+                "presolve {presolve}"
+            );
+        }
+    }
+
+    /// Found by differential fuzzing against HiGHS: an improving column whose
+    /// only blocking row had its basic var sitting past its bound within
+    /// tolerance. The engine refused the column as "not an improving
+    /// direction", since setting the leaving var onto its bound would have
+    /// moved the entering var backwards out of its own bounds, and reported
+    /// Optimal 3e-3 short of the optimum (-6.19413 for -6.19720). In a
+    /// degenerate step the leaving var now leaves where it sits.
+    #[test]
+    fn a_degenerate_step_past_a_bound_does_not_stop_the_simplex() {
+        init();
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let x0 = p.add_var(0.57, (f64::NEG_INFINITY, -1.979));
+        let x1 = p.add_var(-2.65, (0.125, 1.125));
+        let x2 = p.add_var(2.62, (0.848, 2.848));
+        let x3 = p.add_var(0.36, (-2.887, 1.113));
+        let x4 = p.add_var(-1.54, (-5.2620000000000005, -2.262));
+        let x5 = p.add_var(0.0, (-1.906, -0.9059999999999999));
+        let x6 = p.add_var(-2.03, (0.7839999999999998, 3.784));
+        p.add_constraint(
+            [(x0, -6.076433694637136), (x3, 0.08670910052272117)],
+            ComparisonOp::Le,
+            32.09094329291193,
+        );
+        p.add_constraint(
+            [
+                (x0, -88.79547469052551),
+                (x1, 551.2716307241976),
+                (x2, -0.0017178835049954455),
+                (x3, -0.07756659223302026),
+                (x4, 0.0710803378234343),
+                (x6, -0.015061521859049312),
+            ],
+            ComparisonOp::Le,
+            512.9487571961115,
+        );
+        p.add_constraint(
+            [
+                (x0, 0.0002492743006467558),
+                (x2, 0.7628838231891608),
+                (x4, 0.00011242224615839288),
+            ],
+            ComparisonOp::Eq,
+            0.6454300462006779,
+        );
+        p.add_constraint(
+            [
+                (x0, 0.008507916026172499),
+                (x1, 0.00012974266836798682),
+                (x5, 0.00028865653400840866),
+                (x6, -0.024549509136579904),
+            ],
+            ComparisonOp::Eq,
+            -0.13579021798740526,
+        );
+        for presolve in [true, false] {
+            let sol = solution(
+                p.solve_with(SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                })
+                .unwrap(),
+            );
+            assert!(
+                (sol.objective() - -6.1972020386339866).abs() < 1e-6,
+                "presolve {presolve}: objective {}",
+                sol.objective()
+            );
+        }
+        let _ = (x0, x1, x2, x3, x4, x5, x6);
+    }
+
+    /// The same on the MIP path, where it matters twice: in the node LPs, and
+    /// in the zero-objective search that classifies an unbounded relaxation,
+    /// which makes every var a zero-cost one.
+    #[test]
+    fn free_variables_with_a_zero_cost_in_a_milp() {
+        init();
+        let inf = f64::INFINITY;
+        {
+            let mut problem = Problem::new(OptimizationDirection::Minimize);
+            let n = problem.add_integer_var(1.0, (0, 10));
+            let _f = problem.add_var(0.0, (-inf, inf));
+            problem.add_constraint([(n, 2.0)], ComparisonOp::Ge, 3.0);
+            assert_eq!(solution(problem.solve().unwrap()).objective(), 2.0);
+        }
+        {
+            let mut problem = Problem::new(OptimizationDirection::Maximize);
+            let z = problem.add_integer_var(1.0, (0, 10));
+            let w = problem.add_var(0.0, (-inf, inf));
+            problem.add_constraint([(w, 1.0), (z, -1.0)], ComparisonOp::Le, 1.0);
+            problem.add_constraint([(z, 1.0)], ComparisonOp::Le, 2.5);
+            assert_eq!(solution(problem.solve().unwrap()).objective(), 2.0);
+        }
+        {
+            // The relaxation is unbounded (y is free and pushes down), and any
+            // integer point proves the MILP unbounded.
+            let mut problem = Problem::new(OptimizationDirection::Minimize);
+            let x = problem.add_binary_var(0.0);
+            let y = problem.add_var(1.0, (-inf, inf));
+            problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 1.0);
+            assert_eq!(problem.solve().map(|_| "solved"), Err(Error::Unbounded));
+        }
+    }
+
     #[test]
     fn fix_unfix_var() {
         init();

@@ -124,7 +124,8 @@ impl SolveOptions {
 /// Overrides for the solver settings used for a subsequent search/resume call.
 ///
 /// These fields override the ones defined in the previous call to
-/// [`Problem::solve`] or [`Problem::resume`].
+/// [`Problem::solve_with`](crate::Problem::solve_with) or
+/// [`SolveOutcome::resume_with`](crate::SolveOutcome::resume_with).
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct ResumeOptions {

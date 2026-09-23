@@ -82,12 +82,17 @@ pub(crate) struct Solver {
     /// The user's absolute feasibility tolerance
     /// ([`crate::Tolerances::feasibility`]), in user units.
     feasibility: f64,
-    /// Per total var, the absolute tolerance (in the engine's scaled units)
-    /// within which the var counts as at a bound or within its bounds:
+    /// Per total var, the absolute tolerances (in the engine's scaled units)
+    /// within which the var counts as at or within each of its bounds:
     /// [`structural_tol`] for a structural var (refreshed when its bounds
-    /// change) and [`slack_tol`] for a slack (refreshed whenever the rows are
-    /// checked, since its round-off floor depends on the values).
-    var_tols: Vec<f64>,
+    /// change) and [`slack_tol`] at both bounds for a slack (refreshed
+    /// whenever the rows are checked, since its round-off floor depends on
+    /// the values).
+    var_tols: Vec<BoundTols>,
+    /// Per row, the magnitude `|b| + Σ|a_j x_j|` (scaled) its slack
+    /// tolerance was last derived from: the scale of the round-off of
+    /// recomputing the row's slack (see the primal ratio test).
+    row_mags: Vec<f64>,
     /// Per total var, the tolerance within which its reduced cost counts as
     /// zero ([`dual_tol`]); refreshed whenever the reduced costs are
     /// recomputed from the multipliers.
@@ -96,6 +101,15 @@ pub(crate) struct Solver {
     /// [`structural_tol`]); infinite for a var in no row. Static apart from
     /// rows added later.
     row_budgets: Vec<f64>,
+    /// The user's rows, as written and in user units, that the engine does
+    /// not hold because presolve dropped them (implied by the bounds it
+    /// emitted) or rewrote them (valid for integer points only): the answer
+    /// is checked against them at the boundary, like against the engine's
+    /// own rows ([`Self::first_violated_row`]), but no pivot ever sees them.
+    /// A point that holds the engine's rows and violates one of these is a
+    /// presolve bug, which the boundary then reports instead of returning
+    /// the point.
+    validation_rows: Vec<(CsVec, ComparisonOp, f64)>,
 
     enable_primal_steepest_edge: bool,
     enable_dual_steepest_edge: bool,
@@ -110,11 +124,11 @@ pub(crate) struct Solver {
     is_primal_feasible: bool,
     is_dual_feasible: bool,
 
-    /// Whether the basic values have been changed incrementally (pivots,
-    /// bound shifts) since [`Self::verify_primal`] last checked them against
-    /// the rows; when not, a phase exit needs no residual check and no
-    /// refinement. A recompute through the factorization does NOT clear it:
-    /// recomputed is not verified (see [`Self::recalc_basic_var_vals`]).
+    /// Whether the basic values have changed (pivots, bound shifts, a
+    /// recompute through the factorization) since [`Self::verify_primal`]
+    /// last checked them against the rows; when not, a phase exit needs no
+    /// residual check and no refinement. A recompute sets it: recomputed is
+    /// not verified (see [`Self::recalc_basic_var_vals`]).
     values_dirty: bool,
     /// Whether the reduced costs have been updated incrementally since they
     /// were last recomputed exactly; when not, a phase exit needs no
@@ -167,6 +181,20 @@ enum VarState {
 struct NonBasicVarState {
     at_min: bool,
     at_max: bool,
+}
+
+impl NonBasicVarState {
+    /// Whether a non-basic var in this state with reduced cost `d` offers no
+    /// improving move beyond the tolerance `tol`: its cost pushes it against
+    /// a bound it sits at, or moving it changes the objective by less than
+    /// `tol` per unit. A var at neither bound (a free var, or one a bound
+    /// change left between its bounds) can move both ways, so only the
+    /// second holds for it; entering such a var with a zero reduced cost is
+    /// a move that improves nothing, and with no bound in the way an
+    /// infinite one.
+    fn is_dual_feasible(&self, d: f64, tol: f64) -> bool {
+        self.at_min && d > -tol || self.at_max && d < tol || d.abs() < tol
+    }
 }
 
 /// Status of one variable in a simplex basis snapshot.
@@ -260,7 +288,7 @@ impl Solver {
         let mut prepared_rows = Vec::with_capacity(constraints.len());
         for (coeffs, cmp_op, rhs) in constraints {
             let coeffs = scale_columns(coeffs.clone(), &col_scales);
-            if let Some(row) = prepare_row(coeffs, *cmp_op, *rhs, is_fixed)? {
+            if let Some(row) = prepare_row(coeffs, *cmp_op, *rhs, feasibility, is_fixed)? {
                 prepared_rows.push(row);
             }
         }
@@ -271,7 +299,7 @@ impl Solver {
                     row_budgets[var].min(snap_budget(feasibility, row.row_scale, coeff));
             }
         }
-        let mut var_tols: Vec<f64> = (0..num_vars)
+        let mut var_tols: Vec<BoundTols> = (0..num_vars)
             .map(|v| {
                 structural_tol(
                     col_scales[v],
@@ -306,7 +334,7 @@ impl Solver {
 
             // Choose an initial value, preferring a bound that keeps this
             // variable's reduced cost dual-feasible.
-            let (init_val, var_dual_feasible) = if at_bound(min, max, tol) {
+            let (init_val, var_dual_feasible) = if at_bound(min, max, tol.lo.min(tol.hi)) {
                 // Fixed variable: the obj. coeff doesn't matter.
                 (min, true)
             } else {
@@ -320,14 +348,15 @@ impl Solver {
             obj_val += init_val * orig_obj_coeffs[v];
 
             nb_var_states.push(NonBasicVarState {
-                at_min: at_bound(init_val, min, tol),
-                at_max: at_bound(init_val, max, tol),
+                at_min: at_bound(init_val, min, tol.lo),
+                at_max: at_bound(init_val, max, tol.hi),
             });
         }
 
         let mut constraint_coeffs = vec![];
         let mut orig_rhs = vec![];
         let mut row_scales = vec![];
+        let mut row_mags = vec![];
 
         // Initially, all slack vars are basic.
         let mut basic_vars = vec![];
@@ -364,7 +393,12 @@ impl Solver {
                 magnitude += (coeff * nb_var_vals[var]).abs();
             }
             basic_var_vals.push(rhs - lhs_val);
-            var_tols.push(slack_tol(feasibility, row_scale, magnitude));
+            var_tols.push(BoundTols::uniform(slack_tol(
+                feasibility,
+                row_scale,
+                magnitude,
+            )));
+            row_mags.push(magnitude);
         }
 
         let num_constraints = constraint_coeffs.len();
@@ -470,6 +504,8 @@ impl Solver {
             var_tols,
             dual_tols,
             row_budgets,
+            validation_rows: Vec::new(),
+            row_mags,
             deadline,
             operation_time_limit: None,
             lp_iterations: 0,
@@ -642,6 +678,11 @@ impl Solver {
     /// decisive in absolute terms. The round-off floor is relative to the
     /// row's ACTIVITY instead: what evaluating the row in `f64` can resolve
     /// at all.
+    ///
+    /// The rows presolve dropped or rewrote are checked after the engine's
+    /// own, as the user wrote them ([`Self::validation_rows`]), so every
+    /// caller holds the answer to the whole model: the MIP guard, the LP
+    /// boundary, and the LP edits and resumes that go through it.
     pub(crate) fn first_violated_row(&self, values: &[f64]) -> Option<(usize, f64)> {
         for r in 0..self.num_constraints() {
             // `values` are user units; the stored column is scaled by `s_v`,
@@ -657,17 +698,30 @@ impl Solver {
                 return Some((r, excursion(implied, smin, smax) / self.row_scales[r]));
             }
         }
-        None
+        // The rows presolve took over: the same contract on the rows as the
+        // user wrote them (numbered after the engine's own).
+        self.validation_rows
+            .iter()
+            .enumerate()
+            .find_map(|(k, (coeffs, op, rhs))| {
+                row_violation(coeffs, *op, *rhs, values, self.feasibility)
+                    .map(|violation| (self.num_constraints() + k, violation))
+            })
+    }
+
+    /// Install the rows the answer must satisfy beyond the engine's own (see
+    /// [`Self::validation_rows`]): those presolve dropped or rewrote.
+    pub(crate) fn set_validation_rows(&mut self, rows: Vec<(CsVec, ComparisonOp, f64)>) {
+        self.validation_rows = rows;
     }
 
     /// The first structural var whose value (user units) violates its bounds
     /// beyond the contract, the user tolerance floored at the round-off of
-    /// the bound ([`bound_tolerance`]), with the violation in user units.
+    /// each bound ([`outside_bounds`]), with the violation in user units.
     pub(crate) fn first_violated_bound(&self, values: &[f64]) -> Option<(usize, f64)> {
         values.iter().enumerate().find_map(|(v, &x)| {
             let (lo, hi) = self.get_var_bounds(v);
-            let tol = bound_tolerance(self.feasibility, lo, hi);
-            outside(x, lo, hi, tol).then(|| (v, excursion(x, lo, hi)))
+            outside_bounds(x, lo, hi, self.feasibility).then(|| (v, excursion(x, lo, hi)))
         })
     }
 
@@ -711,7 +765,7 @@ impl Solver {
                 self.basic_var_mins[row] = min;
                 self.basic_var_maxs[row] = max;
                 let val = self.basic_var_vals[row];
-                if val < min - tol || val > max + tol {
+                if val < min - tol.lo || val > max + tol.hi {
                     self.is_primal_feasible = false;
                 }
             }
@@ -732,16 +786,13 @@ impl Solver {
                     self.values_dirty = true;
                 }
                 self.nb_var_states[col] = NonBasicVarState {
-                    at_min: at_bound(new_val, min, tol),
-                    at_max: at_bound(new_val, max, tol),
+                    at_min: at_bound(new_val, min, tol.lo),
+                    at_max: at_bound(new_val, max, tol.hi),
                 };
                 // A var at a loosened bound may no longer justify its reduced cost.
-                let dual_tol = self.dual_tols[var];
                 self.is_dual_feasible = self.is_dual_feasible
-                    && (self.nb_var_states[col].at_min && self.nb_var_obj_coeffs[col] > -dual_tol
-                        || self.nb_var_states[col].at_max
-                            && self.nb_var_obj_coeffs[col] < dual_tol
-                        || self.nb_var_obj_coeffs[col].abs() < dual_tol);
+                    && self.nb_var_states[col]
+                        .is_dual_feasible(self.nb_var_obj_coeffs[col], self.dual_tols[var]);
             }
         }
         Ok(())
@@ -779,10 +830,8 @@ impl Solver {
                 continue;
             }
             // Dual verification: exact reduced costs. If they still show an
-            // infeasibility, let the primal simplex act on them; a column it
-            // cannot exploit (see `PivotChoice::Unexploitable`) is not an
-            // improving direction, so no pivot at all means the vertex is
-            // optimal within tolerance.
+            // infeasibility, let the primal simplex act on them; no pivot at
+            // all means the vertex is optimal within tolerance.
             if self.artificial_obj.is_some() || self.reduced_costs_dirty {
                 self.artificial_obj = None;
                 self.recalc_obj_coeffs()?;
@@ -875,7 +924,8 @@ impl Solver {
                 VarState::NonBasic(col) => implied - self.nb_var_vals[col],
             };
             let tol = slack_tol(self.feasibility, self.row_scales[r], magnitude);
-            self.var_tols[slack] = tol;
+            self.var_tols[slack] = BoundTols::uniform(tol);
+            self.row_mags[r] = magnitude;
             // A NaN residual holds nothing.
             if residual.is_nan() || residual.abs() > tol {
                 hold = false;
@@ -983,10 +1033,21 @@ impl Solver {
     /// to the round-off of the computations that produced it, `scale` being
     /// the largest entry of the tableau row and column involved (a genuine
     /// entry far below its neighbours is computed with an absolute error of
-    /// that order and can never agree relatively).
+    /// that order and can never agree relatively). Agreement within that
+    /// round-off vouches only for an element above it: one within the
+    /// round-off floor of the scale ([`LU_SINGULAR_REL`], where the
+    /// factorization would call its basis singular) agrees with anything of
+    /// its own size, round-off included, so there only relative agreement
+    /// tells a genuine element from noise. (The genuine tiny pivots of wide
+    /// coefficient chains, down to 4e-15 of their column, come out of both
+    /// computations identical; a round-off entry of 1.4e-15, the only one
+    /// "blocking" an unbounded ray, came out 2% apart and was taken as a
+    /// pivot with a step of 1.6e15, into a basis the factorization refused.)
     fn pivots_agree(a_row: f64, a_col: f64, scale: f64) -> bool {
         let diff = (a_row - a_col).abs();
-        diff <= PIVOT_AGREEMENT_TOL * a_row.abs().max(a_col.abs()) || diff <= ENTRY_ROUNDOFF * scale
+        let element = a_row.abs().min(a_col.abs());
+        diff <= PIVOT_AGREEMENT_TOL * a_row.abs().max(a_col.abs())
+            || (diff <= ENTRY_ROUNDOFF * scale && element > LU_SINGULAR_REL * scale)
     }
 
     /// The entry of the current pivot column at `row`.
@@ -1114,8 +1175,8 @@ impl Solver {
                     self.nb_vars.push(var);
                     self.nb_var_vals.push(val);
                     self.nb_var_states.push(NonBasicVarState {
-                        at_min: at_bound(val, min, tol),
-                        at_max: at_bound(val, max, tol),
+                        at_min: at_bound(val, min, tol.lo),
+                        at_max: at_bound(val, max, tol.hi),
                     });
                 }
             }
@@ -1149,13 +1210,17 @@ impl Solver {
     /// a fixed equality slack it reported `Infeasible` for a value the solve
     /// itself had just returned: issue #47.)
     ///
-    /// `val` must lie within the var's bounds as they were before any fix;
-    /// fixing again replaces the previous fixed value.
+    /// `val` must lie within the var's bounds as they were before any fix,
+    /// within the contract (a value a solve reports may sit outside a bound
+    /// by round-off, issue #47): a value outside a bound within its
+    /// tolerance fixes the var at that bound. Fixing again replaces the
+    /// previous fixed value.
     pub(crate) fn fix_var(&mut self, var: usize, val: f64) -> Result<StopReason, Error> {
         let (min, max) = self.fixed_var_bounds[var].unwrap_or(self.get_var_bounds(var));
-        if val < min || val > max {
+        if outside_bounds(val, min, max, self.feasibility) {
             return Err(Error::Infeasible);
         }
+        let val = val.clamp(min, max);
         self.fixed_var_bounds[var] = Some((min, max));
         self.set_var_bounds(var, val, val)?;
         self.reoptimize()
@@ -1202,10 +1267,8 @@ impl Solver {
     /// provisionally set (the caller verifies it on recomputed reduced costs).
     fn optimize(&mut self) -> Result<(StopReason, bool), Error> {
         // Rows whose entry in the current entering column proved to be
-        // round-off (see `PivotChoice::Inconsistent`) and columns found
-        // unexploitable at the current vertex; both reset after a pivot.
+        // round-off (see `PivotChoice::Inconsistent`); reset after a pivot.
         let mut excluded_rows: Vec<usize> = Vec::new();
-        let mut excluded_cols: Vec<usize> = Vec::new();
         let mut pivoted = false;
         for iter in 0.. {
             self.lp_iterations += 1;
@@ -1221,15 +1284,7 @@ impl Solver {
                 );
             }
 
-            match self.choose_pivot(&excluded_rows, &excluded_cols)? {
-                PivotChoice::Unexploitable(col) => {
-                    debug!(
-                        "optimize iter {iter}: column of var {} blocked at tolerance level; \
-                         not an improving direction",
-                        self.nb_vars[col]
-                    );
-                    excluded_cols.push(col);
-                }
+            match self.choose_pivot(&excluded_rows)? {
                 PivotChoice::Pivot(pivot_info) => {
                     trace!(
                         "primal pivot: var {} enters (col {}) with step {:e}, {}",
@@ -1250,7 +1305,6 @@ impl Solver {
                     self.pivot(&pivot_info)?;
                     pivoted = true;
                     excluded_rows.clear();
-                    excluded_cols.clear();
                 }
                 PivotChoice::Inconsistent { row, tiny } => {
                     if !self.factorization_is_fresh() {
@@ -1425,7 +1479,7 @@ impl Solver {
             row_scale,
             slack_var_min,
             slack_var_max,
-        }) = prepare_row(coeffs, cmp_op, rhs, |var| {
+        }) = prepare_row(coeffs, cmp_op, rhs, self.feasibility, |var| {
             self.orig_var_mins[var] == self.orig_var_maxs[var]
         })?
         else {
@@ -1450,8 +1504,12 @@ impl Solver {
             magnitude += term.abs();
         }
         self.basic_var_vals.push(rhs - lhs_val);
-        self.var_tols
-            .push(slack_tol(self.feasibility, row_scale, magnitude));
+        self.var_tols.push(BoundTols::uniform(slack_tol(
+            self.feasibility,
+            row_scale,
+            magnitude,
+        )));
+        self.row_mags.push(magnitude);
         for (var, &coeff) in coeffs.iter() {
             let budget = snap_budget(self.feasibility, row_scale, coeff);
             if budget < self.row_budgets[var] {
@@ -1523,10 +1581,10 @@ impl Solver {
             .enumerate()
         {
             let tol = self.var_tols[self.basic_vars[r]];
-            if val < min - tol {
+            if val < min - tol.lo {
                 num_vars += 1;
                 infeasibility += min - val;
-            } else if val > max + tol {
+            } else if val > max + tol.hi {
                 num_vars += 1;
                 infeasibility += val - max;
             }
@@ -1544,8 +1602,7 @@ impl Solver {
             .zip(&self.nb_var_states)
             .enumerate()
         {
-            let tol = self.dual_tols[self.nb_vars[c]];
-            if !(var_state.at_min && obj_coeff > -tol || var_state.at_max && obj_coeff < tol) {
+            if !var_state.is_dual_feasible(obj_coeff, self.dual_tols[self.nb_vars[c]]) {
                 num_vars += 1;
                 infeasibility += obj_coeff.abs();
             }
@@ -1583,13 +1640,7 @@ impl Solver {
     /// `excluded_rows` lists rows judged numerically zero in the entering
     /// column (their entry disagreed with the row computation on a fresh
     /// factorization) and therefore not candidate pivots.
-    /// `excluded_cols` lists columns found unexploitable at this vertex (see
-    /// [`PivotChoice::Unexploitable`]).
-    fn choose_pivot(
-        &mut self,
-        excluded_rows: &[usize],
-        excluded_cols: &[usize],
-    ) -> Result<PivotChoice, Error> {
+    fn choose_pivot(&mut self, excluded_rows: &[usize]) -> Result<PivotChoice, Error> {
         let entering_c = {
             let filtered_obj_coeffs = self
                 .nb_var_obj_coeffs
@@ -1599,11 +1650,7 @@ impl Solver {
                 .filter_map(|(col, (&obj_coeff, var_state))| {
                     // Choose only among non-basic vars that can be changed
                     // with objective decreasing.
-                    let tol = self.dual_tols[self.nb_vars[col]];
-                    if (var_state.at_min && obj_coeff > -tol)
-                        || (var_state.at_max && obj_coeff < tol)
-                        || excluded_cols.contains(&col)
-                    {
+                    if var_state.is_dual_feasible(obj_coeff, self.dual_tols[self.nb_vars[col]]) {
                         None
                     } else {
                         Some((col, obj_coeff))
@@ -1648,24 +1695,20 @@ impl Solver {
 
         self.calc_col_coeffs(entering_c);
 
-        let get_leaving_var_step = |r: usize, coeff: f64| -> f64 {
+        // leaving_diff = -entering_diff * coeff: whether the basic var of a
+        // row with this entry moves towards its max as the entering var moves.
+        let moves_up = |coeff: f64| {
+            (entering_diff_sign && coeff < 0.0) || (!entering_diff_sign && coeff > 0.0)
+        };
+        // How far the basic var of row `r` is from the bound it moves
+        // towards: negative when it already sits past that bound (within
+        // its tolerance), infinite when that bound is.
+        let signed_room = |r: usize, coeff: f64| -> f64 {
             let val = self.basic_var_vals[r];
-            // leaving_diff = -entering_diff * coeff. From this we can determine
-            // in which direction this basic var will change and select appropriate bound.
-            if (entering_diff_sign && coeff < 0.0) || (!entering_diff_sign && coeff > 0.0) {
-                let max = self.basic_var_maxs[r];
-                if val < max {
-                    max - val
-                } else {
-                    0.0
-                }
+            if moves_up(coeff) {
+                self.basic_var_maxs[r] - val
             } else {
-                let min = self.basic_var_mins[r];
-                if val > min {
-                    val - min
-                } else {
-                    0.0
-                }
+                val - self.basic_var_mins[r]
             }
         };
 
@@ -1676,13 +1719,16 @@ impl Solver {
         //
         // https://link.springer.com/content/pdf/10.1007/BF01589114.pdf
 
-        // Entries below the pivot tolerance are not candidate pivots: an
-        // entry within the round-off of computing the column (relative to
-        // its largest entry, see ENTRY_ROUNDOFF) is noise, and an entry
-        // seven orders below the largest entry among the rows whose basic
-        // var can block the step at all (see PIVOT_REL_TOL) is too unstable
-        // while a better candidate exists; a row with no finite bound in the
-        // way says nothing about the scale of the candidates.
+        // An entry within the round-off of computing the column (relative to
+        // its largest entry, see ENTRY_ROUNDOFF) is noise: it neither blocks
+        // the step nor is a pivot. Every other entry blocks the step, since
+        // the phase exit holds every basic var to its tolerance whatever the
+        // size of its entry. An entry seven orders below the largest entry
+        // among the rows whose basic var can block the step at all (see
+        // PIVOT_REL_TOL) is too unstable to pivot on while a larger entry can
+        // take the step, and is the pivot only when none can; a row with no
+        // finite bound in the way says nothing about the scale of the
+        // candidates.
         let col_max_all = self
             .col_coeffs
             .iter()
@@ -1691,56 +1737,78 @@ impl Solver {
         let col_max = self
             .col_coeffs
             .iter()
-            .filter(|&(r, &coeff)| {
-                !excluded_rows.contains(&r) && get_leaving_var_step(r, coeff).is_finite()
-            })
+            .filter(|&(r, &coeff)| !excluded_rows.contains(&r) && signed_room(r, coeff).is_finite())
             .map(|(_, coeff)| coeff.abs())
             .fold(0.0, f64::max);
-        let pivot_floor = (ENTRY_ROUNDOFF * col_max_all).max(PIVOT_REL_TOL * col_max);
+        let noise_floor = ENTRY_ROUNDOFF * col_max_all;
+        let pivot_floor = noise_floor.max(PIVOT_REL_TOL * col_max);
 
-        // First, we determine the max change in entering variable so that basic variables
-        // remain feasible using relaxed bounds (relaxed by each basic var's own tolerance).
+        // First, the largest step of the entering var after which no basic
+        // var has left its bound by more than its tolerance (Harris's
+        // relaxed bounds). The allowance is measured from where the var
+        // sits: one already past its bound has only the rest of its
+        // tolerance left, and granting it the whole tolerance again would
+        // carry it out of the contract the phase exit verifies. And it is
+        // the tolerance less the round-off of recomputing the var (its row's
+        // for a slack, its bound's for a structural var): a step that left a
+        // var exactly at its tolerance was undone by the phase exit whenever
+        // the recomputation landed it an ulp past, and the phases alternated
+        // until they gave up.
         let mut max_step = (entering_other_val - entering_cur_val).abs();
         for (r, &coeff) in self.col_coeffs.iter() {
             let coeff_abs = coeff.abs();
-            if coeff_abs < pivot_floor || excluded_rows.contains(&r) {
+            if coeff_abs < noise_floor || excluded_rows.contains(&r) {
                 continue;
             }
 
-            // By which amount can we change the entering variable so that the limit on this
-            // basic var is not violated. The var with the minimum such amount becomes leaving.
-            let tol = self.var_tols[self.basic_vars[r]];
-            let cur_step = (get_leaving_var_step(r, coeff) + tol) / coeff_abs;
+            let var = self.basic_vars[r];
+            let up = moves_up(coeff);
+            let round_off = ROUNDOFF_FLOOR
+                * if var >= self.num_vars {
+                    self.row_mags[var - self.num_vars]
+                } else if up {
+                    self.basic_var_maxs[r].abs()
+                } else {
+                    self.basic_var_mins[r].abs()
+                };
+            let allowance = (self.var_tols[var].toward(up) - round_off).max(0.0);
+            let cur_step = (signed_room(r, coeff) + allowance).max(0.0) / coeff_abs;
             if cur_step < max_step {
                 max_step = cur_step;
             }
         }
 
-        // Second, we choose among variables with steps less than max_step a variable with the biggest
-        // abs. coefficient as the leaving variable. This means that we get numerically more stable
-        // basis at the price of slight infeasibility of some basic variables.
+        // Second, among the rows whose own step (to the bound itself) is
+        // within that limit, the one with the largest entry leaves: a
+        // numerically more stable basis at the price of a tolerance-level
+        // infeasibility of the others. Entries above the pivot floor are
+        // preferred; the row that set the limit always qualifies, so a
+        // blocked step always finds a pivot.
         let mut leaving_r = None;
         let mut leaving_new_val = 0.0;
         let mut pivot_coeff_abs = f64::NEG_INFINITY;
         let mut pivot_coeff = 0.0;
-        for (r, &coeff) in self.col_coeffs.iter() {
-            let coeff_abs = coeff.abs();
-            if coeff_abs < pivot_floor || excluded_rows.contains(&r) {
-                continue;
-            }
+        for floor in [pivot_floor, noise_floor] {
+            for (r, &coeff) in self.col_coeffs.iter() {
+                let coeff_abs = coeff.abs();
+                if coeff_abs < floor || excluded_rows.contains(&r) {
+                    continue;
+                }
 
-            let cur_step = get_leaving_var_step(r, coeff) / coeff_abs;
-            if cur_step <= max_step && coeff_abs > pivot_coeff_abs {
-                leaving_r = Some(r);
-                leaving_new_val = if (entering_diff_sign && coeff < 0.0)
-                    || (!entering_diff_sign && coeff > 0.0)
-                {
-                    self.basic_var_maxs[r]
-                } else {
-                    self.basic_var_mins[r]
-                };
-                pivot_coeff = coeff;
-                pivot_coeff_abs = coeff_abs;
+                let cur_step = signed_room(r, coeff).max(0.0) / coeff_abs;
+                if cur_step.is_finite() && cur_step <= max_step && coeff_abs > pivot_coeff_abs {
+                    leaving_r = Some(r);
+                    leaving_new_val = if moves_up(coeff) {
+                        self.basic_var_maxs[r]
+                    } else {
+                        self.basic_var_mins[r]
+                    };
+                    pivot_coeff = coeff;
+                    pivot_coeff_abs = coeff_abs;
+                }
+            }
+            if leaving_r.is_some() {
+                break;
             }
         }
 
@@ -1776,11 +1844,21 @@ impl Solver {
             } else {
                 raw_diff.min(0.0)
             };
-            // The next recomputation from the factorization will move the
-            // entering var by the clamped-away `raw_diff`; if that exceeds
-            // its tolerance the pivot would land on an infeasible basis.
-            if entering_diff == 0.0 && raw_diff.abs() > self.var_tols[self.nb_vars[entering_c]] {
-                return Ok(PivotChoice::Unexploitable(entering_c));
+            if entering_diff == 0.0 {
+                // A degenerate step: the leaving var sits at or past the
+                // bound it leaves at, within its tolerance, so it leaves
+                // where it sits, which is at that bound as far as the engine
+                // is concerned; the basis equations keep holding and nothing
+                // moves. (Set onto the bound itself, the leaving var moved
+                // the entering one backwards by the clamped-away `raw_diff`
+                // at the next recomputation, out of its bounds whenever that
+                // exceeded its tolerance; refusing such a column instead
+                // declared optimal a vertex with an improving direction left,
+                // 3e-3 short of the optimum.)
+                let tol = self.var_tols[self.basic_vars[row]]
+                    .toward(leaving_new_val == self.basic_var_maxs[row]);
+                leaving_new_val =
+                    self.basic_var_vals[row].clamp(leaving_new_val - tol, leaving_new_val + tol);
             }
             let entering_new_val = entering_cur_val + entering_diff;
 
@@ -1817,9 +1895,9 @@ impl Solver {
             .enumerate()
             .filter_map(|(r, ((&val, &min), &max))| {
                 let tol = self.var_tols[self.basic_vars[r]];
-                if val < min - tol {
+                if val < min - tol.lo {
                     Some((r, min - val))
-                } else if val > max + tol {
+                } else if val > max + tol.hi {
                     Some((r, val - max))
                 } else {
                     None
@@ -1943,9 +2021,10 @@ impl Solver {
                 );
             // A slack's stored tolerance carries a round-off floor derived
             // at the last recomputation; what it may absorb is judged on
-            // its row's magnitude at the current point.
+            // its row's magnitude at the current point. A structural var
+            // crosses the bound in the direction the pivot moves it.
             let tol = if var < self.num_vars {
-                self.var_tols[var]
+                self.var_tols[var].toward(leaving_move / coeff > 0.0)
             } else {
                 self.current_slack_tol(var - self.num_vars)
             };
@@ -2078,7 +2157,7 @@ impl Solver {
                 for (c, &coeff) in self.row_coeffs.iter() {
                     let state = &self.nb_var_states[c];
                     debug!(
-                        "  var {} coeff {coeff:e} value {:e} at_min {} at_max {} tol {:e} \
+                        "  var {} coeff {coeff:e} value {:e} at_min {} at_max {} tol {:?} \
                          direction_ok {} absorbs {}",
                         self.nb_vars[c],
                         self.nb_var_vals[c],
@@ -2114,12 +2193,12 @@ impl Solver {
             var_state.at_min = at_bound(
                 pivot_info.entering_new_val,
                 self.orig_var_mins[entering_var],
-                tol,
+                tol.lo,
             );
             var_state.at_max = at_bound(
                 pivot_info.entering_new_val,
                 self.orig_var_maxs[entering_var],
-                tol,
+                tol.hi,
             );
             return Ok(());
         }
@@ -2154,12 +2233,12 @@ impl Solver {
         leaving_var_state.at_min = at_bound(
             pivot_elem.leaving_new_val,
             self.orig_var_mins[leaving_var],
-            leaving_tol,
+            leaving_tol.lo,
         );
         leaving_var_state.at_max = at_bound(
             pivot_elem.leaving_new_val,
             self.orig_var_maxs[leaving_var],
-            leaving_tol,
+            leaving_tol.hi,
         );
 
         let pivot_obj = self.nb_var_obj_coeffs[pivot_info.col] / pivot_coeff;
@@ -2292,10 +2371,13 @@ impl Solver {
         // Recomputed is not verified: on an ill-conditioned basis a solve
         // through the factorization leaves a residual above the rows'
         // tolerances, which only `verify_primal`'s refinement removes. So
-        // `values_dirty` stays as it is; clearing it here let a phase exit
-        // skip verification right after a refactorization had recomputed the
-        // values, and report a point that missed a row by four times its
-        // tolerance (the magnitude fixture at 1e8).
+        // the values are dirty until the next phase exit checks them.
+        // Clearing the flag here let a phase exit skip verification right
+        // after a refactorization had recomputed the values, and report a
+        // point that missed a row by four times its tolerance (the magnitude
+        // fixture at 1e8); leaving it as it was let a node reached by a basis
+        // load finish on values nothing had checked.
+        self.values_dirty = true;
         self.pivots_since_drift_check = 0;
         Ok(())
     }

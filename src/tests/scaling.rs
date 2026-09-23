@@ -13,13 +13,15 @@
 //! solution's objective is held to the objective at `x*`. With coefficients
 //! from `1e-8` to `1e4` a row satisfied to `1e-7` lets a variable with a `1e-8`
 //! coefficient move by ten units, and that freedom propagates through the
-//! other rows into the objective; the wide properties therefore assert only
-//! that the model solves and the solution is feasible.
+//! other rows into the objective; the wide properties therefore solve the
+//! model with its objective but assert only that it solves and the solution
+//! is feasible.
 
 #[cfg(test)]
 mod tests_scaling {
     use crate::tests::oracle::{
-        assert_solves_within_contract, xstar_is_feasible, Model, Row, Var, OBJECTIVE_SLACK,
+        assert_solves_feasibly_within_contract, assert_solves_within_contract, xstar_is_feasible,
+        Model, Row, Var,
     };
     use crate::{ComparisonOp, OptimizationDirection};
 
@@ -196,35 +198,13 @@ mod tests_scaling {
         assert_solves_within_contract(model);
     }
 
-    /// The oracle without the objective check: feasibility and status only.
+    /// The oracle without the comparison with the objective at `x*`: the
+    /// model is solved with its objective (so the optimization runs), and
+    /// status, bounds, rows and the reported objective's consistency are
+    /// checked. (It used to zero the objective instead, which solved a pure
+    /// feasibility problem and never exercised the primal simplex.)
     fn check_feasibility(model: &Model) {
-        // Zero objective coefficients make the objective check vacuous while
-        // keeping every other assertion of the oracle.
-        let feasibility_only = Model {
-            direction: model.direction,
-            vars: model
-                .vars
-                .iter()
-                .map(|v| Var {
-                    obj: 0.0,
-                    lo: v.lo,
-                    hi: v.hi,
-                    integer: v.integer,
-                })
-                .collect(),
-            rows: model
-                .rows
-                .iter()
-                .map(|r| Row {
-                    terms: r.terms.clone(),
-                    op: r.op,
-                    rhs: r.rhs,
-                })
-                .collect(),
-            xstar: model.xstar.clone(),
-        };
-        let _ = OBJECTIVE_SLACK;
-        assert_solves_within_contract(&feasibility_only);
+        assert_solves_feasibly_within_contract(model);
     }
 
     #[hegel::test(settings())]

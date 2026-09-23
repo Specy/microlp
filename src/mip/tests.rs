@@ -284,9 +284,12 @@ fn try_adopt_incumbent_respects_custom_feasibility_tolerance() {
         let mut solved = run(&p, options).unwrap();
         let state = &mut solved.state;
         // Force the relaxation to a specific near-zero fractional b: pin its
-        // bounds to [5e-7, 5e-7] and re-solve. The equality row then forces
-        // x to 10 + m*5e-7 = 510, deterministically.
+        // bounds to [5e-7, 5e-7], and x to the 10 + m*5e-7 = 510 the row
+        // then asks for (a loose tolerance would otherwise let the engine
+        // move x, and with it the violation this test is about), and
+        // re-solve.
         state.solver.set_var_bounds(b.idx(), 5e-7, 5e-7).unwrap();
+        state.solver.set_var_bounds(x.idx(), 510.0, 510.0).unwrap();
         assert_eq!(
             state.solver.reoptimize().unwrap(),
             crate::StopReason::Finished
@@ -298,7 +301,7 @@ fn try_adopt_incumbent_respects_custom_feasibility_tolerance() {
     // Default tolerance (1e-7): the rounded point (x=510, b=0) misses the
     // original `x - m*b == 10` row by 500 — must be rejected.
     let (x_value, adopted) = pin_and_adopt(Tolerances::default().feasibility);
-    assert!((x_value - 510.0).abs() < 1e-6);
+    assert_eq!(x_value, 510.0);
     assert!(
         !adopted,
         "a 500-unit rounding-induced violation must be rejected at the default feasibility tolerance"
@@ -306,7 +309,8 @@ fn try_adopt_incumbent_respects_custom_feasibility_tolerance() {
 
     // Absurdly loosened tolerance: the same 500-unit violation is now
     // within bounds — the guard must accept it.
-    let (_, adopted) = pin_and_adopt(1e6);
+    let (x_value, adopted) = pin_and_adopt(1e6);
+    assert_eq!(x_value, 510.0);
     assert!(
         adopted,
         "the same violation must be accepted once tolerances.feasibility is loosened past it"

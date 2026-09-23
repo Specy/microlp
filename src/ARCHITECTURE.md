@@ -124,11 +124,17 @@ Two normalizations happen at the boundary and hold everywhere inside:
   `Mode::Mip` adds reductions that preserve the integer feasible set or merely some
   optimum, sound because MILP edits re-solve from the untouched base problem and incumbents
   are validated against the original rows. Every presolve decision is made against the
-  engine's tolerance contract (§7).
+  engine's tolerance contract (§7), and presolve hands the rows it dropped or rewrote to
+  the engine as they were written, for the checks at the boundary (§3.1): a reduction
+  that is wrong shows as a loud error, never as a returned point that violates a row.
 
 `prepare_row` is the single row-normalization contract used by both `Solver::try_new` and
-incremental `Solver::add_constraint`. It classifies empty rows, computes the power-of-two
-scale, scales coefficients and the right-hand side together, and derives slack bounds.
+incremental `Solver::add_constraint`. It settles the rows whose data alone decide them
+(`trivial_row_verdict`, which presolve applies too: an empty row is held to the contract at
+activity zero, an infinite right-hand side is no constraint on the side the row leaves open
+and unsatisfiable on the side it constrains, and a NaN or an infinite coefficient makes a
+row no point satisfies), computes the power-of-two scale, scales coefficients and the
+right-hand side together, and derives slack bounds.
 The two callers still own their genuinely different work: initial matrix/basis construction
 versus extending a live matrix and repairing the current basis.
 
@@ -197,12 +203,15 @@ every read-out and every candidate starts from.
 evaluate an explicit structural-variable vector (user units) against the stored rows (sense
 recovered from slack bounds) and bounds within the **absolute** user tolerance floored at
 the round-off of the row or bound (`row_tolerance`, through `outside`), and compute its
-objective. Non-finite row activity is infeasible. These are the contract check: the
-rounded-incumbent guard (§5.4) and the pure-LP path (`SolveOutcome::from_lp_stop`) apply
-them. They evaluate a row exactly as the engine's own verification does (`row_activity`,
-term for term in the same order), so a point the engine has verified passes them by
+objective. A value or row activity that is not finite violates every bound and row (a
+point is finite). These are the contract check: the rounded-incumbent guard (§5.4) and the
+pure-LP path (`SolveOutcome::from_lp_stop`, on every solve, edit and resume) apply them.
+They evaluate a row exactly as the engine's own verification does (`row_activity`, term
+for term in the same order), so a point the engine has verified passes them by
 construction, and they are independent of the current basis values, so a rounded candidate
-is judged on its own merits.
+is judged on its own merits. `first_violated_row` also checks the rows presolve dropped or
+rewrote, as the user wrote them (`validation_rows`, installed from `Presolved`): the
+engine never pivots on them, so the answer is held to the whole model only here.
 
 ---
 
@@ -339,8 +348,9 @@ rounds integer variables and applies one validation funnel:
 
 1. `candidate_variables_feasible` rejects malformed lengths, non-finite values, invalid
    bounds, bound violations, and domain violations.
-2. `Solver::first_violated_row` validates the vector against the rows within the absolute
-   `Tolerances::feasibility` (default `1e-7`) floored at each row's round-off (§7).
+2. `Solver::first_violated_row` validates the vector against the rows, the ones presolve
+   dropped or rewrote included, within the absolute `Tolerances::feasibility` (default
+   `1e-7`) floored at each row's round-off (§7).
 3. `objective_of` must produce a finite objective before the incumbent can change.
 
 Post-edit warm-start filtering deliberately remains separate: `incumbent_feasible` checks
@@ -579,8 +589,8 @@ computed quantity is floored at that quantity's round-off:
 | Is a basic slack (row) within its bounds? | `slack_tol`: the engine's share (`ROW_BUDGET_SHARE`, ½) of the contract `row_tolerance(feasibility × r, m)` in the row's scaled units, at the row's magnitude `m = |b| + Σ|a_j x_j|` at the current values (refreshed whenever the rows are checked). The other half is the reserve: for the snap of an integer or fixed var, and for evaluating the row in another order of operations. | `ROUNDOFF_FLOOR = 1e-14`, `ROW_BUDGET_SHARE = 0.5` |
 | Is a structural var within / at its bounds? | `structural_tol`: the user contract in user units, but never more than any of its rows can absorb when the value is snapped to the bound (`snap_budget`: the row's reserve over the var's scaled coefficient, minimised over its rows), floored at the round-off of the bound magnitude. One rule for every var: it keeps a big-M row within contract when its binary is rounded, and a fixed var's report at its value within the rows presolve substituted it out of. | |
 | Is a reduced cost zero? | `dual_tol`: `EPS` floored at the round-off of `|c_j| + Σ|a_ij y_i|`, refreshed with the multipliers. | `EPS = 1e-10` |
-| Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it (`ENTRY_ROUNDOFF` relative to the larger of its own terms and the row's largest entry), and at least `PIVOT_REL_TOL` of the largest genuine entry among the vars that could enter (rows that could block, in the primal test). | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7` |
-| Do the row and column computations of the pivot element agree? | to `PIVOT_AGREEMENT_TOL` relatively or to `ENTRY_ROUNDOFF` of the computations' scale; else rebuild (stale factorization) or exclude the entry as noise (fresh one). | `PIVOT_AGREEMENT_TOL = 1e-7` |
+| Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it (`ENTRY_ROUNDOFF` relative to its row's or column's largest entry); a genuine entry at least `PIVOT_REL_TOL` of the largest genuine entry among the vars that could enter (rows that could block, in the primal test) is preferred, a smaller one is the pivot only when nothing larger will do. In the primal test every genuine entry bounds the step, with each basic var's tolerance counted from where it sits and less the round-off of recomputing it (its row's for a slack, its bound's for a structural var), so no step leaves a basic var where the phase exit's recomputation could find it outside its tolerance. | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7` |
+| Do the row and column computations of the pivot element agree? | to `PIVOT_AGREEMENT_TOL` relatively, or to `ENTRY_ROUNDOFF` of the computations' scale for an element above `LU_SINGULAR_REL` of that scale (below it, round-off agrees with anything of its size, so only relative agreement tells a genuine element from noise); else rebuild (stale factorization) or exclude the entry as noise (fresh one). | `PIVOT_AGREEMENT_TOL = 1e-7` |
 | Is the LU pivot column singular? | eligible part below `LU_SINGULAR_REL` of the column's largest transformed entry. | `= ROUNDOFF_FLOOR` |
 
 Two rules complete the model. **Absorption:** when no var can enter a violated row's pivot
@@ -589,9 +599,9 @@ fixed value) by no more than its own tolerance — "at a bound" means within tol
 everywhere, so it is still at its bound afterwards; this is how a round-off-level violation
 that a tightly held var cannot carry is handed to a row or var that can. Integer vars never
 absorb. **Verified termination:** a phase reports `Finished` only after `verify_primal` and exact
-reduced costs (recomputed only when pivots have updated them incrementally since); a dual
-infeasibility whose only primal step is degenerate and would land the entering var outside
-its tolerance is not an improving direction (`PivotChoice::Unexploitable`). `verify_primal`
+reduced costs (recomputed only when pivots have updated them incrementally since); in a
+degenerate primal step the leaving var leaves where it sits, at its bound within tolerance,
+so the basis equations keep holding and no column is ever refused. `verify_primal`
 runs `check_rows`: every basic slack is re-derived from its row, `s = b − Σ a_j x_j` at the
 current structural values, so that a row's violation lives in its slack's value where the
 dual simplex sees it; the slack tolerances are refreshed from the rows' magnitudes; and the
@@ -613,22 +623,30 @@ unverified until the next phase exit checks and, if needed, refines them.
 **Presolve** (`src/presolve/`, module docs) makes its decisions with the same model, in
 user units: a row is held to the engine's *budget*, `ROW_BUDGET_SHARE` of
 `row_tolerance(feasibility, m)` at the magnitude `m` of the corner the decision is about
-(never over the whole box, so a bound of `f64::MAX` cannot inflate a tolerance); a
-continuous var may sit outside its emitted bounds by its bound tolerance, so every activity
-range is widened by `Σ|a_j|·bound_tol_j` before a verdict is drawn or a row dropped;
-equality (a forcing row) is judged within `ROUNDOFF_FLOOR` of the sum; a bound implied by a
-row is relaxed by the row's budget over the coefficient, so it never cuts a point the engine
-may return — a tiny coefficient is thereby a weak witness, exactly as the engine treats it.
-A row becomes bounds only where a bound describes it at least as well as the engine would
-hold the row: forcing rows are judged over the emitted bounds, require every term's range to
-be resolvable above the row's round-off (a term below it is invisible to the row and cannot
-be forced) and fix vars at those exact values, a singleton row is converted only when the
-engine's bound tolerance keeps the row
-within budget or when it fixes the var, and a conversion is skipped when the round-off it
-moves into the var, amplified by the var's coefficient in another row, would exceed that
-row's budget (the two rows disagree at the level of their own round-off; only the simplex,
-which balances both, resolves that). Infeasibility is declared only when no point the
-engine could accept exists.
+(never over the whole box, so a bound of `f64::MAX` cannot inflate a tolerance), `m`
+counting the right-hand side as written, fixed terms not substituted out; a continuous var
+may sit outside its emitted bounds by its bound tolerance, so every activity range is
+widened by `Σ|a_j|·bound_tol_j` before a verdict is drawn or a row dropped; equality (a
+forcing row) is judged within `ROUNDOFF_FLOOR` of the sum; a bound implied by a row is
+relaxed by the row's allowance (the budget, or for an integer var the full contract the
+incumbent guard holds integer points to), plus the round-off of the cancellation it was
+computed by, over the coefficient, so it never cuts a point the engine may return — a tiny
+coefficient is thereby a weak witness, exactly as the engine treats it. A row becomes
+bounds only where the bounds keep what the row does: a singleton row becomes its implied
+bound itself (keeping the vertices the row makes) where the engine's bound tolerance keeps
+the dropped row within its budget, a tighter row stays a row, and an equality fixes its
+var only where it pins it within the var's own tolerance (a looser one stays a row, so
+rows agreeing only within their tolerances are not made inconsistent); a forcing row, judged over the emitted
+bounds, fixes its vars at their extremes only when every term's range is resolvable above
+the row's round-off and the room the row leaves each var (its sliver plus the engine's
+share of the absolute tolerance, over the coefficient) is room nothing resolves; and a
+conversion is skipped when the round-off it moves into the var, amplified by the var's
+coefficient in another row, would exceed that row's budget (the two rows disagree at the
+level of their own round-off; only the simplex, which balances both, resolves that).
+Infeasibility is declared only when no point the engine could accept exists. The rows
+presolve dropped or rewrote stay with the engine for the checks at the boundary (§3.1),
+so a reduction that is wrong at the level of the tolerances shows as a loud error, never
+as a returned point that violates a row.
 
 The layering rule: the engine's tolerances decide *simplex* questions; `int_tol` decides
 *integrality* questions; `feasibility` is the contract presolve, the engine and *solution

@@ -35,15 +35,17 @@
 //! [`row_tolerance`]), in user units, so that presolve on and off agree on
 //! what is feasible:
 //!
-//! * A row of magnitude `m` (`|b| + Σ|a_j x_j|` at the point in question)
-//!   is held by the engine to a BUDGET of `ROW_BUDGET_SHARE *
-//!   row_tolerance(feasibility, m)`; the checks at the boundary accept the
-//!   full `row_tolerance`. Presolve never introduces a violation above the
-//!   budget and never declares infeasible what a point within the budget
-//!   could satisfy. The magnitude is taken at the corner of the box the
-//!   decision is about (the minimum-activity corner for an upper row bound,
-//!   and so on), never over the whole box: a bound of `f64::MAX` must not
-//!   inflate the tolerance of a row evaluated at small values.
+//! * A row of magnitude `m` (`|b| + Σ|a_j x_j|` at the point in question,
+//!   `b` being the right-hand side as written, fixed terms not substituted
+//!   out: [`Row::rhs_mag`](model::Row::rhs_mag)) is held by the engine to a
+//!   BUDGET of `ROW_BUDGET_SHARE * row_tolerance(feasibility, m)`; the
+//!   checks at the boundary accept the full `row_tolerance`. Presolve never
+//!   introduces a violation above the budget and never declares infeasible
+//!   what a point within the budget could satisfy. The magnitude is taken at
+//!   the corner of the box the decision is about (the minimum-activity
+//!   corner for an upper row bound, and so on), never over the whole box: a
+//!   bound of `f64::MAX` must not inflate the tolerance of a row evaluated
+//!   at small values.
 //! * A continuous var may sit outside its EMITTED bounds by its bound
 //!   tolerance `row_tolerance(feasibility, |bound|)`, exactly as
 //!   `Solver::first_violated_bound` allows; an integer var's adopted value
@@ -52,24 +54,43 @@
 //!   verdict and every dropped row accounts for that.
 //! * Round-off: an activity computed from terms of magnitude `m` is exact
 //!   only to [`ROUNDOFF_FLOOR`]` * m`; the one equality test (forcing rows)
-//!   uses that.
+//!   uses that, and a quantity computed by cancellation (the rest of a row
+//!   once a term is taken out) carries the round-off of what it was
+//!   computed from, the term included.
 //! * A working bound implied by a row is relaxed outward by the row's
-//!   budget plus slack, divided by the coefficient: the implication then
-//!   holds for every point the engine may return, so the bound never cuts
-//!   one. This is what makes a tiny coefficient a weak witness (a `1e-7`
-//!   coefficient in a row held to `5e-8` determines its var to about `0.5`),
-//!   exactly as the engine treats it.
-//! * A row becomes bounds only where a bound describes it at least as well
-//!   as the engine would hold the row: forcing rows are judged over the
-//!   EMITTED bounds, only when every term's range is resolvable above the
-//!   row's round-off (a term below it is invisible to the row and cannot be
-//!   forced), and fix vars at those exact values; a singleton row is
-//!   converted only when the engine's bound tolerance keeps the row within
-//!   its budget, or when it fixes the var (a fixed var is exact); and a
-//!   conversion is skipped when the round-off it moves into the var,
-//!   amplified by the var's coefficient in another row, would exceed that
-//!   row's budget — the rows disagree at the level of their own round-off,
-//!   and only the simplex, which balances both, resolves that.
+//!   allowance plus that round-off plus slack, divided by the coefficient:
+//!   the implication then holds for every point the engine may return, so
+//!   the bound never cuts one. The allowance is the budget for a continuous
+//!   var; for an integer var, whose values that matter are an incumbent's,
+//!   it is the full contract the incumbent guard holds them to. This is
+//!   what makes a tiny coefficient a weak witness (a `1e-7` coefficient in
+//!   a row held to `5e-8` determines its var to about `0.5`), exactly as the
+//!   engine treats it.
+//! * A row becomes bounds only where the bounds keep what the row does. A
+//!   singleton row becomes its implied bound `q` itself, which keeps the
+//!   vertices the row makes (the engine returns the point it would have
+//!   returned with the row), where the engine's bound tolerance keeps the
+//!   dropped row within its budget, i.e. where the row accepts at least that
+//!   tolerance around `q`; a tighter row stays a row, as does a side the
+//!   var's own bound already implies only up to the tolerances. An equality
+//!   fixes its var only where it pins it within the var's own tolerance and
+//!   no other row of the var can tell the pinned range apart; a looser one
+//!   stays a row, so that rows agreeing only within their tolerances are
+//!   not made inconsistent by a fixing. A forcing row (judged over the EMITTED bounds, equal to
+//!   its bound within the round-off of the sum) fixes its vars at their
+//!   extremes only when every term's range is resolvable above the row's
+//!   round-off, and when the room the row leaves each var off its extreme
+//!   (the sliver plus the engine's share of the absolute tolerance, over
+//!   the coefficient) is room nothing resolves: within the var's bound
+//!   tolerance and within what its other rows tolerate, or short of a unit
+//!   for an integer var. And a conversion is skipped when the round-off it
+//!   moves into the var, amplified by the var's coefficient in another row,
+//!   would exceed that row's budget — the rows disagree at the level of
+//!   their own round-off, and only the simplex, which balances both,
+//!   resolves that.
+//! * Whatever presolve drops or rewrites, the answer is still checked
+//!   against the row as written ([`Presolved::validation_rows`]), so a rule
+//!   that is wrong shows as a loud error at the boundary.
 //!
 //! # Soundness by mode
 //!
@@ -96,6 +117,7 @@ use model::{is_int_domain, Row};
 use params::*;
 use work::Work;
 
+use crate::solver::trivial_row_verdict;
 use crate::{ComparisonOp, CsVec, Error, VarDomain};
 
 /// Run presolve. `obj_coeffs` are the INTERNAL (minimize-space) objective
@@ -120,9 +142,9 @@ pub(crate) fn presolve(
     let mut lo = var_mins.to_vec();
     let mut hi = var_maxs.to_vec();
 
-    // Crossed input bounds: same verdict Solver::try_new gives.
+    // Crossed or NaN input bounds: same verdict Solver::try_new gives.
     for v in 0..num_vars {
-        if lo[v] > hi[v] {
+        if lo[v].is_nan() || hi[v].is_nan() || lo[v] > hi[v] {
             return Err(Error::Infeasible);
         }
     }
@@ -147,20 +169,15 @@ pub(crate) fn presolve(
     let mut dropped_on_input = 0usize;
     let mut rows: Vec<Row> = Vec::with_capacity(constraints.len());
     for (orig, (coeffs, op, rhs)) in constraints.iter().enumerate() {
-        if coeffs.indices().is_empty() {
-            // User-authored empty row: replicate Solver::try_new's exact
-            // (tolerance-free) semantics.
-            let tautological = match op {
-                ComparisonOp::Eq => *rhs == 0.0,
-                ComparisonOp::Le => 0.0 <= *rhs,
-                ComparisonOp::Ge => 0.0 >= *rhs,
-            };
-            if tautological {
+        // Rows whose data alone decide them (empty, non-finite): the verdict
+        // Solver::try_new gives them, under the same contract.
+        match trivial_row_verdict(coeffs, *op, *rhs, feasibility) {
+            Some(true) => {
                 dropped_on_input += 1;
                 continue;
-            } else {
-                return Err(Error::Infeasible);
             }
+            Some(false) => return Err(Error::Infeasible),
+            None => {}
         }
         let (lo, hi) = match op {
             ComparisonOp::Le => (f64::NEG_INFINITY, *rhs),
@@ -173,6 +190,7 @@ pub(crate) fn presolve(
             lo,
             hi,
             fold_scale: 0.0,
+            shift: 0.0,
             folded: Vec::new(),
             alive: true,
             orig: orig as u32,
@@ -242,10 +260,14 @@ pub(crate) fn presolve(
         }
     }
 
-    // Rebuild the output rows in the Problem's (coeffs, op, rhs) form.
+    // Rebuild the output rows in the Problem's (coeffs, op, rhs) form. Every
+    // input row the output does not carry as written is kept aside for the
+    // engine to check the answer against (`Presolved::validation_rows`).
     let mut out = Vec::with_capacity(rows.len());
+    let mut validation_rows = Vec::new();
     for row in rows.iter_mut() {
         if !row.alive {
+            validation_rows.push(constraints[row.orig as usize].clone());
             continue;
         }
         // A row can become all-substituted after the final pass (e.g. by a
@@ -253,6 +275,7 @@ pub(crate) fn presolve(
         work.fold_fixed(row);
         if row.vars.is_empty() {
             work.empty_row_check(row)?;
+            validation_rows.push(constraints[row.orig as usize].clone());
             continue;
         }
         if !row.coeffs_touched {
@@ -269,6 +292,9 @@ pub(crate) fn presolve(
         // Rewritten: rebuild with the folded terms restored and the bounds
         // shifted back, so the row keeps its magnitude here too. The shift's
         // round-off is within the relaxation the rewrite already applied.
+        // The rewrite is valid for integer points only, so the answer is
+        // also checked against the row as written.
+        validation_rows.push(constraints[row.orig as usize].clone());
         let shift: f64 = row.folded.iter().map(|&(v, a)| a * work.elo[v]).sum();
         let (op, rhs) = match (row.lo.is_finite(), row.hi.is_finite()) {
             (false, true) => (ComparisonOp::Le, row.hi + shift),
@@ -319,6 +345,7 @@ pub(crate) fn presolve(
         var_mins: work.elo,
         var_maxs: work.ehi,
         constraints: out,
+        validation_rows,
         stats: work.stats,
     })
 }
