@@ -14,7 +14,8 @@
 //! See §7 of `ARCHITECTURE.md`. Three fixtures were pinned this way and all
 //! three were fixed: a presolve forcing rule, a skipped verification, and a
 //! dual ratio test that took "no pivot" for a proof of infeasibility (the
-//! `wide_chain` fixtures). None is pinned today.
+//! `wide_chain` fixtures). One is pinned today: a forcing row whose fixing
+//! another row can tell apart.
 
 #[cfg(test)]
 mod regression_tests {
@@ -646,5 +647,32 @@ mod regression_tests {
                 "presolve {presolve}"
             );
         }
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): presolve's forcing row
+    /// `x1 + 100 x4 = 8388700` fixes `x1` at its lower bound `-2^-30`, where
+    /// the row allows it within the row's tolerance, and
+    /// `-1000 x1 + x4 / 1000 = 83.887`, which pins `x1` at zero, then misses
+    /// by 9.3e-7, beyond the contract: a feasible model (`x1 = 0`,
+    /// `x4 = 83887`) comes back `Infeasible` with presolve on. The instance
+    /// the properties found (a coefficient of 100, the pinning row a
+    /// singleton) is fixed by processing singleton rows first and judging a
+    /// row whose vars are all fixed at the full contract; this one needs a
+    /// forcing test that accounts for the var's other rows.
+    #[test]
+    #[should_panic(expected = "returned Infeasible")]
+    fn forcing_row_fixing_a_var_another_row_pins_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, -(2.0f64.powi(-30)), 1.0),
+                real(1.0, 83887.0, 83888.0),
+            ],
+            rows: vec![
+                row(&[(0, -1.0), (1, -100.0)], ComparisonOp::Eq, -8388700.0),
+                row(&[(0, -1000.0), (1, 1e-3)], ComparisonOp::Eq, 83.887),
+            ],
+            xstar: vec![0.0, 83887.0],
+        });
     }
 }

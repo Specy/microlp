@@ -177,22 +177,24 @@ pub(crate) fn slack_bounds(op: ComparisonOp) -> (f64, f64) {
     }
 }
 
-/// How far the user-unit row `coeffs op rhs` is from holding at `values`,
-/// if it violates the contract there (`row_tolerance(feasibility, m)` at
-/// the row's magnitude `m = |rhs| + Σ|a_j x_j|`); `None` if it holds. This
-/// is the check of a row as the user wrote it, for rows the engine does not
-/// hold itself (see `Solver::first_violated_row`).
+/// How far the user-unit row `coeffs op rhs` is from holding at the point
+/// `value` (a var's value by index), if it violates the contract there
+/// (`row_tolerance(feasibility, m)` at the row's magnitude
+/// `m = |rhs| + Σ|a_j x_j|`); `None` if it holds. This is the check of a row
+/// as the user wrote it, for rows the engine does not hold itself (see
+/// `Solver::first_violated_row`), and presolve's verdict on a row whose vars
+/// it fixed, so that the two are the same evaluation.
 pub(crate) fn row_violation(
     coeffs: &CsVec,
     op: ComparisonOp,
     rhs: f64,
-    values: &[f64],
+    value: impl Fn(usize) -> f64,
     feasibility: f64,
 ) -> Option<f64> {
     let mut lhs = 0.0;
     let mut magnitude = rhs.abs();
     for (v, &coeff) in coeffs.iter() {
-        let term = coeff * values[v];
+        let term = coeff * value(v);
         lhs += term;
         magnitude += term.abs();
     }

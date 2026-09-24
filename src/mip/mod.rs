@@ -194,7 +194,8 @@ pub(crate) fn incumbent_feasible(
                 (value, value)
             })
     }) && base.constraints.iter().all(|(coeffs, op, rhs)| {
-        crate::solver::row_violation(coeffs, *op, *rhs, values, tolerances.feasibility).is_none()
+        crate::solver::row_violation(coeffs, *op, *rhs, |v| values[v], tolerances.feasibility)
+            .is_none()
     })
 }
 

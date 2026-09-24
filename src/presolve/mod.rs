@@ -40,8 +40,9 @@
 //!   out: [`Row::rhs_mag`](model::Row::rhs_mag)) is held by the engine to a
 //!   BUDGET of `ROW_BUDGET_SHARE * row_tolerance(feasibility, m)`; the
 //!   checks at the boundary accept the full `row_tolerance`. Presolve never
-//!   introduces a violation above the budget and never declares infeasible
-//!   what a point within the budget could satisfy. The magnitude is taken at
+//!   introduces a violation above the budget in a row the engine holds, and
+//!   never declares infeasible what a point within the budget could
+//!   satisfy. The magnitude is taken at
 //!   the corner of the box the decision is about (the minimum-activity
 //!   corner for an upper row bound, and so on), never over the whole box: a
 //!   bound of `f64::MAX` must not inflate the tolerance of a row evaluated
@@ -88,9 +89,21 @@
 //!   would exceed that row's budget — the rows disagree at the level of
 //!   their own round-off, and only the simplex, which balances both,
 //!   resolves that.
+//! * A row all of whose vars are fixed is judged as the boundary will judge
+//!   it once it is dropped: the row as written, evaluated at the fixed
+//!   values by the boundary's own evaluation ([`row_violation`]), against
+//!   the full contract. Nothing the engine does moves such a row, so the
+//!   budget has no part in it (and its verdict agrees with the boundary's to
+//!   the bit).
+//! * Each wave of the worklist processes the rows left with at most one
+//!   term before the others, as HiGHS's fast presolve loop removes row
+//!   singletons first: a singleton states its var's range exactly and pins
+//!   the var before a multi-term row deduces anything about it.
 //! * Whatever presolve drops or rewrites, the answer is still checked
 //!   against the row as written ([`Presolved::validation_rows`]), so a rule
 //!   that is wrong shows as a loud error at the boundary.
+//!
+//! [`row_violation`]: crate::solver::row_violation
 //!
 //! # Soundness by mode
 //!
@@ -224,6 +237,7 @@ pub(crate) fn presolve(
         elo: lo,
         ehi: hi,
         domains: var_domains,
+        constraints,
         mode,
         feas: feasibility,
         stats: PresolveStats {
