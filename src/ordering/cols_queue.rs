@@ -1,17 +1,5 @@
 //! [`ColsQueue`]: a bucket queue over column scores, so "the cheapest
-//! remaining column" is an O(1) lookup for both orderings.
-
-#[derive(Clone, Debug)]
-pub(super) struct Slice {
-    pub(super) begin: usize,
-    pub(super) end: usize,
-}
-
-impl Slice {
-    pub(super) fn elems<'a>(&self, storage: &'a [usize]) -> &'a [usize] {
-        &storage[self.begin..self.end]
-    }
-}
+//! remaining column" is an O(1) lookup for [`super::order_simple`].
 
 #[derive(Debug)]
 pub(super) struct ColsQueue {
@@ -19,7 +7,6 @@ pub(super) struct ColsQueue {
     prev: Vec<usize>,
     next: Vec<usize>,
     min_score: usize,
-    pub(super) len: usize,
 }
 
 impl ColsQueue {
@@ -29,12 +16,7 @@ impl ColsQueue {
             prev: vec![0; num_cols],
             next: vec![0; num_cols],
             min_score: num_cols,
-            len: 0,
         }
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.len
     }
 
     pub(super) fn pop_min(&mut self) -> Option<usize> {
@@ -55,7 +37,6 @@ impl ColsQueue {
 
     pub(super) fn add(&mut self, col: usize, score: usize) {
         self.min_score = std::cmp::min(self.min_score, score);
-        self.len += 1;
 
         if let Some(head) = self.score2head[score] {
             self.prev[col] = self.prev[head];
@@ -70,7 +51,6 @@ impl ColsQueue {
     }
 
     pub(super) fn remove(&mut self, col: usize, score: usize) {
-        self.len -= 1;
         if self.next[col] == col {
             self.score2head[score] = None;
         } else {

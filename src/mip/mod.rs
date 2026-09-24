@@ -178,7 +178,10 @@ pub(crate) fn candidate_variables_feasible(
 
 /// Cheap feasibility check of a value vector against base + fixes: bounds,
 /// domains, and every user-scale constraint row, under the same contract the
-/// solver's boundary applies ([`crate::solver::row_violation`]). This is a
+/// solver's boundary applies ([`crate::solver::row_violation`]). The bounds
+/// are the ones the solve works with, as `Problem` stores them (each bound
+/// from 2^52 on infinite, [`crate::solver::entry_bounds`]), so an incumbent
+/// the engine found beyond such a bound survives an edit. This is a
 /// warm-start prefilter; adoption re-validates the candidate through the
 /// active solver.
 pub(crate) fn incumbent_feasible(

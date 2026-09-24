@@ -101,6 +101,375 @@ mod regression_tests {
         }
     }
 
+    /// Issue #3 in the ratio test (C3-16 of the solver review): `max x` s.t.
+    /// `-3x + y <= 1`, `0 <= x <= f64::MAX`, `0 <= y <= 1` is unbounded, as
+    /// HiGHS reports it. The bound of `f64::MAX` was only kept out of the
+    /// starting vertex, so the primal simplex moved `x` onto it, the row's
+    /// activity overflowed, and the boundary reported
+    /// `InternalError("... violates constraint row 0 by inf")`. A bound at or
+    /// beyond 2^52 on its side of infinity is now infinite for the whole
+    /// solve.
+    #[test]
+    fn huge_bound_on_an_improving_ray_is_unbounded() {
+        for upper in [f64::MAX, 1e20, f64::INFINITY] {
+            for presolve in [true, false] {
+                let mut problem = Problem::new(OptimizationDirection::Maximize);
+                let x = problem.add_var(1.0, (0.0, upper));
+                let y = problem.add_var(0.0, (0.0, 1.0));
+                problem.add_constraint([(x, -3.0), (y, 1.0)], ComparisonOp::Le, 1.0);
+                let got = problem.solve_with(crate::SolveOptions {
+                    presolve,
+                    ..crate::SolveOptions::default()
+                });
+                assert_eq!(
+                    got.map(|_| "solved"),
+                    Err(crate::Error::Unbounded),
+                    "upper {upper:e}, presolve {presolve}"
+                );
+            }
+        }
+    }
+
+    /// The bound infinity is 2^52 (`INFINITE_BOUND`), not HiGHS's default
+    /// of 1e20, and this pins what that means on both sides of it: a bound
+    /// from 2^52 on is no bound at all, so `max x` with `x ≤ 5e15` is
+    /// unbounded (HiGHS at its default returns 5e15) and a solution can lie
+    /// beyond such a bound, while a bound below it binds. The reason for the
+    /// choice is the next test.
+    #[test]
+    fn a_bound_from_2_pow_52_is_infinite_and_one_below_binds() {
+        let two_52 = 2.0f64.powi(52);
+        for presolve in [true, false] {
+            let options = || crate::SolveOptions {
+                presolve,
+                ..crate::SolveOptions::default()
+            };
+            for upper in [
+                two_52,
+                5e15,
+                1e19,
+                i64::MAX as f64,
+                two_52 - 1.0,
+                4e15,
+                1e15,
+            ] {
+                let mut problem = Problem::new(OptimizationDirection::Maximize);
+                let x = problem.add_var(1.0, (0.0, upper));
+                let y = problem.add_var(0.0, (0.0, 1.0));
+                problem.add_constraint([(x, -3.0), (y, 1.0)], ComparisonOp::Le, 1.0);
+                let got = problem
+                    .solve_with(options())
+                    .map(|outcome| outcome.into_solution().unwrap()[x]);
+                let want = if upper >= two_52 {
+                    Err(crate::Error::Unbounded)
+                } else {
+                    Ok(upper)
+                };
+                assert_eq!(got, want, "upper {upper:e}, presolve {presolve}");
+            }
+            // The bound of 2^53 is infinite, so the row alone stops `x`.
+            let mut problem = Problem::new(OptimizationDirection::Maximize);
+            let x = problem.add_var(1.0, (0.0, 2.0 * two_52));
+            problem.add_constraint([(x, 1.0)], ComparisonOp::Le, 1e16);
+            let solution = problem
+                .solve_with(options())
+                .unwrap()
+                .into_solution()
+                .unwrap();
+            assert_eq!(solution[x], 1e16, "presolve {presolve}");
+        }
+    }
+
+    /// Why the bound infinity is 2^52 and not 1e20: a bound in between that
+    /// stands for infinity, as `i64::MAX` does in issue #3, must not change
+    /// the answer, and it does once a var sits at it, since a row beside such
+    /// a value is held to the round-off of its magnitude, units at 2^52
+    /// (`INFINITE_BOUND` gives the measurement). `min x0 + x1 + 2 x2` s.t.
+    /// `x0 + 2 x1 + 2 x2 >= 9`, `x1 ∈ [4, 10]` has the optimum -1 with `x0`
+    /// and `x2` free; written with bounds of `±H` it came back -2, 16 or 0
+    /// with a threshold of 1e20, and issue #3's model with `z ≤ 5e15` or
+    /// `1e16` an `InternalError` (a row violated by 1 or 2 units).
+    #[test]
+    fn a_bound_from_2_pow_52_standing_for_infinity_keeps_the_answer() {
+        for h in [5e15, 1e16, 1e17, 1e19, i64::MAX as f64] {
+            for presolve in [true, false] {
+                let options = crate::SolveOptions {
+                    presolve,
+                    ..crate::SolveOptions::default()
+                };
+                let mut problem = Problem::new(OptimizationDirection::Minimize);
+                let x0 = problem.add_var(1.0, (-h, h));
+                let x1 = problem.add_var(1.0, (4.0, 10.0));
+                let x2 = problem.add_var(2.0, (-h, h));
+                problem.add_constraint([(x0, 1.0), (x1, 2.0), (x2, 2.0)], ComparisonOp::Ge, 9.0);
+                let objective = problem
+                    .solve_with(options.clone())
+                    .unwrap_or_else(|e| panic!("H {h:e}, presolve {presolve}: {e:?}"))
+                    .into_solution()
+                    .unwrap()
+                    .objective();
+                assert!(
+                    (objective + 1.0).abs() < 1e-9,
+                    "H {h:e}, presolve {presolve}: objective {objective}"
+                );
+
+                let mut problem = Problem::new(OptimizationDirection::Maximize);
+                let x = problem.add_var(50.0, (2.0, f64::INFINITY));
+                let y = problem.add_var(40.0, (0.0, 7.0));
+                let z = problem.add_var(45.0, (0.0, h));
+                problem.add_constraint([(x, 3.0), (y, 2.0), (z, 1.0)], ComparisonOp::Le, 20.0);
+                problem.add_constraint([(x, 2.0), (y, 1.0), (z, 3.0)], ComparisonOp::Le, 15.0);
+                let objective = problem
+                    .solve_with(options)
+                    .unwrap_or_else(|e| panic!("issue 3, z <= {h:e}, presolve {presolve}: {e:?}"))
+                    .into_solution()
+                    .unwrap()
+                    .objective();
+                assert!(
+                    (objective - 420.0).abs() < 1e-6,
+                    "issue 3, z <= {h:e}, presolve {presolve}: objective {objective}"
+                );
+            }
+        }
+    }
+
+    /// A var whose range lies beyond 2^52 (a lower bound of 5e15, or 2^52
+    /// itself) with an upper bound standing for infinity (`f64::MAX`,
+    /// `i64::MAX`, 1e20): `max x + y - 2z` s.t. `x + 2y - z <= 7`,
+    /// `-3x + y + z <= 1`, `y ∈ [0, 10]`, `z` free, has its optimum at `x`
+    /// on its lower bound, `y = 0` and `z = x - 7` (objective `14 - x`), and
+    /// its mirror (`min` with `x ∈ [-f64::MAX, -5e15]`) is infeasible. The
+    /// far bound stayed as written because the var's whole range lay beyond
+    /// the threshold, so the engine started `x` on it: at `f64::MAX` the
+    /// rows overflowed (a panic on a NaN in the primal ratio test, and
+    /// `InternalError("basis too ill-conditioned ...")` for the mirror), and
+    /// at `i64::MAX` or 1e20 the answer came back 14 short of the optimum
+    /// (found by the third review of R0; 1dcd664 solved all of them). Each
+    /// side of a range is now judged on its own, so the far bound is
+    /// infinite and the model is the one written with `f64::INFINITY`, to
+    /// the bit.
+    #[test]
+    fn a_var_beyond_2_pow_52_takes_its_far_bound_as_infinite() {
+        let two_52 = 2.0f64.powi(52);
+        let solve = |direction, (lo, hi): (f64, f64), milp: bool, presolve: bool| {
+            let mut problem = Problem::new(direction);
+            let x = problem.add_var(1.0, (lo, hi));
+            let y = problem.add_var(1.0, (0.0, 10.0));
+            let z = problem.add_var(-2.0, (f64::NEG_INFINITY, f64::INFINITY));
+            if milp {
+                let n = problem.add_integer_var(0.0, (0, 1));
+                problem.add_constraint([(n, 1.0)], ComparisonOp::Le, 1.0);
+            }
+            problem.add_constraint([(x, 1.0), (y, 2.0), (z, -1.0)], ComparisonOp::Le, 7.0);
+            problem.add_constraint([(x, -3.0), (y, 1.0), (z, 1.0)], ComparisonOp::Le, 1.0);
+            problem
+                .solve_with(crate::SolveOptions {
+                    presolve,
+                    ..crate::SolveOptions::default()
+                })
+                .map(|outcome| {
+                    let solution = outcome.into_solution().unwrap();
+                    (solution.objective(), solution[x], solution[y], solution[z])
+                })
+        };
+        for milp in [false, true] {
+            for presolve in [true, false] {
+                let case = |near: f64| format!("x >= {near:e}, milp {milp}, presolve {presolve}");
+                for near in [5e15, two_52] {
+                    let want = solve(
+                        OptimizationDirection::Maximize,
+                        (near, f64::INFINITY),
+                        milp,
+                        presolve,
+                    )
+                    .unwrap_or_else(|e| panic!("{}: {e:?}", case(near)));
+                    let (objective, x, y, z) = want;
+                    assert!(
+                        x == near
+                            && y == 0.0
+                            && (z - (near - 7.0)).abs() <= 1e-12 * near
+                            && (objective - (14.0 - near)).abs() <= 1e-12 * near,
+                        "{}: {want:?}",
+                        case(near)
+                    );
+                    for far in [f64::MAX, i64::MAX as f64, 1e20, f64::INFINITY] {
+                        let got =
+                            solve(OptimizationDirection::Maximize, (near, far), milp, presolve);
+                        assert_eq!(got, Ok(want), "{}, x <= {far:e}", case(near));
+                        let got = solve(
+                            OptimizationDirection::Minimize,
+                            (-far, -near),
+                            milp,
+                            presolve,
+                        );
+                        assert_eq!(
+                            got,
+                            Err(crate::Error::Infeasible),
+                            "mirror of {}, x >= {:e}",
+                            case(near),
+                            -far
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The other side of the per-side rule of the last test: only a bound
+    /// that leaves the var room toward it can stand for infinity. A var
+    /// fixed beyond 2^52 stays fixed (as `fix_var` fixes a var at a value
+    /// the solve reported there), and a range that is empty beyond it stays
+    /// infeasible, where making its far bound infinite would have turned
+    /// `x ∈ [5e15, 5e15]` into `x ≥ 5e15` and `x ∈ [6e15, 5e15]` into a
+    /// feasible var. Any other bound from 2^52 on its side of infinity is
+    /// infinite, also beside a bound out there: `max x` with
+    /// `x ∈ [5e15, 1e16]` is `Unbounded` as with `x ∈ [0, 1e16]` (the band
+    /// trade-off of `a_bound_from_2_pow_52_is_infinite_and_one_below_binds`;
+    /// 1dcd664 returned 1e16). Each case is also run in its mirror image
+    /// (`x → -x`: the bounds negated and swapped, `x`'s coefficients
+    /// negated), where a lower bound is the one that could be taken for
+    /// infinity.
+    #[test]
+    fn a_var_fixed_or_empty_beyond_2_pow_52_keeps_its_bounds() {
+        use crate::Error::{Infeasible, Unbounded};
+        use OptimizationDirection::{Maximize, Minimize};
+        let two_52 = 2.0f64.powi(52);
+        for milp in [false, true] {
+            for presolve in [true, false] {
+                // `x + y` s.t. `x + y >= 1`, `y ∈ [0, 10]`, `x ∈ [lo, hi]`,
+                // and with `mirror` the same model in `x' = -x`: the answer
+                // is `x' = -x`, and an outcome without one the same.
+                let solve = |direction, (lo, hi): (f64, f64), mirror: bool| {
+                    let (sign, lo, hi) = if mirror {
+                        (-1.0, -hi, -lo)
+                    } else {
+                        (1.0, lo, hi)
+                    };
+                    let mut problem = Problem::new(direction);
+                    let x = problem.add_var(sign, (lo, hi));
+                    let y = problem.add_var(1.0, (0.0, 10.0));
+                    if milp {
+                        let n = problem.add_integer_var(0.0, (0, 1));
+                        problem.add_constraint([(n, 1.0)], ComparisonOp::Le, 1.0);
+                    }
+                    problem.add_constraint([(x, sign), (y, 1.0)], ComparisonOp::Ge, 1.0);
+                    problem
+                        .solve_with(crate::SolveOptions {
+                            presolve,
+                            ..crate::SolveOptions::default()
+                        })
+                        .map(|outcome| sign * outcome.into_solution().unwrap()[x])
+                };
+                for mirror in [false, true] {
+                    let case = format!("milp {milp}, presolve {presolve}, mirror {mirror}");
+                    for value in [two_52, 5e15, 1e20] {
+                        for direction in [Maximize, Minimize] {
+                            assert_eq!(
+                                solve(direction, (value, value), mirror),
+                                Ok(value),
+                                "{case}: {direction:?}, x fixed at {value:e}"
+                            );
+                        }
+                    }
+                    for (lo, hi) in [(6e15, 5e15), (f64::MAX, two_52)] {
+                        assert_eq!(
+                            solve(Maximize, (lo, hi), mirror),
+                            Err(Infeasible),
+                            "{case}: x in [{lo:e}, {hi:e}]"
+                        );
+                    }
+                    assert_eq!(
+                        solve(Maximize, (5e15, 1e16), mirror),
+                        Err(Unbounded),
+                        "{case}: max, x in [5e15, 1e16]"
+                    );
+                    assert_eq!(
+                        solve(Minimize, (5e15, 1e16), mirror),
+                        Ok(5e15),
+                        "{case}: min, x in [5e15, 1e16]"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Issue #3 through a basis reload (C4-16 of the solver review). Two
+    /// free vars written with `±f64::MAX` bounds were seeded at zero, but a
+    /// reload of a basis in which they are non-basic put them back at their
+    /// finite lower bound, `-f64::MAX`: here the reload of the root basis
+    /// after the warm-start hint is evaluated, after which `x + z` overflows
+    /// to `-inf` in `x + z <= 5`. The bounds are infinite for the whole solve
+    /// now, so every load puts the vars at zero.
+    #[test]
+    fn huge_bounds_stay_infinite_across_a_basis_reload() {
+        for presolve in [true, false] {
+            let mut problem = Problem::new(OptimizationDirection::Minimize);
+            let n = problem.add_integer_var(1.0, (0, 10));
+            let x = problem.add_var(0.0, (-f64::MAX, f64::MAX));
+            let z = problem.add_var(0.0, (-f64::MAX, f64::MAX));
+            problem.add_constraint([(n, 1.0)], ComparisonOp::Ge, 1.5);
+            problem.add_constraint([(x, 1.0), (z, 1.0)], ComparisonOp::Le, 5.0);
+            let options = crate::SolveOptions {
+                presolve,
+                warm_start: Some(vec![(n, 2.0)]),
+                ..crate::SolveOptions::default()
+            };
+            let sol = problem
+                .solve_with(options)
+                .unwrap_or_else(|e| panic!("presolve {presolve}: {e:?}"))
+                .into_solution()
+                .unwrap();
+            assert_eq!(sol.objective(), 2.0, "presolve {presolve}");
+            assert!(
+                sol[x].abs() < 1e10 && sol[z].abs() < 1e10 && sol[x] + sol[z] <= 5.0 + 1e-7,
+                "presolve {presolve}: x = {:e}, z = {:e}",
+                sol[x],
+                sol[z]
+            );
+        }
+    }
+
+    /// `fix_var` accepts a value the solve reported (issue #47's contract)
+    /// when it lies beyond a bound from 2^52 on, which the solve takes as
+    /// infinite: `x ≤ 5e15` is no bound, the row stops `x` at 1e16, and
+    /// fixing `x` there restates the answer. The MIP path checked the fix
+    /// against the bound as written and refused it as `Infeasible`, where
+    /// the LP path, checking against the engine's bounds, accepted it (found
+    /// by the second review of R0). The bound is now made infinite where the
+    /// var is added, so no check can see it as written.
+    #[test]
+    fn fix_var_accepts_a_reported_value_beyond_a_bound_from_2_pow_52() {
+        for milp in [false, true] {
+            for presolve in [true, false] {
+                let mut problem = Problem::new(OptimizationDirection::Maximize);
+                let x = problem.add_var(1.0, (0.0, 5e15));
+                if milp {
+                    let n = problem.add_integer_var(0.0, (0, 1));
+                    problem.add_constraint([(n, 1.0)], ComparisonOp::Le, 1.0);
+                }
+                problem.add_constraint([(x, 1.0)], ComparisonOp::Le, 1e16);
+                let solution = problem
+                    .solve_with(crate::SolveOptions {
+                        presolve,
+                        ..crate::SolveOptions::default()
+                    })
+                    .unwrap()
+                    .into_solution()
+                    .unwrap();
+                let value = solution[x];
+                assert_eq!(value, 1e16, "milp {milp}, presolve {presolve}");
+                let refixed = solution
+                    .fix_var(x, value)
+                    .unwrap_or_else(|e| {
+                        panic!("milp {milp}, presolve {presolve}: fix_var(x, {value:e}) gave {e:?}")
+                    })
+                    .into_solution()
+                    .unwrap();
+                assert_eq!(refixed[x], 1e16, "milp {milp}, presolve {presolve}");
+            }
+        }
+    }
+
     /// <https://github.com/Specy/microlp/issues/42>: an always-feasible integer
     /// model must solve no matter how large `x`'s upper bound is. The only
     /// feasible point of `3x + 2y = 5` with `x` integer and `y ∈ [0, 1]` is

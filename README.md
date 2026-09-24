@@ -70,6 +70,14 @@ let y = problem.add_integer_var(1.0, (-10, 10));    // integer, -10 <= y <= 10
 let z = problem.add_binary_var(2.0);                // boolean: 0 or 1
 ```
 
+A bound of magnitude 2^52 (about 4.5e15) or more on its side of infinity is
+treated as infinite, so an upper bound of `f64::MAX` or `i64::MAX` means no
+upper bound. A bound that large meant as a real bound is therefore not one,
+and a solution can lie beyond it. Each bound is judged on its own, so
+`(5e15, f64::MAX)` means `x >= 5e15`; only bounds with `min >= max` are kept
+as given, so a variable fixed at such a value stays fixed and an empty range
+stays infeasible.
+
 The left-hand side of a constraint can be given as a slice of
 `(variable, coefficient)` pairs, as any iterator of such pairs, or as a
 `LinearExpr` built term by term:
@@ -195,8 +203,8 @@ let outcome = problem.solve_with(options)?;
 * `warm_start`: a starting assignment (it may cover only some variables).
   A good one gives the solver an immediate solution to improve on. It is
   advisory: if it isn't usable it is ignored.
-* `int_tol`, `tolerances`: numeric tolerances. Values must be finite and non-negative, and the two integrality
-  tolerances must be below `0.5`.
+* `int_tol`, `tolerances`: numeric tolerances. Values must be finite and non-negative, the feasibility
+  tolerance at least `1e-10`, and the two integrality tolerances below `0.5`.
 
 ## Changing a solved problem
 

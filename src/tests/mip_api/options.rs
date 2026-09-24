@@ -244,3 +244,34 @@ fn invalid_gap_and_expert_tolerances_are_rejected() {
         assert_invalid("tolerances.prune_epsilon", options);
     }
 }
+
+/// A feasibility tolerance below HiGHS's minimum of 1e-10 is rejected (C4-35
+/// of the solver review): at zero the engine holds every bound at zero
+/// exactly and every row to the bare round-off of evaluating it. The minimum
+/// itself is accepted, on the LP and the MILP path.
+#[test]
+fn feasibility_tolerance_below_the_minimum_is_rejected() {
+    for integer in [false, true] {
+        let solve = |feasibility: f64| {
+            let mut p = Problem::new(OptimizationDirection::Maximize);
+            let x = if integer {
+                p.add_integer_var(1.0, (0, 10))
+            } else {
+                p.add_var(1.0, (0.0, 10.0))
+            };
+            p.add_constraint([(x, 2.0)], ComparisonOp::Le, 9.0);
+            let mut options = SolveOptions::default();
+            options.tolerances.feasibility = feasibility;
+            p.solve_with(options)
+        };
+        for value in [0.0, 1e-11, 9.99e-11] {
+            let err = solve(value).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidOptions(message) if message.contains("tolerances.feasibility")),
+                "unexpected error for feasibility={value}, integer {integer}: {err}"
+            );
+        }
+        let solution = solve(1e-10).unwrap().into_solution().unwrap();
+        assert_eq!(solution.objective(), if integer { 4.0 } else { 4.5 });
+    }
+}
