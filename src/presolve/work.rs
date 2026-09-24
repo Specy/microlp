@@ -8,8 +8,10 @@
 
 use super::model::{is_int_domain, term_range, Activity, Mode, PresolveStats, Row};
 use super::params::*;
-use crate::solver::{bound_tolerance, row_tolerance, ROUNDOFF_FLOOR, ROW_BUDGET_SHARE};
-use crate::{Error, VarDomain};
+use crate::solver::{
+    bound_tolerance, row_tolerance, row_violation, ROUNDOFF_FLOOR, ROW_BUDGET_SHARE,
+};
+use crate::{ComparisonOp, CsVec, Error, VarDomain};
 
 /// Bound state and reduction context. Rows live OUTSIDE this struct so the
 /// hot passes can hold a row borrow and mutate bounds at the same time —
@@ -23,6 +25,9 @@ pub(crate) struct Work<'a> {
     pub(crate) elo: Vec<f64>,
     pub(crate) ehi: Vec<f64>,
     pub(crate) domains: &'a [VarDomain],
+    /// The input rows as written (indexed by [`Row::orig`]): what the
+    /// boundary checks a dropped row against.
+    pub(crate) constraints: &'a [(CsVec, ComparisonOp, f64)],
     pub(crate) mode: Mode,
     /// The user's absolute feasibility tolerance (`Tolerances::feasibility`).
     pub(crate) feas: f64,
@@ -339,17 +344,27 @@ impl Work<'_> {
         Ok(false)
     }
 
-    /// Whether an all-substituted row holds at the substituted values within
-    /// the engine's budget: what remains of `lo`/`hi` after the shifts is
-    /// the residual, judged at the magnitude of what was folded.
+    /// Whether an all-substituted row holds at the values its vars are fixed
+    /// at, judged exactly as the boundary judges it once it is dropped: the
+    /// row as written, evaluated at those values by [`row_violation`] (with
+    /// which `Solver::first_violated_row` checks the rows presolve dropped),
+    /// against the full contract. That is the verdict [`trivial_row_verdict`]
+    /// gives an empty input row, and since it is the boundary's own
+    /// evaluation, there is no round-off of evaluating the row again to allow
+    /// for. Nothing the engine does can move such a row, so the engine's
+    /// budget has no part in it: held to the budget, a forcing row's fixing
+    /// left `-100 x1 = 0` a residual of 9.3e-8, within the 1e-7 the boundary
+    /// accepts, and the feasible model was declared infeasible. (HiGHS
+    /// judges an empty row at the full `primal_feastol`, `checkRowInfeasible`
+    /// and the empty-row removal in highs/presolve/HPresolve.cpp.) A var the
+    /// row keeps with a zero coefficient is not fixed and adds a zero term at
+    /// whatever value it gets.
+    ///
+    /// [`trivial_row_verdict`]: crate::solver::trivial_row_verdict
     fn empty_row_consistent(&self, row: &Row) -> bool {
-        let side = if row.lo.is_finite() {
-            row.rhs_mag(row.lo)
-        } else {
-            row.rhs_mag(row.hi)
-        };
-        let budget = self.budget(side + row.fold_scale);
-        row.lo <= budget && row.hi >= -budget
+        let (coeffs, op, rhs) = &self.constraints[row.orig as usize];
+        let value = |v: usize| if self.fixed(v) { self.elo[v] } else { 0.0 };
+        row_violation(coeffs, *op, *rhs, value, self.feas).is_none()
     }
 
     /// An all-substituted row: consistent (drop) or a proof of infeasibility.
@@ -524,12 +539,45 @@ impl Work<'_> {
 
     /// One wave of the primal worklist: process every row queued so far;
     /// rows whose inputs change during the wave land in the next wave.
+    ///
+    /// The rows left with at most one term go first, in queue order, then
+    /// the others, as HiGHS's `fastPresolveLoop` runs `removeRowSingletons`
+    /// before `presolveChangedRows` (highs/presolve/HPresolve.cpp). A
+    /// singleton row states its var's range exactly, while a multi-term row
+    /// deduces from bounds; processed first, the singleton pins its var
+    /// before a forcing row can fix it at another bound that its own row
+    /// allows only within the row's tolerance (`x1 + 100 x4 = 8388700` fixed
+    /// `x1` at its lower bound `-9.3e-10` before `-100 x1 = 0` could pin it
+    /// at zero). A multi-term row that loses terms to the singletons'
+    /// fixings in the same wave is still processed in it, as the singleton
+    /// it has become if it has.
     pub(crate) fn primal_wave(&mut self, rows: &mut [Row]) -> Result<(), Error> {
         let wave = std::mem::take(&mut self.queue);
+        let mut multi_term = Vec::with_capacity(wave.len());
         for &r in &wave {
             let r = r as usize;
+            if !rows[r].alive {
+                self.dirty[r] = false;
+                continue;
+            }
+            self.fold_fixed(&mut rows[r]);
+            if rows[r].vars.len() > 1 {
+                // Still queued (dirty) for the second pass of this wave: a
+                // change to its vars before then needs no requeue.
+                multi_term.push(r);
+                continue;
+            }
             // Clear before processing: a change made while processing this
             // very row (its own var tightened) legitimately requeues it.
+            self.dirty[r] = false;
+            if rows[r].vars.is_empty() {
+                self.empty_row_check(&mut rows[r])?;
+            } else {
+                let other = self.other_coeff(rows, rows[r].vars[0], r);
+                self.singleton_row(&mut rows[r], other)?;
+            }
+        }
+        for r in multi_term {
             self.dirty[r] = false;
             if !rows[r].alive {
                 continue;

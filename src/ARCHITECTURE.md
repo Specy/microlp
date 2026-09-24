@@ -645,6 +645,12 @@ share of the absolute tolerance, over the coefficient) is room nothing resolves;
 conversion is skipped when the round-off it moves into the var, amplified by the var's
 coefficient in another row, would exceed that row's budget (the two rows disagree at the
 level of their own round-off; only the simplex, which balances both, resolves that).
+A row all of whose vars are fixed is judged as the boundary will judge it once dropped: the
+row as written, at the fixed values, by the boundary's own evaluation (`row_violation`),
+against the full contract (nothing the engine does moves such a row, so the budget has no
+part in it). Each wave of the worklist processes the rows left with at most one term first,
+as HiGHS's fast presolve loop removes row singletons first, so a singleton pins its var
+before a multi-term row deduces anything about it.
 Infeasibility is declared only when no point the engine could accept exists. The rows
 presolve dropped or rewrote stay with the engine for the checks at the boundary (§3.1),
 so a reduction that is wrong at the level of the tolerances shows as a loud error, never
@@ -703,14 +709,20 @@ the models these searches found and moved one into the second class:
   columns by slacks and continuing, as HiGHS and CLP do);
 - the primal ratio test's round-off scale is its column's largest entry, so a genuine blocking
   entry below `ENTRY_ROUNDOFF` of a huge entry in rows that cannot block counts as noise and a
-  bounded LP can come back `Unbounded` (pinned with a constructed basis in `src/solver/tests.rs`);
+  bounded LP can come back `Unbounded` (found by reading, and pinned with a constructed basis in
+  `src/solver/tests.rs`);
   a scale over the blocking rows alone pivots on round-off instead, since the rows of one column
   share the round-off of one solve, so this needs an absolute pivot tolerance and a refined
   column rather than another relative floor;
 - a degenerate dual simplex can cycle: there is no cost perturbation and no iteration bound, so
   without a time limit such a solve does not return;
 - presolve's forcing-row rule can fix a var at a bound its row allows within the row's
-  tolerance while another row pins it elsewhere, reporting a feasible model `Infeasible`.
+  tolerance while another row pins it elsewhere, reporting a feasible model `Infeasible`. The
+  instance found by the properties is fixed (a singleton row now goes first and pins the var,
+  and a row whose vars are all fixed is judged at the full contract); the class remains where
+  the pinning row has other terms and its coefficient amplifies the forcing row's slack beyond
+  the contract (`-1000 x1 + x4 / 1000 = 83.887` beside `x1 + 100 x4 = 8388700`, pinned in
+  `src/tests/magnitudes.rs`).
 
 The convention for such models is to pin each as a `#[should_panic]` test named
 `..._is_a_known_limitation` in `src/tests/magnitudes.rs` (beside the engine's unit tests when
@@ -719,7 +731,7 @@ as a change fixes it**, which is the signal to drop the attribute and keep the m
 ordinary regression test. Three models were pinned this way and all three were fixed (a
 presolve forcing rule that fixed a var its row could not resolve, a recompute of the basic
 values that counted as a verification, and the dual ratio test's reading of "no pivot" as
-infeasibility); one is pinned today, the primal ratio test's scale above. The wide-coefficient MILP property stays `#[ignore]`d while the classes
+infeasibility); two are pinned today, the primal ratio test's scale and the forcing row above. The wide-coefficient MILP property stays `#[ignore]`d while the classes
 above stand (a random search cannot assert its own failure); run it with
 `cargo test --lib -- --ignored`.
 

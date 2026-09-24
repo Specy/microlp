@@ -718,7 +718,7 @@ impl Solver {
             .iter()
             .enumerate()
             .find_map(|(k, (coeffs, op, rhs))| {
-                row_violation(coeffs, *op, *rhs, values, self.feasibility)
+                row_violation(coeffs, *op, *rhs, |v| values[v], self.feasibility)
                     .map(|violation| (self.num_constraints() + k, violation))
             })
     }

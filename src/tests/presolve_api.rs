@@ -507,4 +507,47 @@ mod tests_presolve_api {
             assert!((sol[x0] - 13421773.0).abs() < 1e-6, "x0 = {}", sol[x0]);
         }
     }
+
+    /// A row whose vars presolve fixed is judged against the full contract,
+    /// as an empty input row is and as the boundary checks the dropped row,
+    /// not against the engine's half (C5-18). The forcing row
+    /// `x1 + 100 x4 = 8388700` fixes `x1` at its lower bound `-2^-30` and
+    /// `x4` at 83887, which leaves `-100 x1 + x4 / 1000 = 83.887` a residual
+    /// of 9.3e-8: within the 1e-7 the answer is held to, and presolve,
+    /// holding it to 5e-8, declared the model infeasible. (Without presolve
+    /// the engine puts `x1` at zero.)
+    #[test]
+    fn all_substituted_row_is_judged_at_the_full_contract() {
+        init();
+        let mut p = Problem::new(OptimizationDirection::Maximize);
+        let x1 = p.add_var(-1.0, (-2.0f64.powi(-30), 1.0));
+        let x4 = p.add_var(1.0, (83887.0, 83888.0));
+        p.add_constraint(&[(x1, -1.0), (x4, -100.0)], ComparisonOp::Eq, -8388700.0);
+        p.add_constraint(&[(x1, -100.0), (x4, 1e-3)], ComparisonOp::Eq, 83.887);
+        let sol = assert_same_objective(&p);
+        assert_eq!(sol[x4], 83887.0);
+    }
+
+    /// Singleton rows go first in each wave, as in HiGHS's fast presolve
+    /// loop (C5-25). Processed in index order, the forcing row
+    /// `x1 + 100 x4 = 8388700` came first and fixed `x1` at its lower bound
+    /// `-2^-30`, which `-100 x1 = 0` then held to half its contract (see
+    /// the test above) and declared infeasible; taken first, the singleton
+    /// pins `x1` at zero and the other row becomes a singleton in `x4`.
+    /// Found by the wide-coefficient MILP property.
+    #[test]
+    fn singleton_row_is_processed_before_a_forcing_row() {
+        init();
+        let mut p = Problem::new(OptimizationDirection::Maximize);
+        let _x0 = p.add_integer_var(0.0, (0, 0));
+        let x1 = p.add_var(-1.0, (-2.0f64.powi(-30), 1.0));
+        let _x2 = p.add_var(0.0, (0.0, 0.0));
+        let _x3 = p.add_var(-1.0, (0.0, 0.0));
+        let x4 = p.add_var(1.0, (83887.0, 83888.0));
+        p.add_constraint(&[(x1, -1.0), (x4, -100.0)], ComparisonOp::Eq, -8388700.0);
+        p.add_constraint(&[(x1, -100.0)], ComparisonOp::Eq, -0.0);
+        let sol = solution(p.solve_with(SolveOptions::default()));
+        assert_eq!((sol[x1], sol[x4]), (0.0, 83887.0));
+        assert_same_objective(&p);
+    }
 }
