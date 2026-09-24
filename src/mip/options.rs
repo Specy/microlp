@@ -97,11 +97,13 @@ impl SolveOptions {
                 "invalid SolveOptions.int_tol: expected a finite value in [0, 0.5)".to_string(),
             ));
         }
-        if !self.tolerances.feasibility.is_finite() || self.tolerances.feasibility < 0.0 {
-            return Err(Error::InvalidOptions(
-                "invalid SolveOptions.tolerances.feasibility: expected a finite non-negative value"
-                    .to_string(),
-            ));
+        if !self.tolerances.feasibility.is_finite()
+            || self.tolerances.feasibility < MIN_FEASIBILITY_TOLERANCE
+        {
+            return Err(Error::InvalidOptions(format!(
+                "invalid SolveOptions.tolerances.feasibility: expected a finite value of at least \
+                 {MIN_FEASIBILITY_TOLERANCE:e}"
+            )));
         }
         if !self.tolerances.integrality_rounding.is_finite()
             || !(0.0..0.5).contains(&self.tolerances.integrality_rounding)
@@ -151,6 +153,14 @@ impl ResumeOptions {
     }
 }
 
+/// The smallest accepted [`Tolerances::feasibility`], HiGHS's minimum for its
+/// feasibility tolerances (`kMinimumKktTolerance`, highs/lp_data/HConst.h).
+/// Below it the tolerance stops being a tolerance: at zero every bound at
+/// zero is held exactly and every row to the bare round-off of its
+/// evaluation, so a basic value computed a few ulps off a bound is infeasible
+/// and the simplex pivots on round-off.
+const MIN_FEASIBILITY_TOLERANCE: f64 = 1e-10;
+
 /// Numeric tolerances for a solve (see [`SolveOptions::tolerances`]).
 ///
 /// This options override the solver's tolerances when solving the problem.
@@ -166,7 +176,7 @@ pub struct Tolerances {
     /// candidate before it is accepted as the incumbent, a pure-LP solution
     /// before it is returned, and, in the post-edit warm-start pre-filter,
     /// whether a previous incumbent survives a [`crate::Solution`] edit.
-    /// Must be finite and non-negative. Default `1e-7`.
+    /// Must be finite and at least `1e-10`. Default `1e-7`.
     pub feasibility: f64,
     /// Distance from the nearest integer within which an integer/boolean
     /// variable's value is still treated as exactly that integer. Used by

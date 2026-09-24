@@ -1,15 +1,13 @@
-//! Column orderings for the LU factorization, plus the structural analyses
-//! built on the same sparsity pattern.
-//!
-//! * [`order_simple`] — order by column size; cheap, used as the fallback.
-//! * [`colamd`] — approximate minimum degree, kept for when the solver
-//!   switches orderings.
-//! * [`cols_queue`] — the bucket queue both orderings pick columns from.
-//! * [`matching`] — diagonal matching and lower block triangular form.
+//! The column ordering of the LU factorization: [`order_simple`], which takes
+//! the columns by their number of entries, the sparsest first, out of the
+//! bucket queue in [`cols_queue`]. `lu_factorize` uses it for every
+//! factorization. (The COLAMD ordering, diagonal matching and block
+//! triangular form minilp carried here were never called and are gone; the
+//! references' factorizations get their sparsity from a singleton phase and
+//! a Markowitz search instead, the place to start if the ordering is ever
+//! improved.)
 
-mod colamd;
 mod cols_queue;
-mod matching;
 
 use cols_queue::ColsQueue;
 

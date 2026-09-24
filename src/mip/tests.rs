@@ -345,6 +345,29 @@ fn incumbent_feasible_row_tolerance_is_absolute_not_relative_to_rhs() {
     ));
 }
 
+/// The prefilter judges the bounds the solve works with: a bound from 2^52
+/// on is infinite there, so the engine's answer can lie beyond it (here
+/// `x = 1e16` with `x <= 2^53`, the row alone stopping `x`), and such an
+/// incumbent was dropped as a warm-start hint after an edit because the
+/// prefilter compared it with the bound as written.
+#[test]
+fn incumbent_feasible_takes_a_bound_from_2_pow_52_as_infinite() {
+    let mut p = Problem::new(OptimizationDirection::Maximize);
+    let x = p.add_var(1.0, (0.0, 2.0f64.powi(53)));
+    let n = p.add_integer_var(0.0, (0, 1));
+    p.add_constraint(&[(x, 1.0)], ComparisonOp::Le, 1e16);
+    let fixed = BTreeMap::new();
+    let tolerances = Tolerances::default();
+    let solution = p.solve().unwrap().into_solution().unwrap();
+    assert_eq!(solution[x], 1e16);
+    assert!(incumbent_feasible(
+        &p,
+        &fixed,
+        &[solution[x], solution[n]],
+        &tolerances
+    ));
+}
+
 #[test]
 fn candidate_validation_rejects_non_finite_and_malformed_values() {
     let mut problem = Problem::new(OptimizationDirection::Minimize);

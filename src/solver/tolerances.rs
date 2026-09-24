@@ -301,6 +301,16 @@ pub(crate) fn dual_tol(magnitude: f64) -> f64 {
     EPS.max(ROUNDOFF_FLOOR * magnitude)
 }
 
+/// The smallest value a dual steepest-edge weight `||e_r^T B^-1||^2` is
+/// updated to (HiGHS's `kMinDualSteepestEdgeWeight`,
+/// highs/simplex/SimplexConst.h, applied in
+/// `HEkk::updateDualSteepestEdgeWeights`). The weights are only a pricing
+/// measure, so the floor decides nothing about feasibility; it keeps a weight
+/// the update has driven to zero or below (from the underestimate a basis
+/// load resets every weight to) from making its row dominate the choice or
+/// never be chosen.
+pub(crate) const MIN_DUAL_EDGE_WEIGHT: f64 = 1e-4;
+
 /// How often (in simplex iterations) the primal/dual loops in `optimize` and
 /// `restore_feasibility` check the deadline and emit a progress `debug!` log.
 /// Checking every iteration would make the deadline check itself a

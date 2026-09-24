@@ -225,3 +225,27 @@ fn lu_rand() {
         assert!(diff.norm(1.0) < 1e-5);
     }
 }
+
+/// A basis with an empty column is singular, and that is the answer with
+/// trace logging on too: the trace of the matrix's excess entries,
+/// `nnz - size`, ran before the empty-column check and underflowed (a panic
+/// in a debug build).
+#[test]
+fn lu_empty_column_is_singular_with_trace_logging() {
+    init();
+    let mat = mat_from_triplets(3, 3, &[(0, 0, 1.0), (1, 1, 1.0)]);
+    let previous = log::max_level();
+    log::set_max_level(log::LevelFilter::Trace);
+    let res = std::panic::catch_unwind(|| {
+        let mut scratch = ScratchSpace::with_capacity(3);
+        lu_factorize(
+            3,
+            |c| mat.outer_view(c).unwrap().into_raw_storage(),
+            0.9,
+            &mut scratch,
+        )
+        .map(|_| ())
+    });
+    log::set_max_level(previous);
+    assert_eq!(res.unwrap(), Err(Error::SingularMatrix));
+}

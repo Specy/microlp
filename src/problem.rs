@@ -78,7 +78,13 @@ impl Problem {
     ///
     /// `obj_coeff` is the variable's coefficient in the objective. `min` and
     /// `max` are inclusive bounds; use [`f64::NEG_INFINITY`] or
-    /// [`f64::INFINITY`] for an unbounded side.
+    /// [`f64::INFINITY`] for an unbounded side. A bound of magnitude 2^52
+    /// (about 4.5e15) or more on its side of infinity (`min <= -2^52`,
+    /// `max >= 2^52`) is treated as infinite, so `f64::MAX` works like
+    /// [`f64::INFINITY`], and a solution may lie beyond such a bound. Each
+    /// bound is judged on its own: `(5e15, f64::MAX)` means `x >= 5e15`.
+    /// Only bounds with `min >= max` are kept as given, so a variable fixed
+    /// at such a value stays fixed and an empty range stays infeasible.
     pub fn add_var(&mut self, obj_coeff: f64, (min, max): (f64, f64)) -> Variable {
         self.internal_add_var(obj_coeff, (min, max), VarDomain::Real)
     }
@@ -106,6 +112,15 @@ impl Problem {
         self.internal_add_var(obj_coeff, (0.0, 1.0), VarDomain::Boolean)
     }
 
+    /// Record a var. Its bounds are stored as the solve takes them, each
+    /// bound at or beyond 2^52 on its side of infinity made infinite, a
+    /// point or empty range kept as written
+    /// ([`crate::solver::entry_bounds`]), as HiGHS's `assessBounds` writes
+    /// them into its model when one is passed or columns are added
+    /// (highs/lp_data/HighsLpUtils.cpp, HighsInterface.cpp): every later
+    /// reader (presolve, the engine, the MIP's base problem, the post-edit
+    /// incumbent prefilter, `Solution::fix_var`'s check) sees the one set of
+    /// bounds, and none can compare a value with a bound as written.
     fn internal_add_var(
         &mut self,
         obj_coeff: f64,
@@ -117,6 +132,7 @@ impl Problem {
             OptimizationDirection::Minimize => obj_coeff,
             OptimizationDirection::Maximize => -obj_coeff,
         };
+        let (min, max) = crate::solver::entry_bounds(min, max);
         self.obj_coeffs.push(obj_coeff);
         self.var_mins.push(min);
         self.var_maxs.push(max);

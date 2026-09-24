@@ -132,6 +132,10 @@ pub fn lu_factorize<'a>(
     //
     // https://ecommons.cornell.edu/bitstream/handle/1813/6623/86-783.pdf
 
+    // The ordering rejects an empty column (a singular matrix), after which
+    // every column has an entry and the excess below cannot underflow.
+    let col_perm = super::ordering::order_simple(size, |c| get_col(c).0)?;
+
     let mat_nnz = (0..size).map(|c| get_col(c).0.len()).sum::<usize>();
     trace!(
         "lu_factorize: starting, matrix size: {}, nnz: {} (excess: {})",
@@ -139,8 +143,6 @@ pub fn lu_factorize<'a>(
         mat_nnz,
         mat_nnz - size,
     );
-
-    let col_perm = super::ordering::order_simple(size, |c| get_col(c).0)?;
 
     let mut orig_row2elt_count = vec![0; size];
     for col_rows in (0..size).map(|c| get_col(c).0) {

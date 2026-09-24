@@ -14,8 +14,10 @@
 //! See §7 of `ARCHITECTURE.md`. Three fixtures were pinned this way and all
 //! three were fixed: a presolve forcing rule, a skipped verification, and a
 //! dual ratio test that took "no pivot" for a proof of infeasibility (the
-//! `wide_chain` fixtures). One is pinned today: a forcing row whose fixing
-//! another row can tell apart.
+//! `wide_chain` fixtures). Three are pinned today: a forcing row whose fixing
+//! another row can tell apart, the row tolerance a var leaves behind at a
+//! huge bound, and a fixed var's huge coefficient in a row added after the
+//! fix.
 
 #[cfg(test)]
 mod regression_tests {
@@ -645,6 +647,132 @@ mod regression_tests {
                 (solution[f], solution[y], solution.objective()),
                 (0.0, 1.0, 1.0),
                 "presolve {presolve}"
+            );
+        }
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the model above through the LP
+    /// edit path (found by the second review of R0). `min y` s.t. `f + y >= 0`,
+    /// `f ∈ [0, 10]`, then `fix_var(f, 0)` and
+    /// `add_constraint(1e17 f + y >= 1)`: the added row leaves the now fixed
+    /// `f` out of its equilibration, so the dual ratio test meets `[1e17, 1]`
+    /// again, but the round-off scale leaves out only the columns fixed when
+    /// the solve began, so `f`'s entry sets a floor of 100, `y`'s exact
+    /// entry of one is "noise", and the edit comes back `Infeasible` (the
+    /// answer is `y = 1`), with presolve on and off, as at 1dcd664. The MIP
+    /// path rebuilds the model with `f` fixed from the start and solves it.
+    /// Which columns a row left out of its equilibration differs from row to
+    /// row once rows are added; this wants the absolute pivot tolerances of
+    /// R3, not another per-column flag.
+    #[test]
+    #[should_panic(expected = "the edit returned Infeasible")]
+    fn a_fixed_vars_huge_coefficient_in_an_added_row_is_a_known_limitation() {
+        for presolve in [true, false] {
+            let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+            let f = problem.add_var(0.0, (0.0, 10.0));
+            let y = problem.add_var(1.0, (0.0, f64::INFINITY));
+            problem.add_constraint([(f, 1.0), (y, 1.0)], ComparisonOp::Ge, 0.0);
+            let solution = problem
+                .solve_with(SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                })
+                .unwrap()
+                .into_solution()
+                .unwrap()
+                .fix_var(f, 0.0)
+                .unwrap()
+                .into_solution()
+                .unwrap()
+                .add_constraint([(f, 1e17), (y, 1.0)], ComparisonOp::Ge, 1.0)
+                .unwrap_or_else(|e| panic!("presolve {presolve}: the edit returned {e:?}"))
+                .into_solution()
+                .unwrap();
+            assert_eq!(
+                (solution[f], solution[y]),
+                (0.0, 1.0),
+                "presolve {presolve}"
+            );
+        }
+    }
+
+    /// A row whose coefficients span thirty orders of magnitude keeps its
+    /// small genuine entry. `min -g + y` s.t. `big g + y >= 2 big`,
+    /// `g ∈ [0, 1]`, `y >= 0`: the optimum is `g = 1`, `y = big`. With the
+    /// column factors bounded to `2^±20`, as HiGHS bounds them (C4-14 of the
+    /// solver review), neither column could be scaled far enough and the
+    /// equilibrated row was `[1, 1.1e-18]` at `big = 1e30`: `y`'s entry lay
+    /// below the dual ratio test's round-off floor, `y` has no upper bound to
+    /// flip to, and the row came back as a proof of infeasibility (as an LP
+    /// with presolve on and off, and as a MILP with presolve off). HiGHS
+    /// never meets the row, since it refuses matrix entries of 1e15 or more;
+    /// this engine takes them, so its column factors are not bounded.
+    #[test]
+    fn a_row_spanning_thirty_orders_keeps_its_small_genuine_entry() {
+        for big in [3e27, 1e28, 1e30] {
+            for integer in [false, true] {
+                for presolve in [true, false] {
+                    let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+                    let g = if integer {
+                        problem.add_integer_var(-1.0, (0, 1))
+                    } else {
+                        problem.add_var(-1.0, (0.0, 1.0))
+                    };
+                    let y = problem.add_var(1.0, (0.0, f64::INFINITY));
+                    problem.add_constraint([(g, big), (y, 1.0)], ComparisonOp::Ge, 2.0 * big);
+                    let label = format!("big {big:e}, integer {integer}, presolve {presolve}");
+                    let solution = problem
+                        .solve_with(SolveOptions {
+                            presolve,
+                            ..SolveOptions::default()
+                        })
+                        .unwrap_or_else(|e| panic!("{label}: {e:?}"))
+                        .into_solution()
+                        .unwrap();
+                    assert_eq!(solution[g], 1.0, "{label}");
+                    assert!(
+                        (solution[y] - big).abs() <= 1e-12 * big,
+                        "{label}: y = {:e}",
+                        solution[y]
+                    );
+                }
+            }
+        }
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): a var that starts at a huge
+    /// finite bound leaves its rows held to the round-off of that magnitude
+    /// after it moves away. Issue #3's model with `z ≤ 1e15`, a real bound
+    /// below the bound infinity of 2^52: `z` starts at 1e15, where the rows'
+    /// tolerances are taken (about 2.5 in the scaled row), one dual pivot
+    /// brings it down to 1.375, and `3x + 2y + z ≤ 20`, violated by 1.375,
+    /// passes as feasible; the primal simplex then lets the row's slack
+    /// leave where it sits, off its bound, and the boundary reports
+    /// `InternalError("LP solution violates constraint row 0 by 1.375")`.
+    /// The same at 1dcd664, for bounds from about 3e14; it is why the bound
+    /// infinity is 2^52 and not HiGHS's 1e20 (`INFINITE_BOUND`).
+    #[test]
+    #[should_panic(expected = "violates constraint row 0")]
+    fn a_var_leaving_a_huge_bound_leaves_its_rows_tolerance_behind_is_a_known_limitation() {
+        for presolve in [true, false] {
+            let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+            let x = problem.add_var(50.0, (2.0, f64::INFINITY));
+            let y = problem.add_var(40.0, (0.0, 7.0));
+            let z = problem.add_var(45.0, (0.0, 1e15));
+            problem.add_constraint([(x, 3.0), (y, 2.0), (z, 1.0)], ComparisonOp::Le, 20.0);
+            problem.add_constraint([(x, 2.0), (y, 1.0), (z, 3.0)], ComparisonOp::Le, 15.0);
+            let solution = problem
+                .solve_with(SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                })
+                .unwrap()
+                .into_solution()
+                .unwrap();
+            assert!(
+                (solution.objective() - 420.0).abs() < 1e-6,
+                "presolve {presolve}: objective {}",
+                solution.objective()
             );
         }
     }

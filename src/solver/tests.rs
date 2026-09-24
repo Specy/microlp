@@ -86,6 +86,49 @@ fn try_new_rejects_nan_bound() {
     assert_eq!(res.unwrap_err(), Error::Infeasible);
 }
 
+/// `entry_bounds` judges each side of a range on its own: a bound at or
+/// beyond 2^52 on its side of infinity is infinite, whatever the other
+/// bound (a var living beyond the threshold kept a far bound of `f64::MAX`
+/// as written, and started on it), and a bound on the other side is data.
+/// Only a range that is a point or empty is kept as written, and a NaN
+/// bound stays NaN.
+#[test]
+fn entry_bounds_judges_each_side_on_its_own() {
+    let t = INFINITE_BOUND;
+    let (inf, max) = (f64::INFINITY, f64::MAX);
+    let cases = [
+        ((0.0, max), (0.0, inf)),
+        ((-max, 0.0), (-inf, 0.0)),
+        ((-max, max), (-inf, inf)),
+        ((0.0, t), (0.0, inf)),
+        ((-t, 0.0), (-inf, 0.0)),
+        ((0.0, t - 1.0), (0.0, t - 1.0)),
+        ((1.0 - t, 0.0), (1.0 - t, 0.0)),
+        // The range lies beyond the threshold: the far side is infinite,
+        // the near side a bound.
+        ((5e15, max), (5e15, inf)),
+        ((t, 1e20), (t, inf)),
+        ((5e15, 1e16), (5e15, inf)),
+        ((-max, -5e15), (-inf, -5e15)),
+        ((-(i64::MAX as f64), -t), (-inf, -t)),
+        ((max, inf), (max, inf)),
+        // A point or an empty range is the var's value or a contradiction.
+        ((5e15, 5e15), (5e15, 5e15)),
+        ((-t, -t), (-t, -t)),
+        ((max, max), (max, max)),
+        ((6e15, 5e15), (6e15, 5e15)),
+        ((-5e15, -6e15), (-5e15, -6e15)),
+        ((max, -max), (max, -max)),
+        ((inf, inf), (inf, inf)),
+    ];
+    for ((min, max), want) in cases {
+        assert_eq!(entry_bounds(min, max), want, "[{min:e}, {max:e}]");
+    }
+    // A NaN bound stays NaN for the solve to refuse (`try_new_rejects_nan_bound`).
+    assert!(entry_bounds(f64::NAN, f64::MAX).0.is_nan());
+    assert!(entry_bounds(-f64::MAX, f64::NAN).1.is_nan());
+}
+
 /// Dense recalculations with pending etas must match a fresh factorization
 /// of the same basis. Values are compared per variable because reloading
 /// may reorder basis positions.
@@ -838,4 +881,141 @@ fn primal_ratio_test_scale_hides_a_blocking_entry_is_a_known_limitation() {
         sol.get_value(2)
     );
     assert!((sol.cur_obj_val + 8.0).abs() < 1e-9);
+}
+
+/// Dual steepest-edge weights are floored (C2-02, C2-03). A basis load
+/// resets every weight to one, an underestimate of `||e_1^T B^-1||^2 = 4.61`
+/// for `B = [[1, 0], [1.9, 1]]` (the basis `y`, `s1` of `y <= 3`,
+/// `1.9 y <= 10`); the dual pivot that repairs `y = 3 > 1` then updated the
+/// second row's weight to `1 - 1.9^2 = -2.61`, and a negative weight gives
+/// its row a negative score. Also: a weight that overflows, or that a NaN
+/// reaches, is the engine's error, not a panic (the floor once made a NaN
+/// weight finite, review of R0).
+#[test]
+fn dual_steepest_edge_weights_are_floored_after_a_basis_load() {
+    init();
+    let new_solver = || {
+        let mut sol = Solver::try_new(
+            &[-1.0],
+            &[0.0],
+            &[1.0],
+            &[
+                (to_sparse(&[1.0]), ComparisonOp::Le, 3.0),
+                (to_sparse(&[1.9]), ComparisonOp::Le, 10.0),
+            ],
+            &[VarDomain::Real],
+            None,
+            crate::Tolerances::default().feasibility,
+        )
+        .unwrap();
+        let basis = Basis(vec![VarStatus::Basic, VarStatus::AtLower, VarStatus::Basic]);
+        sol.load_basis(&basis).unwrap();
+        assert_eq!(sol.dual_edge_sq_norms, [1.0, 1.0]);
+        sol
+    };
+    let mut sol = new_solver();
+    assert_eq!(sol.reoptimize().unwrap(), StopReason::Finished);
+    assert_eq!(sol.get_value(0), 1.0);
+    assert!(
+        sol.dual_edge_sq_norms
+            .iter()
+            .all(|&w| w >= MIN_DUAL_EDGE_WEIGHT),
+        "weights {:?}",
+        sol.dual_edge_sq_norms
+    );
+
+    let mut sol = new_solver();
+    let (row, _) = sol.choose_pivot_row_dual().unwrap();
+    sol.calc_row_coeffs(row);
+    sol.calc_col_coeffs(0);
+    let entry = |sol: &Solver, r: usize| {
+        sol.col_coeffs
+            .iter()
+            .find_map(|(i, &c)| (i == r).then_some(c))
+            .unwrap_or(0.0)
+    };
+    let pivot_coeff = entry(&sol, row);
+    let mut planted = sol.clone();
+    assert!(matches!(
+        sol.update_dual_sq_norms(row, 1e-200),
+        Err(Error::InternalError(_))
+    ));
+    let other = 1 - row;
+    assert_ne!(entry(&planted, other), 0.0);
+    planted.dual_edge_sq_norms[other] = f64::NAN;
+    assert!(matches!(
+        planted.update_dual_sq_norms(row, pivot_coeff),
+        Err(Error::InternalError(_))
+    ));
+}
+
+/// Primal steepest-edge weights are floored at `1 + lambda^2`, a lower
+/// bound of the true weight, as HiGHS does (C3-06): planted, the weight of
+/// `x2` an underestimate far below its true value (as cancellation in the
+/// update can leave one), which the update of the first pivot of
+/// `min -x1 - x2` s.t. `x1 + x2 <= 4`, `x1 - x2 <= 2` left at -2. Also: a
+/// weight that overflows, or that a NaN reaches, is the engine's error, not
+/// a panic (the floor once made a NaN weight finite, review of R0).
+#[test]
+fn primal_steepest_edge_weights_are_floored() {
+    init();
+    let mut sol = Solver::try_new(
+        &[-1.0, -1.0],
+        &[0.0, 0.0],
+        &[f64::INFINITY, f64::INFINITY],
+        &[
+            (to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 4.0),
+            (to_sparse(&[1.0, -1.0]), ComparisonOp::Le, 2.0),
+        ],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert!(sol.enable_primal_steepest_edge);
+    let c2 = sol.nb_vars.iter().position(|&v| v == 1).unwrap();
+    sol.primal_edge_sq_norms[c2] = -5.0;
+    let PivotChoice::Pivot(info) = sol.choose_pivot(&[]).unwrap() else {
+        panic!("x1 enters");
+    };
+    assert_eq!(sol.nb_vars[info.col], 0);
+    let r_coeff = *sol.row_coeffs.get(c2);
+    let pivot_coeff = info.elem.as_ref().unwrap().coeff;
+    sol.pivot(&info).unwrap();
+    let lambda = r_coeff / pivot_coeff;
+    assert_eq!(sol.primal_edge_sq_norms[c2], 1.0 + lambda * lambda);
+
+    let mut planted = sol.clone();
+    assert!(matches!(
+        sol.update_primal_sq_norms(info.col, 1e-200),
+        Err(Error::InternalError(_))
+    ));
+    planted.primal_edge_sq_norms[c2] = f64::NAN;
+    assert!(matches!(
+        planted.update_primal_sq_norms(info.col, pivot_coeff),
+        Err(Error::InternalError(_))
+    ));
+}
+
+/// A reduced cost that is not a number never ends a phase as optimal
+/// (C4-07): it counts as dual infeasible, but its steepest-edge score, not
+/// a number either, lost every comparison, so the primal simplex found no
+/// entering column and the phase reported the vertex optimal. Planted: a
+/// NaN in a verified optimum's reduced costs.
+#[test]
+fn nan_reduced_cost_is_an_error_not_an_optimum() {
+    init();
+    let mut sol = Solver::try_new(
+        &[1.0, 2.0],
+        &[0.0, 0.0],
+        &[10.0, 10.0],
+        &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 1.0)],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(sol.initial_solve().unwrap(), StopReason::Finished);
+    sol.nb_var_obj_coeffs[0] = f64::NAN;
+    assert!(matches!(sol.reoptimize(), Err(Error::InternalError(_))));
 }

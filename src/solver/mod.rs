@@ -1747,23 +1747,28 @@ impl Solver {
                     }
                 });
 
+            // A reduced cost that is not a number is dual infeasible (every
+            // comparison with it is false), but its score, not a number
+            // either, never wins the choice below, and a phase whose only
+            // candidates were such costs ended as optimal. It is the loud
+            // error it is instead.
             let mut best_col = None;
             let mut best_score = f64::NEG_INFINITY;
-            if self.enable_primal_steepest_edge {
-                for (col, obj_coeff) in filtered_obj_coeffs {
-                    let score = obj_coeff * obj_coeff / self.primal_edge_sq_norms[col];
-                    if score > best_score {
-                        best_col = Some(col);
-                        best_score = score;
-                    }
+            for (col, obj_coeff) in filtered_obj_coeffs {
+                if !obj_coeff.is_finite() {
+                    return Err(Error::InternalError(format!(
+                        "reduced cost of var {} is not finite: {obj_coeff}",
+                        self.nb_vars[col]
+                    )));
                 }
-            } else {
-                for (col, obj_coeff) in filtered_obj_coeffs {
-                    let score = obj_coeff.abs();
-                    if score > best_score {
-                        best_col = Some(col);
-                        best_score = score;
-                    }
+                let score = if self.enable_primal_steepest_edge {
+                    obj_coeff * obj_coeff / self.primal_edge_sq_norms[col]
+                } else {
+                    obj_coeff.abs()
+                };
+                if score > best_score {
+                    best_col = Some(col);
+                    best_score = score;
                 }
             }
 
@@ -2699,7 +2704,7 @@ impl Solver {
         self.basic_var_maxs[pivot_elem.row] = self.orig_var_maxs[entering_var];
 
         if self.enable_dual_steepest_edge {
-            self.update_dual_sq_norms(pivot_elem.row, pivot_coeff);
+            self.update_dual_sq_norms(pivot_elem.row, pivot_coeff)?;
         }
 
         // Update non-basic vars stuff
@@ -2730,7 +2735,7 @@ impl Solver {
         }
 
         if self.enable_primal_steepest_edge {
-            self.update_primal_sq_norms(pivot_info.col, pivot_coeff);
+            self.update_primal_sq_norms(pivot_info.col, pivot_coeff)?;
         }
 
         // Update basis itself
@@ -2743,8 +2748,11 @@ impl Solver {
         // A simple heuristic to choose when to recompute LU factorization.
         // Note: a possible failure mode is that the LU factorization accidentally
         // generates a lot of fill-in and doesn't get recomputed for a long time.
-        // A refactorization also recomputes the values and reduced costs from
-        // it, so incremental round-off never outlives one eta file.
+        // A refactorization renews only the factorization: the values are
+        // recomputed from it when the check once per basis turnover finds
+        // them off the rows (see `refactorize`), and the reduced costs only
+        // by a rebuild, a basis load or the phase exit, so incremental
+        // round-off can outlive an eta file until the phase exit verifies.
         let eta_matrices_nnz = self.basis_solver.eta_matrices.coeff_cols.nnz();
         if eta_matrices_nnz < self.basis_solver.lu_factors.nnz() {
             self.basis_solver
@@ -2755,7 +2763,22 @@ impl Solver {
         Ok(())
     }
 
-    fn update_primal_sq_norms(&mut self, entering_col: usize, pivot_coeff: f64) {
+    /// Update the primal steepest-edge weights `1 + ||B^-1 a_j||^2` for the
+    /// pivot on `pivot_coeff` (the column's element, see
+    /// [`PivotElem::coeff`]). The update is exact in exact arithmetic, but
+    /// cancellation can take a weight below the true one, even to zero or
+    /// below, where it would make its column always or never the choice:
+    /// every updated weight is floored at `1 + lambda^2` (`lambda` the
+    /// column's entry in the pivot row over the pivot), a lower bound of its
+    /// true value, as HiGHS's `HEkkPrimal::updatePrimalSteepestEdgeWeights`
+    /// does. A weight the update leaves not finite (overflowed by a pivot
+    /// below about 1e-154, or reached by a NaN) is the engine's error, not a
+    /// panic, and is caught before the floor could make it finite.
+    fn update_primal_sq_norms(
+        &mut self,
+        entering_col: usize,
+        pivot_coeff: f64,
+    ) -> Result<(), Error> {
         // Computations for the steepest edge pivoting rule. See
         // Forrest, J. J., & Goldfarb, D. (1992).
         // Steepest-edge simplex algorithms for linear programming.
@@ -2792,19 +2815,41 @@ impl Solver {
 
         let pivot_coeff_sq = pivot_coeff * pivot_coeff;
         for (c, &r_coeff) in self.row_coeffs.iter() {
+            let weight = &mut self.primal_edge_sq_norms[c];
             if c == entering_col {
-                self.primal_edge_sq_norms[c] = pivot_sq_norm / pivot_coeff_sq;
+                *weight = pivot_sq_norm / pivot_coeff_sq;
             } else {
-                self.primal_edge_sq_norms[c] += -2.0 * r_coeff * self.sq_norms_update_helper[c]
-                    / pivot_coeff
+                *weight += -2.0 * r_coeff * self.sq_norms_update_helper[c] / pivot_coeff
                     + pivot_sq_norm * r_coeff * r_coeff / pivot_coeff_sq;
             }
-
-            assert!(self.primal_edge_sq_norms[c].is_finite());
+            // Before the floor: `f64::max` would turn a NaN or `-inf` into
+            // the floor and hide the breakdown.
+            if !weight.is_finite() {
+                return Err(Error::InternalError(format!(
+                    "primal steepest-edge weight is not finite after a pivot on {pivot_coeff:e}"
+                )));
+            }
+            if c != entering_col {
+                let lambda = r_coeff / pivot_coeff;
+                *weight = weight.max(1.0 + lambda * lambda);
+            }
         }
+        Ok(())
     }
 
-    fn update_dual_sq_norms(&mut self, leaving_row: usize, pivot_coeff: f64) {
+    /// Update the dual steepest-edge weights `||e_r^T B^-1||^2` for the pivot
+    /// on `pivot_coeff` (the column's element, see [`PivotElem::coeff`]):
+    /// the pivot row's new weight exactly, from the row just computed, the
+    /// others by the Forrest-Goldfarb update. A weight that starts as an
+    /// underestimate (every weight is reset to one when a basis is loaded)
+    /// can be driven to zero or below by the update, where its row would
+    /// dominate the choice or never be chosen: every updated weight is
+    /// floored at [`MIN_DUAL_EDGE_WEIGHT`], as HiGHS's
+    /// `HEkk::updateDualSteepestEdgeWeights` does. A weight the update leaves
+    /// not finite (overflowed by a pivot below about 1e-154, or reached by a
+    /// NaN) is the engine's error, not a panic, and is caught before the
+    /// floor could make it finite.
+    fn update_dual_sq_norms(&mut self, leaving_row: usize, pivot_coeff: f64) -> Result<(), Error> {
         // Computations for the dual steepest edge pivoting rule.
         // See the same reference (Forrest, Goldfarb).
 
@@ -2816,15 +2861,26 @@ impl Solver {
 
         let pivot_coeff_sq = pivot_coeff * pivot_coeff;
         for (r, &col_coeff) in self.col_coeffs.iter() {
+            let weight = &mut self.dual_edge_sq_norms[r];
             if r == leaving_row {
-                self.dual_edge_sq_norms[r] = pivot_sq_norm / pivot_coeff_sq;
+                *weight = pivot_sq_norm / pivot_coeff_sq;
             } else {
-                self.dual_edge_sq_norms[r] += -2.0 * col_coeff * tau.get(r) / pivot_coeff
+                *weight += -2.0 * col_coeff * tau.get(r) / pivot_coeff
                     + pivot_sq_norm * col_coeff * col_coeff / pivot_coeff_sq;
             }
-
-            assert!(self.dual_edge_sq_norms[r].is_finite());
+            // Before the floor: `f64::max` would turn a NaN or `-inf` into
+            // the floor and hide the breakdown (HiGHS's `std::max` floors a
+            // NaN; the engine's rule is to fail loudly).
+            if !weight.is_finite() {
+                return Err(Error::InternalError(format!(
+                    "dual steepest-edge weight is not finite after a pivot on {pivot_coeff:e}"
+                )));
+            }
+            if r != leaving_row {
+                *weight = weight.max(MIN_DUAL_EDGE_WEIGHT);
+            }
         }
+        Ok(())
     }
 
     fn recalc_basic_var_vals(&mut self) -> Result<(), Error> {

@@ -67,7 +67,7 @@ Three principles shape everything:
 | `src/expr.rs`, `src/error.rs` | The model vocabulary (`OptimizationDirection`, `Variable`, `LinearExpr`, `ComparisonOp`) and the `Error` type. |
 | `src/presolve/` | Presolve: activity-based bound tightening, forcing / singleton / redundant-row elimination, variable fixing and substitution, and in MIP mode integer bound rounding, binary coefficient tightening and dual fixing — all on the original variable indices, so there is no postsolve (§2, §7). `mod.rs` holds the contract and the entry point, `work.rs` the reduction passes, `model.rs` the data, `params.rs` the constants. |
 | `src/solver/` | The simplex engine. `mod.rs` is `Solver` itself (bounded-variable primal/dual simplex, basis management, and the small contract surface the MIP layer uses); `tolerances.rs` is the tolerance model of §7; `scaling.rs` turns a user problem into the scaled representation and seeds the starting vertex; `basis.rs` is the basis inverse and the pivot descriptions. |
-| `src/lu/`, `src/sparse/`, `src/ordering/` | LU factorization with eta-file updates, sparse containers, fill-reducing ordering (`ordering/colamd.rs`, `ordering/matching.rs`, `ordering/cols_queue.rs`). |
+| `src/lu/`, `src/sparse/`, `src/ordering/` | LU factorization with eta-file updates, sparse containers, and the column ordering of the factorization (`order_simple`: the sparsest columns first, from the bucket queue in `ordering/cols_queue.rs`). |
 | `src/mip/mod.rs` | The branch & bound lifecycle: building a search from a `Problem`, starting / resuming / re-editing it, bound and gap accounting, and validating a candidate against the user's original rows. |
 | `src/mip/search.rs` | The search itself: node visits, warm starts, branching, pruning, and the outer search loop. |
 | `src/mip/state.rs` | `MipState` (the complete, resumable search state) and `MipRun`. |
@@ -91,6 +91,33 @@ Two normalizations happen at the boundary and hold everywhere inside:
   flipped back exactly once per read (`Solution::objective`, user-facing `Stats.best_bound`).
   Everything inside the driver — incumbents, bounds, pruning, gaps — is minimize-space.
   When editing driver code, never reason about direction; it does not exist there.
+- **A bound of magnitude 2^52 or more on its side of infinity is infinite.** `entry_bounds`
+  (`INFINITE_BOUND`, the counterpart of HiGHS's `infinite_bound`) turns a lower bound at or
+  below `-2^52` into `-∞` and an upper bound at or above `2^52` into `+∞` when a var is added
+  (`internal_add_var`), and `Problem` stores the bounds so, as HiGHS's `assessBounds` writes
+  them into its model. Presolve, the engine, the MIP's base problem, the post-edit incumbent
+  prefilter and `Solution::fix_var`'s check all read those stored bounds, so none can compare
+  a value with a bound as written (two such checks once refused an answer the solve itself
+  had returned beyond one); bounds presolve derives are left as they are, as in HiGHS. So
+  `f64::MAX` and `i64::MAX` behave as `f64::INFINITY` everywhere (issue #3): in the starting
+  vertex, the ratio tests, every basis load, every edit, and the answer, which may lie beyond
+  such a bound. Each side is judged on its own, as `assessBounds` converts them, so
+  `x ∈ [5e15, f64::MAX]` is `x ≥ 5e15`, a var that lives beyond the threshold (such a var
+  was once kept whole, started on its `f64::MAX` bound and overflowed its rows). HiGHS, whose
+  infinity starts at its threshold, refuses a lower bound out there; here a value out there
+  is data, as `fix_var` fixes a var at one the solve reported. A range that is a point or
+  empty keeps its bounds as written, since its far bound does not lie beyond its near one: a
+  var fixed beyond the threshold stays fixed and an empty range stays infeasible (HiGHS never
+  widens such a range either: converting one of its bounds puts the other beyond the
+  threshold too, which it refuses). HiGHS defaults to 1e20 (it accepts any threshold from 1e15);
+  2^52 is chosen because a row beside a var at a bound `B` with a coefficient `a` is held only
+  to about `1e-14 |a| B` (§7), units at 2^52 when `|a|` is near one: with 1e20, bounds in
+  between written for infinity, `i64::MAX` among them, changed answers on the fuzz corpus (the
+  measurement is in `INFINITE_BOUND`'s doc; both sides are pinned in
+  `src/tests/regressions.rs`). The price: a bound in `[2^52, 1e20)` meant as a bound is none
+  (`max x` with `x ≤ 5e15` is `Unbounded`, where HiGHS at its default returns 5e15, and so is
+  `max x` with `x ∈ [5e15, 1e16]`), even where small coefficients would let the rows resolve
+  it, since the threshold, like HiGHS's, is on the bound as given, not on `|a| B`.
 - **Every constraint row gets a slack variable.** A row `a·x ≤ b` becomes `a·x + s = b`
   with `s ∈ [0, +∞)`; `≥` gives `s ∈ (−∞, 0]`; `=` gives `s ∈ [0,0]`. So the `Solver`'s
   variable universe is `num_vars` *structural* variables followed by one slack per row
@@ -100,8 +127,11 @@ Two normalizations happen at the boundary and hold everywhere inside:
 - **The matrix is scaled by powers of two, rows and columns.** Before the simplex engine
   sees a model, `column_scales` derives a power-of-two factor per structural column (the
   rounded geometric mean of the column's extreme coefficients, iterated against row factors
-  in the Curtis–Reid manner; skipped entirely when every coefficient already lies within
-  `[1/8, 8]`, and never for a fixed column), and each row is then equilibrated so that its
+  as HiGHS's `equilibrationScaleMatrix` and SoPlex's `SPxGeometSC` do, but not bounded to
+  HiGHS's `2^±20`, since this engine takes coefficients HiGHS refuses (1e15 and more) and a
+  bounded factor leaves such a row too wide for its pivot floors (see `column_scales`);
+  skipped entirely when every coefficient already lies within `[1/8, 8]`, and never for a
+  fixed column), and each row is then equilibrated so that its
   largest coefficient of a var that can move lies in `[1, 2)`. The engine works on
   `x'_j = x_j / s_j`; powers of two mean no datum is rounded, integrality of `s_j x'_j` is
   exact, and a bound change in user units maps to exactly one internal bound. Everything
@@ -569,7 +599,7 @@ Two homes, by audience:
 | `presolve` | `true` | run the reductions of `src/presolve/` before the solve (§2); off, the engine gets the model as written |
 | `int_tol` | `1e-6` | "is this LP value integral?" — a rounded feasible point may be adopted, but branching continues until its LP point is exact. Must be finite and in `[0, 0.5)`. |
 | `mip_gap` | `0.0` | early-stop proof quality (relative gap) |
-| `tolerances.feasibility` | `1e-7` **absolute** | the rounded-incumbent guard and the post-edit incumbent pre-filter (§5.4 explains why absolute) |
+| `tolerances.feasibility` | `1e-7` **absolute**, at least `1e-10` (HiGHS's minimum) | the rounded-incumbent guard and the post-edit incumbent pre-filter (§5.4 explains why absolute) |
 | `tolerances.integrality_rounding` | `1e-5` | integrality check in the edit pre-filter; `var_value`'s sanity assert pins the *default* deliberately |
 | `tolerances.prune_epsilon` | `1e-9` | the pruning cutoff slack |
 
@@ -578,11 +608,14 @@ Two homes, by audience:
 (see below) and presolve decides against it, so what presolve assumes, what the engine
 reports and what the guard accepts are the same contract.
 
-**Internal — `src/mip/params.rs` and `src/solver/tolerances.rs` consts (each documented at its
-definition):** `SCORE_EPS`, `PSEUDOCOST_INIT_EPS`, `BRANCH_FRAC_GUARD` (all `1e-6`),
+**Internal — `src/mip/params.rs`, `src/solver/tolerances.rs` and `src/solver/scaling.rs` consts
+(each documented at its definition):** `SCORE_EPS`, `PSEUDOCOST_INIT_EPS`, `BRANCH_FRAC_GUARD` (all `1e-6`),
 `GAP_DENOM_GUARD` (`1e-10`), `HINT_BOUNDS_SLACK` (`1e-9`), `DEADLINE_CHECK_INTERVAL`
-(`1000` pivots), `LU_STABILITY_THRESHOLD` (`0.1`), and the engine's tolerance model in
-`solver/tolerances.rs`, which is one rule applied to three kinds of comparison — every tolerance is
+(`1000` pivots), `LU_STABILITY_THRESHOLD` (`0.1`), `MIN_DUAL_EDGE_WEIGHT` (`1e-4`, the floor
+of the dual steepest-edge weights, as HiGHS; the primal weights are floored at their lower
+bound `1 + lambda^2`, as HiGHS too), `INFINITE_BOUND` (`2^52`, §2), and the engine's
+tolerance model in `solver/tolerances.rs`, which is one rule applied to three kinds of
+comparison — every tolerance is
 either the user's contract or a property of the arithmetic, and every comparison of a
 computed quantity is floored at that quantity's round-off:
 
@@ -703,7 +736,8 @@ the models these searches found and moved one into the second class:
   an infinite bound in its direction, so no flip can check the entry) is reported
   `Infeasible`: nothing checks such an entry reliably before the pivot (round-off can come out
   identical through the row and the column), and pivoting on round-off leaves a basis the
-  factorization rejects;
+  factorization rejects (this is why the column factors are not bounded to HiGHS's `2^±20`:
+  bounded, they left `1e30 g + y ≥ 2e30` with `y`'s entry in this class);
 - a pivot on a genuine but tiny element can leave a basis the factorization rejects, reported
   as `InternalError("Singular matrix")`; the engine has no basis repair (replacing the dependent
   columns by slacks and continuing, as HiGHS and CLP do);
@@ -722,7 +756,22 @@ the models these searches found and moved one into the second class:
   and a row whose vars are all fixed is judged at the full contract); the class remains where
   the pinning row has other terms and its coefficient amplifies the forcing row's slack beyond
   the contract (`-1000 x1 + x4 / 1000 = 83.887` beside `x1 + 100 x4 = 8388700`, pinned in
-  `src/tests/magnitudes.rs`).
+  `src/tests/magnitudes.rs`);
+- a var at a huge finite bound (from about 3e14, below the bound infinity of §2) sets its
+  rows' tolerances to the round-off of that magnitude, and they stay there until the rows are
+  checked again: once the var moves away, a row violated by units passes as feasible and a
+  primal step leaves its slack where it sits, off its bound, which the boundary reports as
+  an `InternalError` (issue #3's model with `z ≤ 1e15`, pinned in `src/tests/magnitudes.rs`;
+  found by the review of R0). This is why the bound infinity is 2^52 rather than HiGHS's
+  1e20: with 1e20 the same happens to bounds written for infinity;
+- the dual ratio test's round-off scale leaves out the columns fixed when the solve began
+  (`unscaled_cols`, which neither scaling touches), but a row added later leaves out of its
+  equilibration the vars fixed at that time, so after `fix_var(f, 0)` an added
+  `1e17 f + y ≥ 1` reaches the ratio test as `[1e17, 1]` with `f` counted in the scale, `y`'s
+  entry is noise, and the LP edit comes back `Infeasible` (pinned in
+  `src/tests/magnitudes.rs`; found by the second review of R0; the MIP path rebuilds the model
+  and solves it). Which columns a row left out differs from row to row; the absolute pivot
+  tolerances of R3 remove the relative floor and this flag with it.
 
 The convention for such models is to pin each as a `#[should_panic]` test named
 `..._is_a_known_limitation` in `src/tests/magnitudes.rs` (beside the engine's unit tests when
@@ -731,9 +780,10 @@ as a change fixes it**, which is the signal to drop the attribute and keep the m
 ordinary regression test. Three models were pinned this way and all three were fixed (a
 presolve forcing rule that fixed a var its row could not resolve, a recompute of the basic
 values that counted as a verification, and the dual ratio test's reading of "no pivot" as
-infeasibility); two are pinned today, the primal ratio test's scale and the forcing row above. The wide-coefficient MILP property stays `#[ignore]`d while the classes
-above stand (a random search cannot assert its own failure); run it with
-`cargo test --lib -- --ignored`.
+infeasibility); four are pinned today, the primal ratio test's scale, the forcing row, the
+tolerance a var leaves behind at a huge bound and the fixed column of an added row above. The
+wide-coefficient MILP property stays `#[ignore]`d while the classes above stand (a random
+search cannot assert its own failure); run it with `cargo test --lib -- --ignored`.
 
 ---
 
@@ -747,6 +797,7 @@ above stand (a random search cannot assert its own failure); run it with
 | Singular LU during a node LP | retry once from the slack basis; then propagate |
 | Exactly-integral candidate failing the guard | `InternalError` (the engine verified the same point; see §5.4) |
 | Verified state unreachable (`MAX_PHASE_ROUNDS` alternations, or a basis that cannot represent its vertex) | `InternalError`, never an unverified optimum |
+| A reduced cost the primal simplex would price, or a steepest-edge weight, is not finite | `InternalError` (a NaN reduced cost once ended a phase as optimal; an overflowing weight aborted the process through an `assert!`; a weight is checked before its floor, which would make a NaN finite) |
 | `load_basis` failure on a jump | load the slack basis (infallible) and solve the node from scratch |
 | Phase-1 stall (“no entering column”) | rebuild (fresh LU + recomputed values and reduced costs) and retry once per stall; declare `Infeasible` only if it survives the rebuild |
 | Deadline mid-LP | requeue the node unsolved; return `Interrupted` |

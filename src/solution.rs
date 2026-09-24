@@ -255,8 +255,11 @@ impl Solution {
     /// # Errors
     ///
     /// Returns [`Error::Infeasible`] if `val` is not finite, is outside the
-    /// variable's original bounds, is incompatible with its integer or boolean
-    /// domain, or leaves the edited problem without a feasible assignment.
+    /// variable's original bounds (as the solve takes them: a bound of 2^52
+    /// or more on its side of infinity is infinite, see
+    /// [`Problem::add_var`](crate::Problem::add_var)), is incompatible with
+    /// its integer or boolean domain, or leaves the edited problem without a
+    /// feasible assignment.
     /// Both checks are made under the solve's tolerances, so a value this
     /// solution reports is always accepted: a value outside a bound by no more
     /// than [`Tolerances::feasibility`](crate::Tolerances::feasibility)
