@@ -3,7 +3,7 @@
 //!
 //! The variable set is never changed: a variable presolve "removes" is fixed
 //! by giving it `lo == hi` bounds (the simplex prices such vars out natively
-//! — `choose_pivot` skips vars that are at both bounds) and substituting its
+//! — `price_primal` skips vars that are at both bounds) and substituting its
 //! value out of every row. Rows, by contrast, may be dropped or rewritten
 //! freely: nothing outside the `Solver` addresses constraints by index. This
 //! is what makes a postsolve layer unnecessary — solution read-out, resume,

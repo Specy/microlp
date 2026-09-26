@@ -326,6 +326,45 @@ mod tests_feasibility {
         });
     }
 
+    /// The counterexample CI's run of the property found on the first version
+    /// of the primal simplex's bound shifting, which took a step backwards
+    /// where the leaving var sat past its bound, as HiGHS does. The dual phase
+    /// leaves `x1` basic `7.5e-15` past its bound, the round-off of a step
+    /// of `128.0000128`; the primal step that set it onto its bound moved the
+    /// entering `x0` by that over the element `5.12e-5`, to `1.5e-10` past
+    /// its own bound, beyond its tolerance of `1e-10` (what `-100 x0 - x1 <= 0`
+    /// can absorb); the dual phase moved `x0` back out, and the phases
+    /// alternated until they gave up with `InternalError`. A step that would
+    /// run backwards is zero, and `x1` leaves where it sits, within its
+    /// tolerance of its bound.
+    #[test]
+    fn property_counterexample_where_a_step_backwards_amplified_round_off() {
+        use crate::tests::oracle::{assert_solves_within_contract, Model, Row, Var};
+        let real = |obj, lo, hi| Var {
+            obj,
+            lo,
+            hi,
+            integer: false,
+        };
+        assert_solves_within_contract(&Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![real(-1.0, -0.0, 1.0), real(1.0, -1.0, 0.0)],
+            rows: vec![
+                Row {
+                    terms: vec![(0, -100.0), (1, -1.0)],
+                    op: ComparisonOp::Le,
+                    rhs: 0.0,
+                },
+                Row {
+                    terms: vec![(0, -0.001), (1, 10000.0)],
+                    op: ComparisonOp::Ge,
+                    rhs: -0.0,
+                },
+            ],
+            xstar: vec![0.0, 0.0],
+        });
+    }
+
     /// The third counterexample, and the one that showed a continuous var's
     /// bound tolerance had to be capped by its rows just as an integer var's
     /// already was (see [`crate::solver::structural_tol`]).

@@ -10,14 +10,24 @@
 //! * [`tolerances`] — the tolerance model (magnitudes, floors, pivot limits).
 //! * [`scaling`] — user problem to scaled representation, and vertex seeding.
 //! * [`basis`] — the basis inverse ([`BasisSolver`]) and pivot descriptions.
+//! * [`costs`] — the dual simplex's working costs: perturbation, shifting,
+//!   the correction of dual infeasibilities, and the cleanup.
+//! * [`bounds`] — the primal simplex's working bounds: perturbation,
+//!   shifting, and the cleanup.
+//! * [`cycling`] — the cycling and stall detection of both.
 
 mod basis;
+mod bounds;
+mod costs;
+mod cycling;
 mod scaling;
 mod tolerances;
 
 pub(crate) use basis::*;
 pub(crate) use scaling::*;
 pub(crate) use tolerances::*;
+
+use cycling::{CycleGuard, VertexChange, STALL_ITERATIONS};
 
 use core::time::Duration;
 
@@ -44,6 +54,53 @@ pub(crate) fn check_deadline(deadline: &Deadline) -> StopReason {
     }
     StopReason::Finished
 }
+
+/// A 64-bit hash of `x` (splitmix64's finalizer): the vertex hash of the
+/// cycling detection and the pseudo-random fractions of the perturbations.
+fn mix(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Which pseudo-random stream a fraction is drawn from.
+#[derive(Clone, Copy)]
+enum Stream {
+    /// The perturbation of a var's cost (dual simplex) or bounds (primal
+    /// simplex): HiGHS's `numTotRandomValue_`, which both its
+    /// `initialiseCost` and its `initialiseBound` draw from.
+    Perturbation,
+    /// The margin a shift leaves a var's reduced cost (dual simplex) or
+    /// value (primal simplex) on its feasible side.
+    Shift,
+}
+
+/// A pseudo-random fraction in `[0, 1)` fixed by the var and the stream.
+/// HiGHS draws its perturbations from random values fixed per var for the
+/// LP (`numTotRandomValue_`, `HEkk::initialiseSimplexLpRandomVectors`);
+/// fixing them by the var's index keeps every solve of a model, and every
+/// B&B node, deterministic without a generator state to carry around.
+fn random_fraction(var: usize, stream: Stream) -> f64 {
+    let salt = match stream {
+        Stream::Perturbation => 0x243F_6A88_85A3_08D3,
+        Stream::Shift => 0x1319_8A2E_0370_7344,
+    };
+    (mix(var as u64 ^ salt) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// A phase that starts with no more than this many infeasibilities of the
+/// kind it removes (violated rows for the dual simplex, dual infeasible
+/// reduced costs for the primal) can be near optimal, and is then not
+/// perturbed (HiGHS's `HEkkDual::solve` and `HEkkPrimal::solve`: a value
+/// that is unimportant, since a start that is far from optimal has far more).
+const NEAR_OPTIMAL_MAX_INFEASIBILITIES: usize = 1000;
+
+/// A phase whose infeasibilities of the kind it removes are all below this,
+/// in the engine's scaled units, can be near optimal (HiGHS's
+/// `HEkkDual::solve` and `HEkkPrimal::solve`, where the infeasibilities of a
+/// near-optimal start are orders of magnitude smaller).
+const NEAR_OPTIMAL_MAX_INFEASIBILITY: f64 = 1e-3;
 
 #[derive(Clone)]
 pub(crate) struct Solver {
@@ -96,10 +153,6 @@ pub(crate) struct Solver {
     /// whenever the rows are checked, since its round-off floor depends on
     /// the values).
     var_tols: Vec<BoundTols>,
-    /// Per row, the magnitude `|b| + Σ|a_j x_j|` (scaled) its slack
-    /// tolerance was last derived from: the scale of the round-off of
-    /// recomputing the row's slack (see the primal ratio test).
-    row_mags: Vec<f64>,
     /// Per total var, the tolerance within which its reduced cost counts as
     /// zero ([`dual_tol`]); refreshed whenever the reduced costs are
     /// recomputed from the multipliers.
@@ -127,6 +180,32 @@ pub(crate) struct Solver {
     /// costs during that phase uses the same objective the pivots priced.
     /// `None` once the real objective is in force.
     artificial_obj: Option<Vec<f64>>,
+
+    /// Per total var, what a dual phase adds to the var's cost in force:
+    /// the perturbation drawn when the phase starts and the shifts that
+    /// corrected its reduced cost (HiGHS's `workCost_` less the LP's cost).
+    /// Zero outside a dual phase. See [`costs`].
+    cost_perturbation: Vec<f64>,
+    /// Per total var, the shift a zero dual step gave the var's cost when it
+    /// entered the basis (HiGHS's `workShift_`), given back when it leaves.
+    /// Zero outside a dual phase. See [`costs`].
+    cost_shifts: Vec<f64>,
+    /// Whether any entry of the two above is nonzero, i.e. the simplex works
+    /// with costs other than the costs in force.
+    costs_modified: bool,
+    /// Per total var, its bounds as a primal phase has moved them: perturbed
+    /// when the phase starts, shifted where its steps left a violation or a
+    /// var left the basis past its bound (HiGHS's `workLower_`/`workUpper_`).
+    /// Taken from the true bounds at the first move of a phase, and read only
+    /// while `bounds_modified`, through [`Self::working_bounds`]. See
+    /// [`bounds`].
+    working_mins: Vec<f64>,
+    working_maxs: Vec<f64>,
+    /// Whether a primal phase has moved any bound, i.e. the simplex works
+    /// with bounds other than the true ones.
+    bounds_modified: bool,
+    /// The cycling detection of both simplex phases (see [`cycling`]).
+    cycle_guard: CycleGuard,
 
     is_primal_feasible: bool,
     is_dual_feasible: bool,
@@ -203,7 +282,7 @@ impl NonBasicVarState {
     /// a move that improves nothing, and with no bound in the way an
     /// infinite one.
     fn is_dual_feasible(&self, d: f64, tol: f64) -> bool {
-        self.at_min && d > -tol || self.at_max && d < tol || d.abs() < tol
+        self.dual_infeasibility(d) < tol
     }
 }
 
@@ -368,7 +447,6 @@ impl Solver {
         let mut constraint_coeffs = vec![];
         let mut orig_rhs = vec![];
         let mut row_scales = vec![];
-        let mut row_mags = vec![];
 
         // Initially, all slack vars are basic.
         let mut basic_vars = vec![];
@@ -410,7 +488,6 @@ impl Solver {
                 row_scale,
                 magnitude,
             )));
-            row_mags.push(magnitude);
         }
 
         let num_constraints = constraint_coeffs.len();
@@ -518,7 +595,6 @@ impl Solver {
             dual_tols,
             row_budgets,
             validation_rows: Vec::new(),
-            row_mags,
             deadline,
             operation_time_limit: None,
             lp_iterations: 0,
@@ -527,6 +603,13 @@ impl Solver {
             enable_primal_steepest_edge,
             enable_dual_steepest_edge,
             artificial_obj,
+            cost_perturbation: vec![0.0; num_total_vars],
+            cost_shifts: vec![0.0; num_total_vars],
+            costs_modified: false,
+            working_mins: Vec::new(),
+            working_maxs: Vec::new(),
+            bounds_modified: false,
+            cycle_guard: CycleGuard::default(),
             is_primal_feasible,
             is_dual_feasible,
             values_dirty: false,
@@ -763,6 +846,10 @@ impl Solver {
         if min.is_nan() || max.is_nan() || min > max {
             return Err(Error::Infeasible);
         }
+        debug_assert!(
+            !self.bounds_modified,
+            "a bound changed during a primal phase"
+        );
         // Dividing by a power of two is exact, so the user's bound maps to
         // exactly one internal bound.
         let s = self.col_scale(var);
@@ -823,17 +910,50 @@ impl Solver {
     /// costs recomputed from the multipliers are dual feasible. Each phase's
     /// own exit test runs on incrementally updated numbers, so a phase can end
     /// on drifted values; only a verified state is reported as `Finished`.
+    ///
+    /// A dual phase works with perturbed and shifted costs and ends by
+    /// restoring the costs in force (see [`costs`]); a primal phase works with
+    /// perturbed and shifted bounds and ends by restoring the true ones (see
+    /// [`bounds`]). The verification below then judges the point on the true
+    /// bounds and recomputes the reduced costs from the costs in force. The
+    /// dual infeasibility a dual phase's cleanup uncovers is removed by the
+    /// primal phase that follows, as HiGHS follows its dual cleanup with one
+    /// primal simplex pass (`HEkkDual::solve`), and the primal infeasibility a
+    /// primal phase's cleanup uncovers by the dual phase of the next round, as
+    /// HiGHS follows its primal cleanup with one dual simplex pass
+    /// (`HEkkPrimal::solve`). Only the first phase of a re-solve starts from an
+    /// arbitrary state and may perturb; every later phase cleans up after the
+    /// one before it and runs as HiGHS runs its cleanup passes: unperturbed,
+    /// and a dual phase with phase 2 forced, its dual infeasibilities shifted
+    /// rather than flipped (`pass_force_phase2`; the phase-1 dual on the
+    /// artificial objective does not count: the primal phase after it is the
+    /// real optimization, not its cleanup). Where HiGHS then accepts whatever
+    /// is left (`max_dual_simplex_cleanup_level = 1`), this loop verifies and
+    /// alternates the phases at most [`MAX_PHASE_ROUNDS`] times, and fails
+    /// loudly after that. As SoPlex does when its algorithms loop, each round
+    /// after the first cuts the tolerance of the primal ratio test a
+    /// hundredfold ([`LOOP_HARRIS_REDUCTION`]), so that a step no longer ends
+    /// at a tolerance the verification's recomputation finds exceeded.
     fn run_phases(&mut self) -> Result<StopReason, Error> {
+        let mut cleanup = false;
         for round in 0..MAX_PHASE_ROUNDS {
-            if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
-                return Ok(StopReason::Limit);
+            // Each round after the first cuts the primal ratio test's
+            // tolerance a hundredfold (see `LOOP_HARRIS_REDUCTION`).
+            let harris_scale = LOOP_HARRIS_REDUCTION.powi(round as i32);
+            if !self.is_primal_feasible {
+                if self.restore_feasibility(cleanup)? == StopReason::Limit {
+                    return Ok(StopReason::Limit);
+                }
+                cleanup = cleanup || self.artificial_obj.is_none();
             }
             if !self.is_dual_feasible {
                 // Leaving the dual phase for the primal one: the real
                 // objective is in force from here on.
                 self.artificial_obj = None;
                 self.recalc_obj_coeffs()?;
-                if self.optimize()?.0 == StopReason::Limit {
+                let stop = self.optimize(cleanup, harris_scale)?.0;
+                cleanup = true;
+                if stop == StopReason::Limit {
                     return Ok(StopReason::Limit);
                 }
             }
@@ -853,7 +973,8 @@ impl Solver {
                 return Ok(StopReason::Finished);
             }
             debug!("phase round {round}: recomputed reduced costs are dual infeasible; continuing");
-            let (stop, pivoted) = self.optimize()?;
+            let (stop, pivoted) = self.optimize(cleanup, harris_scale)?;
+            cleanup = true;
             if stop == StopReason::Limit {
                 return Ok(StopReason::Limit);
             }
@@ -937,7 +1058,6 @@ impl Solver {
             };
             let tol = slack_tol(self.feasibility, self.row_scales[r], magnitude);
             self.var_tols[slack] = BoundTols::uniform(tol);
-            self.row_mags[r] = magnitude;
             // A NaN residual holds nothing.
             if residual.is_nan() || residual.abs() > tol {
                 hold = false;
@@ -1023,19 +1143,28 @@ impl Solver {
         false
     }
 
-    /// The objective of the current values under the cost vector in force
-    /// (the artificial one during phase 1).
+    /// The objective of the current values under the costs the simplex
+    /// works with: the cost vector in force (the artificial one during phase
+    /// 1), plus the perturbation and shifts of a running dual phase (see
+    /// [`costs`]).
     fn exact_obj_val(&self) -> f64 {
         let costs = self
             .artificial_obj
             .as_deref()
             .unwrap_or(&self.orig_obj_coeffs);
+        let cost = |var: usize| {
+            if self.costs_modified {
+                costs[var] + self.cost_perturbation[var] + self.cost_shifts[var]
+            } else {
+                costs[var]
+            }
+        };
         let mut obj = 0.0;
         for (r, &var) in self.basic_vars.iter().enumerate() {
-            obj += costs[var] * self.basic_var_vals[r];
+            obj += cost(var) * self.basic_var_vals[r];
         }
         for (c, &var) in self.nb_vars.iter().enumerate() {
-            obj += costs[var] * self.nb_var_vals[c];
+            obj += cost(var) * self.nb_var_vals[c];
         }
         obj
     }
@@ -1133,6 +1262,11 @@ impl Solver {
         if basis.0.len() != n || basis.0.iter().filter(|s| **s == VarStatus::Basic).count() != m {
             return Err(Error::InternalError("basis shape mismatch".to_string()));
         }
+        debug_assert!(!self.costs_modified, "a basis loaded during a dual phase");
+        debug_assert!(
+            !self.bounds_modified,
+            "a basis loaded during a primal phase"
+        );
 
         self.basic_vars.clear();
         self.basic_var_mins.clear();
@@ -1274,14 +1408,60 @@ impl Solver {
         Ok(stop)
     }
 
-    /// Primal simplex on the current reduced costs. Returns whether any pivot
-    /// was performed besides the stop reason; ends with `is_dual_feasible`
-    /// provisionally set (the caller verifies it on recomputed reduced costs).
-    fn optimize(&mut self) -> Result<(StopReason, bool), Error> {
-        // Rows whose entry in the current entering column proved to be
-        // round-off (see `PivotChoice::Inconsistent`); reset after a pivot.
+    /// The primal simplex phase: reach dual feasibility while keeping the
+    /// basic values primal feasible. It runs on working bounds (see
+    /// [`bounds`]): [`Self::begin_primal_phase`] perturbs them unless the
+    /// start is near optimal or the phase is a `cleanup` after another (see
+    /// [`Self::run_phases`]), and whatever way the phase ends, they return to
+    /// the true bounds ([`Self::end_primal_phase`]).
+    /// Returns whether any pivot was performed besides the stop reason; ends
+    /// with `is_dual_feasible` provisionally set (the caller verifies it on
+    /// recomputed reduced costs) and `is_primal_feasible` measured on the
+    /// true bounds.
+    fn optimize(&mut self, cleanup: bool, harris_scale: f64) -> Result<(StopReason, bool), Error> {
+        self.begin_primal_phase(cleanup);
+        let result = self.primal_phase(harris_scale);
+        let cleanup = self.end_primal_phase();
+        let result = result?;
+        cleanup?;
+        Ok(result)
+    }
+
+    /// The pivots of the primal simplex phase, on the working bounds.
+    ///
+    /// Each iteration prices the non-basic vars ([`Self::price_primal`]),
+    /// skipping a var whose entry into the basis was found to keep returning
+    /// to visited vertices ([`CycleGuard`], HiGHS's
+    /// `HEkk::applyTabooVariableIn`), and runs the ratio test for the
+    /// entering column ([`Self::choose_pivot`]); it skips the basis change if
+    /// it is bad, and otherwise applies it, then shifts the working bound of
+    /// every basic var the step left outside its bounds beyond its tolerance
+    /// ([`Self::correct_primal`], after a recomputation of the values too).
+    ///
+    /// The phase fails loudly rather than run forever: when, after a rebuild,
+    /// the only vars left to enter are taboo (every basis change left returns
+    /// to visited vertices, HiGHS's `kSolvePhaseTabooBasis`), and when the
+    /// objective has not fallen beyond round-off in [`STALL_ITERATIONS`]
+    /// iterations (SoPlex's stall check).
+    fn primal_phase(&mut self, harris_scale: f64) -> Result<(StopReason, bool), Error> {
+        // Rows whose entry in the entering column `excluded_col` proved to
+        // be round-off (see `PivotChoice::Inconsistent`), for that column
+        // only, as the dual phase keeps its exclusions for its leaving row:
+        // the verdict is on one entry of one column in the current basis.
+        // They are dropped when another column is priced (as after a taboo
+        // made the column's var skip its basis change: excluded for the next
+        // column too, a genuine blocking entry of that column went unseen,
+        // and the step passed it, or the phase took a bounded ray for an
+        // unbounded one) and after any pivot, and kept through a rebuild,
+        // which factorizes the same basis again.
         let mut excluded_rows: Vec<usize> = Vec::new();
+        let mut excluded_col: Option<usize> = None;
         let mut pivoted = false;
+        // Whether the data are fresh from a rebuild with no step since: only
+        // then do taboo vars alone left to enter mean the phase is stuck.
+        let mut refreshed_since_step = false;
+        // The objective at the last stall check.
+        let mut stall_reference = self.cur_obj_val;
         for iter in 0.. {
             self.lp_iterations += 1;
             if iter % DEADLINE_CHECK_INTERVAL == 0 {
@@ -1295,9 +1475,79 @@ impl Solver {
                     iter, self.cur_obj_val, num_vars, infeasibility,
                 );
             }
+            if iter > 0 && iter % STALL_ITERATIONS == 0 {
+                // Every step of the primal simplex is forward or zero (a step
+                // that would run backwards is taken as zero, see
+                // `choose_pivot`), and with the bounds perturbed zero steps
+                // are the exception, so a phase that progresses lowers the
+                // objective (a rebuild moves it by the round-off of
+                // recomputing the values, either way). One that has not
+                // fallen beyond round-off since the last check (or is not a
+                // number) is taken to be stuck in a cycle the vertex hash has
+                // not caught (see `cycling`).
+                let obj = self.cur_obj_val;
+                let resolution = ROUNDOFF_FLOOR * obj.abs().max(stall_reference.abs());
+                let fallen = stall_reference - obj > resolution;
+                if !fallen {
+                    return Err(Error::InternalError(format!(
+                        "primal simplex stalled: the objective did not improve in \
+                         {STALL_ITERATIONS} iterations"
+                    )));
+                }
+                stall_reference = obj;
+            }
 
-            match self.choose_pivot(&excluded_rows)? {
+            let Some(col) = self.price_primal()? else {
+                if self.taboo_var_dual_infeasible() {
+                    // Only vars whose entry returns to visited vertices are
+                    // left. Try them again on fresh data, where the reduced
+                    // costs (and so the pricing) may differ; if nothing
+                    // moved since the last rebuild, the phase is stuck.
+                    if refreshed_since_step {
+                        return Err(Error::InternalError(
+                            "primal simplex cycles: every basis change left returns to visited \
+                             vertices"
+                                .to_string(),
+                        ));
+                    }
+                    debug!("optimize iter {iter}: only taboo vars can enter; rebuilding");
+                    self.rebuild_primal()?;
+                    refreshed_since_step = true;
+                    continue;
+                }
+                debug!(
+                    "found optimum in {} iterations, obj.: {}",
+                    iter + 1,
+                    self.cur_obj_val,
+                );
+                break;
+            };
+            if excluded_col != Some(col) {
+                excluded_rows.clear();
+                excluded_col = Some(col);
+            }
+            match self.choose_pivot(col, &excluded_rows, harris_scale)? {
                 PivotChoice::Pivot(pivot_info) => {
+                    if let Some(elem) = &pivot_info.elem {
+                        let next = self.cycle_guard.hash_after(
+                            self.pivot_vertex_changes(
+                                pivot_info.col,
+                                elem.row,
+                                elem.leaving_new_val,
+                            )
+                            .into_iter(),
+                        );
+                        if self.cycle_guard.is_bad_change(
+                            elem.row,
+                            self.basic_vars[elem.row],
+                            self.nb_vars[pivot_info.col],
+                            next,
+                        ) {
+                            // The entering var is taboo now; the next
+                            // iteration prices another.
+                            continue;
+                        }
+                    }
                     trace!(
                         "primal pivot: var {} enters (col {}) with step {:e}, {}",
                         self.nb_vars[pivot_info.col],
@@ -1314,14 +1564,20 @@ impl Solver {
                             None => "bound flip".to_string(),
                         }
                     );
+                    if let Some(elem) = &pivot_info.elem {
+                        self.hold_leaving_value(self.basic_vars[elem.row], elem.leaving_new_val);
+                    }
                     self.pivot(&pivot_info)?;
+                    self.forget_moved_rows(pivot_info.entering_diff);
+                    self.correct_primal();
                     pivoted = true;
-                    excluded_rows.clear();
+                    refreshed_since_step = false;
+                    excluded_col = None;
                 }
                 PivotChoice::Inconsistent { row, tiny } => {
                     if !self.factorization_is_fresh() {
                         debug!("optimize iter {iter}: pivot row/column disagreement; rebuilding");
-                        self.rebuild()?;
+                        self.rebuild_primal()?;
                     } else if tiny {
                         debug!("optimize iter {iter}: entry at row {row} is round-off; excluded");
                         excluded_rows.push(row);
@@ -1332,14 +1588,6 @@ impl Solver {
                         ));
                     }
                 }
-                PivotChoice::Optimal => {
-                    debug!(
-                        "found optimum in {} iterations, obj.: {}",
-                        iter + 1,
-                        self.cur_obj_val,
-                    );
-                    break;
-                }
             }
         }
 
@@ -1348,11 +1596,87 @@ impl Solver {
         Ok((StopReason::Finished, pivoted))
     }
 
-    fn restore_feasibility(&mut self) -> Result<StopReason, Error> {
-        let obj_str = if self.is_dual_feasible {
-            "obj."
-        } else {
+    /// A rebuild within the primal phase, as HiGHS's `HEkkPrimal::rebuild`:
+    /// a fresh factorization and everything derived from it
+    /// ([`Self::rebuild`]), the working bounds of the basic vars the
+    /// recomputed values put outside them shifted (HiGHS's `correctPrimal`),
+    /// and every taboo lifted, so that on fresh data every var may enter
+    /// again (the records of bad basis changes stay: see [`CycleGuard`]).
+    fn rebuild_primal(&mut self) -> Result<(), Error> {
+        self.rebuild()?;
+        self.correct_primal();
+        self.cycle_guard.clear_taboo();
+        Ok(())
+    }
+
+    /// Whether a non-basic var whose entry into the basis is taboo is dual
+    /// infeasible, i.e. would be priced if it were not taboo.
+    fn taboo_var_dual_infeasible(&self) -> bool {
+        self.cycle_guard.any_taboo()
+            && self.nb_vars.iter().enumerate().any(|(c, &var)| {
+                self.cycle_guard.is_taboo_entering(var)
+                    && !self.nb_var_states[c]
+                        .is_dual_feasible(self.nb_var_obj_coeffs[c], self.dual_tols[var])
+            })
+    }
+
+    /// Drop the records of bad basis changes whose row the step just made
+    /// (the entering var's move `entering_diff` along the column
+    /// `col_coeffs`, a pivot or a bound flip) has moved by at least the row's
+    /// tolerance: the state the change was bad in is gone (see
+    /// [`CycleGuard::forget_moved_rows`]).
+    fn forget_moved_rows(&mut self, entering_diff: f64) {
+        let (col_coeffs, basic_vars, var_tols) =
+            (&self.col_coeffs, &self.basic_vars, &self.var_tols);
+        self.cycle_guard.forget_moved_rows(|r| {
+            let tol = var_tols[basic_vars[r]];
+            let coeff = col_coeffs
+                .iter()
+                .find(|&(i, _)| i == r)
+                .map_or(0.0, |(_, &coeff)| coeff);
+            (coeff * entering_diff).abs() >= tol.lo.min(tol.hi)
+        });
+    }
+
+    /// The dual simplex phase: restore primal feasibility while keeping the
+    /// reduced costs dual feasible. It runs on working costs (see [`costs`]):
+    /// [`Self::begin_dual_phase`] perturbs them unless the start is near
+    /// optimal or the phase is a `cleanup` after another (see
+    /// [`Self::run_phases`]) and corrects the dual infeasibilities the phase
+    /// starts with, and whatever way the phase ends, they return to the costs
+    /// in force ([`Self::end_dual_phase`]).
+    fn restore_feasibility(&mut self, cleanup: bool) -> Result<StopReason, Error> {
+        let result = self
+            .begin_dual_phase(cleanup)
+            .and_then(|()| self.dual_phase());
+        self.end_dual_phase();
+        result
+    }
+
+    /// The pivots of the dual simplex phase, on the working costs.
+    ///
+    /// Each iteration takes the violated row with the best steepest-edge
+    /// score, skipping a row whose basis change was found to keep returning
+    /// to visited vertices ([`CycleGuard`]); computes the row and runs the
+    /// ratio test; skips the change if it is bad, and otherwise applies it:
+    /// the flips the step passed, then the pivot, with a zero dual step and
+    /// the entering var's cost shifted where its reduced cost lies on the
+    /// wrong side of zero (see [`DualStep::zero_step`]). Every rebuild in the phase
+    /// ([`Self::rebuild_dual`]) also corrects the dual infeasibilities the
+    /// recomputed reduced costs show (HiGHS's `HEkkDual::rebuild`), which
+    /// is also what a candidate found dual infeasible beyond its tolerance
+    /// asks for ([`DualRatioTest::DualInfeasible`]).
+    ///
+    /// The phase fails loudly rather than run forever: when the rows still
+    /// violated after a rebuild are all taboo (every basis change left
+    /// returns to visited vertices, HiGHS's `kSolvePhaseTabooBasis`), and
+    /// when the dual objective has not risen beyond round-off in
+    /// [`STALL_ITERATIONS`] iterations (SoPlex's stall check).
+    fn dual_phase(&mut self) -> Result<StopReason, Error> {
+        let obj_str = if self.artificial_obj.is_some() {
             "artificial obj."
+        } else {
+            "obj."
         };
 
         // Numerics valve, armed once per stall: before an infeasibility
@@ -1367,6 +1691,8 @@ impl Solver {
         // Vars a flip-only step has moved in this phase (see
         // `choose_entering_col_dual`).
         let mut moved_alone: Vec<usize> = Vec::new();
+        // The dual objective at the last stall check.
+        let mut stall_reference = self.cur_obj_val;
 
         for iter in 0.. {
             self.lp_iterations += 1;
@@ -1381,163 +1707,50 @@ impl Solver {
                     iter, obj_str, self.cur_obj_val, num_vars, infeasibility,
                 );
             }
-
-            if let Some((row, leaving_new_val)) = self.choose_pivot_row_dual() {
-                self.calc_row_coeffs(row);
-                if excluded_row != Some(row) {
-                    excluded_cols.clear();
-                    excluded_row = Some(row);
+            if iter > 0 && iter % STALL_ITERATIONS == 0 {
+                // Every dual step is forward or zero and the perturbation
+                // makes zero steps rare, so a phase that progresses raises
+                // the dual objective of the working costs over many
+                // iterations, though not at every one: a shift moves it by
+                // the shift times its var's value, either way, and is given
+                // back when the var leaves. One that has not risen beyond
+                // round-off since the last check (or is not a number) is
+                // taken to be stuck in a cycle the vertex hash has not
+                // caught (see `cycling`, and the limits of this measure at
+                // `STALL_ITERATIONS`).
+                let obj = self.cur_obj_val;
+                let resolution = ROUNDOFF_FLOOR * obj.abs().max(stall_reference.abs());
+                let risen = obj - stall_reference > resolution;
+                if !risen {
+                    return Err(Error::InternalError(format!(
+                        "dual simplex stalled: the objective did not improve in \
+                         {STALL_ITERATIONS} iterations"
+                    )));
                 }
-                let step = match self.choose_entering_col_dual(
-                    row,
-                    leaving_new_val,
-                    &excluded_cols,
-                    &moved_alone,
-                ) {
-                    Ok(step) => step,
-                    Err(Error::Infeasible) if !refreshed_since_pivot => {
-                        // "No eligible entering column" is a proof of primal
-                        // infeasibility only in exact arithmetic. This deep
-                        // in an eta-file chain, the leaving row can be a
-                        // *phantom* violation — basic values drifted by
-                        // accumulated round-off — whose (equally drifted)
-                        // pivot row then blocks every candidate; declaring
-                        // infeasibility here is a wrong answer (netlib/brandy
-                        // did exactly this). Rebuild the factorization and
-                        // everything derived from it and re-examine: a
-                        // phantom dissolves, a real infeasibility survives
-                        // the rebuild and the next declaration stands.
-                        debug!(
-                            "restore feasibility iter {}: no entering column for row {}; \
-                             rebuilding before declaring infeasibility",
-                            iter, row,
-                        );
-                        self.rebuild()?;
-                        refreshed_since_pivot = true;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
-                let Some((col, a_row)) = step.entering else {
-                    // A flip-only step: the flips alone bring the leaving var
-                    // within its bounds, as its row predicts through entries
-                    // below the row's round-off. Applying them computes their
-                    // effect again, through their columns; if the leaving var
-                    // does not land, those entries were the round-off they
-                    // may be, and the flips are undone and excluded for this
-                    // row.
-                    let undo: Vec<(usize, f64)> = step
-                        .flips
-                        .iter()
-                        .map(|&(c, _)| (c, self.nb_var_vals[c]))
-                        .collect();
-                    self.apply_flips(&step.flips);
-                    if self.basic_var_within_bounds(row) {
-                        trace!(
-                            "dual flip-only step: {} vars to their other bound, var {} of row \
-                             {row} lands at {:e}",
-                            step.flips.len(),
-                            self.basic_vars[row],
-                            self.basic_var_vals[row],
-                        );
-                        for &(c, _) in &step.flips {
-                            moved_alone.push(self.nb_vars[c]);
-                            // No dual step went with the move.
-                            self.downgrade_dual_feasibility(c);
-                        }
-                        refreshed_since_pivot = false;
-                    } else {
-                        debug!(
-                            "restore feasibility iter {iter}: flips through entries below \
-                             round-off do not land row {row}; undone and excluded"
-                        );
-                        self.apply_flips(&undo);
-                        excluded_cols.extend(step.flips.iter().map(|&(c, _)| c));
-                    }
-                    continue;
-                };
-                self.calc_col_coeffs(col);
-                // The pivot element is known through the row (from the
-                // transposed solve) and through the column (from the forward
-                // solve). A disagreement means one of them is round-off: with
-                // pivots stacked on the factorization, rebuild and redo the
-                // iteration; on a fresh factorization the basis itself is
-                // numerically unusable.
-                let a_col = self.col_coeff_at(row);
-                let scale = self
-                    .row_coeffs
-                    .iter()
-                    .chain(self.col_coeffs.iter())
-                    .map(|(_, coeff)| coeff.abs())
-                    .fold(0.0, f64::max);
-                if !Self::pivots_agree(a_row, a_col, scale) {
-                    if !self.factorization_is_fresh() {
-                        debug!(
-                            "restore feasibility iter {iter}: pivot row/column disagreement \
-                             ({a_row:e} vs {a_col:e}); rebuilding"
-                        );
-                        self.rebuild()?;
-                    } else if a_row.abs() < PIVOT_REL_TOL * scale {
-                        debug!(
-                            "restore feasibility iter {iter}: entry {a_row:e} of column {col} in \
-                             row {row} is round-off; excluded"
-                        );
-                        excluded_cols.push(col);
-                    } else {
+                stall_reference = obj;
+            }
+
+            let Some((row, leaving_new_val)) = self.choose_pivot_row_dual() else {
+                if self.taboo_row_violated() {
+                    // Only rows whose basis change returns to visited
+                    // vertices are left. Try them again on fresh data, where
+                    // the reduced costs (and so the entering var) may
+                    // differ; if nothing moved since the last rebuild, the
+                    // phase is stuck.
+                    if refreshed_since_pivot {
                         return Err(Error::InternalError(
-                            "pivot element disagrees between row and column on a fresh factorization"
+                            "dual simplex cycles: every basis change left returns to visited \
+                             vertices"
                                 .to_string(),
                         ));
                     }
+                    debug!(
+                        "restore feasibility iter {iter}: only taboo rows are violated; rebuilding"
+                    );
+                    self.rebuild_dual()?;
+                    refreshed_since_pivot = true;
                     continue;
                 }
-                // The flips the step passed come first. They move basic
-                // values, not the basis, so the pivot column stays as
-                // computed; the entering var's step is then measured from
-                // where they leave the leaving var. The pivot is made even if
-                // the flips, computed through their columns, carried the
-                // leaving var up to or past its bound (their row predicted
-                // less): the entering var's step is then tiny or reversed.
-                // The flips never come with a zero dual step (see
-                // `choose_entering_col_dual`), so the dual objective grows
-                // with every step that flips and flips cannot alternate
-                // without progress. (A reversed step can leave the entering
-                // var outside its bounds; that is a primal infeasibility like
-                // any other, for the next iterations.)
-                //
-                // Now that the two computations agree, each is used where it
-                // belongs (HiGHS `HEkkDual::updatePrimal` and
-                // `updateDual`): the column's element for the primal step,
-                // the eta file and the steepest-edge updates, which apply it
-                // together with the rest of the column, and the row's for the
-                // reduced costs, which are updated along the row.
-                self.apply_flips(&step.flips);
-                let val = self.basic_var_vals[row];
-                let entering_diff = (val - leaving_new_val) / a_col;
-                let pivot_info = PivotInfo {
-                    col,
-                    entering_new_val: self.nb_var_vals[col] + entering_diff,
-                    entering_diff,
-                    elem: Some(PivotElem {
-                        row,
-                        leaving_new_val,
-                        coeff: a_col,
-                        dual_step_coeff: a_row,
-                    }),
-                };
-                trace!(
-                    "dual pivot: var {} enters (col {col}), var {} leaves row {row} to \
-                     {leaving_new_val:e}, element {a_col:e} (row {a_row:e}), entering step \
-                     {entering_diff:e}, {} bound flips",
-                    self.nb_vars[col],
-                    self.basic_vars[row],
-                    step.flips.len(),
-                );
-                self.pivot(&pivot_info)?;
-                // Any successful pivot is progress: re-arm the valve.
-                refreshed_since_pivot = false;
-                excluded_row = None;
-            } else {
                 debug!(
                     "restored feasibility in {} iterations, {}: {}",
                     iter + 1,
@@ -1545,12 +1758,267 @@ impl Solver {
                     self.cur_obj_val,
                 );
                 break;
+            };
+            self.calc_row_coeffs(row);
+            if excluded_row != Some(row) {
+                excluded_cols.clear();
+                excluded_row = Some(row);
             }
+            let step = match self.choose_entering_col_dual(
+                row,
+                leaving_new_val,
+                &excluded_cols,
+                &moved_alone,
+            ) {
+                Ok(DualRatioTest::Step(step)) => step,
+                Ok(DualRatioTest::DualInfeasible) => {
+                    // A candidate's reduced cost lies beyond its tolerance
+                    // on its infeasible side (drift of the incremental
+                    // updates, or an earlier step its entry, below the pivot
+                    // floor, did not bound: see `rebuild_dual`): recompute
+                    // and correct, as HiGHS rebuilds when `workTheta <= 0`.
+                    // The correction leaves every reduced cost feasible, so
+                    // this cannot follow a rebuild.
+                    if refreshed_since_pivot {
+                        return Err(Error::InternalError(
+                            "dual simplex: a reduced cost is dual infeasible right after its \
+                             correction"
+                                .to_string(),
+                        ));
+                    }
+                    debug!(
+                        "restore feasibility iter {iter}: a candidate of row {row} is dual \
+                         infeasible; rebuilding and correcting"
+                    );
+                    self.rebuild_dual()?;
+                    refreshed_since_pivot = true;
+                    continue;
+                }
+                Err(Error::Infeasible) if !refreshed_since_pivot => {
+                    // "No eligible entering column" is a proof of primal
+                    // infeasibility only in exact arithmetic. This deep
+                    // in an eta-file chain, the leaving row can be a
+                    // *phantom* violation — basic values drifted by
+                    // accumulated round-off — whose (equally drifted)
+                    // pivot row then blocks every candidate; declaring
+                    // infeasibility here is a wrong answer (netlib/brandy
+                    // did exactly this). Rebuild the factorization and
+                    // everything derived from it and re-examine: a
+                    // phantom dissolves, a real infeasibility survives
+                    // the rebuild and the next declaration stands.
+                    debug!(
+                        "restore feasibility iter {}: no entering column for row {}; \
+                         rebuilding before declaring infeasibility",
+                        iter, row,
+                    );
+                    self.rebuild_dual()?;
+                    refreshed_since_pivot = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let Some((col, a_row)) = step.entering else {
+                // A flip-only step: the flips alone bring the leaving var
+                // within its bounds, as its row predicts through entries
+                // below the row's round-off. Applying them computes their
+                // effect again, through their columns; if the leaving var
+                // does not land, those entries were the round-off they
+                // may be, and the flips are undone and excluded for this
+                // row.
+                let undo: Vec<(usize, f64)> = step
+                    .flips
+                    .iter()
+                    .map(|&(c, _)| (c, self.nb_var_vals[c]))
+                    .collect();
+                self.apply_flips(&step.flips);
+                if self.basic_var_within_bounds(row) {
+                    trace!(
+                        "dual flip-only step: {} vars to their other bound, var {} of row \
+                         {row} lands at {:e}",
+                        step.flips.len(),
+                        self.basic_vars[row],
+                        self.basic_var_vals[row],
+                    );
+                    for &(c, _) in &step.flips {
+                        moved_alone.push(self.nb_vars[c]);
+                        // No dual step went with the move, so the var's
+                        // reduced cost may have the wrong sign where it
+                        // landed: its cost is shifted until it has the
+                        // right one, and the cleanup gives the shift back.
+                        self.shift_to_dual_feasible(c);
+                    }
+                    refreshed_since_pivot = false;
+                } else {
+                    debug!(
+                        "restore feasibility iter {iter}: flips through entries below \
+                         round-off do not land row {row}; undone and excluded"
+                    );
+                    self.apply_flips(&undo);
+                    excluded_cols.extend(step.flips.iter().map(|&(c, _)| c));
+                }
+                continue;
+            };
+            let next = self.cycle_guard.hash_after(
+                self.dual_step_vertex_changes(&step, col, row, leaving_new_val)
+                    .into_iter(),
+            );
+            if self
+                .cycle_guard
+                .is_bad_change(row, self.basic_vars[row], self.nb_vars[col], next)
+            {
+                // The row is taboo now; the next iteration takes another.
+                continue;
+            }
+            self.calc_col_coeffs(col);
+            // The pivot element is known through the row (from the
+            // transposed solve) and through the column (from the forward
+            // solve). A disagreement means one of them is round-off: with
+            // pivots stacked on the factorization, rebuild and redo the
+            // iteration; on a fresh factorization the basis itself is
+            // numerically unusable.
+            let a_col = self.col_coeff_at(row);
+            let scale = self
+                .row_coeffs
+                .iter()
+                .chain(self.col_coeffs.iter())
+                .map(|(_, coeff)| coeff.abs())
+                .fold(0.0, f64::max);
+            if !Self::pivots_agree(a_row, a_col, scale) {
+                if !self.factorization_is_fresh() {
+                    debug!(
+                        "restore feasibility iter {iter}: pivot row/column disagreement \
+                         ({a_row:e} vs {a_col:e}); rebuilding"
+                    );
+                    self.rebuild_dual()?;
+                } else if a_row.abs() < PIVOT_REL_TOL * scale {
+                    debug!(
+                        "restore feasibility iter {iter}: entry {a_row:e} of column {col} in \
+                         row {row} is round-off; excluded"
+                    );
+                    excluded_cols.push(col);
+                } else {
+                    return Err(Error::InternalError(
+                        "pivot element disagrees between row and column on a fresh factorization"
+                            .to_string(),
+                    ));
+                }
+                continue;
+            }
+            // The flips the step passed come first. They move basic
+            // values, not the basis, so the pivot column stays as
+            // computed; the entering var's step is then measured from
+            // where they leave the leaving var. The pivot is made even if
+            // the flips, computed through their columns, carried the
+            // leaving var up to or past its bound (their row predicted
+            // less): the entering var's step is then tiny or reversed.
+            // The flips never come with a zero dual step (see
+            // `choose_entering_col_dual`), so the dual objective grows
+            // with every step that flips and flips cannot alternate
+            // without progress. (A reversed step can leave the entering
+            // var outside its bounds; that is a primal infeasibility like
+            // any other, for the next iterations.)
+            //
+            // Now that the two computations agree, each is used where it
+            // belongs (HiGHS `HEkkDual::updatePrimal` and
+            // `updateDual`): the column's element for the primal step,
+            // the eta file and the steepest-edge updates, which apply it
+            // together with the rest of the column, and the row's for the
+            // reduced costs, which are updated along the row.
+            self.apply_flips(&step.flips);
+            if step.zero_step {
+                // The dual step `d_q / a_row` would run backwards: the
+                // entering var's cost is shifted so its reduced cost is
+                // zero, and the step, zero, changes no other.
+                self.shift_entering_cost(col);
+            }
+            let val = self.basic_var_vals[row];
+            let entering_diff = (val - leaving_new_val) / a_col;
+            let pivot_info = PivotInfo {
+                col,
+                entering_new_val: self.nb_var_vals[col] + entering_diff,
+                entering_diff,
+                elem: Some(PivotElem {
+                    row,
+                    leaving_new_val,
+                    coeff: a_col,
+                    dual_step_coeff: a_row,
+                }),
+            };
+            trace!(
+                "dual pivot: var {} enters (col {col}), var {} leaves row {row} to \
+                 {leaving_new_val:e}, element {a_col:e} (row {a_row:e}), entering step \
+                 {entering_diff:e}, {} bound flips{}",
+                self.nb_vars[col],
+                self.basic_vars[row],
+                step.flips.len(),
+                if step.zero_step {
+                    ", zero dual step"
+                } else {
+                    ""
+                },
+            );
+            self.pivot(&pivot_info)?;
+            self.forget_moved_rows(entering_diff);
+            // Any successful pivot is progress: re-arm the valve.
+            refreshed_since_pivot = false;
+            excluded_row = None;
         }
 
         // Provisional: `run_phases` confirms it on recomputed values.
         self.is_primal_feasible = true;
         Ok(StopReason::Finished)
+    }
+
+    /// A rebuild within the dual phase, as HiGHS's `HEkkDual::rebuild`: a
+    /// fresh factorization and everything derived from it
+    /// ([`Self::rebuild`]), then the dual infeasibilities the recomputed
+    /// reduced costs show corrected, and every taboo lifted, so that on
+    /// fresh data every row may be tried again (the records of bad basis
+    /// changes stay, as HiGHS keeps them through the rebuilds that stand
+    /// for these: see [`CycleGuard`]).
+    ///
+    /// The correction here shifts every infeasible cost, boxed vars' too, as
+    /// SoPlex shifts every violated dual bound, where HiGHS moves a boxed var
+    /// to its other bound. HiGHS's ratio test bounds the step by every entry
+    /// above a tiny absolute tolerance, so what a rebuild finds is drift;
+    /// this one leaves an entry seven orders below the row's largest out of
+    /// the bound ([`PIVOT_REL_TOL`]), and a step can leave such a var dual
+    /// infeasible by far more. Moving it back to the other bound undid the
+    /// step that had moved it and returned the phase to a vertex it had left:
+    /// a model of the differential fuzz went round that loop until the
+    /// cycling detection gave up (`wide_lp_1897_solves_within_the_contract`
+    /// in `src/tests/magnitudes.rs`). A shift keeps the vertex, and the
+    /// cleanup gives it back.
+    fn rebuild_dual(&mut self) -> Result<(), Error> {
+        self.rebuild()?;
+        self.correct_dual_infeasibilities(true);
+        self.cycle_guard.clear_taboo();
+        Ok(())
+    }
+
+    /// Start the cycling detection of a phase from the current vertex: every
+    /// basic var, and every non-basic var at its upper bound (see
+    /// [`CycleGuard`]).
+    fn start_cycle_detection(&mut self) {
+        let vertex = self
+            .basic_vars
+            .iter()
+            .map(|&var| VertexChange::Basic(var))
+            .chain(
+                self.nb_vars
+                    .iter()
+                    .zip(&self.nb_var_states)
+                    .filter(|(_, state)| state.at_upper())
+                    .map(|(&var, _)| VertexChange::Upper(var)),
+            );
+        self.cycle_guard.start(vertex);
+    }
+
+    /// Whether a row whose basis change is taboo is violated.
+    fn taboo_row_violated(&self) -> bool {
+        self.cycle_guard.any_taboo()
+            && (0..self.num_constraints())
+                .any(|r| self.cycle_guard.is_taboo(r) && !self.basic_var_within_bounds(r))
     }
 
     pub(crate) fn add_constraint(
@@ -1578,7 +2046,11 @@ impl Solver {
 
         let slack_var = self.num_total_vars();
 
+        debug_assert!(!self.costs_modified, "a row added during a dual phase");
+        debug_assert!(!self.bounds_modified, "a row added during a primal phase");
         self.orig_obj_coeffs.push(0.0);
+        self.cost_perturbation.push(0.0);
+        self.cost_shifts.push(0.0);
         self.orig_var_mins.push(slack_var_min);
         self.orig_var_maxs.push(slack_var_max);
         self.var_states.push(VarState::Basic(self.basic_vars.len()));
@@ -1599,7 +2071,6 @@ impl Solver {
             row_scale,
             magnitude,
         )));
-        self.row_mags.push(magnitude);
         for (var, &coeff) in coeffs.iter() {
             let budget = snap_budget(self.feasibility, row_scale, coeff);
             if budget < self.row_budgets[var] {
@@ -1727,77 +2198,111 @@ impl Solver {
         }
     }
 
-    /// `excluded_rows` lists rows judged numerically zero in the entering
-    /// column (their entry disagreed with the row computation on a fresh
-    /// factorization) and therefore not candidate pivots.
-    fn choose_pivot(&mut self, excluded_rows: &[usize]) -> Result<PivotChoice, Error> {
-        let entering_c = {
-            let filtered_obj_coeffs = self
-                .nb_var_obj_coeffs
-                .iter()
-                .zip(&self.nb_var_states)
-                .enumerate()
-                .filter_map(|(col, (&obj_coeff, var_state))| {
-                    // Choose only among non-basic vars that can be changed
-                    // with objective decreasing.
-                    if var_state.is_dual_feasible(obj_coeff, self.dual_tols[self.nb_vars[col]]) {
-                        None
-                    } else {
-                        Some((col, obj_coeff))
-                    }
-                });
-
-            // A reduced cost that is not a number is dual infeasible (every
-            // comparison with it is false), but its score, not a number
-            // either, never wins the choice below, and a phase whose only
-            // candidates were such costs ended as optimal. It is the loud
-            // error it is instead.
-            let mut best_col = None;
-            let mut best_score = f64::NEG_INFINITY;
-            for (col, obj_coeff) in filtered_obj_coeffs {
-                if !obj_coeff.is_finite() {
-                    return Err(Error::InternalError(format!(
-                        "reduced cost of var {} is not finite: {obj_coeff}",
-                        self.nb_vars[col]
-                    )));
-                }
-                let score = if self.enable_primal_steepest_edge {
-                    obj_coeff * obj_coeff / self.primal_edge_sq_norms[col]
+    /// The primal simplex's pricing: the entering var, the dual infeasible
+    /// one with the best steepest-edge score (the largest reduced cost when
+    /// the weights are off) that is not taboo ([`CycleGuard`]), as its
+    /// non-basic column; `None` when no var that may enter can improve the
+    /// objective.
+    fn price_primal(&self) -> Result<Option<usize>, Error> {
+        let any_taboo = self.cycle_guard.any_taboo();
+        let filtered_obj_coeffs = self
+            .nb_var_obj_coeffs
+            .iter()
+            .zip(&self.nb_var_states)
+            .enumerate()
+            .filter_map(|(col, (&obj_coeff, var_state))| {
+                // Choose only among non-basic vars that can be changed with
+                // objective decreasing, and whose entry into the basis is
+                // not taboo (HiGHS's `applyTabooVariableIn`).
+                let var = self.nb_vars[col];
+                if var_state.is_dual_feasible(obj_coeff, self.dual_tols[var])
+                    || (any_taboo && self.cycle_guard.is_taboo_entering(var))
+                {
+                    None
                 } else {
-                    obj_coeff.abs()
-                };
-                if score > best_score {
-                    best_col = Some(col);
-                    best_score = score;
+                    Some((col, obj_coeff))
                 }
-            }
+            });
 
-            if let Some(col) = best_col {
-                col
+        // A reduced cost that is not a number is dual infeasible (every
+        // comparison with it is false), but its score, not a number either,
+        // never wins the choice below, and a phase whose only candidates
+        // were such costs ended as optimal. It is the loud error it is
+        // instead.
+        let mut best_col = None;
+        let mut best_score = f64::NEG_INFINITY;
+        for (col, obj_coeff) in filtered_obj_coeffs {
+            if !obj_coeff.is_finite() {
+                return Err(Error::InternalError(format!(
+                    "reduced cost of var {} is not finite: {obj_coeff}",
+                    self.nb_vars[col]
+                )));
+            }
+            let score = if self.enable_primal_steepest_edge {
+                obj_coeff * obj_coeff / self.primal_edge_sq_norms[col]
             } else {
-                return Ok(PivotChoice::Optimal);
+                obj_coeff.abs()
+            };
+            if score > best_score {
+                best_col = Some(col);
+                best_score = score;
             }
-        };
+        }
+        Ok(best_col)
+    }
 
+    /// The primal simplex's ratio test for the entering column `entering_c`
+    /// (see [`Self::price_primal`]), on the working bounds of the phase (see
+    /// [`bounds`]): the basic var that leaves for it, or a flip of the
+    /// entering var to its other bound.
+    ///
+    /// `excluded_rows` lists rows judged numerically zero in this entering
+    /// column (their entry disagreed with the row computation on a fresh
+    /// factorization of the current basis) and therefore not candidate
+    /// pivots. `harris_scale` scales the tolerance the ratio test lets a
+    /// basic var pass its bound by (see `run_phases`).
+    fn choose_pivot(
+        &mut self,
+        entering_c: usize,
+        excluded_rows: &[usize],
+        harris_scale: f64,
+    ) -> Result<PivotChoice, Error> {
         let entering_cur_val = self.nb_var_vals[entering_c];
         // If true, entering variable will increase (because the objective function must decrease).
         let entering_diff_sign = self.nb_var_obj_coeffs[entering_c] < 0.0;
+        let (entering_min, entering_max) = self.working_bounds(self.nb_vars[entering_c]);
         let entering_other_val = if entering_diff_sign {
-            self.orig_var_maxs[self.nb_vars[entering_c]]
+            entering_max
         } else {
-            self.orig_var_mins[self.nb_vars[entering_c]]
+            entering_min
         };
 
         self.calc_col_coeffs(entering_c);
+
+        // An entry of the column, or the value of a basic var in a row the
+        // column moves, that is not a finite number is a breakdown, not
+        // data: it compares false with every bound below, so its row would
+        // drop out of the test unseen and the step could run past it, or be
+        // taken for an unbounded ray. It is the loud error it is instead (as
+        // in the dual ratio test).
+        for (r, &coeff) in self.col_coeffs.iter() {
+            if !coeff.is_finite() || !self.basic_var_vals[r].is_finite() {
+                return Err(Error::InternalError(format!(
+                    "primal simplex: entry {coeff} of var {} in row {r}, whose basic var is at \
+                     {}, is not finite",
+                    self.nb_vars[entering_c], self.basic_var_vals[r]
+                )));
+            }
+        }
 
         // leaving_diff = -entering_diff * coeff: whether the basic var of a
         // row with this entry moves towards its max as the entering var moves.
         let moves_up = |coeff: f64| {
             (entering_diff_sign && coeff < 0.0) || (!entering_diff_sign && coeff > 0.0)
         };
-        // How far the basic var of row `r` is from the bound it moves
-        // towards: negative when it already sits past that bound (within
-        // its tolerance), infinite when that bound is.
+        // How far the basic var of row `r` is from the (working) bound it
+        // moves towards: negative when it already sits past that bound
+        // (within its tolerance), infinite when that bound is.
         let signed_room = |r: usize, coeff: f64| -> f64 {
             let val = self.basic_var_vals[r];
             if moves_up(coeff) {
@@ -1816,13 +2321,15 @@ impl Solver {
 
         // An entry within the round-off of computing the column (relative to
         // its largest entry, see ENTRY_ROUNDOFF) is noise: it neither blocks
-        // the step nor is a pivot. Every other entry blocks the step, since
-        // the phase exit holds every basic var to its tolerance whatever the
-        // size of its entry. An entry seven orders below the largest entry
-        // among the rows whose basic var can block the step at all (see
-        // PIVOT_REL_TOL) is too unstable to pivot on while a larger entry can
-        // take the step, and is the pivot only when none can; a row with no
-        // finite bound in the way says nothing about the scale of the
+        // the step nor is a pivot. The step still moves its basic var, and
+        // where that takes the var outside its bounds beyond its tolerance,
+        // the var's bound is shifted after the step (`correct_primal`), as
+        // HiGHS shifts the bounds of the rows its ratio test ignores. Every
+        // other entry blocks the step. An entry seven orders below the
+        // largest entry among the rows whose basic var can block the step at
+        // all (see PIVOT_REL_TOL) is too unstable to pivot on while a larger
+        // entry can take the step, and is the pivot only when none can; a row
+        // with no finite bound in the way says nothing about the scale of the
         // candidates.
         let col_max_all = self
             .col_coeffs
@@ -1839,16 +2346,36 @@ impl Solver {
         let pivot_floor = noise_floor.max(PIVOT_REL_TOL * col_max);
 
         // First, the largest step of the entering var after which no basic
-        // var has left its bound by more than its tolerance (Harris's
-        // relaxed bounds). The allowance is measured from where the var
-        // sits: one already past its bound has only the rest of its
-        // tolerance left, and granting it the whole tolerance again would
-        // carry it out of the contract the phase exit verifies. And it is
-        // the tolerance less the round-off of recomputing the var (its row's
-        // for a slack, its bound's for a structural var): a step that left a
-        // var exactly at its tolerance was undone by the phase exit whenever
-        // the recomputation landed it an ulp past, and the phases alternated
-        // until they gave up.
+        // var has left its working bound by more than its tolerance (Harris's
+        // relaxed bounds, HiGHS's `relaxSpace` in `HEkkPrimal::chooseRow`),
+        // counted from where the var sits: one already past its bound has
+        // only the rest of its tolerance left, and one past it by all of it
+        // admits no step toward it at all. The tolerance is the whole of the
+        // one the phase exit verifies with, in the first round of
+        // `run_phases`. A step that leaves a var at it, and a recomputation
+        // that then finds the var an ulp past, give a violation like any
+        // other, which the dual simplex removes after the cleanup, and each
+        // further round allows a hundredth of the tolerance more (see
+        // `LOOP_HARRIS_REDUCTION`); cutting the allowance by the round-off
+        // of recomputing the var instead (as once done) left no allowance at
+        // all on rows above about 5e6 in magnitude, where scaling is worst
+        // (C3-10 of the solver review).
+        //
+        // The limit is a step, never below zero. In the first round every basic
+        // var lies within its working bounds up to the tolerance
+        // (`correct_primal`), so no limit falls below zero beyond round-off, as
+        // none does in HiGHS, whose shifts keep every var within the tolerance
+        // its ratio test allows. In a later round a var can sit past its bound
+        // by more than the allowance: it admits no step toward it, a limit of
+        // zero, not the negative step that would take it back within the
+        // allowance, which is no step the simplex takes (see below). A negative
+        // limit let only the rows of vars past their bounds qualify, the most
+        // negative from the smallest entries, and passed over a row at its
+        // bound with an entry of one for an entry of `1.3e-8` below the pivot
+        // floor (review of R1b,
+        // `a_var_past_its_bound_beyond_the_allowance_limits_the_step_to_zero`).
+        // SoPlex's limit is never negative either: it counts a violating var's
+        // allowance from where the var sits (`SPxFastRT::maxDelta`).
         let mut max_step = (entering_other_val - entering_cur_val).abs();
         for (r, &coeff) in self.col_coeffs.iter() {
             let coeff_abs = coeff.abs();
@@ -1856,29 +2383,20 @@ impl Solver {
                 continue;
             }
 
-            let var = self.basic_vars[r];
-            let up = moves_up(coeff);
-            let round_off = ROUNDOFF_FLOOR
-                * if var >= self.num_vars {
-                    self.row_mags[var - self.num_vars]
-                } else if up {
-                    self.basic_var_maxs[r].abs()
-                } else {
-                    self.basic_var_mins[r].abs()
-                };
-            let allowance = (self.var_tols[var].toward(up) - round_off).max(0.0);
-            let cur_step = (signed_room(r, coeff) + allowance).max(0.0) / coeff_abs;
+            let tol = harris_scale * self.var_tols[self.basic_vars[r]].toward(moves_up(coeff));
+            let cur_step = (signed_room(r, coeff) + tol) / coeff_abs;
             if cur_step < max_step {
                 max_step = cur_step;
             }
         }
+        let max_step = max_step.max(0.0);
 
-        // Second, among the rows whose own step (to the bound itself) is
-        // within that limit, the one with the largest entry leaves: a
-        // numerically more stable basis at the price of a tolerance-level
-        // infeasibility of the others. Entries above the pivot floor are
-        // preferred; the row that set the limit always qualifies, so a
-        // blocked step always finds a pivot.
+        // Second, among the rows whose own step (to the bound itself; below
+        // zero for a var past its bound) is within that limit, the one with
+        // the largest entry leaves: a numerically more stable basis at the
+        // price of a tolerance-level infeasibility of the others. Entries
+        // above the pivot floor are preferred; the row that set the limit
+        // always qualifies, so a blocked step always finds a pivot.
         let mut leaving_r = None;
         let mut leaving_new_val = 0.0;
         let mut pivot_coeff_abs = f64::NEG_INFINITY;
@@ -1890,7 +2408,7 @@ impl Solver {
                     continue;
                 }
 
-                let cur_step = signed_room(r, coeff).max(0.0) / coeff_abs;
+                let cur_step = signed_room(r, coeff) / coeff_abs;
                 if cur_step.is_finite() && cur_step <= max_step && coeff_abs > pivot_coeff_abs {
                     leaving_r = Some(r);
                     leaving_new_val = if moves_up(coeff) {
@@ -1926,35 +2444,46 @@ impl Solver {
                 });
             }
 
-            // The step never runs against the entering var's improving
-            // direction. A leaving var that already sits at or (within its
-            // tolerance) past the bound it leaves at gives a degenerate
-            // pivot: the entering var keeps its value and the leaving var is
-            // set onto its bound, which turns its tolerance-level overshoot
-            // into a tolerance-level row residual instead of walking the
-            // entering var backwards out of its own bounds.
-            let raw_diff = (self.basic_var_vals[row] - leaving_new_val) / pivot_coeff;
-            let entering_diff = if entering_diff_sign {
-                raw_diff.max(0.0)
-            } else {
-                raw_diff.min(0.0)
-            };
-            if entering_diff == 0.0 {
-                // A degenerate step: the leaving var sits at or past the
-                // bound it leaves at, within its tolerance, so it leaves
-                // where it sits, which is at that bound as far as the engine
-                // is concerned; the basis equations keep holding and nothing
-                // moves. (Set onto the bound itself, the leaving var moved
-                // the entering one backwards by the clamped-away `raw_diff`
-                // at the next recomputation, out of its bounds whenever that
-                // exceeded its tolerance; refusing such a column instead
-                // declared optimal a vertex with an improving direction left,
-                // 3e-3 short of the optimum.)
-                let tol = self.var_tols[self.basic_vars[row]]
-                    .toward(leaving_new_val == self.basic_var_maxs[row]);
-                leaving_new_val =
-                    self.basic_var_vals[row].clamp(leaving_new_val - tol, leaving_new_val + tol);
+            // The step takes the leaving var exactly onto its working bound
+            // (HiGHS's `theta_primal`, `HEkkPrimal::considerBoundSwap`), and
+            // a var fixed in the model onto its value, whatever the phase did
+            // to its working bounds (HiGHS's `adjustPerturbedEquationOut`: an
+            // equality leaves the basis holding at its right-hand side). But
+            // where the leaving var sits past that target (within its
+            // tolerance, as the Harris pass allows), the step would run
+            // backwards: the entering var would move against its improving
+            // direction by the overshoot over the element, and every basic
+            // var with it. The step is zero instead, and the leaving var
+            // leaves where it sits, its working bound moved there
+            // (`hold_leaving_value`): SoPlex's `SPxFastRT::maxReLeave`, which
+            // takes a backward step only when it moves no basic var by more
+            // than the tolerance, a bound no one tolerance gives here. HiGHS
+            // takes the step: under its uniform tolerance of `1e-7` the
+            // overshoot, divided by the element, stays harmless; under the
+            // engine's, a var's is capped by what its rows can absorb, and
+            // the round-off a leaving var carried (an ulp of 128), divided by
+            // an element of 5e-5, took the entering var `1.5e-10` past a
+            // bound whose tolerance was `1e-10`. The zero step replaces a
+            // step clamped to zero with the leaving var left where it sat off
+            // its bound, unrecorded (C3-21 of the solver review), and before
+            // it the refusal of such a column, which declared optimal a vertex
+            // with an improving direction left, 3e-3 short of the optimum.
+            let leaving_var = self.basic_vars[row];
+            if self.orig_var_mins[leaving_var] == self.orig_var_maxs[leaving_var] {
+                leaving_new_val = self.orig_var_mins[leaving_var];
             }
+            let raw_diff = (self.basic_var_vals[row] - leaving_new_val) / pivot_coeff;
+            let forward = if entering_diff_sign {
+                raw_diff >= 0.0
+            } else {
+                raw_diff <= 0.0
+            };
+            let entering_diff = if forward {
+                raw_diff
+            } else {
+                leaving_new_val = self.basic_var_vals[row];
+                0.0
+            };
             let entering_new_val = entering_cur_val + entering_diff;
 
             Ok(PivotChoice::Pivot(PivotInfo {
@@ -1982,7 +2511,12 @@ impl Solver {
         }
     }
 
+    /// The row to leave the basis: the violated row with the best dual
+    /// steepest-edge score, not counting a row whose basis change is taboo
+    /// (HiGHS's `HEkk::applyTabooRowOut` in `HEkkDual::chooseRow`), and the
+    /// bound its basic var leaves at.
     fn choose_pivot_row_dual(&self) -> Option<(usize, f64)> {
+        let any_taboo = self.cycle_guard.any_taboo();
         let infeasibilities = self
             .basic_var_vals
             .iter()
@@ -1991,7 +2525,9 @@ impl Solver {
             .enumerate()
             .filter_map(|(r, ((&val, &min), &max))| {
                 let tol = self.var_tols[self.basic_vars[r]];
-                if val < min - tol.lo {
+                if any_taboo && self.cycle_guard.is_taboo(r) {
+                    None
+                } else if val < min - tol.lo {
                     Some((r, min - val))
                 } else if val > max + tol.hi {
                     Some((r, val - max))
@@ -2068,6 +2604,22 @@ impl Solver {
     /// Koberstein, PhD thesis, Paderborn 2005): where vars are boxed
     /// (binaries) one pivot does the work of several.
     ///
+    /// A var's breakpoint is its reduced cost on its feasible side (its
+    /// `slack`: the reduced cost itself for a var moving up, its negative
+    /// for one moving down) over its entry, as HiGHS's `workMove * workDual`
+    /// over `alpha`. The Harris pass lets a reduced cost cross zero by its
+    /// tolerance, so a slack can be slightly negative; nothing clamps it. If
+    /// the entering var's is not positive, the step is zero and the var's
+    /// cost is shifted ([`DualStep::zero_step`]), instead of a step
+    /// backwards (HiGHS takes `workTheta = 0` and `shiftCost`s). If a
+    /// candidate's slack is below minus its tolerance, no step is dual
+    /// feasible, and the reduced costs are to be recomputed and corrected
+    /// first ([`DualRatioTest::DualInfeasible`]). An entry of the row, or the
+    /// reduced cost of a var the test weighs, that is not a finite number
+    /// fails the test with an `InternalError` ([`Self::finite_reduced_cost`]):
+    /// it would compare false with every bound and drop out unseen, and the
+    /// row's verdict would rest on the vars left.
+    ///
     /// The row's round-off scale is its largest entry over the columns that
     /// are not excluded and that the scalings made comparable: the entries
     /// of one row share the round-off of one transposed solve, so a var that
@@ -2075,30 +2627,32 @@ impl Solver {
     /// model entered the engine keeps the user's units (a fixed `1e17` beside
     /// a genuine `1`) and measures only its own data.
     ///
-    /// When no var can enter, the row is the whole argument: "no entering
-    /// var" proves infeasibility only if moving every var that can help to
-    /// its other bound still leaves the leaving var beyond its bound, since
-    /// the row is then a Farkas certificate over the vars' bounds. An entry
+    /// When no var can enter regularly, a var that can absorb the leaving
+    /// var's move by crossing its own bound within its tolerance enters
+    /// instead, on a zero dual step (see `absorbs` below). When none can,
+    /// the row is the whole argument: "no entering var" proves
+    /// infeasibility only if moving every var that can help to its other
+    /// bound still leaves the leaving var beyond its bound, since the row is
+    /// then a Farkas certificate over the vars' bounds. An entry
     /// below the round-off of computing the row (`ENTRY_ROUNDOFF`) is never
     /// a pivot, but moving a non-basic var is not a pivot, and its effect is
     /// computed again through the column when it is applied:
-    /// [`Self::restore_feasibility`] keeps such a move only if the leaving
-    /// var lands within its bounds, as the row predicts. So the vars with
-    /// such entries are moved, flipped or (the last one, if a flip would
-    /// overshoot) only partway, when that lands the leaving var, and the row
-    /// declares the model infeasible only when even flipping all of them
-    /// cannot reach the bound. (SoPlex's ratio test, `SPxBoundFlippingRT`,
-    /// takes every entry above its zero tolerance as a breakpoint for the
-    /// same reason; HiGHS's filters by its pivot tolerance first, and
-    /// without presolve fails on a feasible model of this kind.) A var with
-    /// such an entry and an infinite bound in its direction could only
-    /// enter, and nothing checks such an entry reliably before the pivot:
-    /// round-off can come out the same through the row and the column (so
-    /// the agreement check passes it), and the pivot then leaves a basis the
-    /// factorization rejects. It counts as the zero it may be. A flip has a
-    /// check a pivot lacks: the phase exit re-derives every row from the
-    /// data ([`Self::check_rows`]), so a flip whose effect was round-off is
-    /// found out there.
+    /// [`Self::dual_phase`] keeps such a move only if the leaving var lands
+    /// within its bounds, as the row predicts. So the vars with such entries
+    /// are moved, flipped or (the last one, if a flip would overshoot) only
+    /// partway, when that lands the leaving var, and the row declares the
+    /// model infeasible only when even flipping all of them cannot reach the
+    /// bound. (SoPlex's ratio test, `SPxBoundFlippingRT`, takes every entry
+    /// above its zero tolerance as a breakpoint for the same reason; HiGHS's
+    /// filters by its pivot tolerance first, and without presolve fails on a
+    /// feasible model of this kind.) A var with such an entry and an
+    /// infinite bound in its direction could only enter, and nothing checks
+    /// such an entry reliably before the pivot: round-off can come out the
+    /// same through the row and the column (so the agreement check passes
+    /// it), and the pivot then leaves a basis the factorization rejects. It
+    /// counts as the zero it may be. A flip has a check a pivot lacks: the
+    /// phase exit re-derives every row from the data ([`Self::check_rows`]),
+    /// so a flip whose effect was round-off is found out there.
     ///
     /// `excluded` lists non-basic columns judged numerically zero in this row
     /// (their entry disagreed with the column computation on a fresh
@@ -2114,19 +2668,9 @@ impl Solver {
         leaving_new_val: f64,
         excluded: &[usize],
         moved_alone: &[usize],
-    ) -> Result<DualStep, Error> {
+    ) -> Result<DualRatioTest, Error> {
         // True if the new obj. coeff. must be nonnegative in a dual-feasible configuration.
         let leaving_diff_sign = leaving_new_val > self.basic_var_vals[row];
-
-        fn clamp_obj_coeff(mut obj_coeff: f64, var_state: &NonBasicVarState) -> f64 {
-            if var_state.at_min && obj_coeff < 0.0 {
-                obj_coeff = 0.0;
-            }
-            if var_state.at_max && obj_coeff > 0.0 {
-                obj_coeff = 0.0;
-            }
-            obj_coeff
-        }
 
         // How far the leaving var's move would carry an entering var with
         // this tableau entry.
@@ -2163,7 +2707,16 @@ impl Solver {
         // reported infeasible, since the vertex that satisfies every
         // tolerance has the equality's slack basic and nothing else can
         // bring it into the basis. An integer var never absorbs: branching
-        // and rounding rely on it sitting exactly on its bounds.
+        // and rounding rely on it sitting exactly on its bounds. Such a
+        // pivot is no step of the dual simplex (the var moves the way its
+        // bound forbids), so it takes a zero dual step, its cost shifted as
+        // any entering var's with a reduced cost on the wrong side: it
+        // changes no reduced cost, where a step `d_q / a_q` would have run
+        // backwards by any amount (C2-12 of the solver review). Cost
+        // shifting does not make the fallback unnecessary: the violations it
+        // repairs are primal, from the engine's tolerances (half the
+        // contract for a row, a bound tolerance capped by the rows' reserve),
+        // and no dual step removes them.
         let absorbs = |c: usize, coeff: f64| -> bool {
             if coeff == 0.0 {
                 return false;
@@ -2200,92 +2753,25 @@ impl Solver {
         // into the scale it made a genuine entry of one "noise" and the row a
         // false proof of infeasibility. An entry below `ENTRY_ROUNDOFF` of
         // this scale is noise, never a pivot (see the verdict below).
+        //
+        // An entry that is not a finite number is a breakdown, not data: it
+        // compares false with every floor below, so its var would drop out of
+        // the test silently, and the row could prove infeasibility without
+        // it. It is the loud error it is instead (as a reduced cost that is
+        // not finite, see `finite_reduced_cost`).
         let mut scale = 0.0f64;
         for (c, &coeff) in self.row_coeffs.iter() {
             let var = self.nb_vars[c];
+            if !coeff.is_finite() {
+                return Err(Error::InternalError(format!(
+                    "dual simplex: entry of var {var} in row {row} is not finite: {coeff}"
+                )));
+            }
             if !excluded.contains(&c) && !(var < self.num_vars && self.unscaled_cols[var]) {
                 scale = scale.max(coeff.abs());
             }
         }
         let noise_floor = ENTRY_ROUNDOFF * scale;
-
-        // The Harris two-pass ratio test over the vars `can_enter` admits;
-        // returns the entering column and its pivot element.
-        //
-        // Gill, P. E., Murray, W., Saunders, M. A., & Wright, M. H. (1989).
-        // A practical anti-cycling procedure for linearly constrained optimization.
-        // Mathematical Programming, 45(1-3), 437-474.
-        //
-        // https://link.springer.com/content/pdf/10.1007/BF01589114.pdf
-        let select = |can_enter: &dyn Fn(usize, f64, &NonBasicVarState) -> bool| {
-            // Entries below the pivot tolerance are not candidate pivots: an
-            // entry within the row's round-off is noise, and an entry seven
-            // orders below the largest entry among the vars that could enter
-            // and are not excluded (see PIVOT_REL_TOL) is too unstable while
-            // a better candidate exists.
-            let mut row_max = 0.0f64;
-            for (c, &coeff) in self.row_coeffs.iter() {
-                if coeff.abs() > row_max
-                    && can_enter(c, coeff, &self.nb_var_states[c])
-                    && !excluded.contains(&c)
-                {
-                    row_max = coeff.abs();
-                }
-            }
-            let pivot_floor = noise_floor.max(PIVOT_REL_TOL * row_max);
-
-            let is_eligible_var = |c: usize, coeff: f64, var_state: &NonBasicVarState| -> bool {
-                coeff.abs() >= pivot_floor
-                    && !excluded.contains(&c)
-                    && can_enter(c, coeff, var_state)
-            };
-
-            // First, we determine the max step (change in the leaving variable obj. coeff that still
-            // leaves us with a dual-feasible state) using relaxed bounds.
-            let mut max_step = f64::INFINITY;
-            for (c, &coeff) in self.row_coeffs.iter() {
-                let var_state = &self.nb_var_states[c];
-                if !is_eligible_var(c, coeff, var_state) {
-                    continue;
-                }
-
-                let obj_coeff = clamp_obj_coeff(self.nb_var_obj_coeffs[c], var_state);
-                let tol = self.dual_tols[self.nb_vars[c]];
-                let cur_step = (obj_coeff.abs() + tol) / coeff.abs();
-                if cur_step < max_step {
-                    max_step = cur_step;
-                }
-            }
-
-            // Second, we choose among the variables satisfying the relaxed step bound
-            // the one with the biggest pivot coefficient. This allows for a much more
-            // numerically stable basis at the price of slight infeasibility in dual variables.
-            let mut entering_c = None;
-            let mut pivot_coeff_abs = f64::NEG_INFINITY;
-            let mut pivot_coeff = 0.0;
-            for (c, &coeff) in self.row_coeffs.iter() {
-                let var_state = &self.nb_var_states[c];
-                if !is_eligible_var(c, coeff, var_state) {
-                    continue;
-                }
-
-                let obj_coeff = clamp_obj_coeff(self.nb_var_obj_coeffs[c], var_state);
-
-                // If we change obj. coeff of the leaving variable by this amount,
-                // obj. coeff if the current variable will reach the bound of dual infeasibility.
-                // Variable with the tightest such bound is the entering variable.
-                let cur_step = obj_coeff.abs() / coeff.abs();
-                if cur_step <= max_step {
-                    let coeff_abs = coeff.abs();
-                    if coeff_abs > pivot_coeff_abs {
-                        entering_c = Some(c);
-                        pivot_coeff_abs = coeff_abs;
-                        pivot_coeff = coeff;
-                    }
-                }
-            }
-            (entering_c, pivot_coeff)
-        };
 
         // The leaving var's distance from its bound, the tolerance within
         // which it counts as there, and how far past it a flip-only step may
@@ -2317,7 +2803,6 @@ impl Solver {
             capacity: f64,
         }
         let breakpoint = |c: usize, coeff: f64| -> Breakpoint {
-            let state = &self.nb_var_states[c];
             let var = self.nb_vars[c];
             let up = (coeff > 0.0) != leaving_diff_sign;
             let bound = if up {
@@ -2325,12 +2810,16 @@ impl Solver {
             } else {
                 self.orig_var_mins[var]
             };
-            let cost = clamp_obj_coeff(self.nb_var_obj_coeffs[c], state).abs();
+            // The reduced cost on the var's feasible side: HiGHS's
+            // `workMove * workDual`, negative for a reduced cost the Harris
+            // pass let cross zero.
+            let d = self.nb_var_obj_coeffs[c];
+            let slack = if up { d } else { -d };
             Breakpoint {
                 col: c,
                 coeff,
-                ratio: cost / coeff.abs(),
-                relaxed_ratio: (cost + self.dual_tols[var]) / coeff.abs(),
+                ratio: slack / coeff.abs(),
+                relaxed_ratio: (slack + self.dual_tols[var]) / coeff.abs(),
                 bound,
                 capacity: coeff.abs() * (bound - self.nb_var_vals[c]).abs(),
             }
@@ -2354,22 +2843,31 @@ impl Solver {
                 && !excluded.contains(&c)
         };
 
-        // The Harris bound on the step: the smallest relaxed ratio.
+        // The Harris bound on the step: the smallest relaxed ratio. Below
+        // zero, a candidate's reduced cost is beyond its tolerance on its
+        // infeasible side and no step is dual feasible (HiGHS's `workTheta
+        // <= 0`): the reduced costs are to be corrected first. Every
+        // candidate passes here first, so from here on every candidate's
+        // reduced cost is finite and every ratio a number.
         let mut max_step = f64::INFINITY;
         for (c, &coeff) in self.row_coeffs.iter() {
             if candidate(c, coeff) {
+                self.finite_reduced_cost(c)?;
                 max_step = max_step.min(breakpoint(c, coeff).relaxed_ratio);
             }
+        }
+        if max_step < 0.0 {
+            return Ok(DualRatioTest::DualInfeasible);
         }
         // The Harris pass: among the candidates whose ratio is within the
         // bound, the one with the largest entry, for a stable basis at the
         // price of a slight dual infeasibility (Gill, Murray, Saunders &
-        // Wright 1989, above). These candidates are also the first group of
-        // the bound-flipping walk below, so the same pass measures how far
-        // flipping all of them would carry the leaving var.
-        let mut entering_c = None;
-        let mut pivot_coeff = 0.0;
-        let mut pivot_coeff_abs = f64::NEG_INFINITY;
+        // Wright, "A practical anti-cycling procedure for linearly
+        // constrained optimization", Mathematical Programming 45, 1989).
+        // These candidates are also the first group of the bound-flipping
+        // walk below, so the same pass measures how far flipping all of them
+        // would carry the leaving var.
+        let mut entering: Option<(usize, f64, f64)> = None;
         let mut first_group_capacity = 0.0;
         let mut beyond_first_group = false;
         for (c, &coeff) in self.row_coeffs.iter() {
@@ -2377,10 +2875,8 @@ impl Solver {
                 let b = breakpoint(c, coeff);
                 if b.ratio <= max_step {
                     first_group_capacity += b.capacity;
-                    if coeff.abs() > pivot_coeff_abs {
-                        entering_c = Some(c);
-                        pivot_coeff_abs = coeff.abs();
-                        pivot_coeff = coeff;
+                    if entering.is_none_or(|(_, best, _)| coeff.abs() > best.abs()) {
+                        entering = Some((c, coeff, b.ratio));
                     }
                 } else {
                     beyond_first_group = true;
@@ -2411,13 +2907,12 @@ impl Solver {
         // comes with a zero dual step, as in both references (HiGHS flips
         // nothing when `workTheta == 0`, SoPlex's `SPxBoundFlippingRT` only
         // on a non-degenerate step): a group after the first holds only
-        // ratios above the first group's bound, which exceeds zero by the
-        // reduced-cost tolerance, so the pivot's own ratio, the dual step, is
-        // positive whenever there is a group to flip. If the leaving var is
-        // still short after every group, the pivot's step carries the
-        // entering var past its other bound, which a later iteration
-        // repairs, as in HiGHS.
-        if entering_c.is_some()
+        // ratios above the first group's bound, which is not negative, so
+        // the pivot's own ratio, the dual step, is positive whenever there
+        // is a group to flip. If the leaving var is still short after every
+        // group, the pivot's step carries the entering var past its other
+        // bound, which a later iteration repairs, as in HiGHS.
+        if entering.is_some()
             && beyond_first_group
             && infeasibility - first_group_capacity > target_tol
         {
@@ -2435,8 +2930,10 @@ impl Solver {
                     pending.into_iter().partition(|b| b.ratio <= bound);
                 pending = rest;
                 // The smallest relaxed ratio's own breakpoint always joins
-                // (its ratio is below its relaxed ratio); only a reduced
-                // cost that is not a number joins none, and ends the walk.
+                // (its ratio is below its relaxed ratio, and every ratio is
+                // a number: the Harris bound above failed on a reduced cost
+                // that is not), so no group is empty; the check only keeps
+                // the walk from running on if one were.
                 if group.is_empty() {
                     break;
                 }
@@ -2450,11 +2947,11 @@ impl Solver {
                     .map(|b| b.relaxed_ratio)
                     .fold(f64::INFINITY, f64::min);
             }
-            let largest = |group: &[Breakpoint]| -> (usize, f64) {
-                let mut best = (group[0].col, group[0].coeff);
+            let largest = |group: &[Breakpoint]| -> (usize, f64, f64) {
+                let mut best = (group[0].col, group[0].coeff, group[0].ratio);
                 for b in &group[1..] {
                     if b.coeff.abs() > best.1.abs() {
-                        best = (b.col, b.coeff);
+                        best = (b.col, b.coeff, b.ratio);
                     }
                 }
                 best
@@ -2467,10 +2964,10 @@ impl Solver {
             let final_compare = (0.1 * largest_grouped).min(1.0);
             // The group holding the largest entry always qualifies, so the
             // backward scan stops there at the latest.
-            let (pivot_group, entering) = (0..groups.len())
+            let (pivot_group, (col, coeff, ratio)) = (0..groups.len())
                 .rev()
                 .map(|g| (g, largest(&groups[g])))
-                .find(|&(_, (_, coeff))| coeff.abs() > final_compare)
+                .find(|&(_, (_, coeff, _))| coeff.abs() > final_compare)
                 .expect("the group of the largest grouped entry qualifies as the pivot's");
             let flips: Vec<(usize, f64)> = groups[..pivot_group]
                 .iter()
@@ -2478,36 +2975,81 @@ impl Solver {
                 .map(|b| (b.col, b.bound))
                 .collect();
             debug_assert!(
-                flips.is_empty() || {
-                    let b = groups[pivot_group]
-                        .iter()
-                        .find(|b| b.col == entering.0)
-                        .expect("the pivot belongs to its group");
-                    b.ratio > 0.0
-                },
+                flips.is_empty() || ratio > 0.0,
                 "bound flips with a zero dual step"
             );
-            return Ok(DualStep {
+            return Ok(DualRatioTest::Step(DualStep {
                 flips,
-                entering: Some(entering),
-            });
+                entering: Some((col, coeff)),
+                zero_step: ratio <= 0.0,
+            }));
+        }
+        if let Some((col, coeff, ratio)) = entering {
+            return Ok(DualRatioTest::Step(DualStep {
+                flips: Vec::new(),
+                entering: Some((col, coeff)),
+                zero_step: ratio <= 0.0,
+            }));
         }
 
-        // Vars that could only absorb the move within their tolerance are a
-        // fallback, since their pivot does not keep dual feasibility by
-        // construction (the primal phase repairs that) while a regular one
-        // does.
-        if entering_c.is_none() {
-            let relaxed = |c: usize, coeff: f64, state: &NonBasicVarState| {
-                direction_ok(coeff, state) || absorbs(c, coeff)
+        // No var can enter regularly. A var that can absorb the move within
+        // its tolerance enters instead, on a zero dual step with its cost
+        // shifted by its whole reduced cost (see `absorbs` above), and the
+        // choice is the absorber whose shift can do the least harm when the
+        // var leaves again and the shift is given back (HiGHS's `shiftBack`):
+        // a fixed var's none, since any reduced cost is feasible for it, any
+        // other's as much as its reduced cost. So the ratio is that reduced
+        // cost (zero for a fixed var) over the entry, and among the absorbers
+        // within the Harris relaxation of the smallest ratio the one with the
+        // largest entry enters, for a stable basis; as among the regular
+        // candidates, an entry `PIVOT_REL_TOL` below the largest absorbing
+        // entry is no candidate. (Taking the absorber with the largest entry
+        // instead left a model of the differential fuzz above its optimum:
+        // see `wide_lp_558_reaches_the_optimum` in `src/tests/magnitudes.rs`.)
+        let absorber_ratio = |c: usize, coeff: f64, tol: f64| -> f64 {
+            let state = &self.nb_var_states[c];
+            let d = if state.at_min && state.at_max {
+                0.0
+            } else {
+                self.nb_var_obj_coeffs[c].abs()
             };
-            (entering_c, pivot_coeff) = select(&relaxed);
+            (d + tol) / coeff.abs()
+        };
+        let mut absorbing_max = 0.0f64;
+        for (c, &coeff) in self.row_coeffs.iter() {
+            if !excluded.contains(&c) && absorbs(c, coeff) {
+                absorbing_max = absorbing_max.max(coeff.abs());
+            }
         }
-        if let Some(col) = entering_c {
-            return Ok(DualStep {
+        let absorbing_floor = noise_floor.max(PIVOT_REL_TOL * absorbing_max);
+        let absorber = |c: usize, coeff: f64| {
+            coeff.abs() >= absorbing_floor && !excluded.contains(&c) && absorbs(c, coeff)
+        };
+        let mut max_step = f64::INFINITY;
+        for (c, &coeff) in self.row_coeffs.iter() {
+            if absorber(c, coeff) {
+                // Its whole reduced cost becomes its shift, so it must be a
+                // number even for a fixed var.
+                self.finite_reduced_cost(c)?;
+                let tol = self.dual_tols[self.nb_vars[c]];
+                max_step = max_step.min(absorber_ratio(c, coeff, tol));
+            }
+        }
+        let mut absorbing: Option<(usize, f64)> = None;
+        for (c, &coeff) in self.row_coeffs.iter() {
+            if absorber(c, coeff)
+                && absorber_ratio(c, coeff, 0.0) <= max_step
+                && absorbing.is_none_or(|(_, best)| coeff.abs() > best.abs())
+            {
+                absorbing = Some((c, coeff));
+            }
+        }
+        if absorbing.is_some() {
+            return Ok(DualRatioTest::Step(DualStep {
                 flips: Vec::new(),
-                entering: Some((col, pivot_coeff)),
-            });
+                entering: absorbing,
+                zero_step: true,
+            }));
         }
 
         // No var can enter. What can still move the leaving var are the flips
@@ -2589,10 +3131,11 @@ impl Solver {
             }
         }
         if infeasibility - moved <= target_tol {
-            return Ok(DualStep {
+            return Ok(DualRatioTest::Step(DualStep {
                 flips: moves,
                 entering: None,
-            });
+                zero_step: false,
+            }));
         }
         // Only vars a flip-only step has already moved could close the gap.
         Err(Error::InternalError(format!(
@@ -2602,8 +3145,28 @@ impl Solver {
         )))
     }
 
+    /// The reduced cost of the non-basic var at `col`, which the dual ratio
+    /// test is about to weigh. One that is not a finite number compares false
+    /// with every bound of the test, so its var would drop out of it unseen:
+    /// working costs perturbed to infinity once left a row of a feasible
+    /// model with no candidate but such vars, and its verdict was a false
+    /// proof of infeasibility. It is the loud error it is instead, as in the
+    /// primal pricing ([`Self::price_primal`]).
+    fn finite_reduced_cost(&self, col: usize) -> Result<f64, Error> {
+        let d = self.nb_var_obj_coeffs[col];
+        if d.is_finite() {
+            Ok(d)
+        } else {
+            Err(Error::InternalError(format!(
+                "reduced cost of var {} is not finite: {d}",
+                self.nb_vars[col]
+            )))
+        }
+    }
+
     /// Move each non-basic column in `flips` to the value given with it (its
-    /// other bound, or for the last var of a flip-only step a value between
+    /// other bound, its perturbed bound when a primal phase starts (see
+    /// [`bounds`]), or for the last var of a flip-only step a value between
     /// its bounds; either way the basis stays as it is) and carry the moves
     /// into the basic values, `x_B -= B^-1 Σ Δx_c a_c`, through one solve
     /// with the combined column. The objective moves by the reduced costs,
@@ -2619,11 +3182,11 @@ impl Solver {
             let diff = new_val - self.nb_var_vals[col];
             self.cur_obj_val += self.nb_var_obj_coeffs[col] * diff;
             self.nb_var_vals[col] = new_val;
-            let tol = self.var_tols[var];
-            self.nb_var_states[col] = NonBasicVarState {
-                at_min: at_bound(new_val, self.orig_var_mins[var], tol.lo),
-                at_max: at_bound(new_val, self.orig_var_maxs[var], tol.hi),
-            };
+            let state = self.nonbasic_state(var, new_val);
+            if state.at_upper() != self.nb_var_states[col].at_upper() {
+                self.cycle_guard.apply(VertexChange::Upper(var));
+            }
+            self.nb_var_states[col] = state;
             //guaranteed to be a valid index
             for (r, &coeff) in self.orig_constraints_csc.outer_view(var).unwrap().iter() {
                 *self.flip_rhs.get_mut(r) += diff * coeff;
@@ -2633,6 +3196,78 @@ impl Solver {
         for (r, &d) in delta.iter() {
             self.basic_var_vals[r] -= d;
         }
+    }
+
+    /// The state of the non-basic `var` at `val`: at a bound when within its
+    /// tolerance of it. The bounds are the working bounds of a running
+    /// primal phase (see [`bounds`]), where a non-basic var sits at a moved
+    /// bound.
+    fn nonbasic_state(&self, var: usize, val: f64) -> NonBasicVarState {
+        let tol = self.var_tols[var];
+        let (min, max) = self.working_bounds(var);
+        NonBasicVarState {
+            at_min: at_bound(val, min, tol.lo),
+            at_max: at_bound(val, max, tol.hi),
+        }
+    }
+
+    /// The state the basic `var` takes when it leaves the basis at `val`
+    /// ([`Self::nonbasic_state`]), except that a var fixed in the model is
+    /// fixed where it leaves, at both of its working bounds (see
+    /// [`Self::hold_leaving_value`]).
+    fn leaving_state(&self, var: usize, val: f64) -> NonBasicVarState {
+        if self.orig_var_mins[var] == self.orig_var_maxs[var] {
+            NonBasicVarState {
+                at_min: true,
+                at_max: true,
+            }
+        } else {
+            self.nonbasic_state(var, val)
+        }
+    }
+
+    /// The vertex changes (see [`CycleGuard`]) of the pivot that brings the
+    /// non-basic var at `col` into the basis in place of the basic var of
+    /// `row`, which leaves at `leaving_new_val`.
+    fn pivot_vertex_changes(
+        &self,
+        col: usize,
+        row: usize,
+        leaving_new_val: f64,
+    ) -> Vec<VertexChange> {
+        let (entering, leaving) = (self.nb_vars[col], self.basic_vars[row]);
+        let mut changes = Vec::with_capacity(4);
+        if self.nb_var_states[col].at_upper() {
+            changes.push(VertexChange::Upper(entering));
+        }
+        changes.push(VertexChange::Basic(entering));
+        changes.push(VertexChange::Basic(leaving));
+        if self.leaving_state(leaving, leaving_new_val).at_upper() {
+            changes.push(VertexChange::Upper(leaving));
+        }
+        changes
+    }
+
+    /// The vertex changes (see [`CycleGuard`]) of a dual step: the flips of
+    /// `step`, then the pivot ([`Self::pivot_vertex_changes`]).
+    fn dual_step_vertex_changes(
+        &self,
+        step: &DualStep,
+        col: usize,
+        row: usize,
+        leaving_new_val: f64,
+    ) -> Vec<VertexChange> {
+        let mut changes: Vec<VertexChange> = step
+            .flips
+            .iter()
+            .filter(|&&(c, new_val)| {
+                self.nonbasic_state(self.nb_vars[c], new_val).at_upper()
+                    != self.nb_var_states[c].at_upper()
+            })
+            .map(|&(c, _)| VertexChange::Upper(self.nb_vars[c]))
+            .collect();
+        changes.extend(self.pivot_vertex_changes(col, row, leaving_new_val));
+        changes
     }
 
     /// Clear `is_dual_feasible` if the non-basic var at `col` no longer
@@ -2669,18 +3304,11 @@ impl Solver {
             for (r, coeff) in self.col_coeffs.iter() {
                 self.basic_var_vals[r] -= pivot_info.entering_diff * coeff;
             }
-            let tol = self.var_tols[entering_var];
-            let var_state = &mut self.nb_var_states[pivot_info.col];
-            var_state.at_min = at_bound(
-                pivot_info.entering_new_val,
-                self.orig_var_mins[entering_var],
-                tol.lo,
-            );
-            var_state.at_max = at_bound(
-                pivot_info.entering_new_val,
-                self.orig_var_maxs[entering_var],
-                tol.hi,
-            );
+            let state = self.nonbasic_state(entering_var, pivot_info.entering_new_val);
+            if state.at_upper() != self.nb_var_states[pivot_info.col].at_upper() {
+                self.cycle_guard.apply(VertexChange::Upper(entering_var));
+            }
+            self.nb_var_states[pivot_info.col] = state;
             return Ok(());
         }
         //guaranteed, none variant already handled
@@ -2700,8 +3328,9 @@ impl Solver {
             }
         }
 
-        self.basic_var_mins[pivot_elem.row] = self.orig_var_mins[entering_var];
-        self.basic_var_maxs[pivot_elem.row] = self.orig_var_maxs[entering_var];
+        let (entering_min, entering_max) = self.working_bounds(entering_var);
+        self.basic_var_mins[pivot_elem.row] = entering_min;
+        self.basic_var_maxs[pivot_elem.row] = entering_max;
 
         if self.enable_dual_steepest_edge {
             self.update_dual_sq_norms(pivot_elem.row, pivot_coeff)?;
@@ -2712,18 +3341,14 @@ impl Solver {
         let leaving_var = self.basic_vars[pivot_elem.row];
 
         self.nb_var_vals[pivot_info.col] = pivot_elem.leaving_new_val;
-        let leaving_tol = self.var_tols[leaving_var];
-        let leaving_var_state = &mut self.nb_var_states[pivot_info.col];
-        leaving_var_state.at_min = at_bound(
-            pivot_elem.leaving_new_val,
-            self.orig_var_mins[leaving_var],
-            leaving_tol.lo,
-        );
-        leaving_var_state.at_max = at_bound(
-            pivot_elem.leaving_new_val,
-            self.orig_var_maxs[leaving_var],
-            leaving_tol.hi,
-        );
+        let leaving_state = self.nonbasic_state(leaving_var, pivot_elem.leaving_new_val);
+        if self.nb_var_states[pivot_info.col].at_upper() {
+            self.cycle_guard.apply(VertexChange::Upper(entering_var));
+        }
+        if leaving_state.at_upper() {
+            self.cycle_guard.apply(VertexChange::Upper(leaving_var));
+        }
+        self.nb_var_states[pivot_info.col] = leaving_state;
 
         let pivot_obj = self.nb_var_obj_coeffs[pivot_info.col] / pivot_elem.dual_step_coeff;
         for (c, &coeff) in self.row_coeffs.iter() {
@@ -2731,6 +3356,16 @@ impl Solver {
                 self.nb_var_obj_coeffs[c] = -pivot_obj;
             } else {
                 self.nb_var_obj_coeffs[c] -= pivot_obj * coeff;
+            }
+        }
+        // A leaving var gives back the shift a zero dual step gave its cost
+        // when it entered (HiGHS's `HEkkDual::shiftBack`): it is non-basic
+        // again, and its reduced cost is that of its unshifted cost.
+        if self.costs_modified {
+            let shift = std::mem::take(&mut self.cost_shifts[leaving_var]);
+            if shift != 0.0 {
+                self.nb_var_obj_coeffs[pivot_info.col] -= shift;
+                self.cur_obj_val -= shift * pivot_elem.leaving_new_val;
             }
         }
 
@@ -2744,6 +3379,9 @@ impl Solver {
         self.var_states[entering_var] = VarState::Basic(pivot_elem.row);
         self.nb_vars[pivot_info.col] = leaving_var;
         self.var_states[leaving_var] = VarState::NonBasic(pivot_info.col);
+        self.cycle_guard.apply(VertexChange::Basic(entering_var));
+        self.cycle_guard.apply(VertexChange::Basic(leaving_var));
+        self.cycle_guard.record_pivot();
 
         // A simple heuristic to choose when to recompute LU factorization.
         // Note: a possible failure mode is that the LU factorization accidentally
@@ -2917,37 +3555,41 @@ impl Solver {
         Ok(())
     }
 
-    /// Recompute the reduced costs and the objective from the cost vector in
-    /// force (the phase-1 artificial objective while it is active, else the
-    /// real one).
+    /// Recompute the reduced costs and the objective from the costs the
+    /// simplex works with: the cost vector in force (the phase-1 artificial
+    /// objective while it is active, else the real one), plus the
+    /// perturbation and shifts of a running dual phase (see [`costs`]).
     fn recalc_obj_coeffs(&mut self) -> Result<(), Error> {
-        // Same as recalc_basic_var_vals: pending etas participate in the
-        // (transposed) dense solve instead of forcing a refactorization.
-        let multipliers = {
-            let costs = self
-                .artificial_obj
-                .as_deref()
-                .unwrap_or(&self.orig_obj_coeffs);
-            let mut rhs = vec![0.0; self.num_constraints()];
-            for (c, &var) in self.basic_vars.iter().enumerate() {
-                rhs[c] = costs[var];
-            }
-            self.basis_solver.solve_transp_dense_with_etas(&mut rhs);
-            rhs
-        };
-        self.refresh_dual_tols(&multipliers);
-
         let costs = self
             .artificial_obj
             .as_deref()
             .unwrap_or(&self.orig_obj_coeffs);
+        let (perturbation, shifts) = (&self.cost_perturbation, &self.cost_shifts);
+        let modified = self.costs_modified;
+        let cost = |var: usize| {
+            if modified {
+                costs[var] + perturbation[var] + shifts[var]
+            } else {
+                costs[var]
+            }
+        };
+        // Same as recalc_basic_var_vals: pending etas participate in the
+        // (transposed) dense solve instead of forcing a refactorization.
+        let mut multipliers = vec![0.0; self.basic_vars.len()];
+        for (c, &var) in self.basic_vars.iter().enumerate() {
+            multipliers[c] = cost(var);
+        }
+        self.basis_solver
+            .solve_transp_dense_with_etas(&mut multipliers);
+
         self.nb_var_obj_coeffs.clear();
         for &var in &self.nb_vars {
             //guaranteed to be a valid index
             let col = self.orig_constraints_csc.outer_view(var).unwrap();
             let dot_prod: f64 = col.iter().map(|(r, val)| val * multipliers[r]).sum();
-            self.nb_var_obj_coeffs.push(costs[var] - dot_prod);
+            self.nb_var_obj_coeffs.push(cost(var) - dot_prod);
         }
+        self.refresh_dual_tols(&multipliers);
 
         self.cur_obj_val = self.exact_obj_val();
         self.reduced_costs_dirty = false;

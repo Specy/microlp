@@ -27,6 +27,7 @@ use crate::{
     ComparisonOp, OptimizationDirection, Problem, SolutionStatus, SolveOptions, Tolerances,
     Variable,
 };
+use std::time::Duration;
 
 /// Relative round-off allowance on a row's or bound's magnitude: about a
 /// hundred ulps of `f64`.
@@ -186,17 +187,34 @@ pub(crate) fn assert_solves_feasibly_within_contract(model: &Model) {
 /// [`assert_solves_within_contract`] with presolve off: the LP engine on the
 /// model as written.
 pub(crate) fn assert_solves_within_contract_without_presolve(model: &Model) {
-    check_contract_with(model, true, false);
+    check_contract_with(model, true, false, None);
+}
+
+/// [`assert_solves_within_contract`] with presolve on and off, each solve
+/// under `time_limit`: for a model whose solve once never returned (a
+/// simplex that cycled), so that a regression fails the test instead of
+/// hanging it. The limit is far above the time the solve takes; reaching it
+/// is the failure.
+pub(crate) fn assert_solves_within_contract_in_time(model: &Model, time_limit: Duration) {
+    for presolve in [true, false] {
+        check_contract_with(model, true, presolve, Some(time_limit));
+    }
 }
 
 fn check_contract(model: &Model, compare_objective: bool) {
-    check_contract_with(model, compare_objective, true);
+    check_contract_with(model, compare_objective, true, None);
 }
 
-fn check_contract_with(model: &Model, compare_objective: bool, presolve: bool) {
+fn check_contract_with(
+    model: &Model,
+    compare_objective: bool,
+    presolve: bool,
+    time_limit: Option<Duration>,
+) {
     let (problem, vars) = model.build();
     let mut options = SolveOptions::default();
     options.presolve = presolve;
+    options.time_limit = time_limit;
     let call = if presolve {
         "solve()"
     } else {
@@ -212,14 +230,14 @@ fn check_contract_with(model: &Model, compare_objective: bool, presolve: bool) {
     let solution = match outcome.into_solution() {
         Ok(solution) => solution,
         Err(interrupted) => panic!(
-            "into_solution() returned {interrupted:?} with no limits set:\n{}",
+            "into_solution() returned {interrupted:?} (time limit {time_limit:?}):\n{}",
             model.source()
         ),
     };
     assert_eq!(
         solution.status(),
         SolutionStatus::Optimal,
-        "no limit is set, so the status must be Optimal:\n{}",
+        "no limit was reached, so the status must be Optimal:\n{}",
         model.source()
     );
 

@@ -79,10 +79,34 @@ pub(crate) const REFINEMENT_STEPS: usize = 3;
 
 /// Upper bound on the number of primal/dual phase alternations
 /// [`super::Solver::run_phases`] performs before giving up loudly. A phase ends on
-/// values verified against the rows, so a second round is already rare;
-/// hitting this bound means the basis is numerically unusable, which must
-/// not be reported as an optimum.
+/// values verified against the rows, so a second round is already rare, and
+/// each round after the first cuts the primal ratio test's tolerance
+/// ([`LOOP_HARRIS_REDUCTION`]); hitting this bound means the phases cannot
+/// agree on a verified state, which must not be reported as an optimum.
 pub(crate) const MAX_PHASE_ROUNDS: usize = 8;
+
+/// The factor by which each round of [`super::Solver::run_phases`] after
+/// the first cuts the tolerance the primal ratio test lets a basic var pass
+/// its bound by (the Harris allowance, `0.01^round` of the var's tolerance):
+/// SoPlex's "to avoid shifts we restrict tolerances in the ratio test",
+/// which cuts its ratio tester's delta a hundredfold each time its
+/// algorithms loop (`SPxSolverBase::solve`, src/soplex/spxsolve.hpp). A
+/// round ends in a verification that recomputes the values from the data,
+/// and a Harris step may leave a var exactly at its tolerance, where the
+/// recomputation finds it an ulp past: the dual phase then undid the step,
+/// the primal phase redid it, and the rounds ran out (an equality
+/// `x2 + 1e-7 x3 = 1.0000001` ending its step at its tolerance and
+/// recomputed `1.15e-12` over it). The first round keeps the whole
+/// tolerance, so the Harris protection stays where scaling is worst; the
+/// allowance was once cut on every step by the round-off of recomputing the
+/// var instead, which left rows above about `5e6` in magnitude with none at
+/// all (C3-10 of the solver review). SoPlex cuts at every pass of either
+/// algorithm once one has ended unverified (its `loopCount`); a round here, a
+/// dual and a primal pass, cuts once. A var the earlier rounds left past its
+/// bound by more than the cut allowance (within its whole tolerance) admits
+/// no step toward it: the ratio test's limit is then zero, never negative
+/// (see `choose_pivot`).
+pub(crate) const LOOP_HARRIS_REDUCTION: f64 = 0.01;
 
 /// The share of a row's contract tolerance the engine uses for the row
 /// itself ([`slack_tol`]). The rest is reserved for what happens to the
