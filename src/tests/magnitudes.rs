@@ -23,9 +23,11 @@
 mod regression_tests {
     use crate::tests::oracle::{
         assert_solves_feasibly_within_contract, assert_solves_within_contract,
-        assert_solves_within_contract_without_presolve, xstar_is_feasible, Model, Row, Var,
+        assert_solves_within_contract_in_time, assert_solves_within_contract_without_presolve,
+        xstar_is_feasible, Model, Row, Var,
     };
     use crate::{ComparisonOp, Error, OptimizationDirection, SolveOptions};
+    use std::time::Duration;
 
     fn real(obj: f64, lo: f64, hi: f64) -> Var {
         Var {
@@ -598,9 +600,13 @@ mod regression_tests {
     /// relaxation, by the equality `x2 + 1e-7 x3 = 1.0000001` at its
     /// tolerance: the ratio test took the step, the equality's slack ended
     /// exactly at its tolerance, the phase exit's recomputation landed it an
-    /// ulp past, the dual phase undid the step, and after eight rounds the
-    /// solve gave up (`InternalError`). The Harris allowance leaves the
-    /// round-off of recomputing a var out of its tolerance.
+    /// ulp past, the dual phase undid the step, the primal phase redid it,
+    /// and after eight rounds the solve gave up (`InternalError`). The
+    /// Harris allowance was then cut by the round-off of recomputing a var;
+    /// now each round after the first cuts it a hundredfold, as SoPlex does
+    /// when its algorithms loop (`LOOP_HARRIS_REDUCTION`): in the third round
+    /// the slack, still at its tolerance, blocks the step (a zero one), and
+    /// the solve ends at the vertex `x3 = 1`.
     #[test]
     fn harris_step_leaves_the_round_off_of_the_recomputation() {
         check(Model {
@@ -618,6 +624,431 @@ mod regression_tests {
             ],
             xstar: vec![0.0, 0.0, 1.0, 1.0],
         });
+    }
+
+    /// Found by CI's run of the wide-coefficient LP property on the first
+    /// version of the primal simplex's bound shifting, which set a leaving
+    /// var onto its bound, taking the step backwards where it sat past it, as
+    /// HiGHS does. The fixed slack of `0.1 x1 + x2 = 0` sat basic `3e-17` off
+    /// its value, the round-off of the updates; the primal step that set it
+    /// onto it moved the entering slack of `10 x0 - 1e-8 x2 <= 0` by that over
+    /// an element of `7.8e-8`, `3.9e-10` past its bound (`1.3e-7` in user
+    /// units, beyond the contract); and the dual simplex's repair pivoted on
+    /// `1e-7` into a basis the factorization rejected (`Singular matrix`,
+    /// with presolve on). A step that would run backwards is zero, and a
+    /// fixed var leaving within its tolerance of its value stays where it
+    /// sits, through the cleanup too.
+    #[test]
+    fn a_fixed_slack_carrying_round_off_leaves_where_it_sits() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, -1.0, 0.0),
+                real(1.0, 0.0, 1.0),
+                real(0.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(1, 0.1), (2, 1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(0, -1.0)], ComparisonOp::Ge, -0.0),
+                row(&[(0, 10.0), (2, -1e-8)], ComparisonOp::Le, 0.0),
+                row(&[(0, -1e-7), (1, -10000.0)], ComparisonOp::Le, 0.0),
+            ],
+            xstar: vec![0.0, 0.0, 0.0],
+        });
+    }
+
+    /// Found by the deep run of the wide-coefficient MILP property on this
+    /// step's tree, and failing the same at 127db49 (the dual simplex's cost
+    /// shifting) and after: `8 phase rounds` where 1dcd664 solves it. In a
+    /// node LP whose branch left the integer `x0` at a bound, each dual phase
+    /// after the first started with `x0`'s reduced cost dual infeasible (the
+    /// shift of the zero dual step before it given back) and corrected it by
+    /// flipping `x0` to its other bound, a move the phase then could not
+    /// repair (no entering column for `x0`'s row) and undid through a zero
+    /// step, and the verification found the same row violated, round after
+    /// round. A phase that cleans up after another forces phase 2, as HiGHS's
+    /// cleanup calls do, and shifts `x0`'s cost instead of flipping it.
+    #[test]
+    fn a_cleanup_dual_phase_shifts_a_boxed_var_rather_than_flipping_it() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(-1.0, -2, 0),
+                real(0.0, 0.0, 0.0),
+                real(0.0, -8388643.0, -8388642.0),
+                real(-1.0, -1.0, 0.0),
+            ],
+            rows: vec![
+                row(
+                    &[(0, 1.0), (2, 1.0), (3, -2.0)],
+                    ComparisonOp::Eq,
+                    -8388643.0,
+                ),
+                row(
+                    &[(0, 1.5000000000000002e-8), (2, 20.0)],
+                    ComparisonOp::Eq,
+                    -167772860.0,
+                ),
+                row(
+                    &[(0, 0.0011298828125), (2, 13046.875)],
+                    ComparisonOp::Eq,
+                    -109445576640.625,
+                ),
+            ],
+            xstar: vec![0.0, 0.0, -8388643.0, 0.0],
+        });
+    }
+
+    /// Found by the wide-coefficient MILP property (`milp_wide_2` of the
+    /// solver review's stress run, C2-17/C2-18): a solve that never
+    /// returned. With the integer vars fixed at 0 and -115, the four
+    /// equalities have zero right-hand sides and pin every continuous var at
+    /// zero, a primal degenerate vertex that the pivots reach only within
+    /// the rows' tolerances. The dual simplex went round a four-pivot cycle:
+    /// two regular pivots on one row handed a tolerance-level violation to
+    /// the other equality, and two pivots of its fixed slacks, absorbing the
+    /// violation, handed it back, each a dual step backwards, so the
+    /// objective rose and fell and the bases repeated forever. With cost
+    /// shifting those pivots take a zero dual step, but the shift of a fixed
+    /// slack is its whole reduced cost, given back when it leaves, and the
+    /// vertices still come back; the vertex hash sees a pivot lead to a
+    /// visited vertex right after the one before it did, makes that basis
+    /// change taboo, and the phase ends at the optimum (HiGHS: 0 at `x*`).
+    /// Without the hash the stall bound ends it in an error. The limit turns
+    /// a regression into a failure instead of a hang.
+    #[test]
+    fn a_dual_simplex_that_cycled_reaches_the_optimum() {
+        let model = Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(1.0, 0, 0),
+                int(0.0, -115, -115),
+                real(1.0, 0.0, 1101.2422443124906),
+                real(-1.0, 0.0, 1.072334405752396),
+                real(-2.0, -1615394529.5388072, 0.0),
+                real(-1.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(
+                    &[(1, -20.0), (2, -2.0), (4, 0.001), (5, 0.1)],
+                    ComparisonOp::Eq,
+                    2300.0,
+                ),
+                row(
+                    &[(0, -1.0), (1, -1.0), (3, -1.0), (4, -1.0), (5, 1.0)],
+                    ComparisonOp::Ge,
+                    115.0,
+                ),
+                row(
+                    &[
+                        (1, -10000.0),
+                        (2, 0.0015177021581456369),
+                        (3, -1e-08),
+                        (4, 1.9180368898411304e-08),
+                    ],
+                    ComparisonOp::Eq,
+                    1150000.0,
+                ),
+                row(
+                    &[
+                        (0, -1.0),
+                        (1, -1.0),
+                        (2, -1.0),
+                        (3, -0.001),
+                        (4, 1.0),
+                        (5, -10000.0),
+                    ],
+                    ComparisonOp::Eq,
+                    115.0,
+                ),
+                row(
+                    &[
+                        (0, -1.0),
+                        (2, -0.00019180368898411305),
+                        (4, -0.001),
+                        (5, 1.0),
+                    ],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+            ],
+            xstar: vec![0.0, -115.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model"
+        );
+        assert_solves_within_contract_in_time(&model, Duration::from_secs(10));
+    }
+
+    /// A huge cost must not make a feasible model infeasible (found by the
+    /// review of the dual simplex's cost perturbation). The model minimizes
+    /// `4 x0 - 1e300 x1 - 5 x2 + 5 x3 - x4 - 2 x5` over four rows, the first
+    /// two of which force `x1 = 2 x4 - 2 = 0`. The perturbation moved a cost
+    /// by about `1e-6 |c|^(5/4)`, which for `1e300` is infinite: the reduced
+    /// costs became infinite or not a number, the dual ratio test dropped
+    /// every such candidate, and a row left with none declared the model
+    /// infeasible, as an LP and as a MILP, with presolve on and off (for any
+    /// cost above about `2e251`). A cost of `1e20` or more now takes no part
+    /// in the perturbation, as none ever reaches HiGHS's (its
+    /// `infinite_cost`), and a reduced cost that is not a number fails the
+    /// ratio test loudly. With such a cost the multipliers are of its size
+    /// and the small costs are round-off beside them, so the objective is
+    /// only as good as that allows (4 is reported, 3 is optimal), which the
+    /// contract's objective slack, relative to the objective's extent, allows
+    /// too.
+    #[test]
+    fn a_huge_cost_leaves_a_feasible_model_feasible() {
+        for integer in [false, true] {
+            let binary = |obj: f64| {
+                if integer {
+                    int(obj, 0, 1)
+                } else {
+                    real(obj, 0.0, 1.0)
+                }
+            };
+            let model = Model {
+                direction: OptimizationDirection::Minimize,
+                vars: vec![
+                    binary(4.0),
+                    real(-1e300, 0.0, 8.0),
+                    real(-5.0, -2.0, -1.0),
+                    real(5.0, -3.0, 4.0),
+                    binary(-1.0),
+                    real(-2.0, -2.0, 6.0),
+                ],
+                rows: vec![
+                    row(
+                        &[(0, 3.0), (1, 1.0), (2, 1.0), (3, 1.0), (4, -1.0), (5, 2.0)],
+                        ComparisonOp::Eq,
+                        -1.0,
+                    ),
+                    row(
+                        &[(0, 3.0), (2, 1.0), (3, 1.0), (4, 1.0), (5, 2.0)],
+                        ComparisonOp::Eq,
+                        1.0,
+                    ),
+                    row(
+                        &[(0, 2.0), (1, -3.0), (2, 1.0), (3, -2.0), (4, -2.0)],
+                        ComparisonOp::Le,
+                        -3.0,
+                    ),
+                    row(
+                        &[
+                            (0, -1.0),
+                            (1, -3.0),
+                            (2, -3.0),
+                            (3, -1.0),
+                            (4, 2.0),
+                            (5, 1.0),
+                        ],
+                        ComparisonOp::Ge,
+                        -6.0,
+                    ),
+                ],
+                xstar: vec![0.0, 0.0, -2.0, -0.5, 1.0, 1.25],
+            };
+            assert!(
+                xstar_is_feasible(&model),
+                "fixture error: x* must satisfy the model"
+            );
+            assert_solves_within_contract(&model);
+            assert_solves_within_contract_without_presolve(&model);
+        }
+    }
+
+    /// The differential fuzz's model `wide_lp-558` reaches its optimum
+    /// (HiGHS: 231413.21367), within the fuzz's `1e-6` relative, with
+    /// presolve on and off. Two decisions of the dual simplex rest on it,
+    /// and without either one the solve ends at 231413.844, the objective at
+    /// `x*` (`x1` at its lower bound instead of its upper), which the
+    /// contract's objective slack does not tell from the optimum: the
+    /// cleanup of a dual phase only restores the costs, so that
+    /// `run_phases` verifies the values before it recomputes the reduced
+    /// costs and runs the primal phase (a cleanup that recomputed them
+    /// itself sent the primal phase onto unverified values and stale slack
+    /// tolerances); and an absorbing pivot takes the absorber whose shift
+    /// does the least harm when it is given back (here a fixed slack), not
+    /// the one with the largest entry.
+    #[test]
+    fn wide_lp_558_reaches_the_optimum() {
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(4.0, -362732.08683384664, 1590851.6121015674),
+                real(-2.0, 0.44352166456169106, 0.6864194512947741),
+                real(5.0, -11.7608931155399, 0.9296651554717794),
+                real(-4.0, -57865.9890336753, 58309.301095335744),
+                real(1.0, -0.17335417252699625, 2.4772179264835907),
+            ],
+            rows: vec![
+                row(
+                    &[(0, 0.6196016712816187), (3, 4.505057732180742e-05)],
+                    ComparisonOp::Le,
+                    -2.6068962132644495,
+                ),
+                row(
+                    &[(0, 41.31211423321696), (4, 1.623352003798267e-06)],
+                    ComparisonOp::Eq,
+                    1.1672677869244323e-06,
+                ),
+                row(
+                    &[
+                        (0, -0.0625575647400732),
+                        (2, 2.1988892362384683e-06),
+                        (3, -8.776267812547736),
+                        (4, -67.52468996017767),
+                    ],
+                    ComparisonOp::Eq,
+                    507798.86349160096,
+                ),
+                row(
+                    &[
+                        (1, 33.06827012942814),
+                        (2, 276.9654820263267),
+                        (4, -0.8992788059382684),
+                    ],
+                    ComparisonOp::Eq,
+                    -2752.514608600898,
+                ),
+            ],
+            xstar: vec![
+                0.0,
+                0.44352166456169106,
+                -9.988733823688296,
+                -57865.9890336753,
+                0.7190478615810352,
+            ],
+        };
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model"
+        );
+        assert_solves_within_contract(&model);
+        assert_solves_within_contract_without_presolve(&model);
+        let optimum = 231413.21367073804;
+        for presolve in [true, false] {
+            let (problem, _) = model.build();
+            let objective = problem
+                .solve_with(SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                })
+                .unwrap()
+                .into_solution()
+                .unwrap()
+                .objective();
+            assert!(
+                objective - optimum <= 1e-6 * (1.0 + optimum),
+                "presolve {presolve}: objective {objective} above the optimum {optimum}"
+            );
+        }
+    }
+
+    /// The differential fuzz's model `wide_lp-1897` solves within the
+    /// contract, with presolve on and off (HiGHS reports -4019.66 at a point
+    /// outside this contract; here the answer is the objective at `x*`). It
+    /// rests on how a rebuild within a dual phase corrects a dual
+    /// infeasibility: by shifting the cost, a boxed var's too. A step
+    /// flipped a boxed var to its upper bound and the next left it dual
+    /// infeasible there (its entry was below the pivot floor, so it did not
+    /// bound the step); moving it back to its lower bound at the rebuild,
+    /// as HiGHS's correction does, returned the phase to a vertex it had
+    /// left, round a loop that the cycling detection ended in an
+    /// `InternalError`.
+    #[test]
+    fn wide_lp_1897_solves_within_the_contract() {
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(-3.0, 0.6883921955253283, 15.517025166440686),
+                real(-4.0, 873.8664825794901, 928.7738519944153),
+                real(0.0, -71.66441409674097, 36.95343826988335),
+                real(6.0, 0.0, 12.289325360619888),
+                real(7.8, -65.21510387756965, 72.78911622394193),
+                real(0.0, 0.0, 666.5395941775796),
+                real(5.85, -1.283497406554833, 0.35507766150091924),
+                real(0.0, 264.3902621802938, 387.9852685320315),
+            ],
+            rows: vec![
+                row(
+                    &[
+                        (0, 1.0),
+                        (1, -0.5),
+                        (3, -5.823957729416976e-05),
+                        (5, -6.704199631700646),
+                    ],
+                    ComparisonOp::Eq,
+                    -432.3062304655302,
+                ),
+                row(
+                    &[
+                        (1, -2.0),
+                        (2, -568261.67098366),
+                        (4, 38995.1516762666),
+                        (5, -0.4317501721527071),
+                        (6, -7.176881805461856e-06),
+                    ],
+                    ComparisonOp::Ge,
+                    6556439.159718655,
+                ),
+                row(
+                    &[
+                        (0, 167575.07817296375),
+                        (2, -7.191313132252542e-06),
+                        (3, 0.0005844836777845698),
+                        (4, -1.4402440281244824e-05),
+                        (5, -5030.603934043473),
+                        (6, -1.0),
+                    ],
+                    ComparisonOp::Eq,
+                    775371.8153046283,
+                ),
+                row(
+                    &[
+                        (0, -28625.642053462398),
+                        (1, 2.0),
+                        (2, 3624.980672864286),
+                        (6, 9556873.256277684),
+                        (7, -0.00021227956360568158),
+                    ],
+                    ComparisonOp::Le,
+                    -1239848.1423610675,
+                ),
+                row(
+                    &[
+                        (2, 0.8260768589663329),
+                        (4, 0.0003244702493151561),
+                        (5, -0.5),
+                        (6, -7.935149186793402),
+                        (7, 0.8606787959107634),
+                    ],
+                    ComparisonOp::Le,
+                    367.2292388216485,
+                ),
+                row(
+                    &[(0, -1423.3949571913254), (4, 1.0), (6, -839.8403651079586)],
+                    ComparisonOp::Eq,
+                    -6416.079244439468,
+                ),
+            ],
+            xstar: vec![
+                4.627010824214878,
+                873.8664825794901,
+                -6.54586514467897,
+                0.0,
+                72.78911622394193,
+                0.0,
+                -0.11573093820184721,
+                264.3902621802938,
+            ],
+        };
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model"
+        );
+        assert_solves_within_contract(&model);
+        assert_solves_within_contract_without_presolve(&model);
     }
 
     /// A fixed var's huge coefficient must not silence the rest of its row
@@ -740,41 +1171,132 @@ mod regression_tests {
         }
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): a var that starts at a huge
-    /// finite bound leaves its rows held to the round-off of that magnitude
-    /// after it moves away. Issue #3's model with `z ≤ 1e15`, a real bound
-    /// below the bound infinity of 2^52: `z` starts at 1e15, where the rows'
-    /// tolerances are taken (about 2.5 in the scaled row), one dual pivot
-    /// brings it down to 1.375, and `3x + 2y + z ≤ 20`, violated by 1.375,
-    /// passes as feasible; the primal simplex then lets the row's slack
-    /// leave where it sits, off its bound, and the boundary reports
-    /// `InternalError("LP solution violates constraint row 0 by 1.375")`.
-    /// The same at 1dcd664, for bounds from about 3e14; it is why the bound
-    /// infinity is 2^52 and not HiGHS's 1e20 (`INFINITE_BOUND`).
+    /// Issue #3's model with `z ≤ B` for `B` of `3e14` to `4e15`, real
+    /// bounds below the bound infinity of 2^52, pinned as a known limitation
+    /// until the primal simplex shifted its bounds (ARCHITECTURE §7): `z`
+    /// starts at `B`, where the rows' tolerances are taken (about 2.5 in the
+    /// scaled row at 1e15), one dual pivot brings it down to 1.375, and
+    /// `3x + 2y + z ≤ 20`, violated by 1.375, passes as feasible within that
+    /// tolerance; the primal simplex then let the row's slack leave where it
+    /// sat, off its bound, and the boundary reported `InternalError("LP
+    /// solution violates constraint row 0 by 1.375")` (from 1dcd664 on). The
+    /// slack still leaves where it sits (a step that would run backwards is
+    /// zero), but the cleanup of the primal phase moves it onto its bound:
+    /// the bound it was left past is a perturbed one, or else its tolerance
+    /// at the current values is far below the one it was judged by
+    /// (`a_slack_left_off_its_bound_beyond_its_current_tolerance_moves_onto_it`
+    /// in `src/solver/tests.rs`), and the dual simplex repairs the row.
     #[test]
-    #[should_panic(expected = "violates constraint row 0")]
-    fn a_var_leaving_a_huge_bound_leaves_its_rows_tolerance_behind_is_a_known_limitation() {
-        for presolve in [true, false] {
-            let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
-            let x = problem.add_var(50.0, (2.0, f64::INFINITY));
-            let y = problem.add_var(40.0, (0.0, 7.0));
-            let z = problem.add_var(45.0, (0.0, 1e15));
-            problem.add_constraint([(x, 3.0), (y, 2.0), (z, 1.0)], ComparisonOp::Le, 20.0);
-            problem.add_constraint([(x, 2.0), (y, 1.0), (z, 3.0)], ComparisonOp::Le, 15.0);
-            let solution = problem
-                .solve_with(SolveOptions {
-                    presolve,
-                    ..SolveOptions::default()
-                })
-                .unwrap()
-                .into_solution()
-                .unwrap();
-            assert!(
-                (solution.objective() - 420.0).abs() < 1e-6,
-                "presolve {presolve}: objective {}",
-                solution.objective()
-            );
+    fn a_row_left_with_the_tolerance_of_a_huge_bound_is_repaired() {
+        for bound in [1e14, 3e14, 1e15, 4e15] {
+            for presolve in [true, false] {
+                let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+                let x = problem.add_var(50.0, (2.0, f64::INFINITY));
+                let y = problem.add_var(40.0, (0.0, 7.0));
+                let z = problem.add_var(45.0, (0.0, bound));
+                problem.add_constraint([(x, 3.0), (y, 2.0), (z, 1.0)], ComparisonOp::Le, 20.0);
+                problem.add_constraint([(x, 2.0), (y, 1.0), (z, 3.0)], ComparisonOp::Le, 15.0);
+                let label = format!("z <= {bound:e}, presolve {presolve}");
+                let solution = problem
+                    .solve_with(SolveOptions {
+                        presolve,
+                        ..SolveOptions::default()
+                    })
+                    .unwrap_or_else(|e| panic!("{label}: {e:?}"))
+                    .into_solution()
+                    .unwrap();
+                assert!(
+                    (solution.objective() - 420.0).abs() < 1e-6,
+                    "{label}: objective {}",
+                    solution.objective()
+                );
+            }
         }
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the phases alternate over a row
+    /// only entries below the round-off floor can repair. `lp_wide_3` of the
+    /// solver review's stress run: the only feasible point is the origin, a
+    /// primal degenerate vertex. The dual phase ends there with `x0`'s
+    /// reduced cost dual infeasible; the primal step that lowers `x0` is
+    /// blocked, in exact arithmetic, by `-1e4 x2 + 1e-3 x3 >= 0`, whose
+    /// entry, a genuine `3e-15`, is below the round-off floor of the column
+    /// (largest entry 4), so the step of 32 passes it and ends the row
+    /// `1e-7` (twice its tolerance) short: its bound is shifted, and the
+    /// cleanup exposes the violation. The dual phase can repair the row only
+    /// by flipping `x5` across its range through another such entry (its
+    /// flip-only stage, C2-10 of the solver review), which gives the primal
+    /// phase its step back; after eight rounds the solve fails with
+    /// `InternalError`. The same at 1dcd664. What resolves it is a pivot
+    /// on the `3e-15` (a degenerate one, onto the optimal basis) or a proof
+    /// that no step is possible: the absolute pivot tolerances with a refined
+    /// row, and the infeasibility proof, of step R3.
+    #[test]
+    #[should_panic(expected = "8 phase rounds")]
+    fn phases_alternating_over_a_row_repaired_through_round_off_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(0.0, -2.0, 0.0),
+                real(0.0, 0.0, 0.0),
+                real(0.0, 0.0, 1.0),
+                real(1.0, -1.0, 0.0),
+                real(1.0, 0.0, 0.0),
+                real(-1.0, -1.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(0, 1.0), (3, -0.01), (5, 1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(2, -10000.0), (3, 0.001)], ComparisonOp::Ge, 0.0),
+                row(
+                    &[(0, -1.0), (2, -1e-8), (3, 10000.0)],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+            ],
+            xstar: vec![0.0; 6],
+        });
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the same class, found by the deep
+    /// run of the wide-coefficient MILP property on the primal simplex's
+    /// bound shifting, which exposed it. `min x0 - x1` s.t.
+    /// `-10 x0 - 1e-8 x1 - 10 x3 = 0`, `-1e-7 x0 + 1e4 x1 = 0`: the second row
+    /// makes `x1 = 1e-11 x0`, so `x1 >= 0` needs `x0 >= 0`, and the optimum
+    /// is 0. The primal step that lowers `x0` to -1 passes the row of `x1`
+    /// through an entry below the round-off floor of its column; the point it
+    /// reaches meets the engine's tolerances only off every vertex (the
+    /// equality at its tolerance and `x1` at its own, which its row's reserve
+    /// caps at `5e-12`), so the cleanup leaves `x1` beyond its tolerance, the
+    /// dual phase moves `x3` across its range through another entry below the
+    /// floor to repair it, and the primal step comes back, round after round.
+    /// Up to the degenerate clamp this step removed (C3-21), the solve
+    /// returned `x0 = -1` with the equality violated by exactly `1e-7`, the
+    /// whole contract and twice the engine's share: the clamp had set the
+    /// equality's slack to within its tolerance without moving anything else,
+    /// and the residual that left in the row passed the verification. The
+    /// same remedies apply (R3), or the full contract of R4, under which the
+    /// vertex that sets `x1` to `-1e-11` verifies.
+    #[test]
+    #[should_panic(expected = "8 phase rounds")]
+    fn an_equality_met_only_off_every_vertex_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(1.0, -1, 1),
+                real(-1.0, 0.0, 1.0),
+                real(1.0, 0.0, 0.0),
+                real(0.0, -1.0, 1.0),
+            ],
+            rows: vec![
+                row(
+                    &[(0, -10.0), (1, -1e-8), (3, -10.0)],
+                    ComparisonOp::Eq,
+                    -0.0,
+                ),
+                row(&[(0, -1e-7), (1, 10000.0)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 0.0],
+        });
     }
 
     /// KNOWN LIMITATION (ARCHITECTURE §7): presolve's forcing row

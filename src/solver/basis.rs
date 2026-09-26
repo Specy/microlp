@@ -14,18 +14,17 @@ use crate::{
 use super::tolerances::LU_STABILITY_THRESHOLD;
 use super::CsMat;
 
-/// Outcome of the primal simplex pivot choice.
+/// Outcome of the primal ratio test for one entering column.
 #[derive(Debug)]
 pub(crate) enum PivotChoice {
-    /// No reduced cost can improve the objective: the current basis is optimal.
-    Optimal,
     /// Apply this pivot.
     Pivot(PivotInfo),
     /// The pivot element at `row` computed through the row and through the
     /// column disagree (see [`super::PIVOT_AGREEMENT_TOL`]). With pivots stacked on
     /// the factorization it must be rebuilt before choosing again; on a fresh
     /// one the entry is noise if `tiny` (relative to the column) and the row
-    /// is then excluded, else the factorization itself is unusable.
+    /// is then excluded for the column, else the factorization itself is
+    /// unusable.
     Inconsistent { row: usize, tiny: bool },
 }
 
@@ -64,7 +63,32 @@ pub(crate) struct PivotElem {
     pub(crate) leaving_new_val: f64,
 }
 
-/// Outcome of the dual ratio test for one leaving row: the non-basic vars to
+/// Outcome of the dual ratio test for one leaving row.
+#[derive(Debug)]
+pub(crate) enum DualRatioTest {
+    /// Apply this step.
+    Step(DualStep),
+    /// A var that could enter has a reduced cost beyond its tolerance on its
+    /// infeasible side, so no step keeps the reduced costs dual feasible:
+    /// the reduced costs are to be recomputed and their infeasibilities
+    /// corrected before the row is tried again (HiGHS's
+    /// `kRebuildReasonPossiblyDualUnbounded` rebuild when `workTheta <= 0`,
+    /// `HEkkDual::chooseColumn`, which runs `correctDualInfeasibilities`).
+    DualInfeasible,
+}
+
+#[cfg(test)]
+impl DualRatioTest {
+    /// The step, for a test that expects one.
+    pub(crate) fn step(self) -> DualStep {
+        match self {
+            Self::Step(step) => step,
+            Self::DualInfeasible => panic!("expected a dual step, got DualInfeasible"),
+        }
+    }
+}
+
+/// A step of the dual ratio test for one leaving row: the non-basic vars to
 /// move to their other bound (bound flips, which leave the basis as it is),
 /// then the var that enters, or none when the moves alone bring the leaving
 /// var within its bounds (the last of them then possibly only partway).
@@ -75,6 +99,15 @@ pub(crate) struct DualStep {
     /// `(col, coeff)`: the entering column and its entry in the leaving row
     /// (the element computed through the row).
     pub(crate) entering: Option<(usize, f64)>,
+    /// Whether the dual step is zero: the entering var's reduced cost lies
+    /// on the side of zero the step would push it away from (within its
+    /// tolerance, as the Harris pass allows), or it enters by absorbing the
+    /// move. The step then leaves every reduced cost as it is, and the
+    /// entering var's cost is shifted so that its own is zero, as HiGHS
+    /// takes `workTheta = 0` and `shiftCost`s the entering var
+    /// (`HEkkDualRow::chooseFinal`, `HEkkDual::updateDual`), instead of a
+    /// step backwards.
+    pub(crate) zero_step: bool,
 }
 
 /// Stuff related to inversion of the basis matrix

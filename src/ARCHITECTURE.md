@@ -66,7 +66,7 @@ Three principles shape everything:
 | `src/solution.rs`, `src/outcome.rs` | `Solution` (a validated assignment, its read-out and its post-solve edits) and `SolveOutcome` / `InterruptedSolve` (what a call returns and how it is resumed). |
 | `src/expr.rs`, `src/error.rs` | The model vocabulary (`OptimizationDirection`, `Variable`, `LinearExpr`, `ComparisonOp`) and the `Error` type. |
 | `src/presolve/` | Presolve: activity-based bound tightening, forcing / singleton / redundant-row elimination, variable fixing and substitution, and in MIP mode integer bound rounding, binary coefficient tightening and dual fixing — all on the original variable indices, so there is no postsolve (§2, §7). `mod.rs` holds the contract and the entry point, `work.rs` the reduction passes, `model.rs` the data, `params.rs` the constants. |
-| `src/solver/` | The simplex engine. `mod.rs` is `Solver` itself (bounded-variable primal/dual simplex, basis management, and the small contract surface the MIP layer uses); `tolerances.rs` is the tolerance model of §7; `scaling.rs` turns a user problem into the scaled representation and seeds the starting vertex; `basis.rs` is the basis inverse and the pivot descriptions. |
+| `src/solver/` | The simplex engine. `mod.rs` is `Solver` itself (bounded-variable primal/dual simplex, basis management, and the small contract surface the MIP layer uses); `tolerances.rs` is the tolerance model of §7; `scaling.rs` turns a user problem into the scaled representation and seeds the starting vertex; `basis.rs` is the basis inverse and the pivot descriptions; `costs.rs` is the dual simplex's working costs (perturbation, shifting, the correction of dual infeasibilities, the cleanup), `bounds.rs` the primal simplex's working bounds (perturbation, shifting, the cleanup), and `cycling.rs` the cycling and stall detection of both (§3, §7). |
 | `src/lu/`, `src/sparse/`, `src/ordering/` | LU factorization with eta-file updates, sparse containers, and the column ordering of the factorization (`order_simple`: the sparsest columns first, from the bucket queue in `ordering/cols_queue.rs`). |
 | `src/mip/mod.rs` | The branch & bound lifecycle: building a search from a `Problem`, starting / resuming / re-editing it, bound and gap accounting, and validating a candidate against the user's original rows. |
 | `src/mip/search.rs` | The search itself: node visits, warm starts, branching, pruning, and the outer search loop. |
@@ -179,11 +179,35 @@ test in Harris groups, as HiGHS's `HEkkDualRow::chooseFinal`: a boxed var the du
 passes is moved to its other bound instead of entering), and an LU-factorized basis updated
 by eta matrices (refactorized when the eta file outgrows the factors).
 
+The dual simplex carries HiGHS's anti-degeneracy package (`src/solver/costs.rs`,
+`src/solver/cycling.rs`; details and constants in §7): a dual phase works on *working costs*
+— the costs in force, perturbed at the start of the phase unless it starts near optimal, with
+its starting dual infeasibilities corrected (boxed vars moved to their dual feasible bound,
+other costs shifted) and an entering var's cost shifted wherever the step would otherwise run
+backwards — and it ends by restoring the costs in force; `run_phases` recomputes the reduced
+costs from them once it has verified the values, and its primal phase removes any dual
+infeasibility that uncovers.
+The primal simplex carries its counterpart (`src/solver/bounds.rs`): a primal phase works on
+*working bounds* — the true bounds, perturbed at the start of the phase unless it starts near
+optimal, and shifted wherever a step or a recomputation leaves a basic var outside them beyond
+its tolerance — and it ends by restoring the true bounds, taking the non-basic vars that sat at
+a moved bound back to the true one; `run_phases` verifies the point, and the dual phase of its
+next round removes the primal infeasibility that uncovers. Only the first phase of a re-solve
+may be perturbed, and the primal phase after a phase-1 dual phase on the artificial objective
+(it is the real optimization, not a cleanup); every other phase cleans up after the one before
+it, as HiGHS runs its cleanup passes: unperturbed, and a dual cleanup with phase 2 forced (its
+dual infeasibilities shifted, never corrected by flipping a boxed var).
+Around both, a vertex hash makes a basis change that keeps returning to visited vertices taboo,
+and a stall bound ends a phase whose objective does not move; both end in a loud error, never
+a hang.
+
 State you need to know when reading it:
 
-- `basic_vars[row]` — which variable is basic in each row; `basic_var_vals` their values.
+- `basic_vars[row]` — which variable is basic in each row; `basic_var_vals` their values,
+  `basic_var_mins`/`basic_var_maxs` their bounds (during a primal phase, the working bounds of
+  `bounds.rs`).
 - `nb_vars[col]` / `nb_var_vals` / `nb_var_states{at_min, at_max}` — non-basic variables
-  sit at one of their bounds (or at 0 if free).
+  sit at one of their bounds, within its tolerance (or at 0 if free).
 - `is_primal_feasible` / `is_dual_feasible` — honest flags; every solve path is a state
   machine over them. `initial_solve` = restore primal feasibility (dual simplex /
   phase-1-style) then optimize (primal simplex).
@@ -608,12 +632,19 @@ Two homes, by audience:
 (see below) and presolve decides against it, so what presolve assumes, what the engine
 reports and what the guard accepts are the same contract.
 
-**Internal — `src/mip/params.rs`, `src/solver/tolerances.rs` and `src/solver/scaling.rs` consts
-(each documented at its definition):** `SCORE_EPS`, `PSEUDOCOST_INIT_EPS`, `BRANCH_FRAC_GUARD` (all `1e-6`),
+**Internal — `src/mip/params.rs`, `src/solver/tolerances.rs`, `src/solver/scaling.rs`,
+`src/solver/costs.rs` and `src/solver/cycling.rs` consts (each documented at its
+definition):** `SCORE_EPS`, `PSEUDOCOST_INIT_EPS`, `BRANCH_FRAC_GUARD` (all `1e-6`),
 `GAP_DENOM_GUARD` (`1e-10`), `HINT_BOUNDS_SLACK` (`1e-9`), `DEADLINE_CHECK_INTERVAL`
 (`1000` pivots), `LU_STABILITY_THRESHOLD` (`0.1`), `MIN_DUAL_EDGE_WEIGHT` (`1e-4`, the floor
 of the dual steepest-edge weights, as HiGHS; the primal weights are floored at their lower
-bound `1 + lambda^2`, as HiGHS too), `INFINITE_BOUND` (`2^52`, §2), and the engine's
+bound `1 + lambda^2`, as HiGHS too), `INFINITE_BOUND` (`2^52`, §2), the anti-degeneracy
+constants of both simplex phases (the cost perturbation base `5e-7` and row scale `1e-12`, the
+cost `INFINITE_COST` = `1e20` beyond which a cost is not perturbed, the bound perturbation base
+`5e-7` in user units, the near-optimal thresholds of 1000 infeasibilities and an infeasibility
+of `1e-3`, `STALL_ITERATIONS` = 10,000, and `LOOP_HARRIS_REDUCTION` = `0.01`, the cut of the
+primal ratio test's tolerance per further round of `run_phases`; all HiGHS's or SoPlex's, see
+*Anti-degeneracy* below), and the engine's
 tolerance model in `solver/tolerances.rs`, which is one rule applied to three kinds of
 comparison — every tolerance is
 either the user's contract or a property of the arithmetic, and every comparison of a
@@ -624,8 +655,8 @@ computed quantity is floored at that quantity's round-off:
 | Is a basic slack (row) within its bounds? | `slack_tol`: the engine's share (`ROW_BUDGET_SHARE`, ½) of the contract `row_tolerance(feasibility × r, m)` in the row's scaled units, at the row's magnitude `m = |b| + Σ|a_j x_j|` at the current values (refreshed whenever the rows are checked). The other half is the reserve: for the snap of an integer or fixed var, and for evaluating the row in another order of operations. | `ROUNDOFF_FLOOR = 1e-14`, `ROW_BUDGET_SHARE = 0.5` |
 | Is a structural var within / at its bounds? | `structural_tol`: the user contract in user units, but never more than any of its rows can absorb when the value is snapped to the bound (`snap_budget`: the row's reserve over the var's scaled coefficient, minimised over its rows), floored at the round-off of the bound magnitude. One rule for every var: it keeps a big-M row within contract when its binary is rounded, and a fixed var's report at its value within the rows presolve substituted it out of. | |
 | Is a reduced cost zero? | `dual_tol`: `EPS` floored at the round-off of `|c_j| + Σ|a_ij y_i|`, refreshed with the multipliers. | `EPS = 1e-10` |
-| Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it (`ENTRY_ROUNDOFF` relative to its column's largest entry in the primal test, and in the dual test to its row's largest entry over the columns that are not excluded and that the scalings made comparable: all but those of vars fixed when the model entered the engine, which keep the user's units, so a fixed column's `1e17` cannot make a genuine `1` noise, while an entry that cannot help still measures the round-off the row's entries share); a genuine entry at least `PIVOT_REL_TOL` of the largest genuine entry among the vars that could enter and are not excluded (rows that could block, in the primal test) is preferred, a smaller one is the pivot only when nothing larger will do. In the primal test every genuine entry bounds the step, with each basic var's tolerance counted from where it sits and less the round-off of recomputing it (its row's for a slack, its bound's for a structural var), so no step leaves a basic var where the phase exit's recomputation could find it outside its tolerance. In the dual test a boxed var the step passes is flipped instead of entering, and an entry below the round-off floor is never a pivot but may move its (boxed) var when that lands the row, checked through the column and at the phase exit (see *Bound flipping* below). | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7` |
-| Do the row and column computations of the pivot element agree? | to `PIVOT_AGREEMENT_TOL` relatively, or to `ENTRY_ROUNDOFF` of the computations' scale for an element above `LU_SINGULAR_REL` of that scale (below it, round-off agrees with anything of its size, so only relative agreement tells a genuine element from noise); else rebuild (stale factorization) or exclude the entry as noise (fresh one). Once they agree, each is used where it belongs, as in HiGHS: the column's element for the primal step, the eta file and both steepest-edge updates (which apply it with the rest of the column), the row's for the dual simplex's reduced-cost update (which runs along the row). | `PIVOT_AGREEMENT_TOL = 1e-7` |
+| Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it (`ENTRY_ROUNDOFF` relative to its column's largest entry in the primal test, and in the dual test to its row's largest entry over the columns that are not excluded and that the scalings made comparable: all but those of vars fixed when the model entered the engine, which keep the user's units, so a fixed column's `1e17` cannot make a genuine `1` noise, while an entry that cannot help still measures the round-off the row's entries share); a genuine entry at least `PIVOT_REL_TOL` of the largest genuine entry among the vars that could enter and are not excluded (rows that could block, in the primal test) is preferred, a smaller one is the pivot only when nothing larger will do. In the primal test every genuine entry bounds the step, with each basic var's tolerance counted from where it sits (the whole of it in the first round of `run_phases`, a hundredth of it more in each further round, as SoPlex restricts its ratio test when its algorithms loop; a var past its bound by more than that admits no step toward it, a limit of zero, never a negative one); a basic var a step still leaves outside its bounds beyond its tolerance (through an entry below the round-off floor, or a recomputation) has its working bound shifted, and a step that would run backwards is zero (see *Anti-degeneracy and cycling in the primal simplex* below). In the dual test a boxed var the step passes is flipped instead of entering, and an entry below the round-off floor is never a pivot but may move its (boxed) var when that lands the row, checked through the column and at the phase exit (see *Bound flipping* below). | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7` |
+| Do the row and column computations of the pivot element agree? | to `PIVOT_AGREEMENT_TOL` relatively, or to `ENTRY_ROUNDOFF` of the computations' scale for an element above `LU_SINGULAR_REL` of that scale (below it, round-off agrees with anything of its size, so only relative agreement tells a genuine element from noise); else rebuild (stale factorization) or exclude the entry as noise (fresh one), for the column (primal test) or row (dual test) it was judged in only, until the next pivot (the primal test once kept its exclusions until then whatever column entered, and a taboo that changed the column passed a genuine blocking row unseen: `rows_excluded_as_round_off_for_one_column_block_another`). Once they agree, each is used where it belongs, as in HiGHS: the column's element for the primal step, the eta file and both steepest-edge updates (which apply it with the rest of the column), the row's for the dual simplex's reduced-cost update (which runs along the row). | `PIVOT_AGREEMENT_TOL = 1e-7` |
 | Is the LU pivot column singular? | eligible part below `LU_SINGULAR_REL` of the column's largest transformed entry. | `= ROUNDOFF_FLOOR` |
 
 Two rules complete the model. **Absorption:** when no var can enter a violated row's pivot
@@ -633,10 +664,24 @@ regularly, a non-basic continuous var or slack may enter by crossing its bound (
 fixed value) by no more than its own tolerance — "at a bound" means within tolerance
 everywhere, so it is still at its bound afterwards; this is how a round-off-level violation
 that a tightly held var cannot carry is handed to a row or var that can. Integer vars never
-absorb. **Verified termination:** a phase reports `Finished` only after `verify_primal` and exact
-reduced costs (recomputed only when pivots have updated them incrementally since); in a
-degenerate primal step the leaving var leaves where it sits, at its bound within tolerance,
-so the basis equations keep holding and no column is ever refused. `verify_primal`
+absorb. The absorber enters on a zero dual step, its cost shifted by its whole reduced cost
+(see *Anti-degeneracy* below): such a pivot is no step of the dual simplex, and taking it as
+the step `d_q / a_q` ran backwards by any amount (C2-12 of the solver review). The choice is
+the absorber whose shift can do the least harm when it is given back: a fixed var's none (any
+reduced cost is feasible for it), any other's its reduced cost; so the ratio is that reduced
+cost over the entry, and among the absorbers within the Harris relaxation of the smallest
+ratio the largest entry enters (an entry `PIVOT_REL_TOL` below the largest absorbing one is
+no candidate). A fixed slack thus wins where it can, as it did when the clamp priced it at
+zero. Cost shifting
+does not make the rule unnecessary: without it six lib tests (the four wide-coefficient and
+magnitude properties among them) come back `Infeasible` on feasible models, since the
+violations it repairs are primal ones the engine's own tolerances create (half the contract
+for a row, a bound tolerance capped by the rows' reserve), which no dual step removes; a
+verdict that does not conclude on tolerance-level gaps (the HiGHS proof) is what can replace
+it. **Verified termination:** a phase reports `Finished` only after `verify_primal` and exact
+reduced costs (recomputed only when pivots have updated them incrementally since); a primal
+step that would run backwards is zero, the leaving var leaving where it sits, so no column is
+ever refused (see the primal simplex's anti-degeneracy below). `verify_primal`
 runs `check_rows`: every basic slack is re-derived from its row, `s = b − Σ a_j x_j` at the
 current structural values, so that a row's violation lives in its slack's value where the
 dual simplex sees it; the slack tolerances are refreshed from the rows' magnitudes; and the
@@ -728,6 +773,182 @@ once pinned here as a known limitation (coefficient chains spanning twelve to fi
 of magnitude, whose only repair ran through such an entry); they are the `wide_chain`
 regression tests in `src/tests/magnitudes.rs`.
 
+**Anti-degeneracy and cycling in the dual simplex** (`src/solver/costs.rs`,
+`src/solver/cycling.rs`), as HiGHS's dual simplex does it (`HEkk::initialiseCost`,
+`HEkkDual::shiftCost`/`shiftBack`/`correctDualInfeasibilities`/`cleanup`,
+`HEkk::isBadBasisChange`), with SoPlex's stall check. A dual phase works on *working costs*:
+the costs in force plus a perturbation and shifts (`cost_perturbation`, `cost_shifts`), and
+every reduced cost, multiplier and objective value of the phase is the working costs'.
+
+- *Perturbation*, when the phase starts, unless it starts near optimal (dual feasible, or dual
+  infeasible by amounts whose square is below `EPS`, with fewer than 1000 rows violated and
+  none by `1e-3` or more, in scaled units) or cleans up after another phase (a dual phase is
+  perturbed only as the first phase of a re-solve, as HiGHS runs its cleanup passes with the
+  perturbation off):
+  a structural var's cost moves by
+  `(1 + r_j)(|c_j| + 1)·5e-7·C`, `C` the largest structural cost (its fourth root above 100,
+  at most one when fewer than 1% of the vars are boxed, one when every cost is zero), up for a
+  var bounded below only, down for one bounded above only, by its cost's sign for a boxed one,
+  not at all for a free or fixed one; a slack's by `(0.5 − r_i)·1e-12`. `r` is a
+  pseudo-random fraction fixed by the var's index, so every solve is deterministic. It makes
+  ties between breakpoints, and so dual steps of zero, the exception. A cost of `1e20` or more
+  (`INFINITE_COST`, HiGHS's `infinite_cost`) takes no part, neither in `C` nor perturbed:
+  HiGHS's perturbation never sees one (`assessCosts` makes it infinite and `handleInfCost`
+  fixes its var before the solve). So `C` stays below `1e5` and a cost moves by less than a
+  tenth of `|c_j| + 1`; without the limit the formula, which grows like `1e-6·|c|^(5/4)`,
+  perturbed a cost above about `2e251` to infinity, and the dual ratio test, dropping the
+  candidates whose reduced costs were then not numbers, proved a feasible model infeasible
+  (`a_huge_cost_leaves_a_feasible_model_feasible`).
+- *Correction*, when the phase starts and at every rebuild within it: a reduced cost on its
+  infeasible side by at least its tolerance is removed by moving a boxed var to the bound where
+  its sign is feasible (all at once, one solve), or by shifting any other var's cost until the
+  reduced cost is `(1 + r)` times its tolerance on the feasible side (zero at neither bound).
+  At the start, dual infeasibilities that were small before the perturbation are shifted, not
+  flipped, and so are all those of a phase that cleans up after another (HiGHS's `force_phase2`,
+  which its cleanup calls pass: flipping there moved a node LP's integer var off its branching
+  bound into a row the phase could not repair, and back, round after round,
+  `a_cleanup_dual_phase_shifts_a_boxed_var_rather_than_flipping_it`). This is the dual
+  simplex's precondition, a dual feasible basis, for warm starts that lack it (a loaded basis,
+  a loosened bound, a moved var). A
+  candidate of the ratio test found dual infeasible beyond its tolerance triggers such a
+  rebuild, as HiGHS's `workTheta <= 0` does. Within the phase every infeasible cost is
+  shifted, boxed vars' too, as SoPlex shifts every violated dual bound: this ratio test leaves
+  an entry `PIVOT_REL_TOL` below the row's largest out of the step's bound, so a step can
+  leave its var dual infeasible by far more than drift, and moving that var back to its other
+  bound returned the phase to a vertex it had left, round a loop the cycling detection ended
+  with an error (fuzz model `wide_lp-1897`, the regression test
+  `wide_lp_1897_solves_within_the_contract`).
+- *Shifting*: the ratio test takes a breakpoint as the reduced cost on its feasible side over
+  the entry, unclamped (the Harris pass may leave it just across zero); where the entering
+  var's is not positive, or the var absorbs, the dual step is zero and the var's cost is
+  shifted so its reduced cost is zero, instead of a step backwards; the shift is given back
+  when the var leaves the basis. Among absorbers the one whose shift can do the least harm when
+  given back enters (a fixed var first), not the largest entry, which left fuzz model
+  `wide_lp-558` above its optimum. A row entry, or the reduced cost of a candidate or an
+  absorber, that is not a finite number fails the test with an `InternalError`: it would compare
+  false with every bound and drop out unseen, and the row's verdict would rest on the rest.
+- *Cleanup*: every way a phase ends (`Finished`, a limit, an error) restores the costs in
+  force, marks the reduced costs for recomputation and recomputes the objective. `run_phases`
+  then verifies as above, in its order: the values first (`verify_primal`), then the reduced
+  costs recomputed exactly from the costs in force, and the primal phase removes the dual
+  infeasibility that uncovers (HiGHS runs one primal simplex pass after its cleanup). A cleanup
+  that recomputed the reduced costs itself and sent `run_phases` to its primal phase before the
+  values were verified let that phase take a degenerate pivot on unverified values and stale
+  slack tolerances, and report a wrong optimum (fuzz model `wide_lp-558`; the regression test
+  `wide_lp_558_reaches_the_optimum` fails with either this cleanup or the largest-entry
+  absorber).
+- *Cycling*: what repeats in a cycle is the vertex, so the vertex is hashed: the XOR of a term
+  per basic var and a term per non-basic var at its upper bound, so that a pivot and a bound
+  flip each toggle terms. (HiGHS hashes the basic set alone, but the bound-flipping ratio test
+  and flip-only steps move boxed vars without a basis change, so a basic set can come back at
+  another vertex and a set hash take progress for a revisit; HiGHS recovers from a wrong verdict
+  with another solve, this engine has no such recovery. A first version hashed the basic set
+  while the correction still flipped boxed vars, and failed fuzz model `wide_lp-1897`; with the
+  correction shifting, no fuzz model tells the hashes apart, and the unit test
+  `vertex_hash_makes_a_repeated_basis_change_taboo` pins the difference.) Every vertex a phase
+  reaches by a pivot is recorded; when two consecutive basis changes both lead to visited
+  vertices, the change is recorded as bad and its row taboo (skipped when the leaving row is
+  chosen) until a rebuild; a bad change seen again is taboo at once; a record is dropped once a
+  pivot moves its row by the row's tolerance. A rebuild lifts the taboos and keeps the records,
+  as HiGHS's does when it does not refactorize, which with its default
+  `no_unnecessary_rebuild_refactor` is the case for its rebuilds that stand for these (no row
+  left; a dual infeasible candidate, or none, before a verdict of infeasibility) unless the
+  solve error exceeds `1e-8`; HiGHS drops the records when it refactorizes, which this engine
+  does every few pivots on a small basis, too often for a record to outlive its cycle, so here
+  they last the phase. When a rebuild leaves only taboo rows violated, the phase fails with an
+  `InternalError` (HiGHS returns `kUnknown` there;
+  `dual_phase_fails_loudly_when_only_taboo_changes_are_left`). A shift or an absorber's zero
+  step can move the working objective back (a fixed absorber's shift is its whole reduced cost),
+  so vertices can come back; the model the property stress found cycling forever, four pivots
+  handing a tolerance-level violation between two equalities, now ends at its optimum through
+  the taboo (`a_dual_simplex_that_cycled_reaches_the_optimum`).
+- *Stall bound*: every `STALL_ITERATIONS` (10,000) iterations of a phase, the working
+  objective must have risen beyond round-off, or the phase fails with an `InternalError`
+  (SoPlex's `SOPLEX_MAXSTALLS`), so a cycle the hash misses ends loudly instead of never. The
+  measure is the objective alone (SoPlex adds the reduction of its shifts, and recovers by
+  switching algorithm up to ten times before it aborts), so it would also end a phase that
+  progresses without raising it: an unperturbed, near-optimal start on a zero objective, or a
+  check that falls while a large shift holds the objective down (known limitations below).
+
+**Anti-degeneracy and cycling in the primal simplex** (`src/solver/bounds.rs`,
+`src/solver/cycling.rs`), as HiGHS's primal simplex does it (`HEkk::initialiseBound`,
+`HEkkPrimal::correctPrimal`/`phase2UpdatePrimal`/`considerInfeasibleValueIn`/`shiftBound`/
+`cleanup`), with SoPlex's treatment of a step that would run backwards (`SPxFastRT::maxReLeave`),
+of the shifts it keeps (`unShift`) and of rounds that loop (the restricted ratio test of
+`SPxSolverBase::solve`). A primal phase works on *working bounds* (`working_mins`,
+`working_maxs`; the basic vars' bounds are theirs), and the dual simplex never sees them:
+
+- *Perturbation*, when the phase starts, unless it starts near optimal (primal feasible, with
+  fewer than 1000 dual infeasibilities and none of `1e-3` or more, in scaled cost units) or
+  cleans up after another phase (the one after a phase-1 dual phase on the artificial objective
+  does not: it is the real optimization): every finite bound of a var that is not fixed moves
+  outward by `r·5e-7·max(1, |b|)`, `r` the var's pseudo-random fraction and `b` the bound in
+  user units (for a slack, its row's right-hand side), mapped into scaled units as the
+  tolerances are: HiGHS's formula in HiGHS's own unscaled-LP mode, which is the engine's
+  (perturbed in scaled units, a slack of a row the equilibration scaled by `2^-20` would get
+  millions of times its tolerance). A non-basic var at a bound moves with it. A fixed var is
+  never perturbed (HiGHS perturbs a basic one and makes it leave at its true value; here a
+  fixed var leaves at its true value when a shift has moved its bounds).
+- *Shifting*: after the start, after every step and after every recomputation of the values, a
+  basic var outside its working bounds beyond its tolerance has the bound moved to `(1 + r)`
+  times its tolerance beyond where it sits (HiGHS's `shiftBound`), and the phase goes on over
+  bounds its point satisfies. A step causes this through an entry below the column's round-off
+  floor, which bounds no step (`a_step_past_a_row_the_ratio_test_ignores_shifts_its_bound`).
+- *Steps*: the Harris pass counts each basic var's whole tolerance from where it sits (the
+  round-off cut it once took left rows above about `5e6` in magnitude with no allowance at all,
+  C3-10); the leaving var goes exactly to its working bound, a fixed var to its true value
+  (HiGHS's `adjustPerturbedEquationOut`). Where the leaving var sits past that target, the step,
+  which HiGHS takes backwards, is zero and the var leaves where it sits (SoPlex's `maxReLeave`):
+  past a moved bound, the bound moves on to it; past its true bound, within its tolerance, it is
+  at that bound in the engine's sense (the tolerance-based state, C4-25, which stays until the
+  engine holds the full contract). Under the engine's tolerances a step backwards amplified
+  round-off: an ulp of 128 in the leaving var, over an element of `5e-5`, took the entering var
+  `1.5e-10` past a bound whose tolerance its row's reserve capped at `1e-10`
+  (`property_counterexample_where_a_step_backwards_amplified_round_off`), and a fixed slack's
+  `3e-17` of round-off took another slack beyond the contract and the repair into a singular
+  basis (`a_fixed_slack_carrying_round_off_leaves_where_it_sits`). The clamp this replaced
+  (C3-21) left the leaving var where it sat too, but unrecorded, and set one beyond its
+  tolerance onto its bound plus its tolerance.
+- *Cleanup*, however the phase ends: the working bounds become the true ones again; a non-basic
+  var at a moved bound goes back to the true one, and when one did, the basic values are
+  recomputed from scratch (HiGHS's `computePrimal`, which also clears the round-off the steps
+  carried into them; HiGHS recomputes whenever the phase moved a bound, where here the values
+  the steps left stand when no non-basic var moved, for `run_phases` to verify against the
+  rows); a non-basic var off a true bound within its tolerance at the current values stays
+  (SoPlex's `unShift` keeps the shifts within its tolerance; moving it back pushed its offset,
+  divided by a tableau entry, into the basic vars), one beyond it moves onto the bound (a slack
+  left there under a tolerance its row had while one of its vars sat at `1e15`:
+  `a_row_left_with_the_tolerance_of_a_huge_bound_is_repaired`, a known limitation until then).
+  Primal feasibility is measured on the true bounds, `run_phases` verifies, and the dual phase
+  of its next round removes what violations the cleanup uncovered, as HiGHS follows its primal
+  cleanup with one dual simplex pass.
+- *Rounds that loop*: each round of `run_phases` after the first cuts the primal ratio test's
+  tolerance a hundredfold (`LOOP_HARRIS_REDUCTION`, SoPlex's "to avoid shifts we restrict
+  tolerances in the ratio test"): a step that ended at a var's tolerance, where the
+  verification's recomputation found it an ulp past, was undone by the dual phase and redone by
+  the primal one until the rounds ran out
+  (`harris_step_leaves_the_round_off_of_the_recomputation`). SoPlex restricts every pass that
+  follows one that ended unverified, of either algorithm (its `loopCount`), cutting the
+  tolerance again at each; a round here, a dual and a primal pass, cuts it once. A var that sits
+  past its bound by more than the cut allowance (within its whole tolerance) admits no step
+  toward it: its limit is zero, never negative, as neither reference's is (HiGHS's shifts keep
+  every var within the tolerance its ratio test allows; SoPlex counts a violating var's
+  allowance from where it sits, `SPxFastRT::maxDelta`). A negative limit qualified only the rows
+  of vars past their bounds, the most negative from the smallest entries, and passed over a row
+  at its bound with an entry of one for one of `1.3e-8`, below the pivot floor
+  (`a_var_past_its_bound_beyond_the_allowance_limits_the_step_to_zero`).
+- *Cycling*: the vertex hash of the dual simplex, with the taboo on the change's entering var
+  (HiGHS's `applyTabooVariableIn`): a var whose entry keeps returning to visited vertices is not
+  priced until a rebuild lifts the taboo; when a rebuild leaves only taboo vars to enter, the
+  phase fails with an `InternalError`
+  (`primal_phase_fails_loudly_when_only_taboo_changes_are_left`). The stall bound applies too:
+  every `STALL_ITERATIONS` iterations the objective must have fallen beyond round-off. Every
+  step is forward or zero, so the objective of a primal phase never rises (a rebuild moves it
+  by round-off).
+
+The phase-1 artificial objective of a cold start that is neither primal nor dual feasible
+(C2-20) stays; it is perturbed like any costs in force.
+
 Known limitations, found by running the wide-coefficient properties of `src/tests/scaling.rs`
 at forty times their case count; all of them predate bound flipping, which removed several of
 the models these searches found and moved one into the second class:
@@ -748,8 +969,24 @@ the models these searches found and moved one into the second class:
   a scale over the blocking rows alone pivots on round-off instead, since the rows of one column
   share the round-off of one solve, so this needs an absolute pivot tolerance and a refined
   column rather than another relative floor;
-- a degenerate dual simplex can cycle: there is no cost perturbation and no iteration bound, so
-  without a time limit such a solve does not return;
+- the cycling detection of both phases ends a cycle it cannot break, and a stalled phase, in
+  an `InternalError` rather than an answer; its stall bound, measured on the working objective
+  alone and with no recovery before the error, would also end a phase that progresses for ten
+  thousand iterations without improving it (an unperturbed, near-optimal start on a zero
+  objective), which none of the suite, the fuzz or the property stress did;
+- the phases can alternate over a row that only entries below the round-off floor can repair:
+  the primal step passes a genuine entry below its column's floor and leaves the row beyond its
+  tolerance (shifted, and exposed by the cleanup), and the dual simplex repairs it only by
+  flipping a var across its range through another such entry (its flip-only stage), which
+  gives the primal step back; after `MAX_PHASE_ROUNDS` the solve fails with `InternalError`
+  (`lp_wide_3` of the review's stress run, pinned in `src/tests/magnitudes.rs`; the same at
+  1dcd664). A degenerate pivot on the tiny entry, or a proof that no step is possible, resolves
+  it: the absolute pivot tolerances and the infeasibility proof of R3. A second model of the
+  class, also pinned, ended in an answer until the primal simplex shifted its bounds: its step
+  reaches a point that meets the engine's tolerances only off every vertex, and the degenerate
+  clamp that shifting replaced had hidden that, leaving an equality violated by exactly the
+  contract, twice the engine's share, as a row residual the verification passed (under the
+  full contract of R4 its vertex verifies);
 - presolve's forcing-row rule can fix a var at a bound its row allows within the row's
   tolerance while another row pins it elsewhere, reporting a feasible model `Infeasible`. The
   instance found by the properties is fixed (a singleton row now goes first and pins the var,
@@ -757,13 +994,6 @@ the models these searches found and moved one into the second class:
   the pinning row has other terms and its coefficient amplifies the forcing row's slack beyond
   the contract (`-1000 x1 + x4 / 1000 = 83.887` beside `x1 + 100 x4 = 8388700`, pinned in
   `src/tests/magnitudes.rs`);
-- a var at a huge finite bound (from about 3e14, below the bound infinity of §2) sets its
-  rows' tolerances to the round-off of that magnitude, and they stay there until the rows are
-  checked again: once the var moves away, a row violated by units passes as feasible and a
-  primal step leaves its slack where it sits, off its bound, which the boundary reports as
-  an `InternalError` (issue #3's model with `z ≤ 1e15`, pinned in `src/tests/magnitudes.rs`;
-  found by the review of R0). This is why the bound infinity is 2^52 rather than HiGHS's
-  1e20: with 1e20 the same happens to bounds written for infinity;
 - the dual ratio test's round-off scale leaves out the columns fixed when the solve began
   (`unscaled_cols`, which neither scaling touches), but a row added later leaves out of its
   equilibration the vars fixed at that time, so after `fix_var(f, 0)` an added
@@ -777,11 +1007,13 @@ The convention for such models is to pin each as a `#[should_panic]` test named
 `..._is_a_known_limitation` in `src/tests/magnitudes.rs` (beside the engine's unit tests when
 the model needs a constructed basis): it passes while the limitation stands and **fails as soon
 as a change fixes it**, which is the signal to drop the attribute and keep the model as an
-ordinary regression test. Three models were pinned this way and all three were fixed (a
+ordinary regression test. Four models were pinned this way and all four were fixed (a
 presolve forcing rule that fixed a var its row could not resolve, a recompute of the basic
-values that counted as a verification, and the dual ratio test's reading of "no pivot" as
-infeasibility); four are pinned today, the primal ratio test's scale, the forcing row, the
-tolerance a var leaves behind at a huge bound and the fixed column of an added row above. The
+values that counted as a verification, the dual ratio test's reading of "no pivot" as
+infeasibility, and the tolerance a var left behind at a huge bound, which the primal
+simplex's cleanup now repairs); five are pinned today, the primal ratio test's scale, the
+two models of phases alternating over a row repaired through round-off, the forcing row and
+the fixed column of an added row above. The
 wide-coefficient MILP property stays `#[ignore]`d while the classes above stand (a random
 search cannot assert its own failure); run it with `cargo test --lib -- --ignored`.
 
@@ -797,9 +1029,11 @@ search cannot assert its own failure); run it with `cargo test --lib -- --ignore
 | Singular LU during a node LP | retry once from the slack basis; then propagate |
 | Exactly-integral candidate failing the guard | `InternalError` (the engine verified the same point; see §5.4) |
 | Verified state unreachable (`MAX_PHASE_ROUNDS` alternations, or a basis that cannot represent its vertex) | `InternalError`, never an unverified optimum |
-| A reduced cost the primal simplex would price, or a steepest-edge weight, is not finite | `InternalError` (a NaN reduced cost once ended a phase as optimal; an overflowing weight aborted the process through an `assert!`; a weight is checked before its floor, which would make a NaN finite) |
+| A reduced cost the primal simplex would price or the dual ratio test would weigh, an entry of the dual ratio test's row or of the primal ratio test's column (or the value of a basic var it moves), or a steepest-edge weight, is not finite | `InternalError` (a NaN reduced cost once ended a phase as optimal, and costs perturbed to infinity once made the dual ratio test drop a row's every candidate and prove a feasible model infeasible; an overflowing weight aborted the process through an `assert!`; a weight is checked before its floor, which would make a NaN finite) |
 | `load_basis` failure on a jump | load the slack basis (infallible) and solve the node from scratch |
-| Phase-1 stall (“no entering column”) | rebuild (fresh LU + recomputed values and reduced costs) and retry once per stall; declare `Infeasible` only if it survives the rebuild |
+| Phase-1 stall (“no entering column”) | rebuild (fresh LU + recomputed values and reduced costs, dual infeasibilities corrected) and retry once per stall; declare `Infeasible` only if it survives the rebuild |
+| Simplex cycling: after a rebuild, every basis change left (a violated row's in the dual simplex, an entering var's in the primal) is taboo (it keeps leading to visited vertices) | `InternalError`, never a hang (HiGHS returns `kUnknown`); on a node LP, the one slack-basis retry |
+| Simplex stalled: the objective of a phase has not improved in `STALL_ITERATIONS` iterations | `InternalError`, never a hang (SoPlex aborts with `ABORT_CYCLING`) |
 | Deadline mid-LP | requeue the node unsolved; return `Interrupted` |
 | Limit with no incumbent | `SolveOutcome::Interrupted`; only reason, stats, and resume are exposed |
 | Search exhausted, no incumbent | `Err(Infeasible)` |
