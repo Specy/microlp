@@ -660,11 +660,11 @@ fn dual_ratio_test_pivots_on_the_largest_entry_of_a_tied_group() {
     let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
     sol.calc_row_coeffs(row);
     let step = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[], &[])
+        .choose_entering_col_dual(row, leaving_new_val, &[], false)
         .unwrap()
         .step();
     assert!(step.flips.is_empty(), "flips {:?}", step.flips);
-    let (col, coeff) = step.entering.unwrap();
+    let (col, coeff) = step.entering;
     assert_eq!((sol.nb_vars[col], coeff), (0, 1.0));
 
     let mut sol = new_solver();
@@ -698,11 +698,11 @@ fn dual_ratio_test_steps_back_to_a_group_with_a_stable_pivot() {
     let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
     sol.calc_row_coeffs(row);
     let step = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[], &[])
+        .choose_entering_col_dual(row, leaving_new_val, &[], false)
         .unwrap()
         .step();
     assert!(step.flips.is_empty(), "flips {:?}", step.flips);
-    let (col, coeff) = step.entering.unwrap();
+    let (col, coeff) = step.entering;
     assert_eq!((sol.nb_vars[col], coeff), (0, 1.0));
 
     let mut sol = new_solver();
@@ -740,11 +740,11 @@ fn excluded_column_does_not_set_the_dual_pivot_floor() {
     *sol.row_coeffs.get_mut(c1) = 1e-6;
     *sol.row_coeffs.get_mut(c2) = 1e-14;
     let step = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[c1], &[])
+        .choose_entering_col_dual(row, leaving_new_val, &[c1], false)
         .unwrap()
         .step();
     assert!(step.flips.is_empty());
-    assert_eq!(step.entering, Some((c2, 1e-14)));
+    assert_eq!(step.entering, (c2, 1e-14));
 }
 
 /// The dual simplex applies a pivot with the element computed through the
@@ -776,10 +776,10 @@ fn dual_pivot_applies_the_column_element_to_the_eta_file() {
     let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
     sol.calc_row_coeffs(row);
     let step = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[], &[])
+        .choose_entering_col_dual(row, leaving_new_val, &[], false)
         .unwrap()
         .step();
-    let (col, a_row) = step.entering.unwrap();
+    let (col, a_row) = step.entering;
     sol.calc_col_coeffs(col);
     let a_col = sol.col_coeff_at(row);
     assert_eq!(
@@ -1095,10 +1095,10 @@ fn dual_step_is_zero_where_the_entering_reduced_cost_has_crossed_zero() {
     let mut sol = sol;
     sol.calc_row_coeffs(row);
     let step = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[], &[])
+        .choose_entering_col_dual(row, leaving_new_val, &[], false)
         .unwrap()
         .step();
-    assert_eq!(step.entering.map(|(c, _)| sol.nb_vars[c]), Some(1));
+    assert_eq!(sol.nb_vars[step.entering.0], 1);
     assert!(step.zero_step && step.flips.is_empty());
 
     // The phase: one pivot, on a zero step. The start violates its row by
@@ -1455,11 +1455,10 @@ fn dual_phase_fails_loudly_when_only_taboo_changes_are_left() {
     let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
     sol.calc_row_coeffs(row);
     let (col, _) = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[], &[])
+        .choose_entering_col_dual(row, leaving_new_val, &[], false)
         .unwrap()
         .step()
-        .entering
-        .unwrap();
+        .entering;
     let (leaving, entering) = (sol.basic_vars[row], sol.nb_vars[col]);
     assert_eq!(entering, 0);
     let here = sol.cycle_guard.hash_after(std::iter::empty());
@@ -1474,6 +1473,627 @@ fn dual_phase_fails_loudly_when_only_taboo_changes_are_left() {
         matches!(&result, Err(Error::InternalError(msg)) if msg.contains("cycles")),
         "{result:?}"
     );
+}
+
+/// The compensated sums of the infeasibility proof keep what `f64` rounds
+/// away (HiGHS's `HighsCDouble`): `1e16 + 1 - 1e16` is one, where `f64`
+/// gives zero, and a product is exact: `(1 + 2^-30)^2` keeps its `2^-60`.
+#[test]
+fn compensated_sums_keep_what_f64_rounds_away() {
+    let mut sum = proof::CDouble::default();
+    sum.add_product(1e16, 1.0);
+    sum.add_product(1.0, 1.0);
+    sum.add_product(-1e16, 1.0);
+    assert_eq!(sum.value(), 1.0);
+    assert_eq!(std::hint::black_box(1e16) + 1.0 - 1e16, 0.0);
+
+    let a = 1.0 + 2f64.powi(-30);
+    let mut square = proof::CDouble::default();
+    square.add_product(a, a);
+    square.add_product(-(1.0 + 2f64.powi(-29)), 1.0);
+    assert_eq!(square.value(), 2f64.powi(-60));
+    assert_eq!(std::hint::black_box(a) * a - (1.0 + 2f64.powi(-29)), 0.0);
+}
+
+/// The proof of infeasibility of the row of `x + y >= rhs` over `x ∈ [0, 1]`
+/// and `y ∈ [0, y_max]`, violated at the slack basis.
+fn proof_of_a_single_row(rhs: f64, y_max: f64) -> proof::Proof {
+    let mut sol = Solver::try_new(
+        &[0.0, 0.0],
+        &[0.0, 0.0],
+        &[1.0, y_max],
+        &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, rhs)],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
+    sol.prove_infeasible(row, leaving_new_val > sol.basic_var_vals[row])
+}
+
+/// The infeasibility proof judges the model's data (C2-14, C4-33 of the
+/// solver review): at the slack basis the certificate is the row itself,
+/// `x + y + s = rhs` with `s <= 0`, whose largest value over the box is 2.
+/// For `rhs = 3` it is out of reach by one: proven. The gap must exceed the
+/// tolerance the engine holds the row's slack to, half the user's `1e-7`:
+/// out of reach by `3e-8`, a point the dual simplex accepts misses the row
+/// by that much, so nothing is proven; by `2e-7`, it is. With `y` unbounded
+/// above the range is unbounded: nothing is proven, however far the row is.
+#[test]
+fn infeasibility_proof_needs_a_gap_beyond_the_tolerance() {
+    init();
+    let proof = proof_of_a_single_row(3.0, 1.0);
+    assert!(proof.holds, "{proof:?}");
+    assert!((proof.gap - 1.0).abs() < 1e-15, "{proof:?}");
+
+    let proof = proof_of_a_single_row(2.0 + 3e-8, 1.0);
+    assert!(!proof.holds, "{proof:?}");
+    assert!(proof.gap > 2.9e-8 && proof.allowance > 4.9e-8, "{proof:?}");
+
+    let proof = proof_of_a_single_row(2.0 + 2e-7, 1.0);
+    assert!(proof.holds, "{proof:?}");
+
+    let proof = proof_of_a_single_row(3.0, f64::INFINITY);
+    assert!(!proof.holds, "{proof:?}");
+    assert_eq!(proof.gap, f64::NEG_INFINITY);
+}
+
+/// The optimal basis of `min x + y` s.t. `x + 2y >= 4`, `3x + y >= 3`, both
+/// structural vars basic, with the row of its inverse for the first row
+/// computed: fifths, which no `f64` holds.
+fn fifths_basis() -> Solver {
+    let mut sol = Solver::try_new(
+        &[1.0, 1.0],
+        &[0.0, 0.0],
+        &[10.0, 10.0],
+        &[
+            (to_sparse(&[1.0, 2.0]), ComparisonOp::Ge, 4.0),
+            (to_sparse(&[3.0, 1.0]), ComparisonOp::Ge, 3.0),
+        ],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(sol.initial_solve().unwrap(), StopReason::Finished);
+    assert!(
+        sol.basic_vars.iter().all(|&var| var < sol.num_vars),
+        "fixture: both structural vars basic, {:?}",
+        sol.basic_vars
+    );
+    sol.calc_row_coeffs(0);
+    sol
+}
+
+/// `B^T rho - e_row` over the basic columns, in compensated arithmetic: the
+/// coefficients the certificate of `rho` gives the basic vars, less the
+/// leaving var's one.
+fn basic_residual(sol: &Solver, rho: &[proof::CDouble], row: usize) -> Vec<f64> {
+    sol.basic_vars
+        .iter()
+        .enumerate()
+        .map(|(i, &var)| {
+            let mut value = proof::CDouble::default();
+            for (r, &a) in sol.orig_constraints_csc.outer_view(var).unwrap().iter() {
+                value.add_scaled(rho[r], a);
+            }
+            if i == row {
+                value.add_product(-1.0, 1.0);
+            }
+            value.value()
+        })
+        .collect()
+}
+
+/// Planted multipliers for the proof.
+fn multipliers(rho: &[f64]) -> Vec<proof::CDouble> {
+    rho.iter().map(|&r| proof::CDouble::from(r)).collect()
+}
+
+/// Planted multipliers for the proof, taken as exact: their error is bounded
+/// by zero.
+fn exact_row(rho: &[f64]) -> proof::RefinedRow {
+    proof::RefinedRow {
+        rho: multipliers(rho),
+        error: Some(vec![0.0; rho.len()]),
+    }
+}
+
+/// The row of the basis inverse the proof starts from is refined, with
+/// HiGHS's `unitBtranIterativeRefinement`: its residual
+/// `B^T rho - e_row`, summed in compensated arithmetic, is solved for and
+/// taken off, twice. Planted: at [`fifths_basis`], the computed row
+/// perturbed by `1e-6`; the refinement brings it back to within round-off of
+/// the computed row (and so its basic coefficients, `B^T rho`, to the unit
+/// vector), and it converges: the second correction, the bound it reports
+/// on the error of each multiplier, is some ten orders below the first.
+#[test]
+fn the_row_of_the_basis_inverse_is_refined_before_the_proof() {
+    init();
+    let mut sol = fifths_basis();
+    let row = 0;
+    let mut exact = vec![0.0; sol.num_constraints()];
+    for (r, &value) in sol.inv_basis_row_coeffs.iter() {
+        exact[r] = value;
+    }
+    let perturbed: Vec<f64> = exact
+        .iter()
+        .enumerate()
+        .map(|(r, &value)| value + if r == 1 { 1e-6 } else { 0.0 })
+        .collect();
+    let refined = sol.refine_basis_inverse_row(row, multipliers(&perturbed));
+    for (r, (got, &want)) in refined.rho.iter().zip(&exact).enumerate() {
+        let got = got.value();
+        assert!(
+            (got - want).abs() <= 1e-15 * want.abs().max(1.0),
+            "rho[{r}] {got:e} vs {want:e}"
+        );
+    }
+    let error = refined.error.expect("the refinement converges");
+    assert!(error.iter().all(|&e| e <= 1e-16), "{error:?}");
+}
+
+/// The refinement keeps its corrections to twice the precision of an `f64`
+/// (as LAPACK's extra-precise refinement keeps its solution), so that the
+/// basic coefficients of the certificate vanish where the basis defines
+/// multipliers no `f64` holds. At [`fifths_basis`], the refined row as a
+/// compensated sum combines the basic columns into the unit vector to within
+/// `1e-30`, and the bound it reports on the error of each multiplier is of
+/// that order too; rounded to `f64`, as HiGHS rounds it, the same row leaves
+/// the error of its representation, some `1e-17`, which times a scaled bound
+/// of `1e9` to `6e10` voided the proofs of three infeasible MILP nodes of the
+/// property stress (`multipliers_no_f64_holds_do_not_void_a_nodes_proof` in
+/// `src/tests/magnitudes.rs`).
+#[test]
+fn the_refined_row_keeps_its_correction_to_twice_the_precision() {
+    init();
+    let mut sol = fifths_basis();
+    let row = 0;
+    let refined = sol.refined_basis_inverse_row(row);
+    let kept = basic_residual(&sol, &refined.rho, row);
+    assert!(kept.iter().all(|res| res.abs() <= 1e-30), "{kept:?}");
+    let error = refined.error.as_ref().expect("the refinement converges");
+    assert!(error.iter().all(|&e| e <= 1e-30), "{error:?}");
+    let rounded: Vec<f64> = refined.rho.iter().map(|rho| rho.value()).collect();
+    let rounded = basic_residual(&sol, &multipliers(&rounded), row);
+    assert!(rounded.iter().any(|res| res.abs() > 1e-20), "{rounded:?}");
+}
+
+/// The bound the refinement puts on the error of each multiplier is its
+/// second correction, and only where the refinement converged in LAPACK's
+/// sense, that correction at most `2^-53` of the refined row in the max
+/// norm: a solve that leaves more cannot measure its own error, and a bound
+/// taken from it could make a coefficient of the model's own count as zero.
+/// With no bound, only the round-off of the certificate's own sums does
+/// (`a_coefficient_on_an_infinite_bound_counts_as_zero_only_within_its_error`).
+/// A row solved exactly has a zero correction and a zero bound; a row or a
+/// correction that is not a number leaves no bound (`f64::max` would drop
+/// it).
+#[test]
+fn the_refinement_bounds_the_multipliers_error_only_where_it_converged() {
+    let row = |values: &[f64]| multipliers(values);
+    assert_eq!(
+        proof::multipliers_error(&row(&[1.0, -2.0]), &[3e-33, -1e-34]),
+        Some(vec![3e-33, 1e-34])
+    );
+    assert_eq!(
+        proof::multipliers_error(&row(&[1.0, 0.5]), &[0.0, 0.0]),
+        Some(vec![0.0, 0.0])
+    );
+    assert_eq!(
+        proof::multipliers_error(&row(&[1e20]), &[1e4]),
+        Some(vec![1e4])
+    );
+    assert_eq!(proof::multipliers_error(&row(&[1.0]), &[2e-16]), None);
+    assert_eq!(proof::multipliers_error(&row(&[1e-20]), &[1e-30]), None);
+    assert_eq!(
+        proof::multipliers_error(&row(&[1.0, 1.0]), &[1e-33, f64::NAN]),
+        None
+    );
+    assert_eq!(
+        proof::multipliers_error(&row(&[f64::INFINITY]), &[0.0]),
+        None
+    );
+}
+
+/// A non-basic var's coefficient of the certificate counts however far
+/// below its terms it cancelled, at its bound where that is finite, and as
+/// an unbounded range where it is not: it is the model's own. Planted: at
+/// the slack basis, `rho` combines `x + y + z >= 3` and
+/// `t - (1 + 2^-50) z >= 1.5` over `x, y, t ∈ [0, 1]` and `z <= 1` (which
+/// starts at 1, its cost being negative), which leaves `z` the coefficient
+/// `-2^-50` beside terms of magnitude two, round-off, and the rest of the
+/// certificate out of reach by `1.5`. With `z >= -2^51` the coefficient
+/// times the bound takes the certificate to `5`, beyond `beta = 4.5`, and
+/// with `z` unbounded below anywhere: nothing is proven either way. Counted
+/// as zero, on the finite bound and then on the infinite one, such a
+/// coefficient proved a feasible model infeasible
+/// (`a_round_off_coefficient_on_a_far_bound_is_no_proof_and_is_a_known_limitation`
+/// and its variant on an infinite bound, in `src/tests/magnitudes.rs`).
+/// This model is infeasible all the same: another combination of the rows
+/// proves it.
+#[test]
+fn a_non_basic_vars_round_off_coefficient_counts_on_every_bound() {
+    init();
+    let proof = |z_min: f64| {
+        let sol = Solver::try_new(
+            &[0.0, 0.0, -1.0, 0.0],
+            &[0.0, 0.0, z_min, 0.0],
+            &[1.0, 1.0, 1.0, 1.0],
+            &[
+                (to_sparse(&[1.0, 1.0, 1.0, 0.0]), ComparisonOp::Ge, 3.0),
+                (
+                    to_sparse(&[0.0, 0.0, -(1.0 + 2f64.powi(-50)), 1.0]),
+                    ComparisonOp::Ge,
+                    1.5,
+                ),
+            ],
+            &vec![VarDomain::Real; 4],
+            None,
+            crate::Tolerances::default().feasibility,
+        )
+        .unwrap();
+        let row = 0;
+        assert_eq!(
+            sol.basic_vars[row], sol.num_vars,
+            "fixture: the slack basis"
+        );
+        sol.proof_of(&exact_row(&[1.0, 1.0]), row, false)
+    };
+    let unproven = proof(-(2f64.powi(51)));
+    assert!(!unproven.holds, "{unproven:?}");
+    assert!((unproven.gap + 0.5).abs() < 1e-14, "{unproven:?}");
+
+    let unproven = proof(f64::NEG_INFINITY);
+    assert!(!unproven.holds, "{unproven:?}");
+    assert_eq!(unproven.gap, f64::NEG_INFINITY);
+}
+
+/// A number of the certificate that is not finite voids it, rather than
+/// count as zero or as a gap. Planted: `x + y + 1e305 f >= 3` over
+/// `x, y ∈ [0, 1]` and `f` fixed at `1e-305`, feasible at `x = y = 1`, taken
+/// alone: a fixed column keeps the user's units, and Dekker's split of
+/// `f`'s coefficient overflows, which leaves it not a number. Counted as
+/// zero (a NaN is above no round-off threshold), it left `x + y + s = 3`
+/// with `s <= 0` out of reach by one: a proof of a feasible model.
+#[test]
+fn non_finite_certificate_data_void_the_proof() {
+    init();
+    let sol = Solver::try_new(
+        &[0.0; 3],
+        &[0.0, 0.0, 1e-305],
+        &[1.0, 1.0, 1e-305],
+        &[(to_sparse(&[1.0, 1.0, 1e305]), ComparisonOp::Ge, 3.0)],
+        &vec![VarDomain::Real; 3],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let row = 0;
+    assert_eq!(
+        sol.basic_vars[row], sol.num_vars,
+        "fixture: the slack basis"
+    );
+    let proof = sol.proof_of(&exact_row(&[1.0]), row, false);
+    assert!(!proof.holds, "{proof:?}");
+    assert!(proof.gap.is_nan(), "{proof:?}");
+}
+
+/// An error bound of a coefficient that is not finite voids the proof, as
+/// any number of the certificate that is not finite does, rather than count
+/// every coefficient within it as zero. Planted: `x + y + j >= 3` over
+/// `x, y ∈ [0, 1]` and `j` free, feasible at `j >= 1`, taken alone with its
+/// multiplier's error unbounded (as an overflow of `Σ e_i |a_ij|` would
+/// leave it): counted as zero, `j`'s coefficient would leave `x + y + s = 3`
+/// with `s <= 0` out of reach by one, a proof of a feasible model.
+#[test]
+fn an_error_bound_that_is_not_finite_voids_the_proof() {
+    init();
+    let sol = Solver::try_new(
+        &[0.0; 3],
+        &[0.0, 0.0, f64::NEG_INFINITY],
+        &[1.0, 1.0, f64::INFINITY],
+        &[(to_sparse(&[1.0, 1.0, 1.0]), ComparisonOp::Ge, 3.0)],
+        &vec![VarDomain::Real; 3],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let row = 0;
+    assert_eq!(
+        sol.basic_vars[row], sol.num_vars,
+        "fixture: the slack basis"
+    );
+    let unbounded_error = proof::RefinedRow {
+        rho: multipliers(&[1.0]),
+        error: Some(vec![f64::INFINITY]),
+    };
+    let proof = sol.proof_of(&unbounded_error, row, false);
+    assert!(!proof.holds, "{proof:?}");
+    assert!(proof.gap.is_nan(), "{proof:?}");
+    let proof = sol.proof_of(&exact_row(&[1.0]), row, false);
+    assert!(!proof.holds, "{proof:?}");
+    assert_eq!(proof.gap, f64::NEG_INFINITY, "{proof:?}");
+}
+
+/// A multiplier of the certificate whose row would need its slack's infinite
+/// bound is dropped, with its row, as HiGHS drops it ("make sure infinite
+/// sides are not used"): what is left is a certificate of the other rows.
+/// Planted: `rho` combines `x + y >= 3` over `x, y ∈ [0, 1]` with `1e-3` of
+/// `z <= 5`, whose slack has no upper bound; kept, that multiplier would make
+/// the range unbounded, and nothing would be proven (without the rule the
+/// differential fuzz's `int_lp-970`, an infeasible LP, failed loudly).
+#[test]
+fn a_multiplier_on_a_rows_infinite_side_is_dropped() {
+    init();
+    let sol = Solver::try_new(
+        &[0.0; 3],
+        &[0.0; 3],
+        &[1.0, 1.0, 10.0],
+        &[
+            (to_sparse(&[1.0, 1.0, 0.0]), ComparisonOp::Ge, 3.0),
+            (to_sparse(&[0.0, 0.0, 1.0]), ComparisonOp::Le, 5.0),
+        ],
+        &vec![VarDomain::Real; 3],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let row = 0;
+    assert_eq!(
+        sol.basic_vars[row], sol.num_vars,
+        "fixture: the slack basis"
+    );
+    let proof = sol.proof_of(&exact_row(&[1.0, 1e-3]), row, false);
+    assert!(proof.holds, "{proof:?}");
+    assert!((proof.gap - 1.0).abs() < 1e-15, "{proof:?}");
+}
+
+/// A basic var of a row the certificate leaves out while the row's
+/// multiplier is the model's own (its slack's tableau entry) keeps the
+/// model's own coefficient, and on an infinite bound that makes the range
+/// unbounded: only what the error of the multipliers could leave counts as
+/// zero, and this row of the basis inverse is exact. The model of the review
+/// of the concession: `min -L` s.t. `L + j + w = 1.000001`,
+/// `-(1 + 2^-50) j - w = 0` and `j + v <= 0` over `L, v ∈ [0, 1]` and
+/// `j, w` free, feasible at `L = 1`, `j = -2^50 (fl(1.000001) - 1)`,
+/// `w = -(1 + 2^-50) j`, where the dual simplex ends: the basis `{j, w}` and
+/// the second row's slack, `L` at its upper bound, which puts that slack
+/// `1e-6` above its bound of zero. The row of the basis inverse is
+/// `(1, 1, 2^-50)`, solved exactly: both corrections of the refinement are
+/// zero, and so is the bound they put on the multipliers' error. The third
+/// row's multiplier needs its non-basic slack's infinite side and is left
+/// out, which leaves the free basic `j` the coefficient `-2^-50` beside terms
+/// of one, `4.4e-16` of them. Conceded as below the `f64` round-off floor of
+/// its terms, it left `L + s1 + s2 = 1.000001`, out of reach by `1e-6`: a
+/// proof of a feasible model (and of its MILP, whose root node was pruned).
+#[test]
+fn a_basic_vars_coefficient_in_a_row_left_out_voids_the_proof() {
+    init();
+    let mut sol = Solver::try_new(
+        &[-1.0, 0.0, 0.0, 0.0],
+        &[0.0, f64::NEG_INFINITY, f64::NEG_INFINITY, 0.0],
+        &[1.0, f64::INFINITY, f64::INFINITY, 1.0],
+        &[
+            (to_sparse(&[1.0, 1.0, 1.0, 0.0]), ComparisonOp::Eq, 1.000001),
+            (
+                to_sparse(&[0.0, -(1.0 + 2f64.powi(-50)), -1.0, 0.0]),
+                ComparisonOp::Eq,
+                0.0,
+            ),
+            (to_sparse(&[0.0, 1.0, 0.0, 1.0]), ComparisonOp::Le, 0.0),
+        ],
+        &vec![VarDomain::Real; 4],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let (j, w, s2) = (1, 2, sol.num_vars + 1);
+    sol.load_basis(&Basis(vec![
+        VarStatus::AtUpper,
+        VarStatus::Basic,
+        VarStatus::Basic,
+        VarStatus::AtLower,
+        VarStatus::AtLower,
+        VarStatus::Basic,
+        VarStatus::AtLower,
+    ]))
+    .unwrap();
+    let row = sol.basic_vars.iter().position(|&var| var == s2).unwrap();
+    assert!(
+        sol.basic_var_vals[row] > 5e-7,
+        "fixture: the slack of the second row above its bound, {:?}",
+        sol.basic_var_vals
+    );
+    assert!(
+        [j, w]
+            .iter()
+            .all(|&var| matches!(sol.var_states[var], VarState::Basic(_))),
+        "fixture: j and w basic"
+    );
+    let refined = sol.refined_basis_inverse_row(row);
+    assert_eq!(refined.error, Some(vec![0.0; 3]), "an exact row");
+    let proof = sol.prove_infeasible(row, false);
+    assert!(!proof.holds, "{proof:?}");
+    assert_eq!(proof.gap, f64::NEG_INFINITY, "{proof:?}");
+}
+
+/// A coefficient on an infinite bound counts as zero exactly where the
+/// error of the multipliers could make it zero, whatever its var: within the
+/// bound the refinement puts on each multiplier's error, carried through the
+/// var's entries in the rows the certificate keeps, plus the error of its
+/// compensated sum; beyond that it makes the range unbounded, and with no
+/// bound only the error of the sum counts. Planted: `x + y + j + w >= 3` and
+/// `j + z + w = 0` over `x, y, z ∈ [0, 1]` and `j, w` free, infeasible
+/// (`j + w = -z <= 0`), at the basis `{j}` and the first row's slack, `3`
+/// above its bound, with `w` non-basic; the row of the basis inverse is
+/// `(1, -1)`. The planted, compensated multipliers `(1, -(1 + d))` leave the
+/// basic `j` and the non-basic `w` the coefficient `-d` beside terms of two,
+/// and the rest of the certificate out of reach by one. At `d = 2^-80` with
+/// the second multiplier's error bounded by `2^-79`, both count as zero:
+/// proven. Bounded by `2^-82`, or with no bound, neither does: nothing is
+/// proven. At `d = 2^-100`, within the error of the compensated sums, both
+/// count as zero with the error bounded by zero, and with no bound.
+#[test]
+fn a_coefficient_on_an_infinite_bound_counts_as_zero_only_within_its_error() {
+    init();
+    let mut sol = Solver::try_new(
+        &[0.0; 5],
+        &[0.0, 0.0, 0.0, f64::NEG_INFINITY, f64::NEG_INFINITY],
+        &[1.0, 1.0, 1.0, f64::INFINITY, f64::INFINITY],
+        &[
+            (to_sparse(&[1.0, 1.0, 0.0, 1.0, 1.0]), ComparisonOp::Ge, 3.0),
+            (to_sparse(&[0.0, 0.0, 1.0, 1.0, 1.0]), ComparisonOp::Eq, 0.0),
+        ],
+        &vec![VarDomain::Real; 5],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let (j, w, s0) = (3, 4, sol.num_vars);
+    sol.load_basis(&Basis(vec![
+        VarStatus::AtLower,
+        VarStatus::AtLower,
+        VarStatus::AtLower,
+        VarStatus::Basic,
+        VarStatus::Free,
+        VarStatus::Basic,
+        VarStatus::AtLower,
+    ]))
+    .unwrap();
+    let row = sol.basic_vars.iter().position(|&var| var == s0).unwrap();
+    assert!(
+        (sol.basic_var_vals[row] - 3.0).abs() < 1e-12,
+        "fixture: the slack of the first row 3 above its bound, {:?}",
+        sol.basic_var_vals
+    );
+    assert!(
+        matches!(sol.var_states[j], VarState::Basic(_))
+            && matches!(sol.var_states[w], VarState::NonBasic(_)),
+        "fixture: j basic, w non-basic"
+    );
+    let proof = |d: f64, error: Option<f64>| {
+        let mut second = proof::CDouble::default();
+        second.add_product(-1.0, 1.0);
+        second.add_product(-d, 1.0);
+        let refined = proof::RefinedRow {
+            rho: vec![proof::CDouble::from(1.0), second],
+            error: error.map(|e| vec![0.0, e]),
+        };
+        sol.proof_of(&refined, row, false)
+    };
+    let proven = proof(2f64.powi(-80), Some(2f64.powi(-79)));
+    assert!(proven.holds, "{proven:?}");
+    assert!((proven.gap - 1.0).abs() < 1e-14, "{proven:?}");
+    for error in [Some(2f64.powi(-82)), None] {
+        let unproven = proof(2f64.powi(-80), error);
+        assert!(!unproven.holds, "{error:?}: {unproven:?}");
+        assert_eq!(unproven.gap, f64::NEG_INFINITY, "{error:?}: {unproven:?}");
+    }
+    for error in [Some(0.0), None] {
+        let proven = proof(2f64.powi(-100), error);
+        assert!(proven.holds, "{error:?}: {proven:?}");
+    }
+}
+
+/// A row that no var can repair and that does not prove infeasibility is
+/// recorded as a bad basis change with no entering var (HiGHS's
+/// `kFailedInfeasibilityProof`): taboo, and unproven, until a rebuild lifts
+/// the taboo; the record goes when a step moves its row.
+#[test]
+fn a_failed_proof_makes_its_row_taboo() {
+    let mut guard = CycleGuard::default();
+    guard.start(std::iter::empty());
+    guard.add_failed_proof(3, 7);
+    assert!(guard.is_taboo(3) && guard.is_unproven(3));
+    assert!(!guard.is_taboo(2) && !guard.is_unproven(2));
+    assert!(!guard.is_taboo_entering(7));
+    guard.clear_taboo();
+    assert!(!guard.is_taboo(3) && !guard.is_unproven(3));
+    guard.add_failed_proof(3, 7);
+    assert!(guard.is_unproven(3));
+    guard.forget_moved_rows(|r| r == 3);
+    assert!(!guard.any_taboo());
+}
+
+/// The model of C2-06 through the LP edit path, to the point where the dual
+/// phase takes over: `min y` s.t. `f + y >= 0` over `f ∈ [0, 10]`, `y >= 0`,
+/// then `f` fixed at zero and `1e17 f + y >= 1` added. The added row leaves
+/// the fixed `f` out of its equilibration, so its row in the dual ratio test
+/// is `[1e17, 1]` with `f`'s entry in the round-off scale, and `y`'s exact
+/// entry of one is below the pivot floor: no candidate. The phase is stopped
+/// before its first iteration (a deadline in the past) and started again.
+fn c2_06_through_an_edit() -> Solver {
+    let mut sol = Solver::try_new(
+        &[0.0, 1.0],
+        &[0.0, 0.0],
+        &[10.0, f64::INFINITY],
+        &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 0.0)],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(sol.initial_solve().unwrap(), StopReason::Finished);
+    assert_eq!(sol.fix_var(0, 0.0).unwrap(), StopReason::Finished);
+    sol.deadline = Some(Instant::now());
+    assert_eq!(
+        sol.add_constraint(to_sparse(&[1e17, 1.0]), ComparisonOp::Ge, 1.0)
+            .unwrap(),
+        StopReason::Limit
+    );
+    sol.deadline = None;
+    sol
+}
+
+/// The last resorts of the dual simplex for a row that no var can repair and
+/// that does not prove infeasibility (C2-06): the row is taboo and nothing
+/// else is left, so SoPlex's instable leave takes `y`'s entry of one, far
+/// above its `lowstab`, and the phase ends at `y = 1`, where the verdict read
+/// off the tableau row declared the model infeasible. When that pivot is
+/// refused (planted here as a bad basis change, as the cycling detection
+/// records one), the instable leave is not tried again: the round-off repair
+/// has nothing to move (`y` has no upper bound) and the phase fails loudly at
+/// once, where a phase that scheduled the instable leave again would go round
+/// until its stall bound ended it. The phase runs under a time limit, so that
+/// a phase that went on instead fails the test.
+#[test]
+fn a_row_the_proof_leaves_open_gets_the_instable_leave_once() {
+    init();
+    let mut sol = c2_06_through_an_edit();
+    assert_eq!(sol.reoptimize().unwrap(), StopReason::Finished);
+    assert_eq!((sol.get_value(0), sol.get_value(1)), (0.0, 1.0));
+
+    let mut sol = c2_06_through_an_edit();
+    sol.begin_dual_phase(false).unwrap();
+    let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
+    assert_eq!(row, 1, "fixture: the added row is the violated one");
+    sol.calc_row_coeffs(row);
+    assert!(matches!(
+        sol.choose_entering_col_dual(row, leaving_new_val, &[], false),
+        Ok(DualRatioTest::NoCandidate)
+    ));
+    let (y_col, _) = sol
+        .choose_entering_col_dual(row, leaving_new_val, &[], true)
+        .unwrap()
+        .step()
+        .entering;
+    assert_eq!(sol.nb_vars[y_col], 1);
+    let here = sol.cycle_guard.hash_after(std::iter::empty());
+    let (leaving, entering) = (sol.basic_vars[row], 1);
+    assert!(!sol.cycle_guard.is_bad_change(row, leaving, entering, here));
+    sol.cycle_guard.record_pivot();
+    assert!(sol.cycle_guard.is_bad_change(row, leaving, entering, here));
+    sol.deadline = Some(Instant::now() + Duration::from_secs(10));
+    let iterations = sol.lp_iterations;
+    let result = sol.dual_phase();
+    sol.end_dual_phase();
+    assert!(
+        matches!(&result, Err(Error::InternalError(msg)) if msg.contains("no var can repair row")),
+        "{result:?}"
+    );
+    assert!(sol.lp_iterations - iterations < 20, "{}", sol.lp_iterations);
 }
 
 /// The bound perturbation of a primal phase, as HiGHS's `initialiseBound`

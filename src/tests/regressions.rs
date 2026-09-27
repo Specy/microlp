@@ -754,37 +754,20 @@ mod regression_tests {
         }
     }
 
-    /// <https://github.com/Specy/microlp/issues/48>: `solve()` returns
-    /// `InternalError("Singular matrix")` on a small, feasible, bounded MILP —
-    /// a DC network with switchable lines (8 buses, 10 lines, at most one
-    /// switched out), whose big-M on/off rows spread the coefficients from
-    /// 4e-2 to 1.1e3. HiGHS and SCIP prove the same model optimal at
-    /// 23.339329.
-    ///
-    /// The report traces it to the dual ratio test accepting a pivot of
-    /// |alpha| = 2.2e-10 — just above the `1e-10` floor, and zero in exact
-    /// arithmetic — after which the refactorization is singular and the
-    /// slack-basis retry re-derives a singular basis of its own.
-    #[test]
-    fn issue_48_switchable_dc_network_solves() {
-        // (from, to, susceptance, rating)
-        let lines = [
-            (0, 1, 0.97, 0.52),
-            (2, 4, 0.24, 1.11),
-            (3, 5, 431.79, 0.55),
-            (2, 6, 54.08, 0.77),
-            (3, 7, 0.06, 1.22),
-            (6, 1, 63.12, 0.84),
-            (4, 1, 1108.6, 1.17),
-            (1, 3, 0.34, 0.48),
-            (5, 1, 538.81, 0.71),
-            (3, 4, 0.04, 0.83),
-        ];
-        let demand = [0.4, 0.4, 0.85, 0.92, 0.19, 0.15, 0.52, 0.6];
-        let gen_max = [0.53, 1.36, 0.95, 0.3, 0.5, 0.92, 0.22, 0.67];
-        let gen_cost = [1.57, 8.12, 8.82, 8.04, 3.59, 2.49, 9.28, 8.04];
-        let max_off = 1;
-
+    /// A DC network with switchable lines, the model of
+    /// [`issue_48_switchable_dc_network_solves`]: per line
+    /// `(from, to, susceptance, rating)`, a flow within its rating and a
+    /// binary `on` whose big-M rows tie the flow to the bus angles (free, but
+    /// for the reference bus 0) while the line is on; per bus, generation
+    /// within `gen_max` at `gen_cost` less `demand` equals the flow out less
+    /// the flow in; at most `max_off` lines off.
+    fn switchable_dc_network(
+        lines: &[(usize, usize, f64, f64)],
+        demand: &[f64],
+        gen_max: &[f64],
+        gen_cost: &[f64],
+        max_off: usize,
+    ) -> Problem {
         let n = demand.len();
         let angle_max = 0.52;
         let big = angle_max * n as f64;
@@ -848,6 +831,39 @@ mod regression_tests {
         }
         let in_service: Vec<_> = on.iter().map(|&z| (z, 1.0)).collect();
         problem.add_constraint(in_service, ComparisonOp::Ge, (lines.len() - max_off) as f64);
+        problem
+    }
+
+    /// <https://github.com/Specy/microlp/issues/48>: `solve()` returns
+    /// `InternalError("Singular matrix")` on a small, feasible, bounded MILP —
+    /// a DC network with switchable lines (8 buses, 10 lines, at most one
+    /// switched out), whose big-M on/off rows spread the coefficients from
+    /// 4e-2 to 1.1e3. HiGHS and SCIP prove the same model optimal at
+    /// 23.339329.
+    ///
+    /// The report traces it to the dual ratio test accepting a pivot of
+    /// |alpha| = 2.2e-10 — just above the `1e-10` floor, and zero in exact
+    /// arithmetic — after which the refactorization is singular and the
+    /// slack-basis retry re-derives a singular basis of its own.
+    #[test]
+    fn issue_48_switchable_dc_network_solves() {
+        // (from, to, susceptance, rating)
+        let lines = [
+            (0, 1, 0.97, 0.52),
+            (2, 4, 0.24, 1.11),
+            (3, 5, 431.79, 0.55),
+            (2, 6, 54.08, 0.77),
+            (3, 7, 0.06, 1.22),
+            (6, 1, 63.12, 0.84),
+            (4, 1, 1108.6, 1.17),
+            (1, 3, 0.34, 0.48),
+            (5, 1, 538.81, 0.71),
+            (3, 4, 0.04, 0.83),
+        ];
+        let demand = [0.4, 0.4, 0.85, 0.92, 0.19, 0.15, 0.52, 0.6];
+        let gen_max = [0.53, 1.36, 0.95, 0.3, 0.5, 0.92, 0.22, 0.67];
+        let gen_cost = [1.57, 8.12, 8.82, 8.04, 3.59, 2.49, 9.28, 8.04];
+        let problem = switchable_dc_network(&lines, &demand, &gen_max, &gen_cost, 1);
 
         let sol = problem
             .solve()
@@ -860,5 +876,115 @@ mod regression_tests {
             "objective {} does not match the 23.339329 HiGHS and SCIP prove optimal",
             sol.objective()
         );
+    }
+
+    /// The minimal objective of the switchable network with these data,
+    /// solved with presolve on or off; `Err` with the solve's error.
+    fn switchable_dc_network_objective(
+        lines: &[(usize, usize, f64, f64)],
+        demand: &[f64],
+        gen_max: &[f64],
+        gen_cost: &[f64],
+        max_off: usize,
+        presolve: bool,
+    ) -> Result<f64, crate::Error> {
+        let options = crate::SolveOptions {
+            presolve,
+            ..crate::SolveOptions::default()
+        };
+        let solved =
+            switchable_dc_network(lines, demand, gen_max, gen_cost, max_off).solve_with(options)?;
+        Ok(solved
+            .into_solution()
+            .unwrap_or_else(|i| panic!("must finish without limits, got {i:?}"))
+            .objective())
+    }
+
+    /// A switchable network like issue 48's, from a random search over such
+    /// networks with susceptances from `1e-3` to `1e6` (HiGHS proves it
+    /// optimal at 18.979188), whose lines of `1.05e-3` and `2e5` put big-M
+    /// rows of very different scales into its bases. At two of its nodes the
+    /// row of the basis inverse that proves the node infeasible gives a free
+    /// bus angle, basic, a coefficient whose only term comes from a row whose
+    /// multiplier is zero for the exact row: the refinement leaves it as its
+    /// own noise, some `1e-46` against multipliers of up to 4, and the
+    /// coefficient is that noise times the angle's entry. No floor relative
+    /// to the coefficient's terms covers it, those terms being the noise too;
+    /// the bound the refinement puts on the multipliers' error, their last
+    /// correction (`3.9e-31`), does. Counted only below the `f64` round-off
+    /// of its terms, on a row refined once, the coefficient voided those
+    /// proofs, and the MILP failed loudly with presolve on and off; counted
+    /// only within the round-off of the compensated sums, it failed the same
+    /// way.
+    #[test]
+    fn a_switchable_network_whose_node_proofs_need_the_multipliers_error_solves() {
+        let lines = [
+            (1, 0, 26.2, 0.353),
+            (2, 1, 0.209, 0.445),
+            (3, 1, 22.1, 0.511),
+            (4, 1, 200000.0, 0.758),
+            (5, 4, 51.5, 0.517),
+            (6, 2, 0.00105, 0.532),
+            (7, 6, 5610.0, 0.689),
+            (0, 2, 136.0, 0.562),
+            (1, 3, 18.1, 0.706),
+            (3, 7, 3.72, 0.93),
+        ];
+        let demand = [0.683, 1.01, 0.531, 0.274, 1.04, 0.464, 0.303, 0.189];
+        let gen_max = [0.828, 0.41, 0.244, 0.451, 1.37, 0.488, 1.24, 0.342];
+        let gen_cost = [5.57, 5.72, 8.87, 9.02, 1.21, 2.02, 5.8, 9.19];
+        for presolve in [true, false] {
+            let objective =
+                switchable_dc_network_objective(&lines, &demand, &gen_max, &gen_cost, 2, presolve)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "presolve {presolve}: a feasible, bounded MILP must solve, got {e:?}"
+                        )
+                    });
+            assert!(
+                (objective - 18.979188).abs() < 1e-4,
+                "presolve {presolve}: objective {objective} does not match the 18.979188 HiGHS \
+                 proves optimal"
+            );
+        }
+    }
+
+    /// An infeasible switchable network like issue 48's (HiGHS agrees), from
+    /// the same search, with lines from `3.15e-3` to `4.13e5`. Its
+    /// certificates give free bus angles, basic, coefficients whose terms
+    /// come from rows whose multipliers are zero for the exact row of the
+    /// basis inverse and which the refinement leaves as its own noise, above
+    /// any floor relative to the coefficients' terms, which are that noise
+    /// too. The second step of the refinement brings them within the bound it
+    /// puts on the multipliers' error, its own correction; refined once, with
+    /// that correction as the bound, some lie beyond it, and counted only
+    /// within the round-off of the compensated sums, all do: either way the
+    /// proofs failed and the solve failed loudly (with presolve on and off).
+    /// Counted only below the `f64` round-off of their terms, on a row
+    /// refined once, the solve failed loudly without presolve.
+    #[test]
+    fn an_infeasible_switchable_network_whose_proof_needs_the_twice_refined_row() {
+        let lines = [
+            (1, 0, 0.17, 0.557),
+            (2, 1, 0.00315, 1.15),
+            (3, 2, 587.0, 0.374),
+            (4, 3, 1.57, 0.519),
+            (5, 3, 1150.0, 1.27),
+            (6, 3, 31900.0, 0.984),
+            (7, 6, 107000.0, 1.15),
+            (5, 0, 0.00352, 1.28),
+            (5, 6, 10.1, 0.823),
+            (0, 1, 413000.0, 1.15),
+        ];
+        let demand = [0.537, 0.835, 0.245, 1.07, 1.09, 0.823, 0.775, 0.73];
+        let gen_max = [0.683, 1.18, 0.38, 1.2, 0.827, 0.318, 1.3, 0.602];
+        let gen_cost = [6.7, 8.07, 2.61, 8.44, 4.5, 5.87, 8.26, 4.92];
+        for presolve in [true, false] {
+            assert_eq!(
+                switchable_dc_network_objective(&lines, &demand, &gen_max, &gen_cost, 2, presolve),
+                Err(crate::Error::Infeasible),
+                "presolve {presolve}"
+            );
+        }
     }
 }

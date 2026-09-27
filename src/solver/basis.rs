@@ -75,6 +75,12 @@ pub(crate) enum DualRatioTest {
     /// `kRebuildReasonPossiblyDualUnbounded` rebuild when `workTheta <= 0`,
     /// `HEkkDual::chooseColumn`, which runs `correctDualInfeasibilities`).
     DualInfeasible,
+    /// No var can enter, and none can absorb the move: the row may prove
+    /// the model infeasible, which only a proof on the model's data decides
+    /// (HiGHS's `kRebuildReasonPossiblyDualUnbounded` when `workCount == 0`,
+    /// then `HEkkDual::assessPossiblyDualUnbounded`; see
+    /// [`super::Solver::prove_infeasible`]).
+    NoCandidate,
 }
 
 #[cfg(test)]
@@ -83,22 +89,21 @@ impl DualRatioTest {
     pub(crate) fn step(self) -> DualStep {
         match self {
             Self::Step(step) => step,
-            Self::DualInfeasible => panic!("expected a dual step, got DualInfeasible"),
+            other => panic!("expected a dual step, got {other:?}"),
         }
     }
 }
 
 /// A step of the dual ratio test for one leaving row: the non-basic vars to
 /// move to their other bound (bound flips, which leave the basis as it is),
-/// then the var that enters, or none when the moves alone bring the leaving
-/// var within its bounds (the last of them then possibly only partway).
+/// then the var that enters.
 #[derive(Debug)]
 pub(crate) struct DualStep {
     /// `(col, new_val)`: a non-basic column and the value it moves to.
     pub(crate) flips: Vec<(usize, f64)>,
     /// `(col, coeff)`: the entering column and its entry in the leaving row
     /// (the element computed through the row).
-    pub(crate) entering: Option<(usize, f64)>,
+    pub(crate) entering: (usize, f64),
     /// Whether the dual step is zero: the entering var's reduced cost lies
     /// on the side of zero the step would push it away from (within its
     /// tolerance, as the Harris pass allows), or it enters by absorbing the

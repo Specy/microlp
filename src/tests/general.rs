@@ -937,6 +937,190 @@ mod tests_general {
         }
     }
 
+    /// An infeasible LP of the differential fuzz (`int_lp-155`, HiGHS
+    /// agrees) whose certificate, without presolve, combines three rows and
+    /// leaves the free basic `x2` a residual of the multipliers, zero for the
+    /// exact row of the basis inverse: `1.2e-32` of its terms from the row
+    /// refined once. On an infinite bound no count of it exists, and any
+    /// count but zero leaves the certificate's range unbounded: counted as it
+    /// was, it voided the proof, and the solve failed loudly. The second step
+    /// of the refinement leaves it exactly zero, and the concession for a
+    /// coefficient the multipliers' error could make zero would cover it
+    /// too. With presolve the row that proves it alone, `-4 x0 - 4 x1 >= 4`
+    /// over `x0, x1 >= 0`, is found before the engine runs.
+    #[test]
+    fn a_basic_free_vars_residual_does_not_void_a_proof() {
+        init();
+        let inf = f64::INFINITY;
+        use ComparisonOp::{Eq, Ge, Le};
+        let problem = fuzz_model(
+            OptimizationDirection::Maximize,
+            &[
+                (4.0, 0.0, inf, false),
+                (3.0, 0.0, inf, false),
+                (2.0, -inf, inf, false),
+                (3.0, -inf, 0.0, false),
+            ],
+            &[
+                (&[(2, 3.0), (3, -1.0)], Eq, -6.0),
+                (&[(0, 5.0), (2, 5.0), (3, 1.0)], Ge, 6.0),
+                (&[(0, -4.0), (1, -4.0)], Ge, 4.0),
+                (&[(0, -4.0), (2, -5.0), (3, 2.0)], Le, 20.0),
+            ],
+        );
+        for presolve in [true, false] {
+            let got = problem.solve_with(SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            });
+            assert_eq!(
+                got.map(|_| "solved"),
+                Err(Error::Infeasible),
+                "presolve {presolve}"
+            );
+        }
+    }
+
+    /// An infeasible LP of the differential fuzz (`int_lp-970`, HiGHS
+    /// agrees) whose certificate leaves out a row whose slack is non-basic:
+    /// that slack's entry in the leaving row is zero, and the refined row of
+    /// the basis inverse carries it as noise (`-7.9e-31` refined once), whose
+    /// sign asks for the slack's infinite side. With the row left out, as
+    /// HiGHS leaves it out (without that the proof failed), the basic `x0`,
+    /// unbounded above, keeps a residual: `3.7e-31` of its terms from the row
+    /// refined once, zero from the row refined twice. A rule that withdrew
+    /// the concession from every var of a row left out while its slack is
+    /// non-basic, taking such a slack's multiplier for the model's own, left
+    /// the proof on the once-refined row void and the solve a loud error,
+    /// with presolve on and off; whether a coefficient counts as zero is
+    /// judged by the error of the multipliers instead, which such a noise
+    /// lies within.
+    #[test]
+    fn a_residual_left_by_a_row_left_out_does_not_void_a_proof() {
+        init();
+        let inf = f64::INFINITY;
+        use ComparisonOp::{Ge, Le};
+        let problem = fuzz_model(
+            OptimizationDirection::Minimize,
+            &[
+                (5.0, 0.0, inf, false),
+                (-1.0, -inf, inf, false),
+                (1.0, 4.0, 4.0, false),
+                (4.0, 4.0, 7.0, false),
+            ],
+            &[
+                (&[(0, -1.0), (1, 3.0), (2, -2.0)], Le, -6.0),
+                (&[(0, 4.0), (1, 3.0), (2, -2.0), (3, -5.0)], Ge, 12.0),
+                (&[(0, -1.0), (1, -1.0)], Ge, 19.0),
+                (&[(0, -3.0), (1, 1.0)], Le, 3.0),
+                (&[(0, -2.0), (1, -2.0), (3, -3.0)], Le, 16.0),
+            ],
+        );
+        for presolve in [true, false] {
+            let got = problem.solve_with(SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            });
+            assert_eq!(
+                got.map(|_| "solved"),
+                Err(Error::Infeasible),
+                "presolve {presolve}"
+            );
+        }
+    }
+
+    /// An infeasible LP of the differential fuzz (`int_lp-1145`, HiGHS
+    /// agrees) whose proof needs a non-basic var's coefficient on an infinite
+    /// bound to count as zero. Once refined, the row of the basis inverse
+    /// that proves it gives the non-basic `x3` (`x3 >= 0`, unbounded above),
+    /// whose tableau entry is zero, the coefficient zero; the second
+    /// correction, spread over the row by its solve, leaves it `3.6e-33` of
+    /// its terms. That lies within the bound the refinement puts on the
+    /// multipliers' error, and counts as zero, as a basic var's residual
+    /// does: a concession for basic vars only voided the proof, and the
+    /// solve failed loudly, with presolve on and off.
+    #[test]
+    fn a_non_basic_vars_residual_does_not_void_a_proof() {
+        init();
+        let inf = f64::INFINITY;
+        use ComparisonOp::{Eq, Ge, Le};
+        let problem = fuzz_model(
+            OptimizationDirection::Minimize,
+            &[
+                (-4.0, 0.0, 17.0, false),
+                (1.0, 0.0, 17.0, false),
+                (2.0, -3.0, 4.0, false),
+                (5.0, 0.0, inf, false),
+                (4.0, 0.0, 9.0, false),
+                (-2.0, 0.0, inf, false),
+                (-4.0, 0.0, inf, false),
+                (2.0, 0.0, inf, false),
+            ],
+            &[
+                (
+                    &[(1, 3.0), (2, -4.0), (3, -4.0), (5, 5.0), (6, -4.0)],
+                    Ge,
+                    5.0,
+                ),
+                (
+                    &[
+                        (0, -4.0),
+                        (1, 5.0),
+                        (2, -3.0),
+                        (3, 1.0),
+                        (4, 5.0),
+                        (5, 2.0),
+                        (6, 5.0),
+                        (7, -2.0),
+                    ],
+                    Eq,
+                    -6.0,
+                ),
+                (&[(0, -3.0), (1, 4.0), (4, 4.0)], Le, 11.0),
+                (
+                    &[
+                        (1, -4.0),
+                        (2, 4.0),
+                        (3, -2.0),
+                        (4, -5.0),
+                        (6, -3.0),
+                        (7, 2.0),
+                    ],
+                    Ge,
+                    14.0,
+                ),
+                (
+                    &[
+                        (1, -3.0),
+                        (2, 4.0),
+                        (4, -5.0),
+                        (5, -2.0),
+                        (6, -5.0),
+                        (7, -1.0),
+                    ],
+                    Ge,
+                    -5.0,
+                ),
+                (
+                    &[(0, 2.0), (1, 2.0), (3, 1.0), (4, 2.0), (6, -5.0), (7, -3.0)],
+                    Eq,
+                    14.0,
+                ),
+            ],
+        );
+        for presolve in [true, false] {
+            let got = problem.solve_with(SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            });
+            assert_eq!(
+                got.map(|_| "solved"),
+                Err(Error::Infeasible),
+                "presolve {presolve}"
+            );
+        }
+    }
+
     /// A MILP whose relaxation is unbounded (HiGHS agrees), where the
     /// improving column meets the one row whose basic var could block it
     /// through a round-off entry of -4.4e-16, next to a genuine entry in a

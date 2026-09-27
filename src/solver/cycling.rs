@@ -54,12 +54,15 @@ pub(crate) const STALL_ITERATIONS: u64 = 10_000;
 /// A basis change found to repeat vertices, as HiGHS's
 /// `HighsSimplexBadBasisChangeRecord`: while it is taboo, its row is not
 /// chosen to leave (dual simplex) and its entering var not chosen to enter
-/// (primal simplex).
+/// (primal simplex). A row of the dual simplex that no var can repair and
+/// that does not prove the model infeasible is recorded with no entering
+/// var (HiGHS's `BadBasisChangeReason::kFailedInfeasibilityProof`, recorded
+/// with `variable_in = -1` by `HEkkDual::assessPossiblyDualUnbounded`).
 #[derive(Clone, Debug)]
 struct BadBasisChange {
     row: usize,
     leaving: usize,
-    entering: usize,
+    entering: Option<usize>,
     taboo: bool,
 }
 
@@ -89,17 +92,17 @@ impl VertexChange {
 /// non-basic var at its upper bound, so every change of either (a pivot, a
 /// bound flip) toggles a term or two. HiGHS hashes the basic set alone
 /// (`HighsHashHelpers::sparse_combine` over the basic vars), but a basic set
-/// can come back at another vertex: the bound-flipping ratio test and a
-/// flip-only step move boxed vars to their other bound without a basis
-/// change, so a set hash can take a phase that has moved on for one that
-/// revisits, and two such verdicts in a row make a change taboo. HiGHS
-/// recovers from a wrong verdict (its `kUnknown` sends the LP to another
-/// solve); this engine has no such recovery, so a verdict here must be a
-/// real repeat. (A first version hashed the basic set while the correction
-/// at a rebuild still moved boxed vars back to their other bound, and so
-/// failed the differential fuzz's model `wide_lp-1897`; with that
-/// correction shifting instead, see `rebuild_dual`, no model of the fuzz
-/// tells the two hashes apart, and the unit test
+/// can come back at another vertex: the bound-flipping ratio test and the
+/// dual simplex's round-off repair (`Solver::round_off_repair`) move boxed
+/// vars without a basis change, so a set hash can take a phase that has
+/// moved on for one that revisits, and two such verdicts in a row make a
+/// change taboo. HiGHS recovers from a wrong verdict (its `kUnknown` sends
+/// the LP to another solve); this engine has no such recovery, so a verdict
+/// here must be a real repeat. (A first version hashed the basic set while
+/// the correction at a rebuild still moved boxed vars back to their other
+/// bound, and so failed the differential fuzz's model `wide_lp-1897`; with
+/// that correction shifting instead, see `rebuild_dual`, no model of the
+/// fuzz tells the two hashes apart, and the unit test
 /// `vertex_hash_makes_a_repeated_basis_change_taboo` pins the difference.)
 ///
 /// Every vertex the phase reaches by a pivot is recorded. A basis change
@@ -211,7 +214,7 @@ impl CycleGuard {
                     "simplex cycling: basis change {leaving} out, {entering} in (row {row}) \
                      revisits a vertex again; taboo"
                 );
-                self.add_bad_change(row, leaving, entering);
+                self.add_bad_change(row, leaving, Some(entering));
                 return true;
             }
             self.last_revisit = Some(self.pivots);
@@ -219,7 +222,7 @@ impl CycleGuard {
         match self
             .bad_changes
             .iter_mut()
-            .find(|c| c.row == row && c.leaving == leaving && c.entering == entering)
+            .find(|c| c.row == row && c.leaving == leaving && c.entering == Some(entering))
         {
             Some(change) => {
                 change.taboo = true;
@@ -229,7 +232,7 @@ impl CycleGuard {
         }
     }
 
-    fn add_bad_change(&mut self, row: usize, leaving: usize, entering: usize) {
+    fn add_bad_change(&mut self, row: usize, leaving: usize, entering: Option<usize>) {
         match self
             .bad_changes
             .iter_mut()
@@ -245,10 +248,26 @@ impl CycleGuard {
         }
     }
 
+    /// Record that no var can repair `row` (basic var `leaving`) and that
+    /// the row does not prove the model infeasible, and make the row taboo,
+    /// so that the dual simplex goes on with the other rows (HiGHS's
+    /// `HEkkDual::assessPossiblyDualUnbounded` on a failed proof).
+    pub(crate) fn add_failed_proof(&mut self, row: usize, leaving: usize) {
+        self.add_bad_change(row, leaving, None);
+    }
+
     /// Whether `row` may not be chosen to leave, in the dual simplex (HiGHS
     /// `HEkk::applyTabooRowOut`).
     pub(crate) fn is_taboo(&self, row: usize) -> bool {
         self.bad_changes.iter().any(|c| c.taboo && c.row == row)
+    }
+
+    /// Whether `row` is taboo because it does not prove the model
+    /// infeasible although no var can repair it ([`Self::add_failed_proof`]).
+    pub(crate) fn is_unproven(&self, row: usize) -> bool {
+        self.bad_changes
+            .iter()
+            .any(|c| c.taboo && c.row == row && c.entering.is_none())
     }
 
     /// Whether `var` may not be chosen to enter, in the primal simplex
@@ -256,7 +275,7 @@ impl CycleGuard {
     pub(crate) fn is_taboo_entering(&self, var: usize) -> bool {
         self.bad_changes
             .iter()
-            .any(|c| c.taboo && c.entering == var)
+            .any(|c| c.taboo && c.entering == Some(var))
     }
 
     /// Whether any change is taboo (HiGHS `HEkk::tabooBadBasisChange`).

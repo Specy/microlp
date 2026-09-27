@@ -11,13 +11,19 @@
 //! test records today's answer, so that fixing it shows up as a FAILING test
 //! rather than passing unnoticed; the attribute is then deleted (the body
 //! already asserts the right answer) and it is an ordinary regression test.
-//! See §7 of `ARCHITECTURE.md`. Three fixtures were pinned this way and all
-//! three were fixed: a presolve forcing rule, a skipped verification, and a
-//! dual ratio test that took "no pivot" for a proof of infeasibility (the
-//! `wide_chain` fixtures). Three are pinned today: a forcing row whose fixing
-//! another row can tell apart, the row tolerance a var leaves behind at a
-//! huge bound, and a fixed var's huge coefficient in a row added after the
-//! fix.
+//! See §7 of `ARCHITECTURE.md`. Five fixtures were pinned this way and all
+//! five were fixed: a presolve forcing rule, a skipped verification, a dual
+//! ratio test that took "no pivot" for a proof of infeasibility (the
+//! `wide_chain` fixtures), the row tolerance a var left behind at a huge
+//! bound, and a fixed var's huge coefficient in a row added after the fix.
+//! Twelve are pinned today: a forcing row whose fixing another row can tell
+//! apart, two models of the phases alternating over a row repaired through
+//! round-off, a vertex off its bound by round-off with nothing to move, a
+//! MILP node whose feasible LP no var can repair, three models whose only
+//! room is a coefficient of round-off size (an LP, its MILP and the LP with
+//! that var unbounded), and four whose only room is such a coefficient of
+//! a basic var (an LP and its MILP, with presolve on and off), all reported
+//! infeasible before and failing loudly now.
 
 #[cfg(test)]
 mod regression_tests {
@@ -1082,22 +1088,24 @@ mod regression_tests {
         }
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): the model above through the LP
-    /// edit path (found by the second review of R0). `min y` s.t. `f + y >= 0`,
+    /// The model above through the LP edit path (found by the second review
+    /// of R0, and pinned as a known limitation until the dual simplex needed
+    /// a proof to report infeasibility). `min y` s.t. `f + y >= 0`,
     /// `f ∈ [0, 10]`, then `fix_var(f, 0)` and
     /// `add_constraint(1e17 f + y >= 1)`: the added row leaves the now fixed
     /// `f` out of its equilibration, so the dual ratio test meets `[1e17, 1]`
-    /// again, but the round-off scale leaves out only the columns fixed when
-    /// the solve began, so `f`'s entry sets a floor of 100, `y`'s exact
-    /// entry of one is "noise", and the edit comes back `Infeasible` (the
-    /// answer is `y = 1`), with presolve on and off, as at 1dcd664. The MIP
-    /// path rebuilds the model with `f` fixed from the start and solves it.
-    /// Which columns a row left out of its equilibration differs from row to
-    /// row once rows are added; this wants the absolute pivot tolerances of
-    /// R3, not another per-column flag.
+    /// again, and its round-off scale leaves out only the columns fixed when
+    /// the solve began, so `f`'s entry sets a floor of 100 and `y`'s exact
+    /// entry of one is "noise": no candidate. The ratio test took that for a
+    /// proof of infeasibility, and the edit came back `Infeasible` (the
+    /// answer is `y = 1`), with presolve on and off, as at 1dcd664. The row's
+    /// certificate does not hold now (`y` has no upper bound), the row is
+    /// made taboo, and with no other row left the dual simplex takes SoPlex's
+    /// last resort, a pivot on an entry its regular test refuses but above
+    /// SoPlex's `lowstab`: `y`'s one. (The absolute pivot tolerances of R3
+    /// would make `y` a regular candidate.)
     #[test]
-    #[should_panic(expected = "the edit returned Infeasible")]
-    fn a_fixed_vars_huge_coefficient_in_an_added_row_is_a_known_limitation() {
+    fn a_fixed_vars_huge_coefficient_in_an_added_row_does_not_silence_it() {
         for presolve in [true, false] {
             let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
             let f = problem.add_var(0.0, (0.0, 10.0));
@@ -1224,13 +1232,15 @@ mod regression_tests {
     /// (largest entry 4), so the step of 32 passes it and ends the row
     /// `1e-7` (twice its tolerance) short: its bound is shifted, and the
     /// cleanup exposes the violation. The dual phase can repair the row only
-    /// by flipping `x5` across its range through another such entry (its
-    /// flip-only stage, C2-10 of the solver review), which gives the primal
-    /// phase its step back; after eight rounds the solve fails with
-    /// `InternalError`. The same at 1dcd664. What resolves it is a pivot
-    /// on the `3e-15` (a degenerate one, onto the optimal basis) or a proof
-    /// that no step is possible: the absolute pivot tolerances with a refined
-    /// row, and the infeasibility proof, of step R3.
+    /// by moving `x5` across its range through another such entry, which
+    /// gives the primal phase its step back; after eight rounds the solve
+    /// fails with `InternalError`. The same at 1dcd664, where the move was the
+    /// dual ratio test's flip-only stage (C2-10 of the solver review); now
+    /// the row's certificate proves nothing (the model is feasible), SoPlex's
+    /// instable leave finds no entry to pivot on, and the move is the dual
+    /// simplex's round-off repair, its last resort. What resolves it is a
+    /// pivot on the `3e-15` (a degenerate one, onto the optimal basis): the
+    /// absolute pivot tolerances with a refined row of step R3.
     #[test]
     #[should_panic(expected = "8 phase rounds")]
     fn phases_alternating_over_a_row_repaired_through_round_off_is_a_known_limitation() {
@@ -1297,6 +1307,403 @@ mod regression_tests {
             ],
             xstar: vec![0.0, 0.0, 0.0, 0.0],
         });
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): a vertex that misses a bound by the
+    /// round-off of solving for it, by more than the tolerance the engine
+    /// holds the var to, with nothing left to move. `lp_wide_1` of the
+    /// property stress run of R1a: three equalities through
+    /// `x* = (0, -230094, 0)`; after two dual pivots every non-basic var is
+    /// an equality's fixed slack, and the vertex puts `x2` `3.3e-10` (scaled)
+    /// past its upper bound of zero, three times the tolerance its rows'
+    /// reserve caps it at. Up to the infeasibility proof, the dual ratio
+    /// test took "no var can enter" for a proof and the solve came back
+    /// `Infeasible` (with presolve on and off, as at 1dcd664). The row's
+    /// certificate, summed from the data, puts the gap at `-6.7e-14`: it
+    /// proves nothing (the vertex is off by round-off, not by the data), and
+    /// the solve fails loudly. The full contract of R4 accepts the vertex.
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn a_vertex_off_its_bound_by_round_off_with_nothing_to_move_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, 0.0, 0.0),
+                real(-1.0, -493315.0, -230094.0),
+                real(0.1, -1681001.0, 0.0),
+            ],
+            rows: vec![
+                row(
+                    &[(1, -1.1275759759608115), (2, 0.1765625)],
+                    ComparisonOp::Eq,
+                    259448.46661272697,
+                ),
+                row(&[(1, -1.0), (2, 184.375)], ComparisonOp::Eq, 230094.0),
+                row(&[(1, 1.0), (2, -0.01)], ComparisonOp::Eq, -230094.0),
+            ],
+            xstar: vec![0.0, -230094.0, 0.0],
+        });
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): a MILP whose node LP is feasible
+    /// but that no var can repair. `b3` of the property stress run of R1b:
+    /// `-0.1 x2 + x5 = 0`, `1e4 x4 - 1e-6 x5 <= 10000010003` and
+    /// `-1e4 x2 + 1e-8 x4 = 0.00500001`, with `x4 ∈ [500001, 1000002]`, pin
+    /// `x5` at zero (`x* = 0` but for `x4 = 500001`). At the root node the
+    /// vertex puts `x5` `3.05e-12` (scaled, `5e-8` in the user's units) past
+    /// its upper bound of zero, beyond the tolerance its rows' reserve caps
+    /// it at, and the only var that could move it is the slack of the
+    /// second row, unbounded, with an entry of `3.2e-16`, below every pivot
+    /// floor. Up to the infeasibility proof, the dual ratio test counted that
+    /// entry as zero and took the row for a proof, and the branch and bound
+    /// pruned the node: the MILP came back `Infeasible` (presolve on and
+    /// off). The certificate's gap is `-1.6e-22`, no proof, so the node is
+    /// not pruned: its LP fails loudly, and after the retry from the slack
+    /// basis so does the MILP. What would repair it is a pivot on the tiny
+    /// entry (the absolute pivot tolerances with a refined row of R3) or the
+    /// full contract of R4, under which the vertex verifies.
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn a_node_lp_no_var_can_repair_is_not_pruned_and_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(0.0, 0, 0),
+                real(-1.0, 0.0, 0.0),
+                real(0.0, 0.0, 1.0),
+                real(-1.0, 0.0, 0.0),
+                real(-1.0, 500001.0, 1000002.0),
+                real(1.0, -1.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(2, -0.1), (5, 1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(4, 10000.0), (5, -1e-6)], ComparisonOp::Le, 10000010003.0),
+                row(&[(2, -10000.0), (4, 1e-8)], ComparisonOp::Eq, 0.00500001),
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 0.0, 500001.0, 0.0],
+        });
+    }
+
+    /// A MILP node whose LP misses a bound by less than the user's tolerance
+    /// but more than the engine's is proven infeasible and pruned, as HiGHS
+    /// prunes it. `max x0` s.t. `-1e-4 x0 - 1e4 x2 = 0`, `-0.1 x2 = 0` over
+    /// `x0 ∈ {-1, 0, 1}`, `x2 ∈ [-1, 0]`: the node `x0 <= -1` puts `x2` at
+    /// `1e-8`, past its bound of zero, beyond the tolerance its first row's
+    /// reserve caps it at but within the user's `1e-7`, and nothing can move.
+    /// Its certificate's gap is exactly that `1e-8`. A proof that asked the
+    /// gap to exceed the user's tolerance too left the node neither proven
+    /// nor solvable, and the MILP a loud error (found by the property stress
+    /// on such a proof); the proof asks what the simplex's own test asks, and
+    /// the optimum is `x0 = 1` (where `x2 = -1e-8`), as HiGHS finds.
+    #[test]
+    fn a_node_infeasible_by_less_than_the_contract_is_pruned() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![int(1.0, -1, 1), real(0.0, 0.0, 0.0), real(0.0, -1.0, 0.0)],
+            rows: vec![
+                row(&[(0, -0.0001), (2, -10000.0)], ComparisonOp::Eq, -0.0),
+                row(&[(2, -0.1)], ComparisonOp::Eq, -0.0),
+            ],
+            xstar: vec![0.0, 0.0, 0.0],
+        });
+    }
+
+    /// A MILP node whose certificate carries a basic var's round-off on a
+    /// huge bound is proven infeasible all the same. `x3 ∈ [0, 64212616]` is
+    /// basic at the node `x1 >= 1`, which violates the second row by
+    /// thousands; the certificate's coefficient of `x3` was `1.45e-17`, the
+    /// round-off of terms of magnitude `0.19`, and times `x3`'s scaled bound
+    /// of `4.2e12` it alone closed the certificate's gap of `6.1e-5`: the
+    /// proof failed, nothing could move, and the MILP failed loudly (found by
+    /// the property stress). The refinement of the row of the basis inverse
+    /// the certificate starts from, added for the next model and kept to
+    /// twice the precision for [`multipliers_no_f64_holds_do_not_void_a_nodes_proof`],
+    /// leaves `x3` no coefficient at all after one step, and after the second
+    /// the noise of its solve, `7.7e-34`, some `3e-21` at that bound, and the
+    /// node is proven. (For a while
+    /// a coefficient of round-off size counted as zero whatever its var's
+    /// bound, which kept this proof too but also proved a feasible model
+    /// infeasible:
+    /// `a_round_off_coefficient_on_a_far_bound_is_no_proof_and_is_a_known_limitation`.)
+    #[test]
+    fn a_round_off_coefficient_on_a_huge_bound_does_not_void_a_nodes_proof() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(1.0, 0, 0),
+                int(1.0, 0, 2),
+                real(0.0, 0.0, 0.0),
+                real(0.0, 0.0, 64212616.0),
+                real(1.0, -1.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(3, -10.0), (4, -1.7421875e-7)], ComparisonOp::Eq, -0.0),
+                row(&[(1, -1.0), (4, -10000.0)], ComparisonOp::Le, 1.0),
+                row(&[(1, -0.0001), (3, 10000.0)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![0.0; 5],
+        });
+    }
+
+    /// A MILP node proven infeasible through an ill-conditioned basis. At the
+    /// node `x1 <= -10` (of `x1 ∈ [-11, 0]`), whose rows allow `x1 >= -9.99`
+    /// only, the basis mixes coefficients from `1e-5` to `1e4`, and the row
+    /// of its inverse leaves the basic `x3 ∈ [-2848554, 0]` a certificate
+    /// coefficient of `8.4e-16`: the residual of the transposed solve,
+    /// `1.8e-14` of the terms it is summed from, above any fixed round-off
+    /// fraction, and times `x3`'s scaled bound of `3.6e8` exactly the gap of
+    /// `3.05e-7`. The proof failed, nothing could move, and the MILP failed
+    /// loudly (found by the property stress); one refinement of that row, as
+    /// HiGHS refines it, leaves `x3` the coefficient `1.7e-18` rounded to
+    /// `f64` and `2.5e-31` kept to twice the precision, a second none, and
+    /// the node proven.
+    #[test]
+    fn an_ill_conditioned_basis_does_not_void_a_nodes_proof() {
+        check(Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(1.0, 0, 0),
+                int(1.0, -11, 0),
+                real(-1.0, 0.0, 0.0),
+                real(-1.0, -2848554.0, 0.0),
+                real(1.0, -1.0, 0.0),
+                real(-1.0, 0.0, 0.0),
+            ],
+            rows: vec![
+                row(
+                    &[(1, -0.0001), (3, -10000.0), (4, -1.0)],
+                    ComparisonOp::Le,
+                    1.0,
+                ),
+                row(&[(1, 1e-5), (3, -1.0), (4, 100.0)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![0.0; 6],
+        });
+    }
+
+    /// A MILP node whose certificate no `f64` multipliers combine exactly is
+    /// proven infeasible all the same. `max -x1` s.t.
+    /// `-2e-8 x1 - 12.5 x2 = 0` and `-2e-7 x0 - 1e-6 x1 + 162.5 x2 = 0` over
+    /// `x0 ∈ {0, 1}`, `x1 ∈ {-2, -1, 0}` and `x2 ∈ [-45451714, 0]`: the rows
+    /// pin `x1` at zero, and the node `x1 <= -1` misses them by `6.5e-7`
+    /// (scaled). Its certificate combines the rows with multipliers no `f64`
+    /// holds, and with the row of the basis inverse refined but rounded to
+    /// `f64`, as HiGHS rounds it, the basic `x2`'s coefficient was
+    /// `8.7e-17`, the representation error of the row beside terms of
+    /// magnitude `3.1`: counted at `x2`'s scaled bound of `-2.9e9`, it left a
+    /// gap of `4.0e-7`, short of the allowance `4e-7` by a hair, and the
+    /// MILP failed loudly (found by the property stress on a version that
+    /// counted such coefficients at finite bounds, as the proof must, but
+    /// rounded the refined row; two more nodes failed the same way, on
+    /// bounds of `6.9e6` and `2.4e8`). The refinement now keeps its
+    /// correction to twice the precision, and `x2`'s coefficient is zero.
+    #[test]
+    fn multipliers_no_f64_holds_do_not_void_a_nodes_proof() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(0.0, 0, 1),
+                int(-1.0, -2, 0),
+                real(0.0, -45451714.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(1, -2e-8), (2, -12.5)], ComparisonOp::Eq, -0.0),
+                row(&[(0, -2e-7), (1, -1e-6), (2, 162.5)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![0.0, 0.0, 0.0],
+        });
+    }
+
+    /// The model the review of the infeasibility proof built:
+    /// `min -x - y - t - z` s.t. `x + y + z + q >= 3` and
+    /// `t - (1 + 2^-50) z - q >= 1e-6` over `x, y, t ∈ [0, 1]` (integer if
+    /// asked), `z ∈ [z_min, 1]`, `q ∈ [-1e10, 1e10]` (`q` free, the review's
+    /// form, behaves the same). Together the rows ask
+    /// `x + y + t - 2^-50 z >= 3 + 1e-6`: only `z`'s coefficient `-2^-50`,
+    /// which the rows' own data leave, makes room for them, at
+    /// `z <= -2^50 · 1e-6 ≈ -1.13e9`, where the optimum is. The model is
+    /// feasible in exact arithmetic at `x*`.
+    fn room_through_a_round_off_coefficient(integer: bool, z_min: f64) -> Model {
+        let unit = |obj| {
+            if integer {
+                int(obj, 0, 1)
+            } else {
+                real(obj, 0.0, 1.0)
+            }
+        };
+        Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                unit(-1.0),
+                unit(-1.0),
+                unit(-1.0),
+                real(-1.0, z_min, 1.0),
+                real(0.0, -1e10, 1e10),
+            ],
+            rows: vec![
+                row(
+                    &[(0, 1.0), (1, 1.0), (3, 1.0), (4, 1.0)],
+                    ComparisonOp::Ge,
+                    3.0,
+                ),
+                row(
+                    &[(2, 1.0), (3, -(1.0 + 2f64.powi(-50))), (4, -1.0)],
+                    ComparisonOp::Ge,
+                    1e-6,
+                ),
+            ],
+            xstar: vec![1.0, 1.0, 1.0, -2e9, 2000000001.0000005],
+        }
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): a feasible LP whose only room is a
+    /// coefficient of round-off size on a far bound.
+    /// [`room_through_a_round_off_coefficient`] with `z >= -2e9`: the dual
+    /// simplex ends with a row that only `z` can repair, through an entry of
+    /// `8.9e-16` beside ones, below every pivot floor. The row's certificate
+    /// gives `z` the coefficient `-2^-50`, round-off beside its terms (ones)
+    /// but the data's own. Counted as zero whatever its bound, as HiGHS
+    /// counts proof entries below `1e-14`, it proved the model infeasible
+    /// (a gap of `1e-6`), and the solve returned `Infeasible`, with presolve
+    /// on and off (as HiGHS does). Counted as it is, times `z`'s bound, it
+    /// leaves the certificate `7.8e-7` of room: no proof. Nothing repairs the
+    /// row either: the round-off repair does not move a var by a coefficient
+    /// below the round-off of its terms (moved by it, `z` goes to `-2e9`, and
+    /// the primal step, whose column's round-off floor hides the same entry,
+    /// takes it back, round after round), so the solve fails loudly. Only a
+    /// pivot on the entry, below every reference's pivot tolerance, solves
+    /// it.
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn a_round_off_coefficient_on_a_far_bound_is_no_proof_and_is_a_known_limitation() {
+        check(room_through_a_round_off_coefficient(false, -2e9));
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the model of the test above with
+    /// `x, y, t` integer. Its root node's LP is that LP, and the branch and
+    /// bound pruned the node on the false proof: the MILP came back
+    /// `Infeasible` (presolve on and off). The node's LP fails loudly now,
+    /// and after the retry from the slack basis so does the MILP.
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn a_node_lp_whose_room_is_round_off_is_not_pruned_and_is_a_known_limitation() {
+        check(room_through_a_round_off_coefficient(true, -2e9));
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the model of
+    /// [`a_round_off_coefficient_on_a_far_bound_is_no_proof_and_is_a_known_limitation`]
+    /// with `z` unbounded below. A round-off coefficient on an infinite bound
+    /// once counted as zero for every var, HiGHS's concession, and the
+    /// certificate proved the feasible model infeasible, with presolve on and
+    /// off (HiGHS answers the same). A coefficient on an infinite bound counts
+    /// as zero now only where the error of the multipliers could make it
+    /// zero; this row of the basis inverse is exact, so `z`'s `-2^-50` makes
+    /// the certificate's range unbounded, and nothing is proven. Nothing
+    /// repairs the row either (the round-off repair moves no var toward an
+    /// infinite bound), and the solve fails loudly.
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn a_round_off_coefficient_on_an_infinite_bound_is_no_proof_and_is_a_known_limitation() {
+        check(room_through_a_round_off_coefficient(
+            false,
+            f64::NEG_INFINITY,
+        ));
+    }
+
+    /// The model the review of the basic vars' concession built:
+    /// `min -L` s.t. `L + j + w = 1.000001`, `-(1 + 2^-50) j - w = 0` and
+    /// `j + v <= 0` over `L, v ∈ [0, 1]` (`L` integer if asked) and `j, w`
+    /// free. The first two rows ask `L - 2^-50 j = 1.000001`: only `j`'s
+    /// coefficient `-2^-50` makes room for them, at `j ≈ -1.13e9`, where the
+    /// optimum `L = 1` is. The model is feasible in exact arithmetic at `x*`.
+    fn room_through_a_basic_vars_coefficient(integer: bool) -> Model {
+        Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                if integer {
+                    int(-1.0, 0, 1)
+                } else {
+                    real(-1.0, 0.0, 1.0)
+                },
+                real(0.0, f64::NEG_INFINITY, f64::INFINITY),
+                real(0.0, f64::NEG_INFINITY, f64::INFINITY),
+                real(0.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(0, 1.0), (1, 1.0), (2, 1.0)], ComparisonOp::Eq, 1.000001),
+                row(
+                    &[(1, -(1.0 + 2f64.powi(-50))), (2, -1.0)],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+                row(&[(1, 1.0), (3, 1.0)], ComparisonOp::Le, 0.0),
+            ],
+            xstar: vec![1.0, -1125899906.75, 1125899906.750001, 0.0],
+        }
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): a feasible LP whose only room is
+    /// a basic var's coefficient of round-off size in what a certificate
+    /// leaves. [`room_through_a_basic_vars_coefficient`]: the dual simplex
+    /// ends at the basis `{j, w}` and the second row's slack, `1e-6` above
+    /// its bound of zero, and only the third row's slack, unbounded, could
+    /// repair that row, through an entry of `2^-50` beside ones, below every
+    /// pivot floor. The row of the basis inverse, `(1, 1, 2^-50)`, needs the
+    /// infinite side of that non-basic slack, so the certificate leaves the
+    /// third row out, and the free basic `j` keeps the coefficient `-2^-50`,
+    /// `4.4e-16` of its terms. The concession for a basic var's coefficient
+    /// on an infinite bound stopped at the `f64` round-off floor of its terms
+    /// and took it for a residual, and the certificate proved the model
+    /// infeasible (a gap of `1e-6`), with presolve on and off (HiGHS's LP
+    /// answers the same). A coefficient counts as zero now only where the
+    /// error of the multipliers could make it zero, and this row of the basis
+    /// inverse is exact: counted, the coefficient makes the range unbounded,
+    /// and nothing is proven. Nothing repairs the row either, and the solve
+    /// fails loudly. Only a pivot on the entry, below every reference's pivot
+    /// tolerance, solves it.
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn a_basic_vars_coefficient_left_by_a_row_left_out_is_no_proof_and_is_a_known_limitation() {
+        check(room_through_a_basic_vars_coefficient(false));
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the test above without presolve,
+    /// on the model as written, which ends at the same basis; it too was
+    /// proven infeasible, and it too fails loudly now.
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn a_basic_vars_coefficient_left_by_a_row_left_out_without_presolve_is_a_known_limitation() {
+        let model = room_through_a_basic_vars_coefficient(false);
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model it was built around"
+        );
+        assert_solves_within_contract_without_presolve(&model);
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the model of the tests above with
+    /// `L` integer. Its root node's LP is that LP, and the branch and bound
+    /// pruned the node on the false proof: the MILP came back `Infeasible`
+    /// (presolve on and off), where its optimum is `L = 1` (HiGHS finds it).
+    /// The node's LP fails loudly now, and after the retry from the slack
+    /// basis so does the MILP.
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn a_node_lp_whose_room_is_a_basic_vars_coefficient_is_not_pruned_and_is_a_known_limitation() {
+        check(room_through_a_basic_vars_coefficient(true));
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the test above without presolve;
+    /// its root node was pruned the same way, and it fails loudly now too.
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn a_node_lp_whose_room_is_a_basic_vars_coefficient_without_presolve_is_a_known_limitation() {
+        let model = room_through_a_basic_vars_coefficient(true);
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model it was built around"
+        );
+        assert_solves_within_contract_without_presolve(&model);
     }
 
     /// KNOWN LIMITATION (ARCHITECTURE §7): presolve's forcing row
