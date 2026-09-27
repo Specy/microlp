@@ -17,9 +17,8 @@ fn mat_from_triplets(rows: usize, cols: usize, triplets: &[(usize, usize)]) -> C
 fn order_simple_singular() {
     init();
     // Column 2 has no entries at all (a variable with zero coefficients
-    // in every row). order_simple used to compute `len() - 1`
-    // unconditionally and panic with a usize underflow instead of
-    // reporting SingularMatrix.
+    // in every row): order_simple must report SingularMatrix, not
+    // underflow computing `len() - 1`.
     let mat = mat_from_triplets(3, 3, &[(0, 0), (1, 0), (2, 1)]);
     let res = order_simple(3, |c| mat.outer_view(c).unwrap().into_raw_storage().0);
     assert_eq!(res.unwrap_err(), Error::SingularMatrix);

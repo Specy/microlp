@@ -30,26 +30,24 @@ pub(crate) const ROUNDOFF_FLOOR: f64 = 1e-14;
 /// Round-off of a single tableau entry computed through the factorization,
 /// relative to the largest entry of its row or column: about ten ulps of
 /// `f64`. An entry below this fraction of its neighbours is indistinguishable
-/// from the round-off of computing it, and two computations of the same
-/// entry (through the row and through the column) agree to about this much. Tighter than [`ROUNDOFF_FLOOR`], which allows
-/// for a sum over a row's many terms.
+/// from the round-off of computing it, and two computations of the same entry
+/// (through the row and through the column) agree to about this much. Tighter
+/// than [`ROUNDOFF_FLOOR`], which allows for a sum over a row's many terms.
 pub(crate) const ENTRY_ROUNDOFF: f64 = 1e-15;
 
 /// A column of the basis whose largest eligible pivot, in the LU
-/// factorization, is below this fraction of the column's largest
-/// transformed entry is treated as singular: the eligible part is then
-/// within the round-off of the elimination that produced it, i.e. the column
-/// is dependent on the previous ones as far as `f64` can tell. Relative to
-/// the column's own scale rather than absolute, so the test does not depend
-/// on the units the column happens to be written in; an ill-conditioned but
-/// non-singular basis is judged by the verification of the values it
-/// produces, not by a threshold on its pivots.
+/// factorization, is below this fraction of the column's largest transformed
+/// entry is treated as singular: the eligible part is then within the
+/// round-off of the elimination, so the column is dependent on the previous
+/// ones as far as `f64` can tell. Relative, so that the test does not depend
+/// on the units the column is written in; an ill-conditioned but non-singular
+/// basis is judged by the verification of the values it produces, not by its
+/// pivots.
 ///
-/// The ratio tests hold a pivot element within this fraction of the scale
-/// of its row and column to more than the factorization can resolve: its
-/// two computations must agree relatively, not just within their round-off
-/// (see `Solver::pivots_agree`), since at this size a round-off entry agrees
-/// with anything of its own size.
+/// A pivot element of the ratio tests within this fraction of the scale of
+/// its row and column must have its two computations agree relatively, not
+/// just within their round-off (see `Solver::pivots_agree`), since at this
+/// size a round-off entry agrees with anything of its own size.
 pub(crate) const LU_SINGULAR_REL: f64 = ROUNDOFF_FLOOR;
 
 /// Relative pivot tolerance of both ratio tests: an entry of the pivot row
@@ -66,17 +64,14 @@ pub(crate) const LU_SINGULAR_REL: f64 = ROUNDOFF_FLOOR;
 pub(crate) const PIVOT_REL_TOL: f64 = 1e-7;
 
 /// The smallest pivot element the dual simplex takes as its last resort, in
-/// the engine's scaled units: SoPlex's `lowstab` (`SOPLEX_LOWSTAB`, `1e-10`,
-/// src/soplex/spxboundflippingrt.hpp and spxfastrt.hpp), the stability its
-/// ratio tests require of an "instable" pivot. The regular floors
-/// ([`ENTRY_ROUNDOFF`], [`PIVOT_REL_TOL`]) are relative to the row's largest
-/// entry, so a huge entry elsewhere in the row (a fixed var's `1e17` beside a
-/// genuine `1`) can make every entry that could repair it "round-off". When
-/// such a row does not prove the model infeasible and no other row is left
-/// (see `Solver::dual_phase`), SoPlex pivots on an entry its regular
-/// stability test refused, if the entry is at least this, on its scaled
-/// data; the rows and columns here are scaled as SoPlex's are
-/// (equilibrated to entries near one), and below this an entry is
+/// the engine's scaled units, where rows and columns are equilibrated to
+/// entries near one. The regular floors ([`ENTRY_ROUNDOFF`],
+/// [`PIVOT_REL_TOL`]) are relative to the row's largest entry, so a huge
+/// entry elsewhere in the row (a fixed var's `1e17` beside a genuine `1`) can
+/// make every entry that could repair it "round-off". When such a row does
+/// not prove the model infeasible and no other row is left (see
+/// `Solver::dual_phase`), the dual simplex pivots on an entry the regular
+/// test refused if the entry is at least this; below it an entry is
 /// indistinguishable from the round-off of a solve through a basis of any
 /// condition, so no pivot is taken on it at all.
 pub(crate) const INSTABLE_PIVOT_TOL: f64 = 1e-10;
@@ -84,9 +79,9 @@ pub(crate) const INSTABLE_PIVOT_TOL: f64 = 1e-10;
 /// Relative disagreement between the pivot element computed through the
 /// pivot row (`row_coeffs[col]`) and through the pivot column
 /// (`col_coeffs[row]`) above which the factorization is not trusted for the
-/// pivot: the two are the same number in exact arithmetic and agree to
-/// ~1e-12 at every legitimate pivot ever measured, while a pivot on round-off
-/// noise disagrees by tens of percent.
+/// pivot: the two are the same number in exact arithmetic and agree to about
+/// `1e-12` at a legitimate pivot, while a pivot on round-off noise disagrees
+/// by tens of percent.
 pub(crate) const PIVOT_AGREEMENT_TOL: f64 = 1e-7;
 
 /// Iterative refinement steps [`super::Solver::verify_primal`] may apply to
@@ -101,27 +96,18 @@ pub(crate) const REFINEMENT_STEPS: usize = 3;
 /// agree on a verified state, which must not be reported as an optimum.
 pub(crate) const MAX_PHASE_ROUNDS: usize = 8;
 
-/// The factor by which each round of [`super::Solver::run_phases`] after
-/// the first cuts the tolerance the primal ratio test lets a basic var pass
-/// its bound by (the Harris allowance, `0.01^round` of the var's tolerance):
-/// SoPlex's "to avoid shifts we restrict tolerances in the ratio test",
-/// which cuts its ratio tester's delta a hundredfold each time its
-/// algorithms loop (`SPxSolverBase::solve`, src/soplex/spxsolve.hpp). A
-/// round ends in a verification that recomputes the values from the data,
-/// and a Harris step may leave a var exactly at its tolerance, where the
-/// recomputation finds it an ulp past: the dual phase then undid the step,
-/// the primal phase redid it, and the rounds ran out (an equality
-/// `x2 + 1e-7 x3 = 1.0000001` ending its step at its tolerance and
-/// recomputed `1.15e-12` over it). The first round keeps the whole
-/// tolerance, so the Harris protection stays where scaling is worst; the
-/// allowance was once cut on every step by the round-off of recomputing the
-/// var instead, which left rows above about `5e6` in magnitude with none at
-/// all (C3-10 of the solver review). SoPlex cuts at every pass of either
-/// algorithm once one has ended unverified (its `loopCount`); a round here, a
-/// dual and a primal pass, cuts once. A var the earlier rounds left past its
-/// bound by more than the cut allowance (within its whole tolerance) admits
-/// no step toward it: the ratio test's limit is then zero, never negative
-/// (see `choose_pivot`).
+/// The factor by which each round of [`super::Solver::run_phases`] after the
+/// first cuts the tolerance the primal ratio test lets a basic var pass its
+/// bound by (the Harris allowance, `0.01^round` of the var's tolerance). A
+/// round ends in a verification that recomputes the values from the data, and
+/// a Harris step may leave a var exactly at its tolerance, where the
+/// recomputation finds it an ulp past: without the cut, the dual phase undoes
+/// the step, the primal phase redoes it, and the rounds run out. The first
+/// round keeps the whole tolerance, so the Harris protection stays where
+/// scaling is worst. A var the earlier rounds left past its bound by more
+/// than the cut allowance (within its whole tolerance) admits no step toward
+/// it: the ratio test's limit is then zero, never negative (see
+/// `choose_pivot`).
 pub(crate) const LOOP_HARRIS_REDUCTION: f64 = 0.01;
 
 /// The share of a row's contract tolerance the engine uses for the row
@@ -146,9 +132,9 @@ pub(crate) fn row_tolerance(tol: f64, magnitude: f64) -> f64 {
 /// The contract on one bound of a var: [`row_tolerance`] at the magnitude of
 /// that bound. Each bound has its own, since comparing a value with a bound
 /// resolves it to the round-off of that bound, not of the other one (the
-/// larger of the two gave a var in `[0, f64::MAX]` a tolerance of 1e294 at
-/// zero, and a var in `[0, 1e10]` one of 1e-4). An infinite bound compares
-/// with nothing; its tolerance is the absolute part alone.
+/// larger of the two would give a var in `[0, 1e10]` a tolerance of `1e-4` at
+/// zero). An infinite bound compares with nothing; its tolerance is the
+/// absolute part alone.
 pub(crate) fn bound_tolerance(feasibility: f64, bound: f64) -> f64 {
     if bound.is_finite() {
         row_tolerance(feasibility, bound.abs())
@@ -342,13 +328,10 @@ pub(crate) fn dual_tol(magnitude: f64) -> f64 {
 }
 
 /// The smallest value a dual steepest-edge weight `||e_r^T B^-1||^2` is
-/// updated to (HiGHS's `kMinDualSteepestEdgeWeight`,
-/// highs/simplex/SimplexConst.h, applied in
-/// `HEkk::updateDualSteepestEdgeWeights`). The weights are only a pricing
-/// measure, so the floor decides nothing about feasibility; it keeps a weight
-/// the update has driven to zero or below (from the underestimate a basis
-/// load resets every weight to) from making its row dominate the choice or
-/// never be chosen.
+/// updated to. The weights are only a pricing measure, so the floor decides
+/// nothing about feasibility; it keeps a weight the update has driven to zero
+/// or below (from the underestimate a basis load resets every weight to) from
+/// making its row dominate the choice or never be chosen.
 pub(crate) const MIN_DUAL_EDGE_WEIGHT: f64 = 1e-4;
 
 /// How often (in simplex iterations) the primal/dual loops in `optimize` and

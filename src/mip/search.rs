@@ -1,6 +1,5 @@
-//! The search itself: how one node is visited, branched, warm-started and
-//! pruned, and the loop that drives those steps until a termination reason
-//! is proven.
+//! The search itself: visiting, branching, warm-starting and pruning nodes,
+//! and the loop that drives them until a termination reason is proven.
 
 use super::node::{effective_bounds, Node};
 use super::params;
@@ -64,12 +63,10 @@ enum IntegralCandidate {
 
 /// Adopt a feasible rounded candidate, but close the current subtree only when
 /// the LP point itself is exactly integral. An exactly integral point that
-/// fails the feasibility guard is a contradiction: the engine reports
-/// `Finished` only after verifying the very values it reports through the
-/// very evaluation the guard repeats (`Solver::check_rows` and
-/// `Solver::first_violated_row` share it), with half the contract to spare,
-/// so this cannot be round-off. It is reported loudly rather than papered
-/// over.
+/// fails the feasibility guard is an `InternalError`, not round-off: the
+/// engine reports `Finished` only after checking the very values it reports
+/// with the evaluation the guard repeats (`Solver::check_rows` and
+/// `Solver::first_violated_row` share it), with half the contract to spare.
 fn process_integral_candidate(
     state: &mut MipState,
     domains: &[VarDomain],
@@ -195,19 +192,17 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
 enum NodeLp {
     /// The solver now holds this node's optimal basis and objective.
     Solved,
-    /// The node's LP is infeasible under its current bounds: the engine
-    /// returned [`Error::Infeasible`], which it does only on a proof checked
-    /// on the model's data (a certificate whose gap exceeds the tolerance,
-    /// `Solver::prove_infeasible`, as HiGHS's MIP prunes a node only on its
-    /// LP's proven infeasibility) or on bounds that cross. A row that no var
-    /// can repair and that proves nothing is an error, never this, so an
-    /// unproven verdict can no longer prune a feasible subtree. The proof
-    /// makes one concession, as HiGHS's and SCIP's do with a fixed
-    /// tolerance: a coefficient on an infinite bound counts as zero where the
-    /// error of the multipliers could make it zero (`Solver::proof_of`); a
-    /// node is pruned through it wrongly only if a coefficient the data leave
-    /// lies within that error, which the arithmetic cannot tell from zero,
-    /// and times its var's value makes room at every point of the node.
+    /// The node's LP is infeasible under its current bounds. The engine
+    /// returns [`Error::Infeasible`] only on bounds that cross or on a proof
+    /// checked on the model's data (a certificate whose gap exceeds the
+    /// tolerance, `Solver::prove_infeasible`); a row it can neither repair nor
+    /// prove infeasible is an error instead, so an unproven verdict never
+    /// prunes a feasible subtree. The proof's one concession: a coefficient on
+    /// an infinite bound counts as zero where the error of the multipliers
+    /// could make it zero (`Solver::proof_of`). A node is pruned wrongly only
+    /// if a genuine coefficient lies within that error, which the arithmetic
+    /// cannot tell from zero, and times its var's value makes room at every
+    /// point of the node.
     Infeasible,
     /// A limit interrupted the solve (possibly during the slack retry); the
     /// solver's unfinished, non-optimal state must not be used as a node result.
@@ -224,8 +219,8 @@ enum NodeLp {
 /// all-slack basis (which is documented to always load) and re-solve the node
 /// from scratch, then take that retry's outcome as final. The retry cannot loop:
 /// it is attempted at most once and its own internal error is propagated rather
-/// than retried again. Only [`Error::Infeasible`] prunes the node, and the engine
-/// returns it only on a proof (see [`NodeLp::Infeasible`]).
+/// than retried again. Only [`Error::Infeasible`] prunes the node (see
+/// [`NodeLp::Infeasible`]).
 fn solve_node_lp(state: &mut MipState) -> Result<NodeLp, Error> {
     state.solver.deadline = state.deadline;
     let err = match state.solver.reoptimize() {

@@ -197,11 +197,10 @@ pub fn lu_factorize<'a>(
         // but bad for sparseness, so we do threshold pivoting instead.
 
         let pivot_orig_r = {
-            // The largest eligible pivot, and the largest entry of the whole
-            // transformed column (eliminated part included) it is judged
-            // against: a column whose remaining part is negligible relative
-            // to what was already eliminated is linearly dependent on the
-            // previous columns up to round-off, whatever its absolute scale.
+            // The largest eligible pivot, judged against the largest entry of
+            // the whole transformed column (eliminated part included): a
+            // column whose remaining part is negligible beside it depends on
+            // the previous columns up to round-off, whatever its scale.
             let mut max_abs = 0.0;
             let mut col_max = 0.0;
             for &orig_r in &scratch.rhs.nonzero {

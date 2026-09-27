@@ -1,5 +1,4 @@
-//! Tests reproducing reported issues, each guarding against its bug
-//! returning.
+//! Regression tests, each reproducing a bug and guarding against its return.
 
 #[cfg(test)]
 mod regression_tests {
@@ -49,11 +48,9 @@ mod regression_tests {
     }
 
     /// Issue #3 from the other side: a huge upper bound must not loosen the
-    /// LOWER bound. The round-off floor of a var's bound tolerance was taken
-    /// from the larger of its bounds, so `x ∈ [0, f64::MAX]` could sit at
-    /// `-5` (a tolerance of 1e294 at zero) and an infeasible model came back
-    /// Optimal; with an upper bound of infinity it was correctly Infeasible.
-    /// Each bound now has the round-off floor of its own magnitude.
+    /// lower bound. Each bound's tolerance has the round-off floor of its own
+    /// magnitude; one taken from the larger bound let `x ∈ [0, f64::MAX]` sit
+    /// at `-5` and made an infeasible model Optimal.
     #[test]
     fn issue_3_huge_upper_bound_does_not_loosen_the_lower_bound() {
         for upper in [f64::MAX, f32::MAX as f64, 1e10, f64::INFINITY] {
@@ -73,10 +70,9 @@ mod regression_tests {
                 );
             }
         }
-        // And a lower bound of zero is held to within the absolute tolerance,
-        // not to the round-off of the upper bound: min y with y ≥ 1 + 1e6 x
-        // wants x as low as it may go, and x = -1e-6 (inside a tolerance of
-        // 1e-2, the round-off of 1e12) would give y = 0 instead of 1.
+        // A lower bound of zero is held to the absolute tolerance, not to the
+        // upper bound's round-off: min y with y ≥ 1 + 1e6 x pushes x down, and
+        // x = -1e-6 (inside 1e-2, the round-off of 1e12) would give y = 0.
         for upper in [f64::MAX, 1e12, f64::INFINITY] {
             for presolve in [true, false] {
                 let mut problem = Problem::new(OptimizationDirection::Minimize);
@@ -101,14 +97,11 @@ mod regression_tests {
         }
     }
 
-    /// Issue #3 in the ratio test (C3-16 of the solver review): `max x` s.t.
-    /// `-3x + y <= 1`, `0 <= x <= f64::MAX`, `0 <= y <= 1` is unbounded, as
-    /// HiGHS reports it. The bound of `f64::MAX` was only kept out of the
-    /// starting vertex, so the primal simplex moved `x` onto it, the row's
-    /// activity overflowed, and the boundary reported
-    /// `InternalError("... violates constraint row 0 by inf")`. A bound at or
-    /// beyond 2^52 on its side of infinity is now infinite for the whole
-    /// solve.
+    /// Issue #3 in the ratio test: `max x` s.t. `-3x + y <= 1`,
+    /// `0 <= x <= f64::MAX`, `0 <= y <= 1` is unbounded. A bound at or beyond
+    /// 2^52 on its side of infinity is infinite for the whole solve; one kept
+    /// only out of the starting vertex let the primal simplex move `x` onto
+    /// it and overflow the row into an `InternalError`.
     #[test]
     fn huge_bound_on_an_improving_ray_is_unbounded() {
         for upper in [f64::MAX, 1e20, f64::INFINITY] {
@@ -130,12 +123,10 @@ mod regression_tests {
         }
     }
 
-    /// The bound infinity is 2^52 (`INFINITE_BOUND`), not HiGHS's default
-    /// of 1e20, and this pins what that means on both sides of it: a bound
-    /// from 2^52 on is no bound at all, so `max x` with `x ≤ 5e15` is
-    /// unbounded (HiGHS at its default returns 5e15) and a solution can lie
-    /// beyond such a bound, while a bound below it binds. The reason for the
-    /// choice is the next test.
+    /// The bound infinity is 2^52 (`INFINITE_BOUND`), pinned on both sides: a
+    /// bound from 2^52 on is no bound at all, so `max x` with `x ≤ 5e15` is
+    /// unbounded and a solution can lie beyond such a bound, while a bound
+    /// below it binds. The next test gives the reason for the choice.
     #[test]
     fn a_bound_from_2_pow_52_is_infinite_and_one_below_binds() {
         let two_52 = 2.0f64.powi(52);
@@ -180,15 +171,13 @@ mod regression_tests {
         }
     }
 
-    /// Why the bound infinity is 2^52 and not 1e20: a bound in between that
-    /// stands for infinity, as `i64::MAX` does in issue #3, must not change
-    /// the answer, and it does once a var sits at it, since a row beside such
-    /// a value is held to the round-off of its magnitude, units at 2^52
-    /// (`INFINITE_BOUND` gives the measurement). `min x0 + x1 + 2 x2` s.t.
-    /// `x0 + 2 x1 + 2 x2 >= 9`, `x1 ∈ [4, 10]` has the optimum -1 with `x0`
-    /// and `x2` free; written with bounds of `±H` it came back -2, 16 or 0
-    /// with a threshold of 1e20, and issue #3's model with `z ≤ 5e15` or
-    /// `1e16` an `InternalError` (a row violated by 1 or 2 units).
+    /// Why the bound infinity is 2^52 and not larger, such as 1e20: a bound
+    /// above it that stands for infinity, as `i64::MAX` does in issue #3,
+    /// must not change the answer, and it would once a var sat at it, since a
+    /// row beside such a value is held to the round-off of its magnitude,
+    /// units at 2^52. `min x0 + x1 + 2 x2` s.t. `x0 + 2 x1 + 2 x2 >= 9`,
+    /// `x1 ∈ [4, 10]` keeps its optimum -1 with `x0` and `x2` written as
+    /// `[-H, H]`, and issue #3's model with `z ≤ H` keeps its 420.
     #[test]
     fn a_bound_from_2_pow_52_standing_for_infinity_keeps_the_answer() {
         for h in [5e15, 1e16, 1e17, 1e19, i64::MAX as f64] {
@@ -233,21 +222,13 @@ mod regression_tests {
         }
     }
 
-    /// A var whose range lies beyond 2^52 (a lower bound of 5e15, or 2^52
-    /// itself) with an upper bound standing for infinity (`f64::MAX`,
-    /// `i64::MAX`, 1e20): `max x + y - 2z` s.t. `x + 2y - z <= 7`,
-    /// `-3x + y + z <= 1`, `y ∈ [0, 10]`, `z` free, has its optimum at `x`
-    /// on its lower bound, `y = 0` and `z = x - 7` (objective `14 - x`), and
-    /// its mirror (`min` with `x ∈ [-f64::MAX, -5e15]`) is infeasible. The
-    /// far bound stayed as written because the var's whole range lay beyond
-    /// the threshold, so the engine started `x` on it: at `f64::MAX` the
-    /// rows overflowed (a panic on a NaN in the primal ratio test, and
-    /// `InternalError("basis too ill-conditioned ...")` for the mirror), and
-    /// at `i64::MAX` or 1e20 the answer came back 14 short of the optimum
-    /// (found by the third review of R0; 1dcd664 solved all of them). Each
-    /// side of a range is now judged on its own, so the far bound is
-    /// infinite and the model is the one written with `f64::INFINITY`, to
-    /// the bit.
+    /// A var whose whole range lies beyond 2^52 (a lower bound of 5e15, or
+    /// 2^52 itself) still takes its far bound (`f64::MAX`, `i64::MAX`, 1e20)
+    /// as infinite: each side of a range is judged on its own, so the model
+    /// solves to the bit as if written with `f64::INFINITY`, and with the
+    /// bounds mirrored (`x ∈ [-f64::MAX, -5e15]`) it is infeasible. Kept as
+    /// written, the far bound became the starting point of `x`, overflowing
+    /// the rows or giving an answer 14 short.
     #[test]
     fn a_var_beyond_2_pow_52_takes_its_far_bound_as_infinite() {
         let two_52 = 2.0f64.powi(52);
@@ -315,19 +296,13 @@ mod regression_tests {
         }
     }
 
-    /// The other side of the per-side rule of the last test: only a bound
-    /// that leaves the var room toward it can stand for infinity. A var
-    /// fixed beyond 2^52 stays fixed (as `fix_var` fixes a var at a value
-    /// the solve reported there), and a range that is empty beyond it stays
-    /// infeasible, where making its far bound infinite would have turned
-    /// `x ∈ [5e15, 5e15]` into `x ≥ 5e15` and `x ∈ [6e15, 5e15]` into a
-    /// feasible var. Any other bound from 2^52 on its side of infinity is
-    /// infinite, also beside a bound out there: `max x` with
-    /// `x ∈ [5e15, 1e16]` is `Unbounded` as with `x ∈ [0, 1e16]` (the band
-    /// trade-off of `a_bound_from_2_pow_52_is_infinite_and_one_below_binds`;
-    /// 1dcd664 returned 1e16). Each case is also run in its mirror image
-    /// (`x → -x`: the bounds negated and swapped, `x`'s coefficients
-    /// negated), where a lower bound is the one that could be taken for
+    /// The limit of the per-side rule of the last test: only a bound that
+    /// leaves the var room toward it stands for infinity. A var fixed beyond
+    /// 2^52 stays fixed (as `fix_var` fixes one at a value the solve reported
+    /// there), and an empty range beyond it stays infeasible. Any other bound
+    /// from 2^52 on its side of infinity is infinite, also beside a bound out
+    /// there: `max x` with `x ∈ [5e15, 1e16]` is `Unbounded`. Each case also
+    /// runs mirrored (`x → -x`), where the lower bound could be taken for
     /// infinity.
     #[test]
     fn a_var_fixed_or_empty_beyond_2_pow_52_keeps_its_bounds() {
@@ -336,9 +311,9 @@ mod regression_tests {
         let two_52 = 2.0f64.powi(52);
         for milp in [false, true] {
             for presolve in [true, false] {
-                // `x + y` s.t. `x + y >= 1`, `y ∈ [0, 10]`, `x ∈ [lo, hi]`,
-                // and with `mirror` the same model in `x' = -x`: the answer
-                // is `x' = -x`, and an outcome without one the same.
+                // `x + y` s.t. `x + y >= 1`, `y ∈ [0, 10]`, `x ∈ [lo, hi]`;
+                // with `mirror`, the same model in `x' = -x`, its answer mapped
+                // back to `x`.
                 let solve = |direction, (lo, hi): (f64, f64), mirror: bool| {
                     let (sign, lo, hi) = if mirror {
                         (-1.0, -hi, -lo)
@@ -393,13 +368,11 @@ mod regression_tests {
         }
     }
 
-    /// Issue #3 through a basis reload (C4-16 of the solver review). Two
-    /// free vars written with `±f64::MAX` bounds were seeded at zero, but a
-    /// reload of a basis in which they are non-basic put them back at their
-    /// finite lower bound, `-f64::MAX`: here the reload of the root basis
-    /// after the warm-start hint is evaluated, after which `x + z` overflows
-    /// to `-inf` in `x + z <= 5`. The bounds are infinite for the whole solve
-    /// now, so every load puts the vars at zero.
+    /// Issue #3 through a basis reload: bounds of `±f64::MAX` are infinite
+    /// for the whole solve, so reloading a basis in which the free `x` and
+    /// `z` are non-basic (the root basis, after the warm-start hint is
+    /// evaluated) puts them at zero, not at `-f64::MAX`, where `x + z`
+    /// overflows to `-inf` in `x + z <= 5`.
     #[test]
     fn huge_bounds_stay_infinite_across_a_basis_reload() {
         for presolve in [true, false] {
@@ -430,13 +403,10 @@ mod regression_tests {
     }
 
     /// `fix_var` accepts a value the solve reported (issue #47's contract)
-    /// when it lies beyond a bound from 2^52 on, which the solve takes as
-    /// infinite: `x ≤ 5e15` is no bound, the row stops `x` at 1e16, and
-    /// fixing `x` there restates the answer. The MIP path checked the fix
-    /// against the bound as written and refused it as `Infeasible`, where
-    /// the LP path, checking against the engine's bounds, accepted it (found
-    /// by the second review of R0). The bound is now made infinite where the
-    /// var is added, so no check can see it as written.
+    /// beyond a bound from 2^52 on, which the solve takes as infinite:
+    /// `x ≤ 5e15` is no bound, the row stops `x` at 1e16, and fixing `x`
+    /// there restates the answer, on the LP and the MIP path. The bound is
+    /// made infinite where the var is added, so no check sees it as written.
     #[test]
     fn fix_var_accepts_a_reported_value_beyond_a_bound_from_2_pow_52() {
         for milp in [false, true] {
@@ -513,11 +483,10 @@ mod regression_tests {
         }
     }
 
-    /// One variant of the model reported in issue #44: maximise `-x1` subject
-    /// to `8.510167104926385 x2 == 0` (when `first_eq`) and `-x1 + tiny x2 ==
-    /// 0`, with `x1` in `[-1, 0]`, `x2` in `[0, 1]` and, when `integer_var`, an
-    /// integer variable fixed at zero by its own bounds that appears in neither
-    /// the objective nor a row.
+    /// A variant of issue #44's model: maximise `-x1` s.t.
+    /// `8.510167104926385 x2 == 0` (when `first_eq`) and `-x1 + tiny x2 == 0`,
+    /// `x1 ∈ [-1, 0]`, `x2 ∈ [0, 1]`, and, when `integer_var`, an integer var
+    /// fixed at zero by its bounds and in no row or objective.
     struct Issue44 {
         tiny: f64,
         integer_var: bool,
@@ -549,22 +518,15 @@ mod regression_tests {
         (sol.objective(), sol.var_value(x1), sol.var_value(x2))
     }
 
-    /// <https://github.com/Specy/microlp/issues/44>: `solve()` returns
-    /// `InternalError("exactly integral solution failed feasibility validation
-    /// after slack-basis retry")` on a feasible, bounded MILP. `x1 = x2 = 0`
-    /// satisfies both equalities and every bound, and it is the only such
-    /// point, so the answer is `Ok` with objective `0`.
-    ///
-    /// The report rules out a magnitude threshold in the small coefficient: the
-    /// same model solves at `-1e-7`, `-1e-8`, `-1e-9` and `-1e-12`, and the
-    /// reported coefficient itself solves once either the integer variable or
-    /// the first row is dropped.
+    /// <https://github.com/Specy/microlp/issues/44>: a feasible, bounded MILP
+    /// failed with `InternalError`. Its only feasible point is `x1 = x2 = 0`,
+    /// so the answer is `Ok` with objective `0`.
     #[test]
     fn issue_44_feasible_bounded_milp_solves() {
         let tiny = -1.190834764418229e-8;
 
-        // The reported model, and the coefficients around it that already
-        // solve. In each the only feasible point is x1 = x2 = 0.
+        // The reported model and its neighbouring coefficients; in each the
+        // only feasible point is x1 = x2 = 0.
         for t in [tiny, -1e-7, -1e-8, -1e-9, -1e-12] {
             let (obj, x1, x2) = solve_issue_44(Issue44 {
                 tiny: t,
@@ -588,10 +550,9 @@ mod regression_tests {
             "pure LP: got obj={obj:e} x1={x1:e} x2={x2:e}, expected all zero"
         );
 
-        // Without the first row, x2 is free to reach its upper bound and the
-        // optimum is -tiny, reached at x1 = tiny, x2 = 1. Asserting it guards
-        // against "fixing" the model above by dropping small coefficients from
-        // the ratio tests, which would answer 0 here.
+        // Without the first row, x2 reaches its upper bound and the optimum is
+        // -tiny at x1 = tiny, x2 = 1: a fix that dropped small coefficients
+        // from the ratio tests would answer 0 here.
         let (obj, x1, x2) = solve_issue_44(Issue44 {
             tiny,
             integer_var: true,
@@ -604,16 +565,11 @@ mod regression_tests {
         );
     }
 
-    /// <https://github.com/Specy/microlp/issues/47>: `Solution::fix_var`
-    /// returns `Infeasible` when a variable that appears in an equality row is
-    /// fixed to the value the solve just reported for it. The row pins `x` to
-    /// its rhs, `solve` returns that value, and fixing `x` to it only restates
-    /// what the row already forces, so the edited model has the same feasible
-    /// point as the original.
-    ///
-    /// The `Le` row is the control: the same value through a row that is not an
-    /// equality is accepted. The third case moves the fixed value off the
-    /// variable's bounds and away from zero, so neither explains the failure.
+    /// <https://github.com/Specy/microlp/issues/47>: `Solution::fix_var` must
+    /// accept the value the solve just reported for a var in an equality row
+    /// (it returned `Infeasible`), since the fix only restates what the row
+    /// forces. The `Le` row is a control, and the third case moves the value
+    /// off the var's bounds and away from zero.
     #[test]
     fn issue_47_fix_var_accepts_the_value_solve_returned() {
         for (op, rhs, hi) in [
@@ -659,13 +615,11 @@ mod regression_tests {
         }
     }
 
-    /// Issue #47 in general: a value `solve` reports may sit outside the
-    /// var's bounds by round-off, within the contract (here
-    /// `0.2999999999999998` on `[0.3, 5.3]`), and `fix_var` compared it with
-    /// the bounds exactly and refused it as `Infeasible`, on the LP and the
-    /// MIP path alike. So did a value within tolerance of a bound presolve
-    /// had tightened (`2 x = 6` fixes `x` at 3). A value within the bound
-    /// tolerance fixes the var at that bound; one beyond it is refused.
+    /// Issue #47 in general: a reported value may sit outside the var's
+    /// bounds by round-off (here `0.2999999999999998` on `[0.3, 5.3]`), and a
+    /// fix may lie within tolerance of a bound presolve tightened (`2 x = 6`
+    /// fixes `x` at 3). A value within the bound tolerance fixes the var at
+    /// that bound, on the LP and the MIP path; one beyond it is `Infeasible`.
     #[test]
     fn issue_47_fix_var_accepts_a_value_within_the_bound_tolerance() {
         for milp in [false, true] {
@@ -718,12 +672,10 @@ mod regression_tests {
         }
     }
 
-    /// Fixing an integer var: a value within the integrality tolerance of an
-    /// integer fixes it there; any other value is incompatible with its
-    /// domain (`Infeasible`, as `fix_var` documents). A fix at `2.0000005`
-    /// used to end in an `InternalError` with presolve off (the fixed var is
-    /// not integral, and branching skips a var whose range is under half a
-    /// unit) and in a silently different value with presolve on.
+    /// Fixing an integer var at a value within the integrality tolerance of
+    /// an integer fixes it at that integer: kept at `2.0000005`, the var is
+    /// not integral, yet branching skips a var whose range is under half a
+    /// unit. Any other value is `Infeasible`, as `fix_var` documents.
     #[test]
     fn fix_var_on_an_integer_var_respects_its_domain() {
         for presolve in [true, false] {
@@ -754,13 +706,12 @@ mod regression_tests {
         }
     }
 
-    /// A DC network with switchable lines, the model of
-    /// [`issue_48_switchable_dc_network_solves`]: per line
+    /// The switchable DC network of issue #48: per line
     /// `(from, to, susceptance, rating)`, a flow within its rating and a
-    /// binary `on` whose big-M rows tie the flow to the bus angles (free, but
+    /// binary `on` whose big-M rows tie the flow to the bus angles (free but
     /// for the reference bus 0) while the line is on; per bus, generation
-    /// within `gen_max` at `gen_cost` less `demand` equals the flow out less
-    /// the flow in; at most `max_off` lines off.
+    /// (within `gen_max`, at `gen_cost`) less `demand` equals the flow out
+    /// less the flow in; at most `max_off` lines off.
     fn switchable_dc_network(
         lines: &[(usize, usize, f64, f64)],
         demand: &[f64],
@@ -834,17 +785,11 @@ mod regression_tests {
         problem
     }
 
-    /// <https://github.com/Specy/microlp/issues/48>: `solve()` returns
-    /// `InternalError("Singular matrix")` on a small, feasible, bounded MILP —
-    /// a DC network with switchable lines (8 buses, 10 lines, at most one
-    /// switched out), whose big-M on/off rows spread the coefficients from
-    /// 4e-2 to 1.1e3. HiGHS and SCIP prove the same model optimal at
-    /// 23.339329.
-    ///
-    /// The report traces it to the dual ratio test accepting a pivot of
-    /// |alpha| = 2.2e-10 — just above the `1e-10` floor, and zero in exact
-    /// arithmetic — after which the refactorization is singular and the
-    /// slack-basis retry re-derives a singular basis of its own.
+    /// <https://github.com/Specy/microlp/issues/48>: a switchable DC network
+    /// (8 buses, 10 lines, at most one off) whose big-M rows spread the
+    /// coefficients from 4e-2 to 1.1e3 must solve to its proven optimum,
+    /// 23.339329. A dual pivot of 2.2e-10, zero in exact arithmetic, made the
+    /// basis singular (`InternalError("Singular matrix")`).
     #[test]
     fn issue_48_switchable_dc_network_solves() {
         // (from, to, susceptance, rating)
@@ -873,7 +818,7 @@ mod regression_tests {
 
         assert!(
             (sol.objective() - 23.339329).abs() < 1e-4,
-            "objective {} does not match the 23.339329 HiGHS and SCIP prove optimal",
+            "objective {} does not match the proven optimum 23.339329",
             sol.objective()
         );
     }
@@ -900,22 +845,14 @@ mod regression_tests {
             .objective())
     }
 
-    /// A switchable network like issue 48's, from a random search over such
-    /// networks with susceptances from `1e-3` to `1e6` (HiGHS proves it
-    /// optimal at 18.979188), whose lines of `1.05e-3` and `2e5` put big-M
-    /// rows of very different scales into its bases. At two of its nodes the
-    /// row of the basis inverse that proves the node infeasible gives a free
-    /// bus angle, basic, a coefficient whose only term comes from a row whose
-    /// multiplier is zero for the exact row: the refinement leaves it as its
-    /// own noise, some `1e-46` against multipliers of up to 4, and the
-    /// coefficient is that noise times the angle's entry. No floor relative
-    /// to the coefficient's terms covers it, those terms being the noise too;
-    /// the bound the refinement puts on the multipliers' error, their last
-    /// correction (`3.9e-31`), does. Counted only below the `f64` round-off
-    /// of its terms, on a row refined once, the coefficient voided those
-    /// proofs, and the MILP failed loudly with presolve on and off; counted
-    /// only within the round-off of the compensated sums, it failed the same
-    /// way.
+    /// A switchable network like issue 48's (proven optimum 18.979188) whose
+    /// lines of `1.05e-3` and `2e5` put big-M rows of very different scales
+    /// into its bases. At two nodes the infeasibility proof gives a basic free
+    /// bus angle a coefficient whose only term comes from a row whose exact
+    /// multiplier is zero, left by the refinement as noise (`1e-46` against
+    /// multipliers up to 4). Only the bound the refinement puts on the
+    /// multipliers' error, their last correction (`3.9e-31`), counts it as
+    /// zero; a floor relative to its terms, noise too, left the proofs void.
     #[test]
     fn a_switchable_network_whose_node_proofs_need_the_multipliers_error_solves() {
         let lines = [
@@ -943,25 +880,19 @@ mod regression_tests {
                     });
             assert!(
                 (objective - 18.979188).abs() < 1e-4,
-                "presolve {presolve}: objective {objective} does not match the 18.979188 HiGHS \
-                 proves optimal"
+                "presolve {presolve}: objective {objective} does not match the proven optimum \
+                 18.979188"
             );
         }
     }
 
-    /// An infeasible switchable network like issue 48's (HiGHS agrees), from
-    /// the same search, with lines from `3.15e-3` to `4.13e5`. Its
-    /// certificates give free bus angles, basic, coefficients whose terms
-    /// come from rows whose multipliers are zero for the exact row of the
-    /// basis inverse and which the refinement leaves as its own noise, above
-    /// any floor relative to the coefficients' terms, which are that noise
-    /// too. The second step of the refinement brings them within the bound it
-    /// puts on the multipliers' error, its own correction; refined once, with
-    /// that correction as the bound, some lie beyond it, and counted only
-    /// within the round-off of the compensated sums, all do: either way the
-    /// proofs failed and the solve failed loudly (with presolve on and off).
-    /// Counted only below the `f64` round-off of their terms, on a row
-    /// refined once, the solve failed loudly without presolve.
+    /// An infeasible switchable network like issue 48's, with lines from
+    /// `3.15e-3` to `4.13e5`. Its certificates give basic free bus angles
+    /// coefficients that are refinement noise, from rows whose exact
+    /// multipliers are zero, above any floor relative to their terms. Only
+    /// the row refined twice brings them within the bound the refinement puts
+    /// on the multipliers' error, its last correction; refined once, some lie
+    /// beyond it, which voided the proofs and failed the solve.
     #[test]
     fn an_infeasible_switchable_network_whose_proof_needs_the_twice_refined_row() {
         let lines = [

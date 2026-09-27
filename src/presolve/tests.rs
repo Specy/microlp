@@ -113,9 +113,8 @@ fn fractional_integer_range_is_infeasible() {
 
 #[test]
 fn singleton_row_becomes_bound_and_is_dropped() {
-    // 0.5x <= 2.5  ->  x <= 5, row gone: the engine may leave the bound
-    // by its tolerance (1e-7), and with a coefficient of 0.5 the row,
-    // held to half of 1e-7, still holds there.
+    // 0.5x <= 2.5 -> x <= 5, row gone: x may pass the bound by its tolerance
+    // (1e-7), which the row sees halved, within its budget of half of 1e-7.
     let cons = vec![(csvec(1, &[(0, 0.5)]), ComparisonOp::Le, 2.5)];
     let pre = run_lp(&[0.0], &[f64::INFINITY], &cons).unwrap();
     assert!(pre.constraints.is_empty());
@@ -135,11 +134,10 @@ fn singleton_row_stays_when_a_bound_would_hold_it_looser() {
 
 #[test]
 fn singleton_row_stays_when_its_round_off_would_break_another_row() {
-    // With x1 fixed at 1, `x1 - 1e-7 x2 = 0.9999999` pins x2 at
-    // 1 - 5e-10: exact to the row's own round-off (5e-17), but then
-    // `-200 x2 = -200` misses by 1e-7. The tiny row is kept, the -200
-    // row fixes x2 = 1 and the tiny row folds to a 5e-17 residual: the
-    // point the simplex finds when it balances both rows.
+    // With x1 fixed at 1, `x1 - 1e-7 x2 = 0.9999999` would pin x2 at
+    // 1 - 5e-10 (exact to its round-off), but then `-200 x2 = -200` misses by
+    // 1e-7. So the -200 row fixes x2 = 1 instead, and the tiny row folds to a
+    // 5e-17 residual: the point the simplex finds when it balances both rows.
     let cons = vec![
         (
             csvec(2, &[(0, 1.0), (1, -1e-7)]),
@@ -155,10 +153,9 @@ fn singleton_row_stays_when_its_round_off_would_break_another_row() {
 
 #[test]
 fn singleton_eq_fixes_var_and_substitutes() {
-    // x == 3; x + y <= 10  ->  x fixed; the second row, `y <= 7` to
-    // presolve, stays (a unit coefficient cannot become a bound, see
-    // `singleton_row_stays_when_a_bound_would_hold_it_looser`) and is
-    // emitted as written, fixed term included.
+    // x == 3; x + y <= 10 -> x fixed; the second row (`y <= 7` to presolve)
+    // stays, as a unit coefficient cannot become a bound, and is emitted as
+    // written, fixed term included.
     let cons = vec![
         (csvec(2, &[(0, 1.0)]), ComparisonOp::Eq, 3.0),
         (csvec(2, &[(0, 1.0), (1, 1.0)]), ComparisonOp::Le, 10.0),
@@ -454,12 +451,10 @@ fn infinite_rhs_le_row_is_dropped_not_crashed() {
 
 #[test]
 fn forcing_row_is_not_applied_to_a_term_below_its_roundoff() {
-    // -x0 - 1e-7·x1 = -2^28 with x0 in [2^28 - 1, 2^28] and x1 in [0, 0.25]:
-    // the minimum activity equals the bound to round-off (the row's round-off
-    // is 5e-6, x1's whole term range is 2.5e-8), so the row looks forcing
-    // wherever x1 sits. It forces nothing about x1, and fixing x1 at its
-    // extreme 0.25 made the second row (-x1 = 0) inconsistent: a feasible
-    // model declared Infeasible by presolve alone.
+    // -x0 - 1e-7·x1 = -2^28 with x0 in [2^28 - 1, 2^28] and x1 in [0, 0.25]
+    // looks forcing wherever x1 sits, as x1's whole term range (2.5e-8) is
+    // below the row's round-off (5e-6). It forces nothing about x1: fixing x1
+    // at 0.25 would contradict the second row, -x1 = 0.
     let big = 268435456.0; // 2^28
     let cons = vec![
         (csvec(2, &[(0, -1.0), (1, -1e-7)]), ComparisonOp::Eq, -big),

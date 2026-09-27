@@ -13,40 +13,25 @@ use super::tolerances::{float_eq, slack_bounds, trivial_row_verdict};
 /// lower bound at or below `-INFINITE_BOUND`, an upper bound at or above it)
 /// stands for infinity, and is made infinite when the var is added to a
 /// problem ([`entry_bounds`], called by `Problem`'s `internal_add_var`, which
-/// stores the bounds so): the one data-level infinity of the crate, as
-/// HiGHS's `infinite_bound` (applied by `assessBounds` to the bounds a model
-/// is given with, and written into the model, highs/lp_data/HighsLpUtils.cpp).
+/// stores the bounds so): the one data-level infinity of the crate. It is
+/// made infinite there, not only kept out of the starting vertex, since a
+/// basis reload or a ratio test would otherwise put a var at such a bound,
+/// and one of `f64::MAX` overflows the var's rows.
 ///
-/// HiGHS lets `infinite_bound` be set anywhere from 1e15 up and defaults to
-/// 1e20 (highs/lp_data/HighsOptions.h). This engine takes 2^52, below
-/// `i64::MAX`, because of its contract: a row is held to the round-off of its
-/// magnitude (`row_tolerance`, 1e-14 of `|b| + Σ|a_j x_j|`), so beside a var
-/// at a bound `B` with a coefficient `a` a row is held to about `1e-14 |a| B`
-/// only, and with `|a|` near one, from 2^52 on the spacing of `f64` is one or
-/// more, so no fraction of the row's data survives. A huge bound that stands
-/// for infinity, as `f64::MAX`, `f32::MAX` and `i64::MAX` do in issue #3,
-/// then changes the answer as soon as a var sits at it. Measured by writing
-/// every infinite bound of the continuous vars of the differential-fuzz
-/// corpus (5,234 of its 20,000 models have one) as `±H`: with a threshold of
-/// 1e20, 5 or 6 models came back wrong for each `H` from 5e15 to `i64::MAX`
-/// (an LP whose optimum is -1 came back -2, 16 or 0, an infeasible MILP came
-/// back optimal at `H`), and issue #3's model with `z ≤ 1e16` an
-/// `InternalError`; with 2^52, none. Below the threshold the
-/// magnitude-relative contract still meets a var at a bound from about 1e15
-/// (2 and 4 models at `H` = 1e15 and 4e15, and more at 1dcd664). The price is
-/// the band `[2^52, 1e20)`: a bound there that is meant as a bound is none
-/// here, so `max x` with `x ≤ 5e15` is `Unbounded` (HiGHS at its default
-/// returns 5e15), and a solution can lie beyond such a bound (both pinned in
-/// `src/tests/regressions.rs`). The threshold, like HiGHS's, is on the bound
-/// as given, not on `|a| B`: the corpus the measurement ran on has
-/// coefficients near one, and a var whose rows could resolve a bound in the
-/// band loses it all the same (`max x` s.t. `1e-8 x ≤ 1e9`, `x ≤ 1e16` gives
-/// `x = 1e17`, where HiGHS at its default and 1dcd664 give 1e16).
-///
-/// A seeding-only rule once kept such a bound out of the starting vertex
-/// alone, but a basis reload put the var back at it, and the ratio tests
-/// honoured it: the primal simplex moved a var to a bound of `f64::MAX` and
-/// overflowed its rows (C3-16 of the solver review).
+/// The value follows from the contract: a row is held to the round-off of its
+/// magnitude (`row_tolerance`, `1e-14` of `|b| + Σ|a_j x_j|`), so beside a
+/// var at a bound `B` with a coefficient `a` it is held to about
+/// `1e-14 |a| B` only, and with `|a|` near one, from 2^52 on the spacing of
+/// `f64` is one or more, so no fraction of the row's data survives. A huge
+/// bound that stands for infinity, as `f64::MAX`, `f32::MAX` and `i64::MAX`
+/// do in issue #3, would then change the answer as soon as a var sits at it;
+/// bounds from about `1e15` up to the threshold still can. The price: a bound
+/// of 2^52 or more that is meant as a bound is none here, so `max x` with
+/// `x ≤ 5e15` is `Unbounded`, and a solution can lie beyond such a bound
+/// (both pinned in `src/tests/regressions.rs`). The threshold is on the bound
+/// as given, not on `|a| B`, so a var whose rows could resolve a bound beyond
+/// it loses the bound all the same (`max x` s.t. `1e-8 x ≤ 1e9`, `x ≤ 1e16`
+/// gives `x = 1e17`).
 pub(crate) const INFINITE_BOUND: f64 = 4_503_599_627_370_496.0; // 2^52
 
 /// Power-of-two row equilibration keeps the largest structural coefficient
@@ -75,18 +60,15 @@ fn equilibration_scale(coeffs: &CsVec, rhs: f64, is_fixed: impl Fn(usize) -> boo
     }
 }
 
-/// Number of alternating geometric column/row passes used to derive the
-/// column scales (the geometric-mean iteration of HiGHS's
-/// `equilibrationScaleMatrix` and SoPlex's `SPxGeometSC`; four passes are
-/// enough for the scales to settle on the coefficient ranges this solver
-/// sees).
+/// Number of alternating geometric-mean column/row passes used to derive the
+/// column scales; four are enough for the scales to settle on the coefficient
+/// ranges this solver sees.
 const SCALING_PASSES: usize = 4;
 
 /// If every structural coefficient magnitude lies within
 /// `[1 / NO_SCALING_RANGE, NO_SCALING_RANGE]`, the matrix is already well
 /// scaled and column scaling is skipped: every column factor is one and the
-/// engine works on the user's own units, so ordinary models take exactly the
-/// path they always took.
+/// engine works on the user's own units.
 const NO_SCALING_RANGE: f64 = 8.0;
 
 /// Power-of-two column scales `s_j` for the structural columns: the engine
@@ -97,26 +79,21 @@ const NO_SCALING_RANGE: f64 = 8.0;
 /// coefficient magnitudes, iterated against the corresponding row factors so
 /// that a coefficient that is tiny only because its row or column is written
 /// in awkward units ends up near one. Only the column factors are returned:
-/// rows are then equilibrated by [`equilibration_scale`] as before, which
-/// makes the row factor part of the same power-of-two family.
+/// rows are then equilibrated by [`equilibration_scale`], which makes the row
+/// factor part of the same power-of-two family.
 ///
 /// Powers of two are exact: scaling and unscaling a value is a change of
 /// exponent, so no user datum is rounded, integrality of `s_j x'_j` is
 /// decidable exactly, and a bound change expressed in user units maps to
 /// exactly one internal bound.
 ///
-/// The factors are not bounded to HiGHS's `2^±20`
-/// (`allowed_matrix_scale_factor`, highs/lp_data/HConst.h). HiGHS refuses a
-/// matrix entry of 1e15 or more and drops one of 1e-9 or less
-/// (`assessMatrix`, highs/util/HighsMatrixUtils.cpp), so factors within
-/// `2^±20` are all its input needs. This engine takes any finite
-/// coefficient, and its dual ratio test counts an entry more than
-/// `ENTRY_ROUNDOFF` below the largest of its row as round-off, so a row that
-/// bounded factors leave wider than that loses its genuine entries:
-/// `min -g + y` s.t. `1e30 g + y >= 2e30`, `g ∈ [0, 1]`, `y >= 0`, came
-/// back `Infeasible` with the factors bounded to `2^±20`, the bound C4-14 of
-/// the solver review asked for (kept in `src/tests/magnitudes.rs`). The
-/// exponent is only kept within ±1000, inside the range of `f64`.
+/// The factors are not bounded but for keeping the exponent within ±1000,
+/// inside the range of `f64`: the engine takes any finite coefficient, and
+/// its dual ratio test counts an entry more than `ENTRY_ROUNDOFF` below the
+/// largest of its row as round-off, so a row that bounded factors leave wider
+/// than that loses its genuine entries. With the factors bounded to `2^±20`,
+/// `min -g + y` s.t. `1e30 g + y >= 2e30`, `g ∈ [0, 1]`, `y >= 0` (a test in
+/// `src/tests/magnitudes.rs`) would come back `Infeasible`.
 ///
 /// A column is left at one when scaling it would leave the finite range of
 /// `f64` for any of its coefficients, its bounds or its objective coefficient.
@@ -248,34 +225,22 @@ pub(crate) fn prepare_row(
 }
 
 /// The bounds a var enters the solve with ([`INFINITE_BOUND`]): each bound at
-/// or beyond the threshold on its side of infinity (a lower bound at or below
-/// `-INFINITE_BOUND`, an upper bound at or above it) made infinite, each side
-/// on its own, as HiGHS's `assessBounds` converts them
-/// (highs/lp_data/HighsLpUtils.cpp). A bound on the other side is data
-/// wherever it lies: `x ∈ [5e15, f64::MAX]` enters as `x ≥ 5e15`, a var that
-/// lives beyond the threshold, and `x ∈ [5e15, 1e16]` as `x ≥ 5e15` too,
-/// since an upper bound in the band is infinite whatever the lower one. HiGHS,
-/// whose infinity starts at its threshold, refuses a lower bound out there
-/// after converting the upper one; here a value out there is data, as
-/// `fix_var` fixes a var at one the solve reported. Such a var's far bound
-/// once stayed as written, the whole range being beyond the threshold, so a
-/// bound of `f64::MAX` standing for infinity became the var's starting value
-/// and overflowed its rows (found by the third review of R0; the seeding rule
-/// that had kept it out of the starting vertex was gone).
+/// or beyond the threshold on its side of infinity made infinite, each side
+/// on its own. A bound on the other side is data wherever it lies, as
+/// `fix_var` may fix a var at a value the solve reported out there:
+/// `x ∈ [5e15, f64::MAX]` enters as `x ≥ 5e15`, and so does
+/// `x ∈ [5e15, 1e16]`, whose upper bound is beyond the threshold too.
 ///
 /// A range that is a point or empty (`min >= max`) keeps its bounds as
 /// written: its far bound does not lie beyond its near one, so it is the
 /// var's value or a contradiction, not a stand-in for infinity, and a var
-/// fixed out there stays fixed, an empty range out there stays infeasible.
-/// HiGHS never widens such a range either: it converts a bound of one only
-/// when that bound lies beyond the threshold, and then the other bound lies
-/// beyond it on the same side too, so HiGHS refuses the model. A NaN bound
-/// fails every comparison and stays NaN, for the solve to refuse.
+/// fixed out there stays fixed, an empty range out there stays infeasible. A
+/// NaN bound fails every comparison and stays NaN, for the solve to refuse.
 ///
 /// Applied once, where a var's bounds enter the crate (`Problem`'s
-/// `internal_add_var` stores them so), so presolve, the engine and every
+/// `internal_add_var` stores them so), so that presolve, the engine and every
 /// check of a value against a bound see the same bounds; not applied to the
-/// bounds presolve derives, which HiGHS does not assess either.
+/// bounds presolve derives.
 pub(crate) fn entry_bounds(min: f64, max: f64) -> (f64, f64) {
     if min >= max {
         return (min, max);

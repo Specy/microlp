@@ -1,11 +1,7 @@
 //! The column ordering of the LU factorization: [`order_simple`], which takes
 //! the columns by their number of entries, the sparsest first, out of the
 //! bucket queue in [`cols_queue`]. `lu_factorize` uses it for every
-//! factorization. (The COLAMD ordering, diagonal matching and block
-//! triangular form minilp carried here were never called and are gone; the
-//! references' factorizations get their sparsity from a singleton phase and
-//! a Markowitz search instead, the place to start if the ordering is ever
-//! improved.)
+//! factorization.
 
 mod cols_queue;
 

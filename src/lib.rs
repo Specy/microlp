@@ -115,6 +115,5 @@ pub use solution::{Solution, SolutionIter};
 pub(crate) use problem::{timed_lp_call, StopReason};
 pub(crate) use solution::SolveState;
 
-/// The crate's internal sparse vector type: one constraint row, or one column
-/// of the constraint matrix, in the user's variable indices.
+/// A sparse constraint row, indexed by the user's variable indices.
 type CsVec = sprs::CsVecI<f64, usize>;

@@ -26,15 +26,12 @@ pub struct Solution {
     pub(crate) termination_reason: TerminationReason,
     pub(crate) state: SolveState,
     pub(crate) last_options: ResumeOptions,
-    /// For an LP solution, the structural values in user units, captured
-    /// (the verified point, see `Solver::reported_values`) when the solution
-    /// was created; the engine stores them in scaled units and converts on
-    /// access, so `Index` needs a place to borrow from. Empty for a MIP
-    /// solution, which borrows from its incumbent.
+    /// For an LP solution, the verified values in user units
+    /// (`Solver::reported_values`), kept because the engine holds them scaled
+    /// and `Index` must borrow them. Empty for a MIP, which uses its incumbent.
     pub(crate) lp_values: Vec<f64>,
-    /// For an LP solution, the objective of `lp_values` in internal
-    /// (minimize) space, so that the reported objective is exactly the
-    /// objective of the reported values.
+    /// For an LP solution, the objective of `lp_values` in internal (minimize)
+    /// space, so the reported objective is exactly that of the reported values.
     pub(crate) lp_objective: f64,
 }
 
@@ -255,17 +252,15 @@ impl Solution {
     /// # Errors
     ///
     /// Returns [`Error::Infeasible`] if `val` is not finite, is outside the
-    /// variable's original bounds (as the solve takes them: a bound of 2^52
-    /// or more on its side of infinity is infinite, see
-    /// [`Problem::add_var`](crate::Problem::add_var)), is incompatible with
-    /// its integer or boolean domain, or leaves the edited problem without a
-    /// feasible assignment.
-    /// Both checks are made under the solve's tolerances, so a value this
-    /// solution reports is always accepted: a value outside a bound by no more
-    /// than [`Tolerances::feasibility`](crate::Tolerances::feasibility)
-    /// allows fixes the variable at that bound, and a value within
-    /// [`Tolerances::integrality_rounding`](crate::Tolerances::integrality_rounding)
-    /// of an integer fixes an integer variable at that integer.
+    /// variable's original bounds, is incompatible with its integer or boolean
+    /// domain, or leaves the edited problem without a feasible assignment.
+    /// A `min <= -2^52` or `max >= 2^52` counts as infinite here too (see
+    /// [`Problem::add_var`](crate::Problem::add_var)), and the bound and domain
+    /// checks allow the solve's tolerances, so any value this solution reports
+    /// is accepted: a value up to [`Tolerances::feasibility`] outside a bound
+    /// is fixed at that bound, and a value within
+    /// [`Tolerances::integrality_rounding`] of an integer is fixed at that
+    /// integer.
     ///
     /// # Panics
     ///

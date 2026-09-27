@@ -1,8 +1,6 @@
-//! Tests for the public solve API, grouped by topic.
-//!
-//! Every group drives the crate exactly as a user would — through [`Problem`],
-//! [`SolveOutcome`] and [`Solution`] — so these are the tests that pin the
-//! behaviour the API promises.
+//! Tests for the public solve API, grouped by topic. Each group drives the
+//! crate as a user would, through [`Problem`], [`SolveOutcome`] and
+//! [`Solution`], to pin the behaviour the API promises.
 
 #[cfg(test)]
 mod common;

@@ -34,13 +34,11 @@ impl std::fmt::Debug for SolveOutcome {
 }
 
 impl SolveOutcome {
-    /// Wrap a finished or interrupted pure-LP engine state. A finished state
-    /// is validated against the problem's own rows and bounds in user units
-    /// (the contract [`Tolerances::feasibility`](crate::Tolerances::feasibility) documents) before it is
-    /// exposed as a [`Solution`]; the engine reports `Finished` only after
-    /// verifying the reported values through the same evaluation, so a
-    /// failure here is an internal contradiction and is reported as
-    /// [`Error::InternalError`] rather than returned as an answer.
+    /// Wraps a pure-LP engine state. A finished one becomes a [`Solution`] only
+    /// if its values meet the problem's rows and bounds in user units (the
+    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility) contract).
+    /// The engine finishes only after that same check, so a failure here is an
+    /// internal contradiction, returned as [`Error::InternalError`].
     pub(crate) fn from_lp_stop(
         direction: OptimizationDirection,
         num_vars: usize,

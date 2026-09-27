@@ -20,11 +20,11 @@ pub(crate) enum PivotChoice {
     /// Apply this pivot.
     Pivot(PivotInfo),
     /// The pivot element at `row` computed through the row and through the
-    /// column disagree (see [`super::PIVOT_AGREEMENT_TOL`]). With pivots stacked on
-    /// the factorization it must be rebuilt before choosing again; on a fresh
-    /// one the entry is noise if `tiny` (relative to the column) and the row
-    /// is then excluded for the column, else the factorization itself is
-    /// unusable.
+    /// column disagree (see [`super::PIVOT_AGREEMENT_TOL`]). With pivots
+    /// stacked on the factorization it must be rebuilt before choosing again;
+    /// on a fresh one the entry is noise if `tiny` (relative to the column)
+    /// and the row is then excluded for the column, else the factorization
+    /// itself is unusable.
     Inconsistent { row: usize, tiny: bool },
 }
 
@@ -47,18 +47,12 @@ pub(crate) struct PivotElem {
     /// (`col_coeffs[row]`): the primal step, the eta file and both
     /// steepest-edge updates use it, so that each is consistent with the
     /// column they apply it with (the eta then represents exactly the basis
-    /// the column describes). As HiGHS: `theta_primal = .../alpha_col` and
-    /// the factor update's `aq->array[iRow]` (`HEkkDual::updatePrimal`,
-    /// `HFactor::updatePF`), and the steepest-edge updates in scaled space
-    /// with `alpha_col` (`HEkk::updateDualSteepestEdgeWeights`,
-    /// `HEkkPrimal::updatePrimalSteepestEdgeWeights`).
+    /// the column describes).
     pub(crate) coeff: f64,
     /// The element the reduced-cost update divides by (the dual step is
     /// `d_q / dual_step_coeff` along the pivot row): in the dual simplex the
     /// element computed through the pivot row, the row the update runs
-    /// along (HiGHS `HEkkDual`: `theta_dual = workDual / workAlpha`); in the
-    /// primal simplex the column element, as `HEkkPrimal::updateDual`
-    /// (`theta_dual = workDual / alpha_col`).
+    /// along; in the primal simplex the column element.
     pub(crate) dual_step_coeff: f64,
     pub(crate) leaving_new_val: f64,
 }
@@ -71,15 +65,11 @@ pub(crate) enum DualRatioTest {
     /// A var that could enter has a reduced cost beyond its tolerance on its
     /// infeasible side, so no step keeps the reduced costs dual feasible:
     /// the reduced costs are to be recomputed and their infeasibilities
-    /// corrected before the row is tried again (HiGHS's
-    /// `kRebuildReasonPossiblyDualUnbounded` rebuild when `workTheta <= 0`,
-    /// `HEkkDual::chooseColumn`, which runs `correctDualInfeasibilities`).
+    /// corrected before the row is tried again.
     DualInfeasible,
     /// No var can enter, and none can absorb the move: the row may prove
     /// the model infeasible, which only a proof on the model's data decides
-    /// (HiGHS's `kRebuildReasonPossiblyDualUnbounded` when `workCount == 0`,
-    /// then `HEkkDual::assessPossiblyDualUnbounded`; see
-    /// [`super::Solver::prove_infeasible`]).
+    /// ([`super::Solver::prove_infeasible`]).
     NoCandidate,
 }
 
@@ -108,9 +98,7 @@ pub(crate) struct DualStep {
     /// on the side of zero the step would push it away from (within its
     /// tolerance, as the Harris pass allows), or it enters by absorbing the
     /// move. The step then leaves every reduced cost as it is, and the
-    /// entering var's cost is shifted so that its own is zero, as HiGHS
-    /// takes `workTheta = 0` and `shiftCost`s the entering var
-    /// (`HEkkDualRow::chooseFinal`, `HEkkDual::updateDual`), instead of a
+    /// entering var's cost is shifted so that its own is zero, instead of a
     /// step backwards.
     pub(crate) zero_step: bool,
 }
@@ -135,10 +123,8 @@ impl BasisSolver {
     /// The diagonal is stored as `1 / pivot` itself, not as `1 - 1 / pivot`
     /// applied by subtraction: for a large pivot `1 - 1 / pivot` rounds to
     /// within an ulp of one, and `x_r - x_r (1 - 1 / pivot)` cancels away all
-    /// but a few digits of `x_r / pivot`. Every later solve through that eta,
-    /// including a from-scratch recomputation of the basic values, carried
-    /// that error (a single-row LP lost nine significant digits at a pivot
-    /// of 7e6).
+    /// but a few digits of `x_r / pivot`, an error every later solve through
+    /// the eta would carry, a recomputation of the basic values included.
     pub(crate) fn push_eta_matrix(
         &mut self,
         col_coeffs: &SparseVec,
