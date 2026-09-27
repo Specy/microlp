@@ -66,7 +66,7 @@ Three principles shape everything:
 | `src/solution.rs`, `src/outcome.rs` | `Solution` (a validated assignment, its read-out and its post-solve edits) and `SolveOutcome` / `InterruptedSolve` (what a call returns and how it is resumed). |
 | `src/expr.rs`, `src/error.rs` | The model vocabulary (`OptimizationDirection`, `Variable`, `LinearExpr`, `ComparisonOp`) and the `Error` type. |
 | `src/presolve/` | Presolve: activity-based bound tightening, forcing / singleton / redundant-row elimination, variable fixing and substitution, and in MIP mode integer bound rounding, binary coefficient tightening and dual fixing — all on the original variable indices, so there is no postsolve (§2, §7). `mod.rs` holds the contract and the entry point, `work.rs` the reduction passes, `model.rs` the data, `params.rs` the constants. |
-| `src/solver/` | The simplex engine. `mod.rs` is `Solver` itself (bounded-variable primal/dual simplex, basis management, and the small contract surface the MIP layer uses); `tolerances.rs` is the tolerance model of §7; `scaling.rs` turns a user problem into the scaled representation and seeds the starting vertex; `basis.rs` is the basis inverse and the pivot descriptions; `costs.rs` is the dual simplex's working costs (perturbation, shifting, the correction of dual infeasibilities, the cleanup), `bounds.rs` the primal simplex's working bounds (perturbation, shifting, the cleanup), and `cycling.rs` the cycling and stall detection of both (§3, §7). |
+| `src/solver/` | The simplex engine. `mod.rs` is `Solver` itself (bounded-variable primal/dual simplex, basis management, and the small contract surface the MIP layer uses); `tolerances.rs` is the tolerance model of §7; `scaling.rs` turns a user problem into the scaled representation and seeds the starting vertex; `basis.rs` is the basis inverse and the pivot descriptions; `costs.rs` is the dual simplex's working costs (perturbation, shifting, the correction of dual infeasibilities, the cleanup), `bounds.rs` the primal simplex's working bounds (perturbation, shifting, the cleanup), `cycling.rs` the cycling and stall detection of both, and `proof.rs` the proof of infeasibility the dual simplex needs before it may return `Infeasible`, with its last resorts (§3, §7). |
 | `src/lu/`, `src/sparse/`, `src/ordering/` | LU factorization with eta-file updates, sparse containers, and the column ordering of the factorization (`order_simple`: the sparsest columns first, from the bucket queue in `ordering/cols_queue.rs`). |
 | `src/mip/mod.rs` | The branch & bound lifecycle: building a search from a `Problem`, starting / resuming / re-editing it, bound and gap accounting, and validating a candidate against the user's original rows. |
 | `src/mip/search.rs` | The search itself: node visits, warm starts, branching, pruning, and the outer search loop. |
@@ -200,6 +200,19 @@ dual infeasibilities shifted, never corrected by flipping a boxed var).
 Around both, a vertex hash makes a basis change that keeps returning to visited vertices taboo,
 and a stall bound ends a phase whose objective does not move; both end in a loud error, never
 a hang.
+The dual simplex returns `Infeasible` only on a proof (`src/solver/proof.rs`, HiGHS's
+`proofOfPrimalInfeasibility`): when no var can repair a violated row, the row of the basis
+inverse, refined twice (its corrections kept to twice the precision of an `f64`, the second
+bounding the error of each multiplier), suggests a certificate, which is summed from the
+model's data in compensated arithmetic and must leave a gap beyond the tolerance of the row's
+basic var (every coefficient counts at its finite bound, however small, and makes the range
+unbounded at an infinite bound, unless the error of the multipliers could make it zero: the
+one concession, which HiGHS makes up to an absolute `1e-9` and SCIP within its dual
+feasibility tolerance). A row whose certificate proves nothing is made taboo and the
+phase goes on with the other rows; when only such rows are left, the last resorts are SoPlex's
+instable pivot and then a move of the vars whose entries are below round-off, as the
+certificate says they can repair the row, and after them a loud error (§7, *Infeasibility only
+from a proof*).
 
 State you need to know when reading it:
 
@@ -376,9 +389,22 @@ cost of the visit: **is the solver already sitting at this node's parent's optim
 
 `solve_node_lp` wraps `reoptimize` and owns error discrimination:
 
-- `Err(Infeasible)` → genuinely infeasible node → prune. Correct and cheap.
+- `Err(Infeasible)` → genuinely infeasible node → prune. Correct and cheap: the engine
+  returns it only on a proof checked on the model's data (or on bounds that cross), never on
+  a row it merely cannot repair (see below), so an unproven verdict cannot prune a feasible
+  subtree, as HiGHS's MIP prunes on its LP's proven infeasibility only. The one gap is the
+  proof's concession: a coefficient on an infinite bound counts as zero where the error of the
+  multipliers could make it zero (the bound the refinement puts on each multiplier's error,
+  carried through the var's entries, some `1e-30` of its terms in well-conditioned bases), so
+  a node could be pruned wrongly through it only if a coefficient the data leave lay within
+  that error and, times its var's value, made room at every point of the node (§7). A
+  coefficient of `f64` round-off size is no residual (a row the certificate leaves out can
+  leave a basic var the model's own `-2^-50`), and conceded below that round-off it once
+  pruned a feasible MILP's root node
+  (`a_node_lp_whose_room_is_a_basic_vars_coefficient_is_not_pruned_and_is_a_known_limitation`).
 - `Err(Unbounded)` → impossible for a bounded node → surfaced as `InternalError`.
-- Any other error, such as a singular LU from numerical degradation → **retry once from
+- Any other error, such as a singular LU from numerical degradation, or a row the dual
+  simplex can neither repair nor prove infeasible → **retry once from
   the slack basis** (identity, cannot fail to load),
   re-solving the node from scratch; a second failure propagates. The retry is per-node-visit
   — it cannot mask a systematic failure.
@@ -389,12 +415,13 @@ cost of the visit: **is the solver already sitting at this node's parent's optim
 Inside the engine, `run_phases` alternates the dual phase (`restore_feasibility`) and the
 primal phase (`optimize`) until a state passes verification (§7): a phase's own exit test
 runs on incrementally updated numbers, so a phase may end on drifted values, and only a
-verified state is reported as `Finished`. One valve lives in `restore_feasibility`: "no
-eligible entering column for a violated row" proves infeasibility only in exact arithmetic,
-so before an infeasibility declaration can stand the engine rebuilds (fresh factorization,
-values, reduced costs) and re-examines the row; a phantom violation dissolves, a real one
-survives. The valve is armed once per stall and any successful pivot re-arms it, so it
-cannot loop.
+verified state is reported as `Finished`. "No eligible entering column for a violated row"
+is not a proof of infeasibility, so the dual phase first rebuilds (fresh factorization, values,
+reduced costs) and re-examines the row, where a phantom violation dissolves, and then declares
+infeasibility only if the row's certificate, summed from the model's data, proves it (§7,
+*Infeasibility only from a proof*). The rebuild is armed once per stall and any successful pivot
+re-arms it, so it cannot loop; a row the proof leaves open is made taboo, and the last resorts
+for it end in a loud error rather than a verdict.
 
 ### 5.4 Incumbents and the rounded-feasibility guard
 
@@ -655,7 +682,8 @@ computed quantity is floored at that quantity's round-off:
 | Is a basic slack (row) within its bounds? | `slack_tol`: the engine's share (`ROW_BUDGET_SHARE`, ½) of the contract `row_tolerance(feasibility × r, m)` in the row's scaled units, at the row's magnitude `m = |b| + Σ|a_j x_j|` at the current values (refreshed whenever the rows are checked). The other half is the reserve: for the snap of an integer or fixed var, and for evaluating the row in another order of operations. | `ROUNDOFF_FLOOR = 1e-14`, `ROW_BUDGET_SHARE = 0.5` |
 | Is a structural var within / at its bounds? | `structural_tol`: the user contract in user units, but never more than any of its rows can absorb when the value is snapped to the bound (`snap_budget`: the row's reserve over the var's scaled coefficient, minimised over its rows), floored at the round-off of the bound magnitude. One rule for every var: it keeps a big-M row within contract when its binary is rounded, and a fixed var's report at its value within the rows presolve substituted it out of. | |
 | Is a reduced cost zero? | `dual_tol`: `EPS` floored at the round-off of `|c_j| + Σ|a_ij y_i|`, refreshed with the multipliers. | `EPS = 1e-10` |
-| Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it (`ENTRY_ROUNDOFF` relative to its column's largest entry in the primal test, and in the dual test to its row's largest entry over the columns that are not excluded and that the scalings made comparable: all but those of vars fixed when the model entered the engine, which keep the user's units, so a fixed column's `1e17` cannot make a genuine `1` noise, while an entry that cannot help still measures the round-off the row's entries share); a genuine entry at least `PIVOT_REL_TOL` of the largest genuine entry among the vars that could enter and are not excluded (rows that could block, in the primal test) is preferred, a smaller one is the pivot only when nothing larger will do. In the primal test every genuine entry bounds the step, with each basic var's tolerance counted from where it sits (the whole of it in the first round of `run_phases`, a hundredth of it more in each further round, as SoPlex restricts its ratio test when its algorithms loop; a var past its bound by more than that admits no step toward it, a limit of zero, never a negative one); a basic var a step still leaves outside its bounds beyond its tolerance (through an entry below the round-off floor, or a recomputation) has its working bound shifted, and a step that would run backwards is zero (see *Anti-degeneracy and cycling in the primal simplex* below). In the dual test a boxed var the step passes is flipped instead of entering, and an entry below the round-off floor is never a pivot but may move its (boxed) var when that lands the row, checked through the column and at the phase exit (see *Bound flipping* below). | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7` |
+| Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it (`ENTRY_ROUNDOFF` relative to its column's largest entry in the primal test, and in the dual test to its row's largest entry over the columns that are not excluded and that the scalings made comparable: all but those of vars fixed when the model entered the engine, which keep the user's units, so a fixed column's `1e17` cannot make a genuine `1` noise, while an entry that cannot help still measures the round-off the row's entries share); a genuine entry at least `PIVOT_REL_TOL` of the largest genuine entry among the vars that could enter and are not excluded (rows that could block, in the primal test) is preferred, a smaller one is the pivot only when nothing larger will do. In the primal test every genuine entry bounds the step, with each basic var's tolerance counted from where it sits (the whole of it in the first round of `run_phases`, a hundredth of it more in each further round, as SoPlex restricts its ratio test when its algorithms loop; a var past its bound by more than that admits no step toward it, a limit of zero, never a negative one); a basic var a step still leaves outside its bounds beyond its tolerance (through an entry below the round-off floor, or a recomputation) has its working bound shifted, and a step that would run backwards is zero (see *Anti-degeneracy and cycling in the primal simplex* below). In the dual test a boxed var the step passes is flipped instead of entering; a row with no candidate is no verdict: it proves infeasibility only through its certificate (next row), and the last resorts for a row that proves nothing take any entry of at least `INSTABLE_PIVOT_TOL` (SoPlex's absolute `lowstab`) as a pivot, then move boxed vars through entries below the floors as the certificate says they can repair the row (see *Infeasibility only from a proof* below). | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7`, `INSTABLE_PIVOT_TOL = 1e-10` |
+| Does a row that no var can repair prove the model infeasible? | its certificate (the rows combined with the row of the basis inverse, refined twice, summed in compensated arithmetic from the model's data) leaves a gap beyond the tolerance the engine holds the row's basic var to, the one that made the row violated; every coefficient counts at its bound where that is finite; on an infinite bound one that the error of the multipliers could make zero (their bound, the refinement's second correction of each, carried through the var's entries, plus the round-off of the compensated sum) counts as zero (the concession, for any var) and any other voids the proof, and so does a number of the certificate that is not finite; the refinement bounds the error only where it converged, its second correction at most `2^-53` of the row in the max norm, and otherwise only the round-off of the compensated sum counts as zero (see *Infeasibility only from a proof* below) | `REFINEMENT_CONVERGED = 2^-53` (LAPACK's `EPS`) |
 | Do the row and column computations of the pivot element agree? | to `PIVOT_AGREEMENT_TOL` relatively, or to `ENTRY_ROUNDOFF` of the computations' scale for an element above `LU_SINGULAR_REL` of that scale (below it, round-off agrees with anything of its size, so only relative agreement tells a genuine element from noise); else rebuild (stale factorization) or exclude the entry as noise (fresh one), for the column (primal test) or row (dual test) it was judged in only, until the next pivot (the primal test once kept its exclusions until then whatever column entered, and a taboo that changed the column passed a genuine blocking row unseen: `rows_excluded_as_round_off_for_one_column_block_another`). Once they agree, each is used where it belongs, as in HiGHS: the column's element for the primal step, the eta file and both steepest-edge updates (which apply it with the rest of the column), the row's for the dual simplex's reduced-cost update (which runs along the row). | `PIVOT_AGREEMENT_TOL = 1e-7` |
 | Is the LU pivot column singular? | eligible part below `LU_SINGULAR_REL` of the column's largest transformed entry. | `= ROUNDOFF_FLOOR` |
 
@@ -672,13 +700,16 @@ reduced cost is feasible for it), any other's its reduced cost; so the ratio is 
 cost over the entry, and among the absorbers within the Harris relaxation of the smallest
 ratio the largest entry enters (an entry `PIVOT_REL_TOL` below the largest absorbing one is
 no candidate). A fixed slack thus wins where it can, as it did when the clamp priced it at
-zero. Cost shifting
-does not make the rule unnecessary: without it six lib tests (the four wide-coefficient and
-magnitude properties among them) come back `Infeasible` on feasible models, since the
+zero. Neither cost shifting nor the infeasibility proof makes the rule unnecessary: the
 violations it repairs are primal ones the engine's own tolerances create (half the contract
-for a row, a bound tolerance capped by the rows' reserve), which no dual step removes; a
-verdict that does not conclude on tolerance-level gaps (the HiGHS proof) is what can replace
-it. **Verified termination:** a phase reports `Finished` only after `verify_primal` and exact
+for a row, a bound tolerance capped by the rows' reserve), which no dual step removes.
+Without it six lib tests came back `Infeasible` on feasible models before the proof, and with
+the proof eight fail, six of them `Infeasible` again: the models are feasible only with vars
+across their bounds within their tolerances, beyond what the engine's tolerance of the row's
+basic var allows the gap, and the proof, which compares with that tolerance and counts every
+other term exact as HiGHS's does, proves them infeasible for the engine; the other two end in a
+loud error and a singular basis. The full contract of R4 is what can replace it.
+**Verified termination:** a phase reports `Finished` only after `verify_primal` and exact
 reduced costs (recomputed only when pivots have updated them incrementally since); a primal
 step that would run backwards is zero, the leaving var leaving where it sits, so no column is
 ever refused (see the primal simplex's anti-degeneracy below). `verify_primal`
@@ -751,7 +782,7 @@ presolve had dropped, a residual counted once by the engine and once more by the
 each is pinned as a regression test (for example
 `property_counterexample_with_bound_slack_one_ulp_over_the_row_budget`).
 
-**Bound flipping and the infeasibility verdict.** The dual ratio test takes the vars that can
+**Bound flipping.** The dual ratio test takes the vars that can
 help a violated row in the order the dual step reaches their breakpoints, in Harris groups as
 HiGHS's `HEkkDualRow::chooseFinal` does: the first group is the Harris pass's candidates, each
 next one the remaining candidates within the smallest relaxed ratio of the remaining. While the
@@ -762,16 +793,161 @@ pivot's are moved to their other bound (no pivot, no basis change), so their red
 cross zero and they are dual feasible where they land (Maros 2003; Koberstein 2005). When the
 first group carries the row, this is the plain Harris pass with nothing flipped; flips come
 only with a positive dual step (a group after the first lies beyond the first group's bound),
-as in HiGHS and SoPlex. When no var can enter, "no pivot" is not taken for a proof: the row
-declares the model infeasible only if moving every var that can help to its other bound still
-leaves the row short (the row is then a Farkas certificate over the bounds). An entry below
-`ENTRY_ROUNDOFF` is never a pivot, but its var may be flipped, or moved partway, when that
-lands the row: the effect is computed again through the column when applied (a move that
-does not land is undone and excluded for the row) and the phase exit re-derives the row from
-the data (`check_rows`), so a move through round-off is found out. This resolved the models
-once pinned here as a known limitation (coefficient chains spanning twelve to fifteen orders
-of magnitude, whose only repair ran through such an entry); they are the `wide_chain`
-regression tests in `src/tests/magnitudes.rs`.
+as in HiGHS and SoPlex.
+
+**Infeasibility only from a proof** (`src/solver/proof.rs`), as HiGHS's dual simplex declares
+infeasibility (`HEkk::proofOfPrimalInfeasibility`, called by
+`HEkkDual::assessPossiblyDualUnbounded`) and SCIP checks its LP solver's Farkas proof
+(`lp/checkfarkas`). When no var can enter a violated row and none can absorb its move, the
+ratio test says so and concludes nothing (`DualRatioTest::NoCandidate`):
+
+- *Fresh data first*: the row is looked at again after a rebuild (fresh factorization,
+  values, reduced costs), where a phantom violation from drift dissolves (netlib/brandy's did),
+  as HiGHS and SoPlex rebuild or refactorize before either concludes.
+- *The proof*: the row of the basis inverse `rho` combines the rows into one equation over
+  every var, the certificate, in which the leaving var has the coefficient one and every other
+  basic var zero. `rho` is refined first, twice, with HiGHS's `unitBtranIterativeRefinement`
+  (which HiGHS applies to a pivot row it doubts, and offers for its proof, off by default):
+  its residual `B^T rho - e_r`, summed in compensated arithmetic over the basic columns, is
+  solved for and taken off, since through an ill-conditioned basis that residual is a basic
+  var's coefficient, above any fixed round-off fraction, and times a huge bound it alone
+  closed an infeasible node's gap (`an_ill_conditioned_basis_does_not_void_a_nodes_proof`;
+  `the_row_of_the_basis_inverse_is_refined_before_the_proof`). The corrections are taken off
+  into the trailing bits of a compensated row, as LAPACK's extra-precise iterative refinement
+  keeps its solution in doubled precision (`DLA_GERFSX_EXTENDED` adds each correction into
+  `(Y, Y_TAIL)` with `DLA_WWADDW`), where HiGHS rounds the refined row to `f64`: rounded, the
+  row keeps the error of its own representation, about `1e-17` of the terms of each basic
+  column, and times scaled bounds of `1e9` to `6e10` that error closed the gaps of three
+  infeasible MILP nodes of the property stress, whose rows no `f64` multipliers combine
+  exactly (`multipliers_no_f64_holds_do_not_void_a_nodes_proof`;
+  `the_refined_row_keeps_its_correction_to_twice_the_precision`). The second correction is
+  also the bound on the error of each multiplier, as LAPACK bounds the error of its refined
+  solution by its last correction, and only where the refinement converged in LAPACK's sense,
+  the correction at most `EPS = 2^-53` of the row in the max norm (`DX_X <= EPS`; beyond it
+  no bound, and only the round-off of the compensated sums counts as zero:
+  `the_refinement_bounds_the_multipliers_error_only_where_it_converged`); one step leaves
+  the residuals the next corrects (in the big-M bases of `issue_48_switchable_dc_network_solves`
+  the first correction reaches `2.6e-3` on multipliers of `7.4e6` and leaves basic
+  coefficients of up to `1.6e-26` of their terms, the second `1e-33`). The certificate is
+  summed from the model's data in compensated arithmetic (HiGHS's `HighsCDouble`; the scaling
+  is by powers of two, so the scaled data are the user's exactly), and proves infeasibility
+  when the largest value it can take over the bounds falls short of its right-hand side by
+  more than the leaving var's tolerance. What the tableau row said (entries computed through
+  the eta file and summed in `f64`, those below a round-off floor counted as zero) decides
+  nothing, as the verdict before it did (C2-14, C4-33 of the solver review): that verdict
+  counted an unboxed var's entry below the floor as zero (`wide_lp-1281` of the differential
+  fuzz, `b3` of the property stress) and took the round-off of a computed vertex for a
+  violation no var could repair (`lp_wide_1` of the property stress), both pinned in
+  `src/tests/magnitudes.rs`, and so returned `Infeasible` on feasible models, and in a MIP
+  pruned the node. As in HiGHS, a multiplier whose row would need its slack's infinite bound
+  is dropped (without it an infeasible LP of the fuzz, `int_lp-970`, failed loudly). Every
+  coefficient counts as it is at its var's bound in the certificate's direction where that is
+  finite, however far below its terms it cancelled: the certificate is exact for its
+  multipliers, and such a coefficient can be the data's own. `1` and `-(1 + 2^-50)` leave
+  `-2^-50`, which at a bound of `-2e9` makes room for a feasible model's rows; counted as
+  zero, as HiGHS counts the entries of its proof row below an absolute `1e-14` and SCIP's
+  check those within its dual feasibility tolerance, it made a proof of that model
+  (`a_round_off_coefficient_on_a_far_bound_is_no_proof_and_is_a_known_limitation`, which now
+  fails loudly). So does a number of the certificate that is not finite (an overflow, such as
+  Dekker's split of a fixed column's coefficient beyond about `1.3e300`), as non-finite data
+  fail the dual ratio test.
+- *The concession*: on an infinite bound a coefficient makes the range unbounded and the
+  proof void, however small it is, unless the error of the multipliers could make it zero:
+  the bound on each multiplier's error, carried through the var's entries in the rows the
+  certificate keeps, plus the round-off of its compensated sum. Such a coefficient counts as
+  zero, whatever its var. That covers a basic var's coefficient, zero for the exact row of the
+  basis inverse (residuals of up to `1.5e-32` of their terms in the fuzz), a non-basic var's
+  whose tableau entry is zero (the second correction, spread over the row by its solve, leaves
+  the non-basic `x3` of `int_lp-1145` `3.6e-33` of its terms:
+  `a_non_basic_vars_residual_does_not_void_a_proof`), and one whose rows' exact multipliers are
+  zero, which the refinement leaves as its noise: in random switchable networks like issue
+  48's, free bus angles in such rows get that noise times their entries, all of their terms
+  (`a_switchable_network_whose_node_proofs_need_the_multipliers_error_solves`,
+  `an_infeasible_switchable_network_whose_proof_needs_the_twice_refined_row`, both failing
+  loudly before). Without the concession 41 solves of 28 models of the fuzz failed loudly (38
+  on infeasible models, 3 at MILP nodes), and so did `issue_48_switchable_dc_network_solves`.
+  No fixed threshold tells such a residual from a coefficient the data leave. HiGHS ignores
+  coefficients on infinite bounds while their sum stays below `1e-9`, and with the bound of
+  `-2e9` above gone that proved the same feasible model infeasible
+  (`a_round_off_coefficient_on_an_infinite_bound_is_no_proof_and_is_a_known_limitation`, which
+  now fails loudly). A concession for basic vars below the `f64` round-off of their terms
+  proved a model built by the review of the concession infeasible: in `L + j + w = 1.000001`,
+  `-(1 + 2^-50) j - w = 0`, `j + v <= 0`, `j` and `w` free, feasible at `j ≈ -1.13e9`, the
+  exact row of the basis inverse `(1, 1, 2^-50)` leaves the third row out (its non-basic
+  slack's entry `2^-50` needs the slack's infinite side), and the free basic `j` keeps the
+  model's own `-2^-50`, `4.4e-16` of its terms, which was counted as zero, and the model's
+  MILP pruned at its root node (`a_basic_vars_coefficient_in_a_row_left_out_voids_the_proof`,
+  and the four `..._a_basic_vars_coefficient_...` known limitations of
+  `src/tests/magnitudes.rs`, which now fail loudly: that row is exact, its error bound is the
+  round-off of the compensated sums, and the coefficient counts). Floors below that fail the
+  other way: one at the round-off of the doubled precision, `1e-28` of the terms, on the row
+  refined once, failed issue 48's node proofs, and the round-off of the compensated sums
+  alone, on the row refined twice, which the fuzz never exceeds, failed 12 of 480 solves of
+  random switchable networks, where the error bound fails none (and the rule before it 13).
+  Each multiplier's error is taken to be at most its own last correction, not, as LAPACK's
+  normwise bound has it, the largest of all, which in a basis of issue 48 would allow a var
+  whose rows have multipliers near `7e-16` (against `1.4e3` elsewhere) `3.9e-14` of its terms,
+  ninety times the `-2^-50` above, where its own corrections allow `1.3e-19`; a multiplier
+  whose error exceeded its correction would only fail a proof, loudly. The concession would
+  still prove a feasible model infeasible through a coefficient the data leave that lies
+  within that error bound, which the arithmetic cannot tell from zero: some `1e-30` of the
+  terms in well-conditioned bases, up to `1.3e-19` in issue 48's.
+- *The tolerance*: HiGHS compares the gap with its primal feasibility tolerance, the one its
+  simplex holds every var to; here it is the tolerance the engine holds the leaving var to
+  (`var_tols`), the one by which the dual simplex found the row violated, and every other term
+  of the certificate counts as exact, as in HiGHS. The proof then says that no point the simplex
+  could accept exists, the same test as the one that made the row leave. Any other tolerance
+  leaves a band where a row is violated for the simplex but not infeasible for the proof, and
+  nothing can act on it. Two were tried. With the user's absolute tolerance as a floor (the
+  engine's is half of it for a row, and a var's is capped by its rows' reserve), two MILPs of
+  the property stress failed loudly where their nodes had been pruned, one of them at a node
+  that puts a var `1e-8` past its bound
+  (`a_node_infeasible_by_less_than_the_contract_is_pruned`). With every term's contract
+  tolerance summed, so
+  that a proof would say that no point within the contract exists, the MIPs failed whose node
+  rows disagree by less than their tolerances together (rows of magnitude `3.4e8` and `2.2e11`
+  that disagree by `1.7e-6`, `a_cleanup_dual_phase_shifts_a_boxed_var_rather_than_flipping_it`;
+  the wide MILP property at its CI seed); the only points that meet them split the
+  disagreement between the rows, off every vertex. HiGHS proves all of those node LPs
+  infeasible. The price is the engine's half budget: a model whose only points lie between the
+  engine's share of the contract and the contract itself is reported infeasible (a row missed
+  by `6e-8`), as it was before the proof; under the full contract of R4 the engine's tolerance,
+  and so the proof's, is the contract's.
+- *A failed proof* makes the row taboo, recorded as a bad basis change with no entering var
+  (HiGHS's `kFailedInfeasibilityProof`), and the phase goes on with the other rows; a rebuild
+  lifts the taboo, and the row is tried again on fresh data.
+- *The last resorts*, when only taboo rows are left on fresh data and one of them failed its
+  proof: SoPlex's instable leave (`SPxSolverBase::solve`), the ratio test again with every
+  entry of at least `INSTABLE_PIVOT_TOL` (`1e-10`, SoPlex's `lowstab`) a candidate, once on
+  those data; it solves the model of C2-06 through the LP edit path, `[1e17, 1]` with the
+  fixed column's entry in the round-off scale
+  (`a_fixed_vars_huge_coefficient_in_an_added_row_does_not_silence_it`). If it makes no pivot
+  and the row is left again, the round-off repair (`Solver::round_off_repair`), which no
+  reference has: the non-basic vars whose certificate coefficients are not round-off and that
+  can move toward the row move there, flipped, or the last one only partway (it stays
+  non-basic between its bounds, which a basis snapshot records as `Free` and a load puts back
+  at a bound: C2-10's second issue, still open), largest reach first, and the moves are kept
+  only if the leaving var then lands, computed through their columns; once per row in a phase,
+  which is the loop breaker of the flip-only stage's per-var `moved_alone` list it replaces. A
+  coefficient of round-off size, which the proof counts at a finite bound since the room it
+  makes may be real, moves nothing: the rest of the engine does not see such an entry (the
+  ratio tests' round-off floors hide it), and the primal step takes the move back (moved by it
+  in the far-bound model above, `z` goes to `-2e9`, and the primal step lifts it again, round
+  after round, until `MAX_PHASE_ROUNDS`). It is kept for the `wide_chain` fixtures
+  of `src/tests/magnitudes.rs` (coefficient chains spanning twelve to fifteen orders of
+  magnitude): after the rebuild, the proof (whose gap is `-5.7e-24`: the one helper's range
+  exactly covers the row), the taboo and the instable leave, their only repair is a boxed var
+  whose entry is `1.5e-15` beside `1.95`, below every pivot floor and `lowstab`, which one
+  fixture moves to its other bound and another only partway (without the partial move that
+  fixture fails). HiGHS fails on them without presolve, and SoPlex's ratio test flips such a
+  var only together with a stable pivot, which these rows lack. The landing check and the
+  phase exit (`check_rows`, which re-derives every row from the data) find out a move through
+  round-off. After these, the phase fails loudly (`InternalError`: no var can repair the row,
+  and it proves nothing).
+
+Returning `Infeasible` only on a proof also means that the branch and bound prunes a node only
+on one (§5.3). Of the 20,000 models of the differential fuzz only `wide_lp-1281` answers
+differently than before: its false `Infeasible` is now a loud error (HiGHS returns `Unknown`).
 
 **Anti-degeneracy and cycling in the dual simplex** (`src/solver/costs.rs`,
 `src/solver/cycling.rs`), as HiGHS's dual simplex does it (`HEkk::initialiseCost`,
@@ -826,7 +1002,7 @@ every reduced cost, multiplier and objective value of the phase is the working c
   given back enters (a fixed var first), not the largest entry, which left fuzz model
   `wide_lp-558` above its optimum. A row entry, or the reduced cost of a candidate or an
   absorber, that is not a finite number fails the test with an `InternalError`: it would compare
-  false with every bound and drop out unseen, and the row's verdict would rest on the rest.
+  false with every bound and drop out unseen, leaving the row to the vars left.
 - *Cleanup*: every way a phase ends (`Finished`, a limit, an error) restores the costs in
   force, marks the reduced costs for recomputation and recomputes the objective. `run_phases`
   then verifies as above, in its order: the values first (`verify_primal`), then the reduced
@@ -840,7 +1016,7 @@ every reduced cost, multiplier and objective value of the phase is the working c
 - *Cycling*: what repeats in a cycle is the vertex, so the vertex is hashed: the XOR of a term
   per basic var and a term per non-basic var at its upper bound, so that a pivot and a bound
   flip each toggle terms. (HiGHS hashes the basic set alone, but the bound-flipping ratio test
-  and flip-only steps move boxed vars without a basis change, so a basic set can come back at
+  and the round-off repair move boxed vars without a basis change, so a basic set can come back at
   another vertex and a set hash take progress for a revisit; HiGHS recovers from a wrong verdict
   with another solve, this engine has no such recovery. A first version hashed the basic set
   while the correction still flipped boxed vars, and failed fuzz model `wide_lp-1897`; with the
@@ -855,8 +1031,9 @@ every reduced cost, multiplier and objective value of the phase is the working c
   left; a dual infeasible candidate, or none, before a verdict of infeasibility) unless the
   solve error exceeds `1e-8`; HiGHS drops the records when it refactorizes, which this engine
   does every few pivots on a small basis, too often for a record to outlive its cycle, so here
-  they last the phase. When a rebuild leaves only taboo rows violated, the phase fails with an
-  `InternalError` (HiGHS returns `kUnknown` there;
+  they last the phase. When a rebuild leaves only taboo rows violated, none of which failed an
+  infeasibility proof (those get the last resorts, see *Infeasibility only from a proof*), the
+  phase fails with an `InternalError` (HiGHS returns `kUnknown` there;
   `dual_phase_fails_loudly_when_only_taboo_changes_are_left`). A shift or an absorber's zero
   step can move the working objective back (a fixed absorber's shift is its whole reduced cost),
   so vertices can come back; the model the property stress found cycling forever, four pivots
@@ -950,15 +1127,31 @@ The phase-1 artificial objective of a cold start that is neither primal nor dual
 (C2-20) stays; it is perturbed like any costs in force.
 
 Known limitations, found by running the wide-coefficient properties of `src/tests/scaling.rs`
-at forty times their case count; all of them predate bound flipping, which removed several of
-the models these searches found and moved one into the second class:
+at forty times their case count (the last by the review of the infeasibility proof); all of
+the others predate bound flipping, which removed several of the models these searches found
+and moved one into the third class, and the infeasibility proof turned the first two, reported
+`Infeasible` before it, into loud errors:
 
-- a feasible model whose only repair is a pivot on an entry below `ENTRY_ROUNDOFF` (a var with
-  an infinite bound in its direction, so no flip can check the entry) is reported
-  `Infeasible`: nothing checks such an entry reliably before the pivot (round-off can come out
-  identical through the row and the column), and pivoting on round-off leaves a basis the
-  factorization rejects (this is why the column factors are not bounded to HiGHS's `2^±20`:
-  bounded, they left `1e30 g + y ≥ 2e30` with `y`'s entry in this class);
+- a feasible model whose only repair is a pivot on an entry below `ENTRY_ROUNDOFF` and below
+  SoPlex's `lowstab` (a var with an infinite bound in its direction, so no move can check the
+  entry) ends in an `InternalError`: the row's certificate proves nothing, so it is no longer
+  reported `Infeasible` (as it was up to the infeasibility proof, and, where the certificate
+  left a basic var the model's own coefficient of `f64` round-off size, up to the second review
+  of the proof, see the last class; a coefficient counts as zero now only within the error of
+  the multipliers), but nothing checks such an entry reliably before the pivot (round-off can
+  come out identical through the row and the column), and pivoting on round-off leaves a
+  basis the factorization rejects (this is why the
+  column factors are not bounded to HiGHS's `2^±20`: bounded, they left `1e30 g + y ≥ 2e30`
+  with `y`'s entry in this class). In a MIP such a node is no longer pruned: its LP fails
+  loudly and so, after the retry from the slack basis, does the solve (`b3` of the property
+  stress run, whose root node was pruned and the MILP reported `Infeasible`, pinned in
+  `src/tests/magnitudes.rs`; `wide_lp-1281` of the differential fuzz);
+- a feasible model whose vertex misses a bound by the round-off of solving for it, by more
+  than the tolerance the engine holds the var to (capped by its rows' reserve), with every
+  non-basic var fixed, ends in an `InternalError` for the same reason: the certificate's gap is
+  the round-off of the data, no proof, and nothing can move (`lp_wide_1` of the property stress
+  run, reported `Infeasible` up to the proof, pinned in `src/tests/magnitudes.rs`). Under the
+  full contract of R4 the vertex verifies;
 - a pivot on a genuine but tiny element can leave a basis the factorization rejects, reported
   as `InternalError("Singular matrix")`; the engine has no basis repair (replacing the dependent
   columns by slacks and continuing, as HiGHS and CLP do);
@@ -977,11 +1170,12 @@ the models these searches found and moved one into the second class:
 - the phases can alternate over a row that only entries below the round-off floor can repair:
   the primal step passes a genuine entry below its column's floor and leaves the row beyond its
   tolerance (shifted, and exposed by the cleanup), and the dual simplex repairs it only by
-  flipping a var across its range through another such entry (its flip-only stage), which
-  gives the primal step back; after `MAX_PHASE_ROUNDS` the solve fails with `InternalError`
-  (`lp_wide_3` of the review's stress run, pinned in `src/tests/magnitudes.rs`; the same at
-  1dcd664). A degenerate pivot on the tiny entry, or a proof that no step is possible, resolves
-  it: the absolute pivot tolerances and the infeasibility proof of R3. A second model of the
+  moving a var across its range through another such entry (its round-off repair, the dual
+  ratio test's flip-only stage before the infeasibility proof), which gives the primal step
+  back; after `MAX_PHASE_ROUNDS` the solve fails with `InternalError` (`lp_wide_3` of the
+  review's stress run, pinned in `src/tests/magnitudes.rs`; the same at 1dcd664). A degenerate
+  pivot on the tiny entry resolves it: the absolute pivot tolerances of R3 (the proof does not,
+  the model being feasible). A second model of the
   class, also pinned, ended in an answer until the primal simplex shifted its bounds: its step
   reaches a point that meets the engine's tolerances only off every vertex, and the degenerate
   clamp that shifting replaced had hidden that, leaving an equality violated by exactly the
@@ -994,26 +1188,41 @@ the models these searches found and moved one into the second class:
   the pinning row has other terms and its coefficient amplifies the forcing row's slack beyond
   the contract (`-1000 x1 + x4 / 1000 = 83.887` beside `x1 + 100 x4 = 8388700`, pinned in
   `src/tests/magnitudes.rs`);
-- the dual ratio test's round-off scale leaves out the columns fixed when the solve began
-  (`unscaled_cols`, which neither scaling touches), but a row added later leaves out of its
-  equilibration the vars fixed at that time, so after `fix_var(f, 0)` an added
-  `1e17 f + y ≥ 1` reaches the ratio test as `[1e17, 1]` with `f` counted in the scale, `y`'s
-  entry is noise, and the LP edit comes back `Infeasible` (pinned in
-  `src/tests/magnitudes.rs`; found by the second review of R0; the MIP path rebuilds the model
-  and solves it). Which columns a row left out differs from row to row; the absolute pivot
-  tolerances of R3 remove the relative floor and this flag with it.
+- a feasible model whose only room is a coefficient of round-off size that its rows' own data
+  leave (`x + y + z + q >= 3` and `t - (1 + 2^-50) z - q >= 1e-6` over `x, y, t ∈ [0, 1]` need
+  `z <= -2^50 · 1e-6`) fails loudly, and in a MIP its node is not pruned: the certificate
+  counts `z`'s coefficient, at its bound if finite and as an unbounded range if not, and
+  proves nothing, and nothing repairs the row (the ratio tests see an entry of `2^-50` beside
+  ones, below every pivot floor, and the round-off repair does not move a var by a
+  coefficient below round-off, nor toward an infinite bound). Up to the review of the proof,
+  such a coefficient counted as zero on every bound, as HiGHS counts it, and the models were
+  reported `Infeasible`, as HiGHS reports them (three models pinned in
+  `src/tests/magnitudes.rs`: the LP with `z >= -2e9`, its MILP, and the LP with `z` unbounded
+  below). The same holds where such a coefficient is a basic var's, left by a row the
+  certificate leaves out (`L + j + w = 1.000001`, `-(1 + 2^-50) j - w = 0` and `j + v <= 0`
+  with `j`, `w` free need `j ≈ -1.13e9`; the third row's non-basic slack, unbounded, is the
+  only var that could repair the row the dual simplex ends on, through `2^-50`): up to the
+  second review of the proof the concession for basic vars stopped at the `f64` round-off
+  floor, so `j`'s `-2^-50` counted as zero on its infinite bound, and the model was reported
+  `Infeasible` with presolve on and off, as HiGHS's LP reports it, and its MILP too, whose
+  optimum HiGHS finds (four more pinned: the LP and its MILP, with presolve on and off); a
+  coefficient counts as zero now only within the error of the multipliers, which this exact
+  row of the basis inverse bounds at the round-off of the compensated sums. No reference
+  solves the LPs: a pivot on `2^-50` beside ones is below every pivot tolerance.
 
 The convention for such models is to pin each as a `#[should_panic]` test named
 `..._is_a_known_limitation` in `src/tests/magnitudes.rs` (beside the engine's unit tests when
 the model needs a constructed basis): it passes while the limitation stands and **fails as soon
 as a change fixes it**, which is the signal to drop the attribute and keep the model as an
-ordinary regression test. Four models were pinned this way and all four were fixed (a
+ordinary regression test. Five models were pinned this way and all five were fixed (a
 presolve forcing rule that fixed a var its row could not resolve, a recompute of the basic
 values that counted as a verification, the dual ratio test's reading of "no pivot" as
-infeasibility, and the tolerance a var left behind at a huge bound, which the primal
-simplex's cleanup now repairs); five are pinned today, the primal ratio test's scale, the
-two models of phases alternating over a row repaired through round-off, the forcing row and
-the fixed column of an added row above. The
+infeasibility, the tolerance a var left behind at a huge bound, which the primal simplex's
+cleanup now repairs, and a fixed column's huge entry in a row added after the fix, which the
+infeasibility proof and SoPlex's instable leave now solve); thirteen are pinned today, the
+primal ratio test's scale, the two models of phases alternating over a row repaired through
+round-off, the forcing row, the two models no var can repair above, and the seven whose only
+room is a coefficient of round-off size. The
 wide-coefficient MILP property stays `#[ignore]`d while the classes above stand (a random
 search cannot assert its own failure); run it with `cargo test --lib -- --ignored`.
 
@@ -1024,7 +1233,8 @@ search cannot assert its own failure); run it with `cargo test --lib -- --ignore
 | Situation | Behavior |
 |---|---|
 | Root LP unbounded on a MILP | run a resumable zero-objective integer-feasibility search; any integer point proves `Unbounded`, exhaustion proves `Infeasible` |
-| Node LP infeasible | prune (correct) |
+| Node LP infeasible | prune (correct: the engine returns `Infeasible` only on a proof, §7; its one concession, a coefficient on an infinite bound counted as zero where the error of the multipliers could make it zero, as HiGHS counts every one below `1e-9`, covers what that error leaves of a coefficient that is zero for the exact multipliers) |
+| A violated row no var can repair, which proves nothing (after a rebuild, the taboo, SoPlex's instable pivot and the round-off repair) | `InternalError` (the verdict read off the tableau row reported such rows `Infeasible`); in a MIP, the retry from the slack basis, then the error |
 | Node LP unbounded | impossible when the node is bounded → `InternalError` |
 | Singular LU during a node LP | retry once from the slack basis; then propagate |
 | Exactly-integral candidate failing the guard | `InternalError` (the engine verified the same point; see §5.4) |

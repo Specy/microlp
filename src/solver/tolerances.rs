@@ -65,6 +65,22 @@ pub(crate) const LU_SINGULAR_REL: f64 = ROUNDOFF_FLOOR;
 /// basic var outside its tolerance.
 pub(crate) const PIVOT_REL_TOL: f64 = 1e-7;
 
+/// The smallest pivot element the dual simplex takes as its last resort, in
+/// the engine's scaled units: SoPlex's `lowstab` (`SOPLEX_LOWSTAB`, `1e-10`,
+/// src/soplex/spxboundflippingrt.hpp and spxfastrt.hpp), the stability its
+/// ratio tests require of an "instable" pivot. The regular floors
+/// ([`ENTRY_ROUNDOFF`], [`PIVOT_REL_TOL`]) are relative to the row's largest
+/// entry, so a huge entry elsewhere in the row (a fixed var's `1e17` beside a
+/// genuine `1`) can make every entry that could repair it "round-off". When
+/// such a row does not prove the model infeasible and no other row is left
+/// (see `Solver::dual_phase`), SoPlex pivots on an entry its regular
+/// stability test refused, if the entry is at least this, on its scaled
+/// data; the rows and columns here are scaled as SoPlex's are
+/// (equilibrated to entries near one), and below this an entry is
+/// indistinguishable from the round-off of a solve through a basis of any
+/// condition, so no pivot is taken on it at all.
+pub(crate) const INSTABLE_PIVOT_TOL: f64 = 1e-10;
+
 /// Relative disagreement between the pivot element computed through the
 /// pivot row (`row_coeffs[col]`) and through the pivot column
 /// (`col_coeffs[row]`) above which the factorization is not trusted for the
