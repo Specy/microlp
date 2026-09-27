@@ -76,8 +76,9 @@ impl Problem {
 
     /// Adds a real-valued variable to the problem.
     ///
-    /// `obj_coeff` is the variable's coefficient in the objective. `min` and
-    /// `max` are inclusive bounds; use [`f64::NEG_INFINITY`] or
+    /// `obj_coeff` is the variable's coefficient in the objective; a NaN or
+    /// infinite one makes the solve return [`Error::InvalidOperation`]. `min`
+    /// and `max` are inclusive bounds; use [`f64::NEG_INFINITY`] or
     /// [`f64::INFINITY`] for an unbounded side. A `min <= -2^52` or a
     /// `max >= 2^52` (2^52 is about 4.5e15) is treated as infinite, so
     /// `f64::MAX` works like [`f64::INFINITY`] and a solution may lie beyond
@@ -90,8 +91,9 @@ impl Problem {
 
     /// Adds an integer-valued variable to the problem.
     ///
-    /// `obj_coeff` is the variable's coefficient in the objective. `min` and
-    /// `max` are inclusive bounds. Use [`i32::MIN`] or [`i32::MAX`] when no
+    /// `obj_coeff` is the variable's coefficient in the objective; a NaN or
+    /// infinite one makes the solve return [`Error::InvalidOperation`]. `min`
+    /// and `max` are inclusive bounds. Use [`i32::MIN`] or [`i32::MAX`] when no
     /// tighter integer bound is required on that side.
     pub fn add_integer_var(&mut self, obj_coeff: f64, (min, max): (i32, i32)) -> Variable {
         self.internal_add_var(obj_coeff, (min as f64, max as f64), VarDomain::Integer)
@@ -106,7 +108,8 @@ impl Problem {
 
     /// Adds a variable restricted to `0` or `1`.
     ///
-    /// `obj_coeff` is the variable's coefficient in the objective.
+    /// `obj_coeff` is the variable's coefficient in the objective; a NaN or
+    /// infinite one makes the solve return [`Error::InvalidOperation`].
     pub fn add_binary_var(&mut self, obj_coeff: f64) -> Variable {
         self.internal_add_var(obj_coeff, (0.0, 1.0), VarDomain::Boolean)
     }
@@ -208,8 +211,9 @@ impl Problem {
     /// # Errors
     ///
     /// Returns [`Error::Infeasible`] when no feasible assignment exists,
-    /// [`Error::Unbounded`] when the objective has no finite optimum, or
-    /// [`Error::InternalError`] when the solve cannot continue.
+    /// [`Error::Unbounded`] when the objective has no finite optimum,
+    /// [`Error::InvalidOperation`] when an objective coefficient is NaN or
+    /// infinite, or [`Error::InternalError`] when the solve cannot continue.
     pub fn solve(&self) -> Result<SolveOutcome, Error> {
         let options = SolveOptions {
             time_limit: self.time_limit,
@@ -226,10 +230,13 @@ impl Problem {
     /// # Errors
     ///
     /// Returns [`Error::InvalidOptions`] when an option is non-finite or outside
-    /// its accepted range. See [`Problem::solve`] for errors that can be
-    /// reported while solving.
+    /// its accepted range, and [`Error::InvalidOperation`] when an objective
+    /// coefficient is NaN or infinite; both are checked before anything is
+    /// solved. See [`Problem::solve`] for errors that can be reported while
+    /// solving.
     pub fn solve_with(&self, options: SolveOptions) -> Result<SolveOutcome, Error> {
         options.validate()?;
+        self.validate_objective()?;
         let num_vars = self.obj_coeffs.len();
         if self.has_integer_vars() {
             let run = mip::run(self, options.clone())?;
@@ -246,7 +253,7 @@ impl Problem {
             // Lp mode applies only feasible-set-exact reductions, so the live
             // solver stays sound under every later Solution edit.
             let presolved = if options.presolve {
-                Some(presolve::presolve(
+                presolve::unless_infeasible(presolve::presolve(
                     &self.obj_coeffs,
                     &self.var_mins,
                     &self.var_maxs,
@@ -256,7 +263,7 @@ impl Problem {
                     options.tolerances.feasibility,
                     options.int_tol,
                     false,
-                )?)
+                ))?
             } else {
                 None
             };
@@ -294,5 +301,21 @@ impl Problem {
                 resume_options,
             )
         }
+    }
+
+    /// `InvalidOperation` for the first objective coefficient that is NaN or
+    /// infinite, reported as the user gave it (a `Maximize` cost is stored
+    /// negated). No solve can use one: the reduced costs would not be numbers.
+    fn validate_objective(&self) -> Result<(), Error> {
+        let Some(var) = self.obj_coeffs.iter().position(|c| !c.is_finite()) else {
+            return Ok(());
+        };
+        let given = match self.direction {
+            OptimizationDirection::Minimize => self.obj_coeffs[var],
+            OptimizationDirection::Maximize => -self.obj_coeffs[var],
+        };
+        Err(Error::InvalidOperation(format!(
+            "invalid objective coefficient {given} of variable {var}: expected a finite value"
+        )))
     }
 }

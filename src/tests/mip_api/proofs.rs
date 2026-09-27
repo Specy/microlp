@@ -83,9 +83,6 @@ fn unbounded_relaxation_classification_resumes_after_root_interrupt() {
     p.add_constraint(&[(x, 1.0)], ComparisonOp::Eq, 0.5);
     let mut options = SolveOptions::default();
     options.time_limit = Some(Duration::ZERO);
-    // Presolve proves this model infeasible up front; the engine's own
-    // classification of an unbounded relaxation is under test.
-    options.presolve = false;
 
     let interrupted = p.solve_with(options).unwrap();
     assert!(interrupted.solution().is_none());
@@ -110,7 +107,6 @@ fn interrupted_unbounded_classification_hides_the_working_point() {
 
     let mut options = SolveOptions::default();
     options.node_limit = Some(0);
-    options.presolve = false; // see the test above
 
     let outcome = p.solve_with(options).unwrap();
     assert!(outcome.solution().is_none());

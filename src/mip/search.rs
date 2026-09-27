@@ -280,15 +280,18 @@ fn pop_node(state: &mut MipState) -> Option<Node> {
 
 /// Evaluate a warm-start hint: fix hinted vars, LP-complete the rest, and if the
 /// completion is feasible and integral adopt it as the initial incumbent.
-/// Advisory by design — every failure path just drops the hint. Always restores
-/// the solver to the root optimum before returning.
+/// Advisory by design — every failure path just drops the hint, an engine error
+/// in the completion included: the search solves the whole model without it.
+/// Always restores the solver to the root optimum before returning.
 ///
 /// Returns `Ok(None)` on the normal path (the caller proceeds to build the root
-/// node). Returns `Ok(Some(TerminationReason::TimeLimit))` only when the restore
-/// of the root basis fails AND the deadline strikes mid-restore: rather than let the
-/// caller read an unfinished `cur_obj_val` as the root bound, it un-sets
-/// `root_solved` so a resume re-enters `initial_solve` and continues honestly from
-/// the solver's feasibility flags.
+/// node). `Err` is either the `Unbounded` verdict, when the completion is the
+/// integer point an unboundedness classification looks for, or an error
+/// restoring the root. Returns `Ok(Some(TerminationReason::TimeLimit))` only when
+/// the restore of the root basis fails AND the deadline strikes mid-restore:
+/// rather than let the caller read an unfinished `cur_obj_val` as the root bound,
+/// it un-sets `root_solved` so a resume re-enters `initial_solve` and continues
+/// honestly from the solver's feasibility flags.
 pub(crate) fn try_warm_start(
     state: &mut MipState,
     hints: &[(crate::Variable, f64)],
@@ -297,7 +300,8 @@ pub(crate) fn try_warm_start(
     let root_basis = state.solver.snapshot_basis();
     let mut applied: Vec<usize> = Vec::new();
     let mut ok = true;
-    let mut pending_error = None;
+    // `try_adopt_incumbent`'s `Unbounded` verdict, returned once the root is restored.
+    let mut verdict = None;
 
     for &(var, val) in hints {
         let v = var.idx();
@@ -338,7 +342,7 @@ pub(crate) fn try_warm_start(
                         Ok(false) => {
                             debug!("warm-start hint rejected by feasibility guard; ignored");
                         }
-                        Err(error) => pending_error = Some(error),
+                        Err(error) => verdict = Some(error),
                     }
                 } else {
                     debug!("warm-start hint LP-completed fractionally; ignored");
@@ -347,7 +351,11 @@ pub(crate) fn try_warm_start(
             Ok(StopReason::Limit) | Err(Error::Infeasible) => {
                 debug!("warm-start hint infeasible or out of time; ignored");
             }
-            Err(error) => pending_error = Some(error),
+            // The engine's own error, even `Unbounded`: the completion only
+            // restricts the bounded root LP.
+            Err(error) => {
+                debug!("warm-start hint LP completion failed ({error}); ignored");
+            }
         }
     } else {
         debug!(
@@ -376,14 +384,14 @@ pub(crate) fn try_warm_start(
             // `initialize_root` continues `initial_solve` from the solver's
             // feasibility flags on resume.
             state.root_solved = false;
-            if let Some(error) = pending_error {
-                return Err(error);
+            if let Some(verdict) = verdict {
+                return Err(verdict);
             }
             return Ok(Some(TerminationReason::TimeLimit));
         }
     }
-    if let Some(error) = pending_error {
-        return Err(error);
+    if let Some(verdict) = verdict {
+        return Err(verdict);
     }
     Ok(None)
 }

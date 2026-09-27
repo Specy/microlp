@@ -1,7 +1,7 @@
 use super::search::{try_adopt_incumbent, try_warm_start};
 use super::state::Incumbent;
 use super::*;
-use crate::{ComparisonOp, OptimizationDirection, Problem, StopReason};
+use crate::{ComparisonOp, OptimizationDirection, Problem, StopReason, Variable};
 use core::time::Duration;
 
 fn int_2var_problem() -> Problem {
@@ -428,4 +428,71 @@ fn warm_start_restores_bounds_before_unbounded_verdict() {
         Err(Error::Unbounded)
     );
     assert_eq!(state.solver.get_var_bounds(x.idx()), (0.0, 10.0));
+}
+
+/// `min -x - y - t - z - w` s.t. `x + y + z + q + 3w >= 3` and
+/// `t - (1 + 2^-50) z - q >= 1e-6` over `x, y, t ∈ [0, 1]`, `z ∈ [-2e9, 1]`,
+/// `q ∈ [-1e10, 1e10]` and a binary `w`: the optimum is `-5`, at `w = 1`. With
+/// `w = 0` the LP is the one of
+/// `a_round_off_coefficient_on_a_far_bound_is_no_proof_and_is_a_known_limitation`
+/// in `src/tests/magnitudes.rs`, on which the engine fails loudly.
+fn round_off_room_unless_w_is_one() -> (Problem, Variable) {
+    let mut p = Problem::new(OptimizationDirection::Minimize);
+    let x = p.add_var(-1.0, (0.0, 1.0));
+    let y = p.add_var(-1.0, (0.0, 1.0));
+    let t = p.add_var(-1.0, (0.0, 1.0));
+    let z = p.add_var(-1.0, (-2e9, 1.0));
+    let q = p.add_var(0.0, (-1e10, 1e10));
+    let w = p.add_binary_var(-1.0);
+    p.add_constraint(
+        [(x, 1.0), (y, 1.0), (z, 1.0), (q, 1.0), (w, 3.0)],
+        ComparisonOp::Ge,
+        3.0,
+    );
+    p.add_constraint(
+        [(t, 1.0), (z, -(1.0 + 2f64.powi(-50))), (q, -1.0)],
+        ComparisonOp::Ge,
+        1e-6,
+    );
+    (p, w)
+}
+
+/// A hint whose LP completion fails with an engine error is dropped, as an
+/// infeasible one is: the solve returns what it returns without the hint.
+#[test]
+fn warm_start_drops_a_hint_whose_completion_fails() {
+    let (problem, w) = round_off_room_unless_w_is_one();
+    for presolve in [true, false] {
+        let options = SolveOptions {
+            presolve,
+            ..SolveOptions::default()
+        };
+        let hinted = SolveOptions {
+            warm_start: Some(vec![(w, 0.0)]),
+            ..options.clone()
+        };
+
+        // The completion, the root LP re-solved with `w = 0`, fails loudly.
+        let mut state = build_state(&problem, hinted.clone()).unwrap();
+        assert_eq!(state.solver.initial_solve().unwrap(), StopReason::Finished);
+        state.solver.set_var_bounds(w.idx(), 0.0, 0.0).unwrap();
+        assert!(matches!(
+            state.solver.reoptimize(),
+            Err(Error::InternalError(_))
+        ));
+
+        let without = problem.solve_with(options).unwrap();
+        let with = match problem.solve_with(hinted) {
+            Ok(outcome) => outcome,
+            Err(err) => panic!("the hinted solve returned {err:?} (presolve {presolve})"),
+        };
+        let (with, without) = (with.solution().unwrap(), without.solution().unwrap());
+        assert!((without.objective() + 5.0).abs() < 1e-6);
+        assert_eq!(with.status(), SolutionStatus::Optimal);
+        assert_eq!(with.objective(), without.objective());
+        assert_eq!(
+            with.iter().collect::<Vec<_>>(),
+            without.iter().collect::<Vec<_>>()
+        );
+    }
 }

@@ -140,25 +140,79 @@ mod tests_presolve_api {
         assert_eq!(sol.var_value(x), 3.0);
     }
 
-    /// Infeasibility detected by presolve must surface as the same public
-    /// error the raw solver reports.
+    /// Models presolve finds infeasible are solved as written, so the engine
+    /// or the search decides, and one that is infeasible stays `Infeasible`:
+    /// crossed bounds, a NaN bound, a row with a NaN or an infinite
+    /// coefficient or right-hand side, rows that contradict each other, and
+    /// an integer var whose rows leave it no integer; as an LP and as a MILP
+    /// (an extra integer var), presolve on and off.
     #[test]
-    fn infeasible_lp_and_milp_report_infeasible() {
+    fn infeasible_models_stay_infeasible_when_presolve_finds_them() {
         init();
-        let mut p = Problem::new(OptimizationDirection::Minimize);
-        let x = p.add_var(1.0, (0.0, 5.0));
-        let y = p.add_var(1.0, (0.0, 5.0));
-        p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 11.0);
-        let (with, without) = solve_both(&p);
-        assert_eq!(with.unwrap_err(), Error::Infeasible);
-        assert_eq!(without.unwrap_err(), Error::Infeasible);
-
-        let mut p = Problem::new(OptimizationDirection::Minimize);
-        let x = p.add_integer_var(1.0, (0, 5));
-        p.add_constraint(&[(x, 2.0)], ComparisonOp::Eq, 3.0); // x = 1.5: no integer
-        let (with, without) = solve_both(&p);
-        assert_eq!(with.unwrap_err(), Error::Infeasible);
-        assert_eq!(without.unwrap_err(), Error::Infeasible);
+        type Build = fn(&mut Problem);
+        let cases: [(&str, Build); 10] = [
+            ("crossed bounds", |p| {
+                let x = p.add_var(1.0, (2.0, 1.0));
+                p.add_constraint(&[(x, 1.0)], ComparisonOp::Ge, 0.0);
+            }),
+            ("NaN bound", |p| {
+                let x = p.add_var(1.0, (f64::NAN, 1.0));
+                p.add_constraint(&[(x, 1.0)], ComparisonOp::Ge, 0.0);
+            }),
+            ("NaN coefficient", |p| {
+                let x = p.add_var(1.0, (0.0, 1.0));
+                p.add_constraint(&[(x, f64::NAN)], ComparisonOp::Le, 1.0);
+            }),
+            ("infinite coefficient", |p| {
+                let x = p.add_var(1.0, (0.0, 1.0));
+                p.add_constraint(&[(x, f64::INFINITY)], ComparisonOp::Le, 1.0);
+            }),
+            ("NaN right-hand side", |p| {
+                let x = p.add_var(1.0, (0.0, 1.0));
+                p.add_constraint(&[(x, 1.0)], ComparisonOp::Le, f64::NAN);
+            }),
+            ("infinite right-hand side", |p| {
+                let x = p.add_var(1.0, (0.0, 1.0));
+                p.add_constraint(&[(x, 1.0)], ComparisonOp::Ge, f64::INFINITY);
+            }),
+            ("a row beyond the bounds", |p| {
+                let x = p.add_var(1.0, (0.0, 5.0));
+                let y = p.add_var(1.0, (0.0, 5.0));
+                p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 11.0);
+            }),
+            ("rows that contradict each other", |p| {
+                let x = p.add_var(1.0, (0.0, 5.0));
+                let y = p.add_var(1.0, (0.0, 5.0));
+                p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 1.0);
+                p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
+            }),
+            ("an integer equality with no integer", |p| {
+                let x = p.add_integer_var(1.0, (0, 5));
+                p.add_constraint(&[(x, 2.0)], ComparisonOp::Eq, 3.0);
+            }),
+            ("an integer range with no integer", |p| {
+                let x = p.add_integer_var(1.0, (0, 5));
+                p.add_constraint(&[(x, 1.0)], ComparisonOp::Ge, 1.2);
+                p.add_constraint(&[(x, 1.0)], ComparisonOp::Le, 1.8);
+            }),
+        ];
+        for (case, build) in cases {
+            for milp in [false, true] {
+                let mut p = Problem::new(OptimizationDirection::Minimize);
+                if milp {
+                    p.add_integer_var(1.0, (0, 1));
+                }
+                build(&mut p);
+                let (with, without) = solve_both(&p);
+                for (presolve, result) in [(true, with), (false, without)] {
+                    assert_eq!(
+                        result.map(|_| "solved"),
+                        Err(Error::Infeasible),
+                        "{case}: milp {milp}, presolve {presolve}"
+                    );
+                }
+            }
+        }
     }
 
     /// Unboundedness must remain the simplex's verdict (dual fixing skips

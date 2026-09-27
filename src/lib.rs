@@ -48,7 +48,8 @@ assert_eq!(solution.var_value(y), 3.0);
 [`Problem::solve`] tries to find the optimal solution. Contradictory
 constraints produce [`Error::Infeasible`], while an objective that can improve
 forever produces [`Error::Unbounded`]. Invalid explicit numeric options produce
-[`Error::InvalidOptions`], and unrecoverable numerical failures produce
+[`Error::InvalidOptions`], a NaN or infinite objective coefficient produces
+[`Error::InvalidOperation`], and unrecoverable numerical failures produce
 [`Error::InternalError`].
 
 When a solve call returns successfully:

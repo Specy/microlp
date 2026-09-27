@@ -29,9 +29,8 @@
 //!   right-hand side as written, [`Row::rhs_mag`](model::Row::rhs_mag)) to a
 //!   budget of `ROW_BUDGET_SHARE * row_tolerance(feasibility, m)`, and the
 //!   boundary accepts the full `row_tolerance`. Presolve never introduces a
-//!   violation above the budget in a row the engine holds, and never
-//!   declares infeasible what a point within the budget could satisfy. `m`
-//!   is taken at the corner of the box the decision is about, never over the
+//!   violation above the budget in a row the engine holds. `m` is taken at
+//!   the corner of the box the decision is about, never over the
 //!   whole box, so a bound of `f64::MAX` cannot inflate the tolerance of a
 //!   row evaluated at small values.
 //! * A continuous var may leave its EMITTED bounds by its bound tolerance
@@ -56,6 +55,8 @@
 //! * Every row presolve drops or rewrites is still checked against the answer
 //!   as written ([`Presolved::validation_rows`]), so a wrong rule fails loudly
 //!   at the boundary.
+//! * An `Infeasible` verdict is not final: the solve then goes on with the
+//!   model as written ([`unless_infeasible`]).
 //!
 //! [`row_violation`]: crate::solver::row_violation
 //!
@@ -89,8 +90,8 @@ use crate::{ComparisonOp, CsVec, Error, VarDomain};
 /// Run presolve. `obj_coeffs` are the internal (minimize-space) objective
 /// coefficients as stored on `Problem`; `feasibility` is the user's absolute
 /// feasibility tolerance, the contract every decision is made against.
-/// Returns `Err(Infeasible)` when the reductions prove no acceptable point
-/// exists.
+/// Returns `Err(Infeasible)` when the reductions find no acceptable point,
+/// which the solve does not take as final ([`unless_infeasible`]).
 #[allow(clippy::too_many_arguments)] // mirrors Solver::try_new's flat-arrays style
 pub(crate) fn presolve(
     obj_coeffs: &[f64],
@@ -312,6 +313,24 @@ pub(crate) fn presolve(
         validation_rows,
         stats: work.stats,
     })
+}
+
+/// [`presolve`]'s result as the solve takes it: `None` for `Infeasible`, so
+/// that the model is solved as written. The reductions fix vars within the
+/// tolerances and then take the fixed values as exact, which can make a model
+/// feasible within the contract look infeasible; the engine returns
+/// `Infeasible` only on a proof, and a MILP's search decides from there.
+pub(crate) fn unless_infeasible(
+    result: Result<Presolved, Error>,
+) -> Result<Option<Presolved>, Error> {
+    match result {
+        Ok(presolved) => Ok(Some(presolved)),
+        Err(Error::Infeasible) => {
+            debug!("presolve found the model infeasible; solving it as written");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]

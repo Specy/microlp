@@ -24,12 +24,14 @@
 //! the engine holds the leaving var to at the bound it violates (`var_tols`),
 //! plus the round-off allowance of the compensated sums, with no tolerance on
 //! the other terms. That is the tolerance by which the dual simplex found the
-//! row violated, so a proof says that no point the simplex could accept for
-//! that var exists; any other tolerance would leave a band where a row is
-//! violated for the simplex yet not infeasible for the proof, and nothing
-//! that can act on it. The price: a model whose only points lie between the
-//! engine's share of the contract and the contract itself (a row missed by
-//! `6e-8`, beyond half of a `1e-7` contract) is reported infeasible.
+//! row violated, so a proof says that no point has that var within its
+//! tolerance and every other term within its bounds; any other tolerance
+//! would leave a band where a row is violated for the simplex yet not
+//! infeasible for the proof, and nothing that can act on it. The price: a
+//! model is reported infeasible when its points all need more room than that,
+//! on the leaving var (a row missed by `6e-8`, beyond half of a `1e-7`
+//! contract) or on another term (rows that agree only within their
+//! tolerances, which the certificate takes as exact).
 
 use super::{Solver, ROUNDOFF_FLOOR};
 
