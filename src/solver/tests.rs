@@ -87,11 +87,9 @@ fn try_new_rejects_nan_bound() {
 }
 
 /// `entry_bounds` judges each side of a range on its own: a bound at or
-/// beyond 2^52 on its side of infinity is infinite, whatever the other
-/// bound (a var living beyond the threshold kept a far bound of `f64::MAX`
-/// as written, and started on it), and a bound on the other side is data.
-/// Only a range that is a point or empty is kept as written, and a NaN
-/// bound stays NaN.
+/// beyond 2^52 on its side of infinity is infinite whatever the other bound
+/// (a var must not start on a far bound of `f64::MAX`), a bound on the other
+/// side is data, a point or an empty range is kept, and NaN stays NaN.
 #[test]
 fn entry_bounds_judges_each_side_on_its_own() {
     let t = INFINITE_BOUND;
@@ -104,8 +102,7 @@ fn entry_bounds_judges_each_side_on_its_own() {
         ((-t, 0.0), (-inf, 0.0)),
         ((0.0, t - 1.0), (0.0, t - 1.0)),
         ((1.0 - t, 0.0), (1.0 - t, 0.0)),
-        // The range lies beyond the threshold: the far side is infinite,
-        // the near side a bound.
+        // Ranges beyond the threshold: the far side is infinite, the near side a bound.
         ((5e15, max), (5e15, inf)),
         ((t, 1e20), (t, inf)),
         ((5e15, 1e16), (5e15, inf)),
@@ -338,12 +335,10 @@ fn initial_solve() {
     assert_eq!(infeasible.unwrap_err(), Error::Infeasible);
 }
 
-/// `min Σ c_i x_i` over `x ∈ [0, 1]^8` with `Σ x_i ≥ 5` and costs `1..=8`:
-/// the start (every var at its lower bound) is dual feasible, and the one
-/// violated row is repaired by the four cheapest vars moving to their upper
-/// bound and the fifth entering. The dual ratio test passes the breakpoints of
-/// the four (flips, no pivot) and pivots only on the fifth, so the phase takes
-/// one pivot where a ratio test without bound flipping takes five.
+/// The bound-flipping dual ratio test: `min Σ c_i x_i` over `x ∈ [0, 1]^8`
+/// with `Σ x_i ≥ 5` and costs `1..=8` starts dual feasible at zero; the four
+/// cheapest vars flip to their upper bound and the fifth enters, so the phase
+/// takes one pivot where a ratio test without flips takes five.
 #[test]
 fn dual_step_flips_the_boxed_vars_it_passes() {
     init();
@@ -505,11 +500,10 @@ fn set_var_bounds_nan_is_infeasible_and_leaves_state_untouched() {
     assert_eq!(solver.get_var_bounds(0), (f64::NEG_INFINITY, f64::INFINITY));
 }
 
-/// A point is finite: a value or an activity that is not finite violates
-/// every bound and row whatever its sense. It would otherwise pass an
-/// infinite bound, or meet the infinite tolerance an infinite magnitude
-/// gives a row (an overflowing `Ge` activity used to pass, as did an
-/// infinite value of a free var, which let a NaN objective through).
+/// A value or an activity that is not finite violates every bound and row,
+/// whatever its sense: it must not pass an infinite bound, nor meet the
+/// infinite tolerance an infinite magnitude gives a row (an infinite value of
+/// a free var would let a NaN objective through).
 #[test]
 fn check_constraints_rejects_non_finite_activity() {
     for op in [ComparisonOp::Eq, ComparisonOp::Le, ComparisonOp::Ge] {
@@ -631,16 +625,11 @@ fn load_basis_rejects_wrong_shape() {
     assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
 }
 
-/// The single violated row `8 x1 + x2 / 8 >= 10` (equilibrated to
-/// `x1 + x2 / 64 >= 1.25`) with both vars at their lower bound and a zero
-/// cost: their breakpoints tie at a zero dual step. Flipping `x1` (entry 1,
-/// capacity 1) and `x2` (entry 1/64, capacity 1) together carries the row, so
-/// they form one Harris group and the pivot is its largest entry, `x1`, with
-/// nothing flipped, as HiGHS's `chooseFinal` has it (C2-07). A walk over the
-/// breakpoints one at a time flipped `x1` and pivoted on `x2`'s entry, 64
-/// times smaller, and made that flip on a zero dual step, which neither
-/// HiGHS nor SoPlex does (C2-09). The solve ends at the same point either
-/// way.
+/// Tied breakpoints form one Harris group, whose largest entry is the pivot,
+/// with nothing flipped: in `8 x1 + x2 / 8 >= 10` (equilibrated to
+/// `x1 + x2 / 64 >= 1.25`), with both vars at their lower bound and zero
+/// cost, the pivot is `x1` (entry 1), not `x2` (entry 1/64) after flipping
+/// `x1` on a zero dual step.
 #[test]
 fn dual_ratio_test_pivots_on_the_largest_entry_of_a_tied_group() {
     init();
@@ -672,13 +661,11 @@ fn dual_ratio_test_pivots_on_the_largest_entry_of_a_tied_group() {
     assert_eq!([sol.get_value(0), sol.get_value(1)], [1.0, 16.0]);
 }
 
-/// The same row with `x2` costing 1: its breakpoint now lies beyond the
-/// first Harris group, which holds `x1` alone and cannot carry the row
-/// (capacity 1 of 1.25). The groups up to `x2`'s can, but the last group's
-/// only entry, 1/64, is below a tenth of the largest grouped entry, so the
-/// pivot steps back to the first group, `x1`, and nothing is flipped (HiGHS
-/// `chooseFinalLargeAlpha`). `x1` then enters past its other bound, and the
-/// next iteration moves the rest of the violation onto `x2`.
+/// The same row with `x2` costing 1: the first Harris group holds `x1` alone
+/// and cannot carry the row (capacity 1 of 1.25), and the next group's only
+/// entry, 1/64, is below a tenth of the largest grouped entry, so the pivot
+/// steps back to `x1` with nothing flipped. `x1` enters past its other bound,
+/// and the next iteration moves the rest of the violation onto `x2`.
 #[test]
 fn dual_ratio_test_steps_back_to_a_group_with_a_stable_pivot() {
     init();
@@ -712,13 +699,10 @@ fn dual_ratio_test_steps_back_to_a_group_with_a_stable_pivot() {
 }
 
 /// A column excluded for the row (its entry disagreed with the column
-/// computation on a fresh factorization) no longer sets the pivot floor
-/// (C2-15). Planted row `x0 + 1e-6 x1 + 1e-14 x2` of the violated row
-/// `x0 + x1 + x2 >= 5`: `x0` sits at its upper bound (no help), `x1` is
-/// excluded, and `x2` (unbounded above) is the only var left to repair the
-/// row. With the floor taken over the excluded `x1`, `x2`'s entry was below
-/// it and above the round-off floor, neither a candidate nor a term of the
-/// verdict, and the row was declared infeasible.
+/// computation on a fresh factorization) does not set the pivot floor.
+/// Planted: the row `x0 + 1e-6 x1 + 1e-14 x2` of `x0 + x1 + x2 >= 5`, with
+/// `x0` at its upper bound and `x1` excluded; a floor set by `x1` (`1e-13`)
+/// would leave `x2`, the only var that can repair the row, no candidate.
 #[test]
 fn excluded_column_does_not_set_the_dual_pivot_floor() {
     init();
@@ -747,14 +731,11 @@ fn excluded_column_does_not_set_the_dual_pivot_floor() {
     assert_eq!(step.entering, (c2, 1e-14));
 }
 
-/// The dual simplex applies a pivot with the element computed through the
-/// column (C2-23): the eta file stores the column's own pivot, so the updated
-/// factorization maps the entering column exactly onto the unit vector of
-/// its row, and the primal step and the steepest-edge weight use it too,
-/// while the reduced costs, updated along the row, use the row's element.
-/// Planted: the row's element 1e-9 (relative) off the column's, within the
-/// agreement check. With the row's element in the eta, the updated basis had
-/// the entering column `a_q + (a_row - a_col) b_r` instead of `a_q`.
+/// A dual pivot puts the column's element in the eta file, so the updated
+/// basis holds the entering column `a_q` exactly (the row's would make it
+/// `a_q + (a_row - a_col) b_r`); the primal step and the steepest-edge weight
+/// use it too, and only the reduced costs use the row's element. Planted: the
+/// row's element `1e-9` (relative) off the column's, within the agreement check.
 #[test]
 fn dual_pivot_applies_the_column_element_to_the_eta_file() {
     init();
@@ -828,22 +809,16 @@ fn dual_pivot_applies_the_column_element_to_the_eta_file() {
     assert_eq!(sol.dual_edge_sq_norms[row], rho_sq_norm / (a_col * a_col));
 }
 
-/// KNOWN LIMITATION (ARCHITECTURE §7; C3-11 of the solver review): the
-/// primal ratio test's round-off scale is the largest entry of the whole
-/// column, so a genuine blocking entry below its `ENTRY_ROUNDOFF` share, next
-/// to huge entries in rows that cannot block, counts as noise. Basis: the free
-/// vars `y1`, `y2` of the nearly dependent equalities `y1 + y2 + x/8 = 0` and
-/// `y1 + (1 + 2^-43) y2 + 8x = 0`, which put 7e13 into the column of `x` in
-/// rows that never block, and the slack of `x/8 + 8z <= 1`, whose entry is
-/// 1/64 after equilibration and exact (the basis is block diagonal). Nothing
-/// blocks `x` and `max x` comes back `Unbounded` instead of `x = 8`. Taking
-/// the scale over the rows that can block instead fixes this model but pivots
-/// on round-off elsewhere (an entry of -4.4e-16 in a blocking row beside a
-/// huge one, taken with a step of 5.6e15, left a singular basis on an LP
-/// HiGHS finds unbounded), since the rows of one column share the round-off
-/// of one solve; telling the two apart needs an absolute pivot tolerance and
-/// a refined column, not a relative floor. When a change fixes this, the test
-/// fails: drop the attribute and keep it as a regression test.
+/// KNOWN LIMITATION (ARCHITECTURE §7): the primal ratio test's round-off
+/// scale is its column's largest entry, so a genuine blocking entry below its
+/// `ENTRY_ROUNDOFF` share counts as noise beside huge entries in rows that
+/// cannot block: `max x` comes back `Unbounded` instead of `x = 8`. Basis: the
+/// free `y1`, `y2` of the nearly dependent `y1 + y2 + x/8 = 0` and
+/// `y1 + (1 + 2^-43) y2 + 8x = 0` (7e13 in `x`'s column, never blocking), and
+/// the slack of `x/8 + 8z <= 1`, whose entry, 1/64, is exact (the basis is
+/// block diagonal). A scale over the blocking rows alone would pivot on
+/// round-off elsewhere; the fix needs an absolute pivot tolerance and a
+/// refined column.
 #[test]
 #[should_panic(expected = "Unbounded")]
 fn primal_ratio_test_scale_hides_a_blocking_entry_is_a_known_limitation() {
@@ -887,14 +862,12 @@ fn primal_ratio_test_scale_hides_a_blocking_entry_is_a_known_limitation() {
     assert!((sol.cur_obj_val + 8.0).abs() < 1e-9);
 }
 
-/// Dual steepest-edge weights are floored (C2-02, C2-03). A basis load
-/// resets every weight to one, an underestimate of `||e_1^T B^-1||^2 = 4.61`
-/// for `B = [[1, 0], [1.9, 1]]` (the basis `y`, `s1` of `y <= 3`,
-/// `1.9 y <= 10`); the dual pivot that repairs `y = 3 > 1` then updated the
-/// second row's weight to `1 - 1.9^2 = -2.61`, and a negative weight gives
-/// its row a negative score. Also: a weight that overflows, or that a NaN
-/// reaches, is the engine's error, not a panic (the floor once made a NaN
-/// weight finite, review of R0).
+/// Dual steepest-edge weights are floored: a basis load resets them to one,
+/// an underestimate of `||e_1^T B^-1||^2 = 4.61` for `B = [[1, 0], [1.9, 1]]`
+/// (the basis `y`, `s1` of `y <= 3`, `1.9 y <= 10`), and the pivot that
+/// repairs `y = 3 > 1` would update the second row's weight to
+/// `1 - 1.9^2 = -2.61`. A weight that overflows or meets a NaN is an
+/// `InternalError`, never floored finite.
 #[test]
 fn dual_steepest_edge_weights_are_floored_after_a_basis_load() {
     init();
@@ -953,13 +926,11 @@ fn dual_steepest_edge_weights_are_floored_after_a_basis_load() {
     ));
 }
 
-/// Primal steepest-edge weights are floored at `1 + lambda^2`, a lower
-/// bound of the true weight, as HiGHS does (C3-06): planted, the weight of
-/// `x2` an underestimate far below its true value (as cancellation in the
-/// update can leave one), which the update of the first pivot of
-/// `min -x1 - x2` s.t. `x1 + x2 <= 4`, `x1 - x2 <= 2` left at -2. Also: a
-/// weight that overflows, or that a NaN reaches, is the engine's error, not
-/// a panic (the floor once made a NaN weight finite, review of R0).
+/// Primal steepest-edge weights are floored at `1 + lambda^2`, a lower bound
+/// of the true weight: planted at -5, as cancellation can leave one, `x2`'s
+/// weight would update to -2 at the first pivot of `min -x1 - x2` s.t.
+/// `x1 + x2 <= 4`, `x1 - x2 <= 2`. A weight that overflows or meets a NaN is
+/// an `InternalError`, never floored finite.
 #[test]
 fn primal_steepest_edge_weights_are_floored() {
     init();
@@ -1001,11 +972,10 @@ fn primal_steepest_edge_weights_are_floored() {
     ));
 }
 
-/// A reduced cost that is not a number never ends a phase as optimal
-/// (C4-07): it counts as dual infeasible, but its steepest-edge score, not
-/// a number either, lost every comparison, so the primal simplex found no
-/// entering column and the phase reported the vertex optimal. Planted: a
-/// NaN in a verified optimum's reduced costs.
+/// A reduced cost that is not a number never ends a phase as optimal: it
+/// counts as dual infeasible, and its steepest-edge score, a NaN too, would
+/// lose every comparison, leaving no entering column and the vertex taken for
+/// optimal. Planted: a NaN in a verified optimum's reduced costs.
 #[test]
 fn nan_reduced_cost_is_an_error_not_an_optimum() {
     init();
@@ -1024,11 +994,9 @@ fn nan_reduced_cost_is_an_error_not_an_optimum() {
     assert!(matches!(sol.reoptimize(), Err(Error::InternalError(_))));
 }
 
-/// The same for a fixed var, which is dual feasible whatever its reduced
-/// cost is, as long as it is a number: one that is not still counts as dual
-/// infeasible, so the pricing reports it. When the dual infeasibility of a
-/// fixed var was zero for any reduced cost, a NaN passed as feasible and
-/// the phase ended optimal. Planted as above.
+/// The same for a fixed var, dual feasible whatever its reduced cost as long
+/// as it is a number: a NaN still counts as dual infeasible, and the pricing
+/// reports it. Planted as above.
 #[test]
 fn nan_reduced_cost_of_a_fixed_var_is_an_error_not_an_optimum() {
     init();
@@ -1053,24 +1021,19 @@ fn nb_col(sol: &Solver, var: usize) -> usize {
     sol.nb_vars.iter().position(|&v| v == var).unwrap()
 }
 
-/// The primal simplex's choice from the current state, as an iteration of
-/// its phase makes it: the pricing, then the ratio test for the priced
-/// column with no row excluded.
+/// The primal simplex's next choice, as its phase makes it: the pricing, then
+/// the ratio test for the priced column with no row excluded.
 fn primal_pivot_choice(sol: &mut Solver, harris_scale: f64) -> PivotChoice {
     let col = sol.price_primal().unwrap().expect("a var can enter");
     sol.choose_pivot(col, &[], harris_scale).unwrap()
 }
 
-/// A dual step never runs backwards (C2-16): where the Harris pass lets the
-/// entering var's reduced cost lie just across zero, the step is zero and
-/// the var's cost is shifted, as HiGHS takes `workTheta = 0` and shifts the
-/// cost. `min x0` s.t. `8 x0 + x1 >= 1e-4` (equilibrated to
-/// `x0 + x1 / 8 >= 1.25e-5`), `x1 >= 0`, with `x1`'s reduced cost planted at
-/// `-9e-11`, across zero within its tolerance of `1e-10`: its relaxed ratio
-/// is the Harris bound and it enters. The step `d_q / a_q` was
-/// `-9e-11 / 0.125`: the leaving slack, at its upper bound, ended with a
-/// reduced cost of `+7.2e-10`, dual infeasible beyond its tolerance, where it
-/// now ends at zero with every other reduced cost as it was.
+/// A dual step never runs backwards: where the Harris pass lets the entering
+/// var's reduced cost lie just across zero, the step is zero and the var's
+/// cost is shifted. In `8 x0 + x1 >= 1e-4` (equilibrated to
+/// `x0 + x1 / 8 >= 1.25e-5`), `x1`'s reduced cost is planted at `-9e-11`,
+/// within its tolerance of `1e-10`: a step `-9e-11 / 0.125` would leave the
+/// slack a reduced cost of `+7.2e-10`, dual infeasible beyond its tolerance.
 #[test]
 fn dual_step_is_zero_where_the_entering_reduced_cost_has_crossed_zero() {
     init();
@@ -1101,9 +1064,8 @@ fn dual_step_is_zero_where_the_entering_reduced_cost_has_crossed_zero() {
     assert_eq!(sol.nb_vars[step.entering.0], 1);
     assert!(step.zero_step && step.flips.is_empty());
 
-    // The phase: one pivot, on a zero step. The start violates its row by
-    // little (near optimal), so the costs are not perturbed and the planted
-    // reduced cost is what the ratio test sees.
+    // The phase: one pivot, on a zero step. The start is near optimal, so the
+    // costs are not perturbed and the ratio test sees the planted reduced cost.
     let mut sol = new_solver();
     let x0_reduced_cost = sol.nb_var_obj_coeffs[nb_col(&sol, 0)];
     sol.begin_dual_phase(false).unwrap();
@@ -1134,17 +1096,13 @@ fn dual_step_is_zero_where_the_entering_reduced_cost_has_crossed_zero() {
     assert_eq!(sol.nb_var_obj_coeffs[nb_col(&sol, 2)], 0.0);
 }
 
-/// A dual phase that starts dual infeasible first corrects its reduced costs
-/// (C2-21, HiGHS `correctDualInfeasibilities`): a boxed var moves to the
-/// bound where its reduced cost has the right sign, any other has its cost
-/// shifted until the reduced cost is just feasible; in a phase that cleans
-/// up after another, the boxed var's cost is shifted too. `min -x0 + x1 + x2 - x3`
-/// s.t. `x2 >= 1`, `x3 <= 7`, `x0 in [0, 5]`, `x1 >= 0`, `x2 in [0, 10]`,
-/// `x3 >= -3`, loaded with every var at its lower bound: `x0` (boxed) and
-/// `x3` (bounded below only) have reduced cost -1 there. The dual phase ran
-/// on those infeasibilities and left `x0` at zero for the primal simplex to
-/// move; now it moves `x0` to 5 before its first step, and the phase ends
-/// with the shift of `x3` given back, for the primal phase to take `x3` to 7.
+/// A dual phase that starts dual infeasible first corrects its reduced costs:
+/// a boxed var moves to the bound where its reduced cost has the right sign,
+/// and any other var (a boxed one too, in a cleanup phase) has its cost
+/// shifted until the reduced cost is just feasible. Loaded at the lower
+/// bounds, `x0` (boxed) and `x3` (bounded below only) have reduced cost -1:
+/// the phase moves `x0` to 5 first and gives `x3`'s shift back at its end,
+/// for the primal phase to take `x3` to 7.
 #[test]
 fn dual_phase_starts_by_correcting_its_dual_infeasibilities() {
     init();
@@ -1208,9 +1166,8 @@ fn dual_phase_starts_by_correcting_its_dual_infeasibilities() {
     );
     assert_eq!(sol.cur_obj_val, -11.0);
 
-    // A dual phase that cleans up after another forces phase 2, as HiGHS's
-    // cleanup calls do (`pass_force_phase2`): the boxed `x0` keeps its bound
-    // and has its cost shifted like any other var.
+    // A dual phase that cleans up after another corrects by shifts alone: the
+    // boxed `x0` keeps its bound and has its cost shifted like any other var.
     let mut sol = new_solver();
     sol.begin_dual_phase(true).unwrap();
     assert_eq!(sol.get_value(0), 0.0);
@@ -1222,12 +1179,11 @@ fn dual_phase_starts_by_correcting_its_dual_infeasibilities() {
     sol.end_dual_phase();
 }
 
-/// The cost perturbation of a dual phase, as HiGHS's `initialiseCost`: the
-/// base is `5e-7` times the largest cost (its fourth root above 100); a
-/// structural var's cost moves by `(1 + r) (|c| + 1) base` towards dual
-/// feasibility at the bound it can sit at (up bounded below only, down
-/// bounded above only, by the cost's sign when boxed), a free or fixed var's
-/// not at all, and a slack's by at most `5e-13` either way.
+/// The cost perturbation of a dual phase: the base is `5e-7` times the
+/// largest cost (its fourth root above 100); a structural var's cost moves by
+/// `(1 + r) (|c| + 1) base` towards dual feasibility at the bound it can sit
+/// at (up bounded below only, down bounded above only, by the cost's sign
+/// when boxed), a free or fixed var's not at all, a slack's by at most `5e-13`.
 #[test]
 fn cost_perturbation_follows_the_bound_types() {
     init();
@@ -1263,8 +1219,7 @@ fn cost_perturbation_follows_the_bound_types() {
     assert_eq!((p[4], p[5]), (0.0, 0.0));
     assert!(p[7] != 0.0 && p[7].abs() <= 5e-13);
 
-    // An objective of zeros is perturbed as if its largest cost were one
-    // (HiGHS's default path).
+    // An objective of zeros is perturbed as if its largest cost were one.
     let mut sol = Solver::try_new(
         &[0.0],
         &[0.0],
@@ -1279,12 +1234,10 @@ fn cost_perturbation_follows_the_bound_types() {
     assert!((5e-7..1e-6).contains(&sol.cost_perturbation[0]));
 }
 
-/// A cost of `1e20` or more (HiGHS's `infinite_cost`, which HiGHS's
-/// perturbation never sees) takes no part in the cost perturbation: it
-/// neither moves nor sets the base, so the other costs move as if it were
-/// not there, by less than a tenth of `|c| + 1`, and every working cost is
-/// finite. Before, `-1e300` moved by about `1e-6 * 1e375`: to minus
-/// infinity.
+/// A cost of `1e20` or more takes no part in the cost perturbation: it
+/// neither moves nor sets the base, so the other costs move by less than a
+/// tenth of `|c| + 1` and every working cost stays finite (perturbed, `-1e300`
+/// would move by about `1e-6 * 1e375`, to minus infinity).
 #[test]
 fn cost_perturbation_leaves_out_infinite_costs() {
     init();
@@ -1318,8 +1271,7 @@ fn cost_perturbation_leaves_out_infinite_costs() {
 }
 
 /// A dual phase that starts near optimal (dual feasible, every row violated
-/// by less than `1e-3`) is not perturbed (HiGHS `HEkkDual::solve`), and one
-/// far from it is.
+/// by less than `1e-3`) is not perturbed, and one far from it is.
 #[test]
 fn dual_phase_is_perturbed_only_far_from_optimal() {
     init();
@@ -1345,13 +1297,12 @@ fn dual_phase_is_perturbed_only_far_from_optimal() {
     }
 }
 
-/// The cycling detection of the dual simplex (HiGHS `isBadBasisChange`): a
-/// basis change leading to a visited vertex is cycling only when the change
-/// before it did too; it is then recorded as bad and made taboo, a bad change
-/// seen again is taboo again at once, the taboo is lifted at a rebuild, and a
-/// record goes once its row has moved. The vertex includes where the
-/// non-basic vars sit: a basic set reached again after a bound flip is a new
-/// vertex, not a revisit.
+/// The cycling detection of the dual simplex: a basis change leading to a
+/// visited vertex is cycling only when the change before it did too; it is
+/// then recorded as bad and made taboo, a bad change seen again is taboo again
+/// at once, a rebuild lifts the taboo, and a record goes once its row has
+/// moved. The vertex includes where the non-basic vars sit, so a basic set
+/// reached again after a bound flip is a new vertex.
 #[test]
 fn vertex_hash_makes_a_repeated_basis_change_taboo() {
     use super::cycling::{
@@ -1399,8 +1350,7 @@ fn vertex_hash_makes_a_repeated_basis_change_taboo() {
     let h = next(&guard, 10, 1);
     assert!(!guard.is_bad_change(0, 10, 1, h));
     // Once row 0 has moved, the record is forgotten: after a pivot in row 1
-    // (var 1 replaces 11), the change leads to a vertex never visited and is
-    // no longer known as bad.
+    // (var 1 replaces 11), the change leads to an unvisited vertex and is not bad.
     guard.forget_moved_rows(|r| r == 0);
     pivot(&mut guard, 11, 1);
     let h = next(&guard, 10, 0);
@@ -1418,16 +1368,11 @@ fn vertex_hash_makes_a_repeated_basis_change_taboo() {
     assert!(!guard.is_bad_change(0, 10, 0, h));
 }
 
-/// A dual phase whose fresh data leave nothing but taboo basis changes fails
-/// loudly (HiGHS's `kSolvePhaseTabooBasis`, which returns `kUnknown`),
-/// instead of reporting an answer or running on. `min x0 + 2 x1` s.t.
-/// `x0 + x1 >= 1`, `x in [0, 10]^2`, from the slack basis: the change of the
-/// one violated row (`x0` enters for the slack) is planted as bad, as two
-/// consecutive revisits record it. The row is skipped while taboo; the
-/// rebuild that follows lifts the taboo, the change is chosen again and is
-/// taboo again at once, and nothing else is left. Without the record the
-/// same phase makes that change and finishes. The phase runs under a time
-/// limit, so that a phase that went on instead fails the test.
+/// A dual phase whose fresh data leave only taboo basis changes fails loudly
+/// instead of answering or running on. From the slack basis of `min x0 + 2 x1`
+/// s.t. `x0 + x1 >= 1`, the violated row's one change (`x0` in for the slack)
+/// is planted as bad, so it is taboo again after each rebuild. Without the
+/// record the phase finishes; a time limit turns running on into a failure.
 #[test]
 fn dual_phase_fails_loudly_when_only_taboo_changes_are_left() {
     init();
@@ -1476,8 +1421,8 @@ fn dual_phase_fails_loudly_when_only_taboo_changes_are_left() {
 }
 
 /// The compensated sums of the infeasibility proof keep what `f64` rounds
-/// away (HiGHS's `HighsCDouble`): `1e16 + 1 - 1e16` is one, where `f64`
-/// gives zero, and a product is exact: `(1 + 2^-30)^2` keeps its `2^-60`.
+/// away: `1e16 + 1 - 1e16` is one, where `f64` gives zero, and a product is
+/// exact: `(1 + 2^-30)^2` keeps its `2^-60`.
 #[test]
 fn compensated_sums_keep_what_f64_rounds_away() {
     let mut sum = proof::CDouble::default();
@@ -1512,14 +1457,11 @@ fn proof_of_a_single_row(rhs: f64, y_max: f64) -> proof::Proof {
     sol.prove_infeasible(row, leaving_new_val > sol.basic_var_vals[row])
 }
 
-/// The infeasibility proof judges the model's data (C2-14, C4-33 of the
-/// solver review): at the slack basis the certificate is the row itself,
-/// `x + y + s = rhs` with `s <= 0`, whose largest value over the box is 2.
-/// For `rhs = 3` it is out of reach by one: proven. The gap must exceed the
-/// tolerance the engine holds the row's slack to, half the user's `1e-7`:
-/// out of reach by `3e-8`, a point the dual simplex accepts misses the row
-/// by that much, so nothing is proven; by `2e-7`, it is. With `y` unbounded
-/// above the range is unbounded: nothing is proven, however far the row is.
+/// The infeasibility proof needs a gap beyond the tolerance the engine holds
+/// the row's slack to, half the user's `1e-7`: at the slack basis the
+/// certificate is the row `x + y + s = rhs`, `s <= 0`, at most 2 over the
+/// box, so `rhs = 3` and `2 + 2e-7` are proven, but not `2 + 3e-8`, a miss
+/// the dual simplex accepts, nor any `rhs` with `y` unbounded above.
 #[test]
 fn infeasibility_proof_needs_a_gap_beyond_the_tolerance() {
     init();
@@ -1600,14 +1542,12 @@ fn exact_row(rho: &[f64]) -> proof::RefinedRow {
     }
 }
 
-/// The row of the basis inverse the proof starts from is refined, with
-/// HiGHS's `unitBtranIterativeRefinement`: its residual
-/// `B^T rho - e_row`, summed in compensated arithmetic, is solved for and
-/// taken off, twice. Planted: at [`fifths_basis`], the computed row
+/// The row of the basis inverse the proof starts from is refined: its
+/// residual `B^T rho - e_row`, summed in compensated arithmetic, is solved
+/// for and taken off, twice. Planted: at [`fifths_basis`], the computed row
 /// perturbed by `1e-6`; the refinement brings it back to within round-off of
-/// the computed row (and so its basic coefficients, `B^T rho`, to the unit
-/// vector), and it converges: the second correction, the bound it reports
-/// on the error of each multiplier, is some ten orders below the first.
+/// the computed row, and converges: the second correction, the bound it
+/// reports on each multiplier's error, is some ten orders below the first.
 #[test]
 fn the_row_of_the_basis_inverse_is_refined_before_the_proof() {
     init();
@@ -1634,17 +1574,12 @@ fn the_row_of_the_basis_inverse_is_refined_before_the_proof() {
     assert!(error.iter().all(|&e| e <= 1e-16), "{error:?}");
 }
 
-/// The refinement keeps its corrections to twice the precision of an `f64`
-/// (as LAPACK's extra-precise refinement keeps its solution), so that the
-/// basic coefficients of the certificate vanish where the basis defines
-/// multipliers no `f64` holds. At [`fifths_basis`], the refined row as a
-/// compensated sum combines the basic columns into the unit vector to within
-/// `1e-30`, and the bound it reports on the error of each multiplier is of
-/// that order too; rounded to `f64`, as HiGHS rounds it, the same row leaves
-/// the error of its representation, some `1e-17`, which times a scaled bound
-/// of `1e9` to `6e10` voided the proofs of three infeasible MILP nodes of the
-/// property stress (`multipliers_no_f64_holds_do_not_void_a_nodes_proof` in
-/// `src/tests/magnitudes.rs`).
+/// The refinement keeps its corrections to twice the precision of an `f64`:
+/// at [`fifths_basis`] the refined row combines the basic columns into the
+/// unit vector to within `1e-30` and bounds each multiplier's error to that
+/// order, whereas rounded to `f64` it keeps its representation error, some
+/// `1e-17`, which a far bound turns into a void proof
+/// (`multipliers_no_f64_holds_do_not_void_a_nodes_proof` in `src/tests/magnitudes.rs`).
 #[test]
 fn the_refined_row_keeps_its_correction_to_twice_the_precision() {
     init();
@@ -1660,16 +1595,12 @@ fn the_refined_row_keeps_its_correction_to_twice_the_precision() {
     assert!(rounded.iter().any(|res| res.abs() > 1e-20), "{rounded:?}");
 }
 
-/// The bound the refinement puts on the error of each multiplier is its
-/// second correction, and only where the refinement converged in LAPACK's
-/// sense, that correction at most `2^-53` of the refined row in the max
-/// norm: a solve that leaves more cannot measure its own error, and a bound
-/// taken from it could make a coefficient of the model's own count as zero.
-/// With no bound, only the round-off of the certificate's own sums does
-/// (`a_coefficient_on_an_infinite_bound_counts_as_zero_only_within_its_error`).
-/// A row solved exactly has a zero correction and a zero bound; a row or a
-/// correction that is not a number leaves no bound (`f64::max` would drop
-/// it).
+/// The refinement bounds each multiplier's error by its second correction
+/// only where it converged (that correction at most `2^-53` of the refined
+/// row in the max norm): a solve that leaves more cannot measure its own
+/// error, and its bound could make a coefficient of the model count as zero.
+/// A row solved exactly has a zero bound; a row or correction that is not
+/// finite has none (`f64::max` would drop a NaN).
 #[test]
 fn the_refinement_bounds_the_multipliers_error_only_where_it_converged() {
     let row = |values: &[f64]| multipliers(values);
@@ -1697,22 +1628,15 @@ fn the_refinement_bounds_the_multipliers_error_only_where_it_converged() {
     );
 }
 
-/// A non-basic var's coefficient of the certificate counts however far
-/// below its terms it cancelled, at its bound where that is finite, and as
-/// an unbounded range where it is not: it is the model's own. Planted: at
-/// the slack basis, `rho` combines `x + y + z >= 3` and
-/// `t - (1 + 2^-50) z >= 1.5` over `x, y, t ∈ [0, 1]` and `z <= 1` (which
-/// starts at 1, its cost being negative), which leaves `z` the coefficient
-/// `-2^-50` beside terms of magnitude two, round-off, and the rest of the
-/// certificate out of reach by `1.5`. With `z >= -2^51` the coefficient
-/// times the bound takes the certificate to `5`, beyond `beta = 4.5`, and
-/// with `z` unbounded below anywhere: nothing is proven either way. Counted
-/// as zero, on the finite bound and then on the infinite one, such a
-/// coefficient proved a feasible model infeasible
-/// (`a_round_off_coefficient_on_a_far_bound_is_no_proof_and_is_a_known_limitation`
-/// and its variant on an infinite bound, in `src/tests/magnitudes.rs`).
-/// This model is infeasible all the same: another combination of the rows
-/// proves it.
+/// A non-basic var's certificate coefficient counts however far below its
+/// terms it cancelled, at a finite bound and as an unbounded range on an
+/// infinite one: it is the model's own, and counted as zero it proves
+/// feasible models infeasible (the round-off coefficient known limitations in
+/// `src/tests/magnitudes.rs`). Planted: `rho = (1, 1)` leaves `z` the
+/// coefficient `-2^-50` beside terms of two and the rest out of reach by
+/// `1.5`; with `z >= -2^51` the certificate reaches `5`, beyond `beta = 4.5`,
+/// and with `z` unbounded below any value, so nothing is proven. (Another
+/// combination of the rows proves this model infeasible.)
 #[test]
 fn a_non_basic_vars_round_off_coefficient_counts_on_every_bound() {
     init();
@@ -1750,13 +1674,11 @@ fn a_non_basic_vars_round_off_coefficient_counts_on_every_bound() {
     assert_eq!(unproven.gap, f64::NEG_INFINITY);
 }
 
-/// A number of the certificate that is not finite voids it, rather than
-/// count as zero or as a gap. Planted: `x + y + 1e305 f >= 3` over
-/// `x, y ∈ [0, 1]` and `f` fixed at `1e-305`, feasible at `x = y = 1`, taken
-/// alone: a fixed column keeps the user's units, and Dekker's split of
-/// `f`'s coefficient overflows, which leaves it not a number. Counted as
-/// zero (a NaN is above no round-off threshold), it left `x + y + s = 3`
-/// with `s <= 0` out of reach by one: a proof of a feasible model.
+/// A number of the certificate that is not finite voids it, rather than count
+/// as zero or as a gap. Planted: in `x + y + 1e305 f >= 3` with `f` fixed at
+/// `1e-305` (a fixed column keeps the user's units), Dekker's split of `f`'s
+/// coefficient overflows to a NaN; counted as zero, it would prove the model,
+/// feasible at `x = y = 1`, infeasible.
 #[test]
 fn non_finite_certificate_data_void_the_proof() {
     init();
@@ -1780,13 +1702,11 @@ fn non_finite_certificate_data_void_the_proof() {
     assert!(proof.gap.is_nan(), "{proof:?}");
 }
 
-/// An error bound of a coefficient that is not finite voids the proof, as
-/// any number of the certificate that is not finite does, rather than count
-/// every coefficient within it as zero. Planted: `x + y + j >= 3` over
-/// `x, y ∈ [0, 1]` and `j` free, feasible at `j >= 1`, taken alone with its
-/// multiplier's error unbounded (as an overflow of `Σ e_i |a_ij|` would
-/// leave it): counted as zero, `j`'s coefficient would leave `x + y + s = 3`
-/// with `s <= 0` out of reach by one, a proof of a feasible model.
+/// An error bound that is not finite voids the proof too, rather than count
+/// every coefficient within it as zero. Planted: the multiplier of
+/// `x + y + j >= 3` (`j` free) with an infinite error, as an overflow of
+/// `Σ e_i |a_ij|` would leave it; counted as zero, `j`'s coefficient would
+/// prove the model, feasible at `j >= 1`, infeasible.
 #[test]
 fn an_error_bound_that_is_not_finite_voids_the_proof() {
     init();
@@ -1817,13 +1737,11 @@ fn an_error_bound_that_is_not_finite_voids_the_proof() {
     assert_eq!(proof.gap, f64::NEG_INFINITY, "{proof:?}");
 }
 
-/// A multiplier of the certificate whose row would need its slack's infinite
-/// bound is dropped, with its row, as HiGHS drops it ("make sure infinite
-/// sides are not used"): what is left is a certificate of the other rows.
+/// A certificate multiplier whose row would need its slack's infinite bound
+/// is dropped with its row, leaving a certificate of the other rows.
 /// Planted: `rho` combines `x + y >= 3` over `x, y ∈ [0, 1]` with `1e-3` of
 /// `z <= 5`, whose slack has no upper bound; kept, that multiplier would make
-/// the range unbounded, and nothing would be proven (without the rule the
-/// differential fuzz's `int_lp-970`, an infeasible LP, failed loudly).
+/// the range unbounded and leave an infeasible model unproven.
 #[test]
 fn a_multiplier_on_a_rows_infinite_side_is_dropped() {
     init();
@@ -1850,24 +1768,14 @@ fn a_multiplier_on_a_rows_infinite_side_is_dropped() {
     assert!((proof.gap - 1.0).abs() < 1e-15, "{proof:?}");
 }
 
-/// A basic var of a row the certificate leaves out while the row's
-/// multiplier is the model's own (its slack's tableau entry) keeps the
-/// model's own coefficient, and on an infinite bound that makes the range
-/// unbounded: only what the error of the multipliers could leave counts as
-/// zero, and this row of the basis inverse is exact. The model of the review
-/// of the concession: `min -L` s.t. `L + j + w = 1.000001`,
-/// `-(1 + 2^-50) j - w = 0` and `j + v <= 0` over `L, v ∈ [0, 1]` and
-/// `j, w` free, feasible at `L = 1`, `j = -2^50 (fl(1.000001) - 1)`,
-/// `w = -(1 + 2^-50) j`, where the dual simplex ends: the basis `{j, w}` and
-/// the second row's slack, `L` at its upper bound, which puts that slack
-/// `1e-6` above its bound of zero. The row of the basis inverse is
-/// `(1, 1, 2^-50)`, solved exactly: both corrections of the refinement are
-/// zero, and so is the bound they put on the multipliers' error. The third
-/// row's multiplier needs its non-basic slack's infinite side and is left
-/// out, which leaves the free basic `j` the coefficient `-2^-50` beside terms
-/// of one, `4.4e-16` of them. Conceded as below the `f64` round-off floor of
-/// its terms, it left `L + s1 + s2 = 1.000001`, out of reach by `1e-6`: a
-/// proof of a feasible model (and of its MILP, whose root node was pruned).
+/// A basic var keeps its certificate coefficient when the certificate leaves
+/// a row out, and on an infinite bound that makes the range unbounded: only
+/// what the multipliers' error could leave counts as zero. The dual simplex
+/// ends this feasible model at the basis `{j, w}` and the second row's slack,
+/// `1e-6` above its bound; the exact row of the basis inverse,
+/// `(1, 1, 2^-50)`, leaves out the third row (its multiplier needs its
+/// slack's infinite side), which gives the free `j` the coefficient `-2^-50`,
+/// `4.4e-16` of its terms. Counted as zero, it proves the model infeasible.
 #[test]
 fn a_basic_vars_coefficient_in_a_row_left_out_voids_the_proof() {
     init();
@@ -1920,21 +1828,14 @@ fn a_basic_vars_coefficient_in_a_row_left_out_voids_the_proof() {
 }
 
 /// A coefficient on an infinite bound counts as zero exactly where the
-/// error of the multipliers could make it zero, whatever its var: within the
-/// bound the refinement puts on each multiplier's error, carried through the
-/// var's entries in the rows the certificate keeps, plus the error of its
-/// compensated sum; beyond that it makes the range unbounded, and with no
-/// bound only the error of the sum counts. Planted: `x + y + j + w >= 3` and
-/// `j + z + w = 0` over `x, y, z ∈ [0, 1]` and `j, w` free, infeasible
-/// (`j + w = -z <= 0`), at the basis `{j}` and the first row's slack, `3`
-/// above its bound, with `w` non-basic; the row of the basis inverse is
-/// `(1, -1)`. The planted, compensated multipliers `(1, -(1 + d))` leave the
-/// basic `j` and the non-basic `w` the coefficient `-d` beside terms of two,
-/// and the rest of the certificate out of reach by one. At `d = 2^-80` with
-/// the second multiplier's error bounded by `2^-79`, both count as zero:
-/// proven. Bounded by `2^-82`, or with no bound, neither does: nothing is
-/// proven. At `d = 2^-100`, within the error of the compensated sums, both
-/// count as zero with the error bounded by zero, and with no bound.
+/// multipliers' error could make it zero: within each multiplier's error
+/// bound carried through the var's entries, plus its compensated sum's own
+/// error. Planted, on an infeasible model at the basis `{j}` and the first
+/// row's slack: the multipliers `(1, -(1 + d))` leave the basic `j` and the
+/// non-basic `w`, both free, the coefficient `-d` and the rest out of reach
+/// by one. `d = 2^-80` is proven with an error bound of `2^-79`, not with
+/// `2^-82` or none; `d = 2^-100`, within the sums' own error, is proven
+/// either way.
 #[test]
 fn a_coefficient_on_an_infinite_bound_counts_as_zero_only_within_its_error() {
     init();
@@ -1998,9 +1899,9 @@ fn a_coefficient_on_an_infinite_bound_counts_as_zero_only_within_its_error() {
 }
 
 /// A row that no var can repair and that does not prove infeasibility is
-/// recorded as a bad basis change with no entering var (HiGHS's
-/// `kFailedInfeasibilityProof`): taboo, and unproven, until a rebuild lifts
-/// the taboo; the record goes when a step moves its row.
+/// recorded as a bad basis change with no entering var: taboo, and
+/// unproven, until a rebuild lifts the taboo; the record goes when a step
+/// moves its row.
 #[test]
 fn a_failed_proof_makes_its_row_taboo() {
     let mut guard = CycleGuard::default();
@@ -2017,13 +1918,12 @@ fn a_failed_proof_makes_its_row_taboo() {
     assert!(!guard.any_taboo());
 }
 
-/// The model of C2-06 through the LP edit path, to the point where the dual
-/// phase takes over: `min y` s.t. `f + y >= 0` over `f ∈ [0, 10]`, `y >= 0`,
-/// then `f` fixed at zero and `1e17 f + y >= 1` added. The added row leaves
-/// the fixed `f` out of its equilibration, so its row in the dual ratio test
-/// is `[1e17, 1]` with `f`'s entry in the round-off scale, and `y`'s exact
-/// entry of one is below the pivot floor: no candidate. The phase is stopped
-/// before its first iteration (a deadline in the past) and started again.
+/// A fixed var's huge coefficient in a row added through the LP edit path:
+/// `min y` s.t. `f + y >= 0`, then `f` fixed at zero and `1e17 f + y >= 1`
+/// added. The added row leaves the fixed `f` out of its equilibration, so the
+/// dual ratio test sees `[1e17, 1]` and `y`'s exact one is below the pivot
+/// floor: no candidate. A deadline in the past stops the edit's solve before
+/// its first iteration, for the tests to resume.
 fn c2_06_through_an_edit() -> Solver {
     let mut sol = Solver::try_new(
         &[0.0, 1.0],
@@ -2047,17 +1947,14 @@ fn c2_06_through_an_edit() -> Solver {
     sol
 }
 
-/// The last resorts of the dual simplex for a row that no var can repair and
-/// that does not prove infeasibility (C2-06): the row is taboo and nothing
-/// else is left, so SoPlex's instable leave takes `y`'s entry of one, far
-/// above its `lowstab`, and the phase ends at `y = 1`, where the verdict read
-/// off the tableau row declared the model infeasible. When that pivot is
-/// refused (planted here as a bad basis change, as the cycling detection
-/// records one), the instable leave is not tried again: the round-off repair
-/// has nothing to move (`y` has no upper bound) and the phase fails loudly at
-/// once, where a phase that scheduled the instable leave again would go round
-/// until its stall bound ended it. The phase runs under a time limit, so that
-/// a phase that went on instead fails the test.
+/// The dual simplex's last resorts for a row that no var can repair and that
+/// does not prove infeasibility: with the row taboo and nothing else left,
+/// the instable leave (a pivot the regular floors refuse, down to
+/// `INSTABLE_PIVOT_TOL`) pivots on `y`'s entry of one, and the phase ends at
+/// `y = 1`. That pivot refused (planted as a bad basis change), the round-off
+/// repair has nothing to move (`y` has no upper bound), and the phase fails
+/// loudly at once instead of retrying until its stall bound; a time limit
+/// turns running on into a failure.
 #[test]
 fn a_row_the_proof_leaves_open_gets_the_instable_leave_once() {
     init();
@@ -2096,12 +1993,11 @@ fn a_row_the_proof_leaves_open_gets_the_instable_leave_once() {
     assert!(sol.lp_iterations - iterations < 20, "{}", sol.lp_iterations);
 }
 
-/// The bound perturbation of a primal phase, as HiGHS's `initialiseBound`
-/// in user units: every finite bound moves outward by `r 5e-7 max(1, |b|)`
-/// (a slack's by the magnitude of its row's right-hand side), mapped into
-/// the engine's scaled units like its tolerances; a fixed var is never
-/// perturbed, basic or not; a non-basic var at a bound moves with it and the
-/// basic values follow.
+/// The bound perturbation of a primal phase: every finite bound moves outward
+/// by `r 5e-7 max(1, |b|)` in user units (a slack's by the magnitude of its
+/// row's right-hand side), mapped into the engine's scaled units like its
+/// tolerances; a fixed var is never perturbed, basic or not; a non-basic var
+/// at a bound moves with it and the basic values follow.
 #[test]
 fn bound_perturbation_follows_the_bound_types() {
     init();
@@ -2155,13 +2051,11 @@ fn bound_perturbation_follows_the_bound_types() {
     );
 }
 
-/// A primal phase is perturbed only when it may be (it is not the cleanup of
-/// another phase) and far from optimal (HiGHS `HEkkPrimal::solve`: a
-/// thousand or more dual infeasibilities, or one of `1e-3` or more), and its
-/// cleanup takes every non-basic var back to the true bound it sits at a
-/// moved version of: `min c (x0 + x1)` s.t. `x0 + x1 <= 4`, `x0 - x1 <= 2`,
-/// `x >= 0`, starts primal feasible at zero with both reduced costs `c`, and
-/// ends at the vertex `(3, 1)` exactly, however it was perturbed.
+/// A primal phase is perturbed only when it is not a cleanup and starts far
+/// from optimal (a thousand or more dual infeasibilities, or one of `1e-3` or
+/// more), and its cleanup takes every non-basic var at a moved bound back to
+/// the true one: `min c (x0 + x1)`, primal feasible at zero with both reduced
+/// costs `c`, ends at the vertex `(3, 1)` exactly, however it was perturbed.
 #[test]
 fn primal_phase_is_perturbed_only_far_from_optimal_and_cleans_up_exactly() {
     init();
@@ -2206,17 +2100,12 @@ fn primal_phase_is_perturbed_only_far_from_optimal_and_cleans_up_exactly() {
     }
 }
 
-/// A leaving var that sits past the bound it leaves at (within its
-/// tolerance, as the Harris pass allows) gives a zero step, not a step
-/// backwards, and leaves where it sits (SoPlex's `maxReLeave`): `min -x0`
-/// s.t. `x0 + x1 <= -3.5e-8`, `x >= 0`, whose slack starts at `-3.5e-8`,
-/// within its tolerance of `5e-8`. The step backwards to the slack's bound
-/// would move `x0` to `-3.5e-8`, out of its own bounds; the clamp this
-/// replaced left the slack where it sat too (C3-21), but unrecorded, and
-/// set a var beyond its tolerance onto bound plus tolerance. Past its true
-/// bound the var keeps its working bounds (it is at its bound in the
-/// engine's sense) and stays there through the cleanup, since it is within
-/// its tolerance of it at the current values.
+/// A leaving var past the bound it leaves at, within its tolerance, gives a
+/// zero step, not a step backwards, and leaves where it sits: the slack of
+/// `x0 + x1 <= -3.5e-8` starts at `-3.5e-8` (tolerance `5e-8`), and a step
+/// back to its bound would move `x0` to `-3.5e-8`, out of its bounds. The
+/// slack keeps its working bounds and, within its tolerance, stays there
+/// through the cleanup.
 #[test]
 fn a_step_that_would_run_backwards_is_zero() {
     init();
@@ -2232,9 +2121,8 @@ fn a_step_that_would_run_backwards_is_zero() {
     .unwrap();
     assert_eq!(sol.basic_var_vals, [-3.5e-8]);
     assert_eq!(sol.var_tols[2].lo, 5e-8);
-    // The start is primal infeasible by the exact test `try_new` makes, so
-    // it came with the phase-1 objective; the primal phase works on the real
-    // one, as `run_phases` has it.
+    // `try_new`'s exact test finds the start primal infeasible and sets the
+    // phase-1 objective; the primal phase works on the real one, as in `run_phases`.
     sol.artificial_obj = None;
     sol.recalc_obj_coeffs().unwrap();
     sol.begin_primal_phase(true);
@@ -2257,20 +2145,14 @@ fn a_step_that_would_run_backwards_is_zero() {
     assert_eq!(sol.get_value(0), 0.0);
 }
 
-/// The Harris pass's limit on the step is never below zero (review of R1b).
-/// In a round of `run_phases` after the first, the primal ratio test allows
-/// a basic var a hundredth of its tolerance past its bound
-/// (`LOOP_HARRIS_REDUCTION`), and a var already past it by more (within its
-/// whole tolerance, as `correct_primal` leaves it) admits no step toward it:
-/// a limit of zero. `min -x0` s.t. `x0 + x1 <= 0`, `1e-16 x0 + x1 <=
-/// -2.5e-8`, `x0 >= 0`, `x1` in `[0, 10]`: the first slack sits at its
-/// bound, the second `2.5e-8` past it, within its tolerance of `5e-8`, and
-/// the scaling puts `x0`'s entries at `1` and `1.34e-8`. With the allowance
-/// cut, the second row's limit was `(-2.5e-8 + 5e-10) / 1.34e-8`, negative,
-/// and only that row's own step was within it: the zero step pivoted on
-/// `1.34e-8`, below the pivot floor, and passed over the first row's `1`, at
-/// its bound. Clamped to zero, the limit lets every row at or past its bound
-/// compete by its entry, in every round alike.
+/// The Harris pass's limit on the step is never below zero: after the first
+/// round of `run_phases` the primal ratio test allows a basic var only a
+/// hundredth of its tolerance past its bound (`LOOP_HARRIS_REDUCTION`), and a
+/// var already past it by more admits no step toward it. Here the second
+/// slack sits `2.5e-8` past its bound (tolerance `5e-8`) and scaling puts
+/// `x0`'s entries at `1` and `1.34e-8`: the negative limit
+/// `(-2.5e-8 + 5e-10) / 1.34e-8` would pivot on `1.34e-8`, below the pivot
+/// floor, instead of on the first row's `1`, at its bound.
 #[test]
 fn a_var_past_its_bound_beyond_the_allowance_limits_the_step_to_zero() {
     init();
@@ -2289,9 +2171,8 @@ fn a_var_past_its_bound_beyond_the_allowance_limits_the_step_to_zero() {
     .unwrap();
     assert_eq!(sol.basic_var_vals, [0.0, -2.5e-8]);
     assert_eq!(sol.var_tols[3].lo, 5e-8);
-    // The start is primal infeasible by the exact test `try_new` makes, so
-    // it came with the phase-1 objective; the primal phase works on the real
-    // one, as `run_phases` has it.
+    // `try_new`'s exact test finds the start primal infeasible and sets the
+    // phase-1 objective; the primal phase works on the real one, as in `run_phases`.
     sol.artificial_obj = None;
     sol.recalc_obj_coeffs().unwrap();
     sol.begin_primal_phase(true);
@@ -2319,13 +2200,12 @@ fn a_var_past_its_bound_beyond_the_allowance_limits_the_step_to_zero() {
     }
 }
 
-/// The working bounds a leaving var holds (see `hold_leaving_value`): past
-/// its true bound, within its tolerance, it keeps them; past a bound the
-/// phase moved, that bound moves on to where it sits; a fixed var is fixed
-/// at its value when it leaves within its tolerance of it, and where it sits
-/// otherwise. The cleanup then takes a var at a moved bound back to its true
-/// one, and a slack off its bound beyond its tolerance at the current values
-/// onto it.
+/// The working bounds a leaving var holds (`hold_leaving_value`): past its
+/// true bound within its tolerance, it keeps them; past a bound the phase
+/// moved, that bound moves to where it sits; a fixed var stays fixed at its
+/// value within its tolerance of it, and is fixed where it sits beyond. The
+/// cleanup takes a var at a moved bound back to its true one, and a slack
+/// off its bound beyond its current tolerance onto it.
 #[test]
 fn a_leaving_var_holds_its_working_bounds_until_the_cleanup() {
     init();
@@ -2368,19 +2248,14 @@ fn a_leaving_var_holds_its_working_bounds_until_the_cleanup() {
     assert_eq!(sol.basic_var_vals[0], 98.0);
 }
 
-/// A step moves the basic vars whose entries are too small for the ratio
-/// test to count, and one of them can end outside its bounds beyond its
-/// tolerance: its bound is shifted, and the phase goes on over bounds its
-/// point satisfies (HiGHS `phase2UpdatePrimal`, C3-23); the cleanup restores
-/// the bound and reports the violation, for the dual simplex. The model is
-/// `lp_wide_3` of the solver review's stress run: from the vertex its dual
-/// phase ends at, `x0` enters, its entry in `-1e4 x2 + 1e-3 x3 >= 0` is a
-/// genuine `3e-15`, below the round-off floor of its column (whose largest
-/// entry is 4), and the step of 32 takes the row's slack `9.5e-14` past its
-/// bound, twice its tolerance. (The whole solve still fails: the dual
-/// simplex repairs the row by moving `x5` across its range through another
-/// such entry, which gives the primal simplex its step back, round after
-/// round; C2-10 of the review, for the infeasibility proof of step R3.)
+/// A step also moves the basic vars whose entries the ratio test ignores, and
+/// one that ends beyond its tolerance has its bound shifted, so the phase
+/// goes on over bounds its point satisfies; the cleanup restores the bound
+/// and reports the violation. Here `x0` enters with a genuine `3e-15` in
+/// `-1e4 x2 + 1e-3 x3 >= 0`, below its column's round-off floor (largest
+/// entry 4), and its step of 32 takes that row's slack `9.5e-14` past its
+/// bound, twice its tolerance. (The whole solve still fails:
+/// `phases_alternating_over_a_row_repaired_through_round_off_is_a_known_limitation`.)
 #[test]
 fn a_step_past_a_row_the_ratio_test_ignores_shifts_its_bound() {
     init();
@@ -2445,19 +2320,13 @@ fn a_step_past_a_row_the_ratio_test_ignores_shifts_its_bound() {
     assert!(sol.calc_primal_infeasibility().0 == 1);
 }
 
-/// The cycling detection of the primal simplex (HiGHS `isBadBasisChange`,
-/// with the taboo on the entering var, `applyTabooVariableIn`): a primal
-/// phase whose fresh data leave nothing but taboo basis changes fails
-/// loudly (HiGHS's `kSolvePhaseTabooBasis`, which returns `kUnknown`)
-/// instead of reporting an answer or running on. `min -x0 - 2 x1` s.t.
-/// `x0 + x1 <= 4`, `x >= 0`, from the slack basis: the change `x1` in for
-/// the slack is planted as bad, as two consecutive revisits record it, and
-/// `x0`'s reduced cost is made feasible, so that `x1` is the only var that
-/// can enter. The pricing skips it while it is taboo; the rebuild that
-/// follows lifts the taboo, the change is chosen again and is taboo again at
-/// once, and nothing else is left. Without the record the same phase makes
-/// that change and finishes. The phase runs under a time limit, so that a
-/// phase that went on instead fails the test.
+/// The cycling detection of the primal simplex, whose taboo is on the
+/// entering var: a phase whose fresh data leave only taboo basis changes
+/// fails loudly instead of answering or running on. From the slack basis of
+/// `min -x0 - 2 x1` s.t. `x0 + x1 <= 4`, `x1` in for the slack is planted as
+/// bad and `x0` made dual feasible, so the only change is taboo again after
+/// each rebuild. Without the record the phase finishes; a time limit turns
+/// running on into a failure.
 #[test]
 fn primal_phase_fails_loudly_when_only_taboo_changes_are_left() {
     init();
@@ -2508,20 +2377,13 @@ fn primal_phase_fails_loudly_when_only_taboo_changes_are_left() {
     );
 }
 
-/// The rows a primal phase excludes as round-off are excluded for the
-/// column they were judged in only (review of R1b): once another var enters,
-/// its own entries in those rows bound its step. `min -2 x0 - x1` s.t.
-/// `x0 + x1 <= 1e-6`, `x0 - x1 <= 1e4`, `x >= 0`, with `x0`'s entry in the
-/// first row planted as `1e-9` in the column data and `2e-9` in the row
-/// data, so that its column and row computations disagree as round-off's
-/// do: the first row, with the smallest limit, is `x0`'s pivot row, its
-/// entry disagrees on a fresh factorization, and it is excluded for `x0`.
-/// The pivot on the second row that `x0` takes then is planted as a bad
-/// basis change, so `x0` becomes taboo and `x1` is priced with no pivot
-/// between. The first row is `x1`'s only blocking row, and the exclusions,
-/// reset only after a pivot, hid it: the phase took `x1`'s ray for an
-/// unbounded one. Now `x1` enters on that row, the step moves the second row
-/// and so drops the planted record, and `x0` enters later.
+/// A row the primal phase excludes as round-off is excluded only for the
+/// column it was judged in. Planted: `x0`'s entry in the first row is `1e-9`
+/// in the column data and `2e-9` in the row data, so the computations
+/// disagree as round-off's do and the row is excluded for `x0`; `x0`'s pivot
+/// on the second row is planted as bad, so `x1` is priced next with no pivot
+/// between. The first row is `x1`'s only blocking row: hidden, it would make
+/// `x1`'s ray look unbounded.
 #[test]
 fn rows_excluded_as_round_off_for_one_column_block_another() {
     init();
@@ -2560,9 +2422,8 @@ fn rows_excluded_as_round_off_for_one_column_block_another() {
         1,
         "fixture: with the first row excluded, x0 pivots on the second"
     );
-    // The change `x0` in for the slack of the second row (var 3) is planted
-    // as bad, as two consecutive revisits record it, and left not taboo, as
-    // a rebuild leaves it.
+    // `x0` in for the second row's slack (var 3) is planted as bad, as two
+    // consecutive revisits record it, and left not taboo, as a rebuild leaves it.
     let here = sol.cycle_guard.hash_after(std::iter::empty());
     assert!(!sol.cycle_guard.is_bad_change(1, 3, 0, here));
     sol.cycle_guard.record_pivot();
@@ -2576,17 +2437,11 @@ fn rows_excluded_as_round_off_for_one_column_block_another() {
 
 /// The cleanup of a primal phase moves a slack left off its bound beyond its
 /// tolerance at the current values onto the bound. Issue #3's model with
-/// `z ≤ 1e15`: `max 50x + 40y + 45z` s.t. `3x + 2y + z ≤ 20`,
-/// `2x + y + 3z ≤ 15`, `x ≥ 2`, `y ≤ 7`. The phase-1 dual phase starts `z`
-/// at 1e15, where the first row's tolerance is taken (2.5 in its scaled
-/// units, where the row is halved), and ends with that row violated by 1.375
-/// (0.6875 scaled) within it; the primal phase that follows, unperturbed
-/// here, lets the row's slack leave the basis where it sits (a step
-/// backwards would be zero). Its tolerance at the current values is
-/// `2.5e-8` (`5e-8` in user units): the cleanup moves it onto its bound,
-/// recomputes the values, and reports the violation that moves into `x` for
-/// the dual simplex, where the slack used to stay and the boundary reported
-/// the row violated.
+/// `z ≤ 1e15`: the phase-1 dual phase starts `z` at 1e15, where the first
+/// row's tolerance is taken (2.5 scaled, the row halved), and ends with the
+/// row violated by 1.375 within it; the primal phase lets the slack leave
+/// there, where its tolerance is now `2.5e-8` scaled, so the cleanup moves it
+/// onto its bound and reports the violation for the dual simplex.
 #[test]
 fn a_slack_left_off_its_bound_beyond_its_current_tolerance_moves_onto_it() {
     init();

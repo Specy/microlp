@@ -1,7 +1,5 @@
-//! The knobs a MILP solve is configured with and the facts it reports back.
-//!
-//! These are the public vocabulary of a search: what it was asked to do
-//! ([`SolveOptions`], [`ResumeOptions`], [`Tolerances`]), how it ended
+//! The public options of a solve and what it reports back: what it was asked
+//! to do ([`SolveOptions`], [`ResumeOptions`], [`Tolerances`]), how it ended
 //! ([`SolutionStatus`], [`TerminationReason`]) and what it cost ([`Stats`]).
 
 use crate::{Error, Variable};
@@ -36,7 +34,7 @@ pub enum TerminationReason {
 #[non_exhaustive]
 pub struct SolveOptions {
     /// Wall-clock budget for this call (`None` = unlimited). On expiry the search
-    /// and can be resumed.
+    /// stops and can be resumed.
     pub time_limit: Option<Duration>,
     /// Maximum number of branch & bound nodes to solve in this call
     /// (`None` = unlimited). Deterministic alternative to `time_limit`; the
@@ -56,13 +54,12 @@ pub struct SolveOptions {
     /// Optional (partial) starting assignment used to seed the incumbent.
     /// An infeasible or incomplete hint is ignored. Default `None`.
     pub warm_start: Option<Vec<(Variable, f64)>>,
-    /// Enable presolve: reductions applied to the problem before the search
-    /// starts (bound tightening, redundant-row elimination, variable fixing;
-    /// for integer problems also coefficient tightening and dual fixing).
-    /// The problem you observe through [`crate::Solution`] is unchanged —
-    /// reductions never remove variables and preserve at least one optimum.
-    /// Disable only to compare raw solver behavior or to rule presolve out
-    /// while investigating a suspected numerical issue. Default `true`.
+    /// Enable presolve, which reduces the problem before the search starts
+    /// (tightening bounds, dropping redundant rows, fixing variables). It
+    /// never removes variables and keeps at least one optimum, so the problem
+    /// you observe through [`crate::Solution`] is unchanged. Disable it only
+    /// to compare raw solver behavior or to rule it out when investigating a
+    /// numerical issue. Default `true`.
     pub presolve: bool,
     /// Edit the tolerances used by the solver, most callers
     /// should leave this at [`Tolerances::default`]; override an individual
@@ -153,12 +150,10 @@ impl ResumeOptions {
     }
 }
 
-/// The smallest accepted [`Tolerances::feasibility`], HiGHS's minimum for its
-/// feasibility tolerances (`kMinimumKktTolerance`, highs/lp_data/HConst.h).
-/// Below it the tolerance stops being a tolerance: at zero every bound at
-/// zero is held exactly and every row to the bare round-off of its
-/// evaluation, so a basic value computed a few ulps off a bound is infeasible
-/// and the simplex pivots on round-off.
+/// The smallest accepted [`Tolerances::feasibility`]. Below it the tolerance
+/// stops being one: at zero, every bound at zero is held exactly and every
+/// row to the bare round-off of its evaluation, so a basic value computed a
+/// few ulps off a bound is infeasible and the simplex pivots on round-off.
 const MIN_FEASIBILITY_TOLERANCE: f64 = 1e-10;
 
 /// Numeric tolerances for a solve (see [`SolveOptions::tolerances`]).
@@ -168,14 +163,13 @@ const MIN_FEASIBILITY_TOLERANCE: f64 = 1e-10;
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct Tolerances {
-    /// The absolute feasibility tolerance of a solution: each variable's
-    /// distance outside its bounds and each row's distance outside its
-    /// feasible range may be at most this, or the round-off of evaluating
-    /// the row or bound in `f64` if that is larger. The simplex engine
-    /// holds every row to it, and it validates a rounded-to-integer
-    /// candidate before it is accepted as the incumbent, a pure-LP solution
-    /// before it is returned, and, in the post-edit warm-start pre-filter,
-    /// whether a previous incumbent survives a [`crate::Solution`] edit.
+    /// The absolute feasibility tolerance of a solution: each variable may lie
+    /// outside its bounds, and each row outside its feasible range, by at most
+    /// this, or by the round-off of evaluating the bound or row in `f64` if
+    /// that is larger. The simplex holds every row to it, and it is checked on
+    /// a rounded-to-integer candidate before it becomes the incumbent, on a
+    /// pure-LP solution before it is returned, and on a previous incumbent to
+    /// decide whether it survives a [`crate::Solution`] edit.
     /// Must be finite and at least `1e-10`. Default `1e-7`.
     pub feasibility: f64,
     /// Distance from the nearest integer within which an integer/boolean

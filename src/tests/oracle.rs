@@ -1,27 +1,19 @@
-//! What a correct answer to a feasible, bounded model must satisfy — shared by
+//! What a correct answer to a feasible, bounded model must satisfy, shared by
 //! the property tests and the regression tests built from their counterexamples.
 //!
-//! The models these tests build are feasible by construction: a point `x*` is
-//! chosen first and the model is written around it. So `solve()` must return a
-//! solution, and that solution must be at least as good as `x*`. What "satisfy
-//! a row" means is pinned here in one place, in the units the user sees:
+//! The models are built around a point `x*` chosen first, so `solve()` must
+//! return a solution at least as good as `x*`. In the units the user sees:
 //!
-//! * A row holds within [`crate::Tolerances::feasibility`], the documented
-//!   absolute feasibility tolerance (default `1e-7`) — never finer than the
-//!   round-off of evaluating the row itself. Evaluating `Σ a_j x_j - b` in
-//!   `f64` is exact to about one ulp of the terms, so a row whose terms are
-//!   `1e10` cannot be checked, by anyone, below ~`1e-6`; demanding `1e-7`
-//!   there would be a test that no correct solver can pass. `ROUNDOFF` is a
-//!   hundred ulps of the row's magnitude, the same allowance the checker
-//!   itself needs.
-//! * A variable is within its bounds by the same rule (round-off of the bound).
-//! * The objective may not be worse than the objective at `x*` by more than a
-//!   coarse slack: the tolerances above let every variable move a little, and
-//!   through the rows those moves add up, so the slack is `1e-4` of the
-//!   objective's extent over the variable box. This catches gross
-//!   sub-optimality (a wrongly pruned branch, a wrong vertex), not
-//!   tolerance-level differences.
-//! * The reported objective must be the objective of the reported values.
+//! * A row holds within [`crate::Tolerances::feasibility`] (default `1e-7`),
+//!   but never finer than the round-off of evaluating it, `ROUNDOFF`, a
+//!   hundred ulps of the row's magnitude: a row whose terms are `1e10`
+//!   cannot be checked below about `1e-6`.
+//! * A variable is within its bounds by the same rule.
+//! * The objective is not worse than at `x*` by more than `1e-4` of its extent
+//!   over the variable box. The tolerances let every variable move a little,
+//!   so this catches gross sub-optimality (a wrongly pruned branch, a wrong
+//!   vertex), not tolerance-level differences.
+//! * The reported objective is the objective of the reported values.
 
 use crate::{
     ComparisonOp, OptimizationDirection, Problem, SolutionStatus, SolveOptions, Tolerances,
@@ -158,9 +150,8 @@ fn bound_tolerance(v: &Var) -> f64 {
     Tolerances::default().feasibility.max(ROUNDOFF * mag)
 }
 
-/// Whether `x*` itself satisfies every row of `model` within the tolerance
-/// above. The right-hand sides were computed in `f64` from `x*`, so this
-/// holds by construction; a generator asserts it before drawing conclusions.
+/// Whether `x*` satisfies every row of `model` within the tolerance above:
+/// true by construction, and assumed by a generator before drawing conclusions.
 pub(crate) fn xstar_is_feasible(model: &Model) -> bool {
     model
         .rows
@@ -175,11 +166,9 @@ pub(crate) fn assert_solves_within_contract(model: &Model) {
 }
 
 /// [`assert_solves_within_contract`] without the comparison with the
-/// objective at `x*`: for models whose tolerances leave the objective real
+/// objective at `x*`, for models whose tolerances leave the objective real
 /// freedom (a tiny coefficient lets a var move far within its row's
-/// tolerance), so only status, bounds, rows and the consistency of the
-/// reported objective are asserted. The model is still solved with its
-/// objective, so the optimization runs as it would for a user.
+/// tolerance). The model is still solved with its objective.
 pub(crate) fn assert_solves_feasibly_within_contract(model: &Model) {
     check_contract(model, false);
 }
@@ -191,10 +180,8 @@ pub(crate) fn assert_solves_within_contract_without_presolve(model: &Model) {
 }
 
 /// [`assert_solves_within_contract`] with presolve on and off, each solve
-/// under `time_limit`: for a model whose solve once never returned (a
-/// simplex that cycled), so that a regression fails the test instead of
-/// hanging it. The limit is far above the time the solve takes; reaching it
-/// is the failure.
+/// under `time_limit`, so that a simplex that cycles fails the test instead
+/// of hanging it: reaching the limit is the failure.
 pub(crate) fn assert_solves_within_contract_in_time(model: &Model, time_limit: Duration) {
     for presolve in [true, false] {
         check_contract_with(model, true, presolve, Some(time_limit));

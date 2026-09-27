@@ -1,8 +1,5 @@
 //! The vocabulary a model is written in: the optimization direction, variable
 //! handles, linear expressions, and the comparison operators constraints use.
-//!
-//! Nothing here solves anything — these are the plain values a [`crate::Problem`]
-//! is built out of and that a [`crate::Solution`] is read back through.
 
 /// Selects whether a problem's objective is minimized or maximized.
 #[derive(Clone, Copy, Debug, PartialEq)]

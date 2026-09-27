@@ -245,10 +245,9 @@ fn invalid_gap_and_expert_tolerances_are_rejected() {
     }
 }
 
-/// A feasibility tolerance below HiGHS's minimum of 1e-10 is rejected (C4-35
-/// of the solver review): at zero the engine holds every bound at zero
-/// exactly and every row to the bare round-off of evaluating it. The minimum
-/// itself is accepted, on the LP and the MILP path.
+/// A feasibility tolerance below 1e-10 is rejected, since at zero the engine
+/// would hold every bound exactly and every row to the bare round-off of
+/// evaluating it; 1e-10 itself is accepted, on the LP and the MILP path.
 #[test]
 fn feasibility_tolerance_below_the_minimum_is_rejected() {
     for integer in [false, true] {

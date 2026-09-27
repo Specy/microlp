@@ -286,8 +286,7 @@ fn try_adopt_incumbent_respects_custom_feasibility_tolerance() {
         // Force the relaxation to a specific near-zero fractional b: pin its
         // bounds to [5e-7, 5e-7], and x to the 10 + m*5e-7 = 510 the row
         // then asks for (a loose tolerance would otherwise let the engine
-        // move x, and with it the violation this test is about), and
-        // re-solve.
+        // move x, and the violation under test with it), and re-solve.
         state.solver.set_var_bounds(b.idx(), 5e-7, 5e-7).unwrap();
         state.solver.set_var_bounds(x.idx(), 510.0, 510.0).unwrap();
         assert_eq!(
@@ -345,11 +344,9 @@ fn incumbent_feasible_row_tolerance_is_absolute_not_relative_to_rhs() {
     ));
 }
 
-/// The prefilter judges the bounds the solve works with: a bound from 2^52
-/// on is infinite there, so the engine's answer can lie beyond it (here
-/// `x = 1e16` with `x <= 2^53`, the row alone stopping `x`), and such an
-/// incumbent was dropped as a warm-start hint after an edit because the
-/// prefilter compared it with the bound as written.
+/// The prefilter judges the bounds the solve works with, where a bound from
+/// 2^52 on is infinite, so the answer `x = 1e16` beyond `x <= 2^53` (the row
+/// alone stops `x`) passes it and survives as a warm-start hint after an edit.
 #[test]
 fn incumbent_feasible_takes_a_bound_from_2_pow_52_as_infinite() {
     let mut p = Problem::new(OptimizationDirection::Maximize);

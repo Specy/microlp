@@ -1,10 +1,6 @@
 //! [`Work`]: the bound state the reduction passes mutate, and the passes
-//! themselves.
-//!
-//! Rows live outside this struct so a hot pass can hold a row borrow and
-//! mutate bounds at the same time; that is what keeps the per-row inner loops
-//! allocation-free. See the module docs in [`super`] for the working-vs-emitted
-//! bound split and the tolerance model every decision here is made against.
+//! themselves. The module docs in [`super`] give the working-vs-emitted bound
+//! split and the tolerance model every decision here is made against.
 
 use super::model::{is_int_domain, term_range, Activity, Mode, PresolveStats, Row};
 use super::params::*;
@@ -13,14 +9,14 @@ use crate::solver::{
 };
 use crate::{ComparisonOp, CsVec, Error, VarDomain};
 
-/// Bound state and reduction context. Rows live OUTSIDE this struct so the
-/// hot passes can hold a row borrow and mutate bounds at the same time —
-/// this is what keeps the per-row inner loops allocation-free.
+/// Bound state and reduction context. Rows live outside this struct so a
+/// pass can hold a row borrow while it mutates bounds, which keeps the
+/// per-row loops allocation-free.
 pub(crate) struct Work<'a> {
     /// Working bounds: every valid deduction, used to deduce further.
     pub(crate) wlo: Vec<f64>,
     pub(crate) whi: Vec<f64>,
-    /// Emitted bounds: what the reduced problem carries (see module docs).
+    /// Emitted bounds: what the reduced problem carries.
     /// Invariant: `[wlo, whi] ⊆ [elo, ehi]` per var.
     pub(crate) elo: Vec<f64>,
     pub(crate) ehi: Vec<f64>,
@@ -32,13 +28,13 @@ pub(crate) struct Work<'a> {
     /// The user's absolute feasibility tolerance (`Tolerances::feasibility`).
     pub(crate) feas: f64,
     pub(crate) stats: PresolveStats,
-    /// var -> rows adjacency in flat CSR form, built once up front. Rows
-    /// only ever LOSE terms, so this stays a (cheap-to-check) superset.
+    /// var -> rows adjacency (flat CSR), built once. Rows only lose terms, so
+    /// it stays a superset.
     pub(crate) adj_start: Vec<u32>,
     pub(crate) adj_rows: Vec<u32>,
-    /// Worklist: a row is queued when one of its inputs (a variable bound,
-    /// its own coefficients/rhs) changed since it was last processed. This
-    /// is what makes the fixpoint O(changed work), not O(passes * nnz).
+    /// Worklist: a row is queued when one of its inputs (a var bound, its own
+    /// coefficients or rhs) changed since it was last processed, so the
+    /// fixpoint costs O(changed work), not O(passes * nnz).
     pub(crate) dirty: Vec<bool>,
     pub(crate) queue: Vec<u32>,
     /// Rows whose inputs changed since the coefficient pass last saw them.
@@ -61,12 +57,11 @@ impl Work<'_> {
         ROW_BUDGET_SHARE * row_tolerance(self.feas, magnitude)
     }
 
-    /// How far a row of magnitude `magnitude` may be violated at the points
-    /// a bound implied for var `v` must keep: the engine's budget for the
-    /// LP points it returns, and for an integer var, whose values that
-    /// matter are those of incumbents, the full contract the incumbent guard
-    /// holds them to (rounding against the budget alone cut integer points
-    /// the guard accepts, one unit per pass, until the bounds crossed).
+    /// How far a row of magnitude `magnitude` may be violated at the points a
+    /// bound implied for var `v` must keep: the engine's budget, and for an
+    /// integer var, whose values that matter are incumbents', the full
+    /// contract the incumbent guard applies (rounding against the budget
+    /// alone would cut integer points the guard accepts).
     fn allowance(&self, v: usize, magnitude: f64) -> f64 {
         if self.is_int(v) {
             row_tolerance(self.feas, magnitude)
@@ -75,10 +70,9 @@ impl Work<'_> {
         }
     }
 
-    /// Tolerance within which the engine holds var `v` to its emitted upper
-    /// (`upper`) or lower bound, in user units
-    /// (`Solver::first_violated_bound`); zero for an integer var, whose
-    /// adopted values are exactly integral.
+    /// Tolerance, in user units, within which the engine holds var `v` to its
+    /// emitted upper (`upper`) or lower bound (`Solver::first_violated_bound`);
+    /// zero for an integer var, whose adopted values are exactly integral.
     fn bound_tol(&self, v: usize, upper: bool) -> f64 {
         if self.is_int(v) {
             0.0
@@ -142,18 +136,14 @@ impl Work<'_> {
         max
     }
 
-    /// Whether fixing every var of a forcing row at its extreme cuts no
-    /// point a var can resolve. With its corner `sliver` short of its bound,
-    /// the row leaves each var `room / |a|` off its extreme, `room` being the
+    /// Whether fixing every var of a forcing row at its extreme cuts no point
+    /// a var can resolve. With its corner `sliver` short of its bound, the
+    /// row leaves each var `room / |a|` off its extreme, `room` being the
     /// sliver plus the engine's share of the absolute tolerance (the
-    /// round-off part of the row's budget is room no evaluation resolves). A
-    /// continuous var's room must lie within its own bound tolerance, and the
+    /// round-off part of the budget is room no evaluation resolves). A
+    /// continuous var's room must lie within its bound tolerance, and the
     /// sliver it gives up within what each of its other rows tolerates at its
-    /// coefficient there; an integer var's room must be short of a unit. (A
-    /// sliver within the round-off of a magnitude of 4e9 was a range of 0.015
-    /// for a var with a coefficient of 0.001, and a coefficient of 1e-8 left
-    /// its var a room of 5 on an exactly met row: fixing either cut feasible
-    /// points, the optimum in the first case and every point in the second.)
+    /// coefficient there; an integer var's room must be short of a unit.
     fn forcing_is_exact(&self, rows: &[Row], r: usize, sliver: f64, min_corner: bool) -> bool {
         let room = (sliver + ROW_BUDGET_SHARE * self.feas).max(0.0);
         let row = &rows[r];
@@ -172,13 +162,10 @@ impl Work<'_> {
     }
 
     /// Whether every term of a forcing candidate can be told apart from the
-    /// row's round-off: a var whose whole term range `|a|·(hi − lo)` lies
-    /// below the sliver plus the round-off of the sum is invisible to the
-    /// row — the corner meets the bound with the var anywhere in its range —
-    /// so the row forces nothing about it and must not fix it. (A `1e-7`
-    /// coefficient on a row of magnitude `2^28`, whose round-off is `5e-6`,
-    /// pinned a var with a range of `0.25` at its extreme and made a
-    /// feasible model infeasible.)
+    /// row's round-off. A var whose whole term range `|a|·(hi − lo)` lies
+    /// below the sliver plus the round-off of the sum is invisible to the row
+    /// (the corner meets the bound with the var anywhere in its range), so
+    /// the row forces nothing about it and must not fix it.
     fn terms_resolvable(&self, row: &Row, sliver: f64, magnitude: f64) -> bool {
         row.vars.iter().zip(&row.coeffs).all(|(&v, &a)| {
             a.abs() * (self.ehi[v] - self.elo[v]) > sliver.max(0.0) + ROUNDOFF_FLOOR * magnitude
@@ -253,11 +240,11 @@ impl Work<'_> {
     }
 
     /// Record the implied upper bound `q` for var `v`, valid for every point
-    /// the engine may return once relaxed outward by `relax` (the row's
-    /// budget plus slack over the coefficient, in var units). Integer bounds
-    /// round and persist (emitted); continuous bounds stay working-only. A
-    /// crossing within the var's bound tolerance is "no reduction" (the
-    /// solver handles slivers); beyond it, a proof of infeasibility.
+    /// the engine may return once relaxed outward by `relax` (in var units).
+    /// Integer bounds round and are emitted; continuous bounds stay
+    /// working-only. A crossing within the var's bound tolerance is no
+    /// reduction (the solver handles slivers); beyond it, a proof of
+    /// infeasibility.
     fn tighten_upper(&mut self, v: usize, q: f64, relax: f64) -> Result<bool, Error> {
         if !q.is_finite() {
             return Ok(false);
@@ -344,21 +331,15 @@ impl Work<'_> {
         Ok(false)
     }
 
-    /// Whether an all-substituted row holds at the values its vars are fixed
-    /// at, judged exactly as the boundary judges it once it is dropped: the
-    /// row as written, evaluated at those values by [`row_violation`] (with
-    /// which `Solver::first_violated_row` checks the rows presolve dropped),
-    /// against the full contract. That is the verdict [`trivial_row_verdict`]
-    /// gives an empty input row, and since it is the boundary's own
-    /// evaluation, there is no round-off of evaluating the row again to allow
-    /// for. Nothing the engine does can move such a row, so the engine's
-    /// budget has no part in it: held to the budget, a forcing row's fixing
-    /// left `-100 x1 = 0` a residual of 9.3e-8, within the 1e-7 the boundary
-    /// accepts, and the feasible model was declared infeasible. (HiGHS
-    /// judges an empty row at the full `primal_feastol`, `checkRowInfeasible`
-    /// and the empty-row removal in highs/presolve/HPresolve.cpp.) A var the
-    /// row keeps with a zero coefficient is not fixed and adds a zero term at
-    /// whatever value it gets.
+    /// Whether an all-substituted row holds at its vars' fixed values, judged
+    /// exactly as the boundary (`Solver::first_violated_row`) judges it once
+    /// dropped, and as [`trivial_row_verdict`] judges an empty input row: the
+    /// row as written, evaluated by [`row_violation`] against the full
+    /// contract, with no further allowance for round-off. Nothing the engine
+    /// does can move such a row, so the engine's budget has no part in it;
+    /// held to the budget, a feasible model could be declared infeasible. A
+    /// var the row keeps with a zero coefficient is not fixed and adds a zero
+    /// term whatever its value.
     ///
     /// [`trivial_row_verdict`]: crate::solver::trivial_row_verdict
     fn empty_row_consistent(&self, row: &Row) -> bool {
@@ -381,11 +362,10 @@ impl Work<'_> {
         Ok(())
     }
 
-    /// Singleton row `a·x ∈ [lo, hi]`: fold it into the variable's EMITTED
-    /// bounds and drop it, where bounds describe the row exactly as the
-    /// engine and the boundary would hold it (module docs). `other_coeff` is
-    /// the largest |coefficient| of `x` in any other live row. Returns
-    /// whether the row was consumed.
+    /// Singleton row `a·x ∈ [lo, hi]`: fold it into the var's EMITTED bounds
+    /// and drop it, where bounds describe the row exactly as the engine and
+    /// the boundary would hold it. `other_coeff` is the largest |coefficient|
+    /// of `x` in any other live row. Returns whether the row was consumed.
     fn singleton_row(&mut self, row: &mut Row, other_coeff: f64) -> Result<bool, Error> {
         let v = row.vars[0];
         let a = row.coeffs[0];
@@ -403,16 +383,14 @@ impl Work<'_> {
         let tight_mag = |b: f64| row.rhs_mag(b) + b.abs() + fold;
 
         if self.is_int(v) {
-            // The integral points the incumbent guard accepts are those
-            // meeting the row within its contract. The bounds keep every one
-            // of them, allowing outward for the round-off of the folded
-            // right-hand side; the row is dropped only where the same bounds
-            // come out of the contract less that round-off, i.e. where no
-            // integer point lies within round-off of the contract. Otherwise
-            // the guard, evaluating the row with its own round-off, might
-            // reject a point the bounds admit (an exactly integral candidate
-            // rejected: `InternalError`), so the row stays for the engine and
-            // the guard to judge.
+            // The bounds keep every integral point the incumbent guard
+            // accepts (those meeting the row within its contract), widened by
+            // the round-off of the folded right-hand side. The row is dropped
+            // only where the contract less that round-off gives the same
+            // bounds, i.e. no integer point lies within round-off of the
+            // contract; otherwise the guard, with its own round-off, might
+            // reject a point the bounds admit (an `InternalError` on an
+            // exactly integral candidate), so the row stays.
             let range = |widen: f64| {
                 let side_tol = |b: f64| {
                     let mag = tight_mag(b);
@@ -456,29 +434,24 @@ impl Work<'_> {
             return Ok(false);
         }
 
-        // A dropped row accepts `x` within its room (`δ`, see below) of its
-        // implied bounds `qlo`, `qhi`, and the engine holds a bound to within
-        // `btol`. The row becomes the bounds `qlo`, `qhi` themselves: they
-        // keep the vertices the row would make, so the engine returns the
-        // point it would have returned with the row (a bound relaxed into the
-        // row's tolerance zone makes a vertex there, and an objective better
-        // than the model's own). A side the var's bound already implies, with
-        // the tolerances, needs no bound. A side whose `δ` is below `btol`
-        // cannot be a bound, since the engine would leave it by more than the
-        // row allows (a `-10 x ≥ 0` beside `x ≤ 0` was dropped as implied, and
-        // `x` sat `1e-8` above zero), so the row stays. An equality fixes its
-        // var only where it pins it within the var's own tolerance and no
-        // other row of the var tells the pinned range apart; a wider one
-        // stays a row, since a fixing would cut the points its tolerance
-        // accepts, and a row agreeing with it only within their tolerances
-        // (`0.01 x = 0.01 + 1e-9` beside `x = 1`) would look inconsistent.
+        // A dropped row accepts `x` within its room `δ` (below) of its implied
+        // bounds `qlo`, `qhi`; the engine holds a bound to within `btol`. The
+        // row becomes the bounds `qlo`, `qhi` themselves, which keep the
+        // vertices the row makes (a bound relaxed into the row's tolerance
+        // would make a vertex there, with a better objective than the model's).
+        // A side the var's bound already implies, with the tolerances, needs no
+        // bound; a side whose `δ` is below `btol` cannot be a bound, since the
+        // engine could leave it by more than the row allows, so the row stays.
+        // An equality fixes its var only where it pins it within the var's own
+        // tolerance and no other row of the var tells the pinned range apart;
+        // otherwise a fixing would cut points the row accepts, or make rows
+        // that agree only within their tolerances look inconsistent.
         let btol_lo = bound_tolerance(self.feas, self.elo[v].max(qlo));
         let btol_hi = bound_tolerance(self.feas, self.ehi[v].min(qhi));
         // The row's room around its implied bound as the engine holds it
-        // (its budget over `|a|`), and as the boundary checks it once it is
-        // dropped: nothing but the var's bound tolerance can move a dropped
-        // singleton row, so it has its whole contract, less the round-off of
-        // evaluating it.
+        // (budget over `|a|`), and as the boundary checks it once dropped:
+        // only the var's bound tolerance can move a dropped singleton row, so
+        // it has its whole contract, less the round-off of evaluating it.
         let dlo = self.budget(finite_mag(blo)) / a.abs();
         let dhi = self.budget(finite_mag(bhi)) / a.abs();
         let dropped_room = |b: f64| {
@@ -540,17 +513,13 @@ impl Work<'_> {
     /// One wave of the primal worklist: process every row queued so far;
     /// rows whose inputs change during the wave land in the next wave.
     ///
-    /// The rows left with at most one term go first, in queue order, then
-    /// the others, as HiGHS's `fastPresolveLoop` runs `removeRowSingletons`
-    /// before `presolveChangedRows` (highs/presolve/HPresolve.cpp). A
-    /// singleton row states its var's range exactly, while a multi-term row
-    /// deduces from bounds; processed first, the singleton pins its var
-    /// before a forcing row can fix it at another bound that its own row
-    /// allows only within the row's tolerance (`x1 + 100 x4 = 8388700` fixed
-    /// `x1` at its lower bound `-9.3e-10` before `-100 x1 = 0` could pin it
-    /// at zero). A multi-term row that loses terms to the singletons'
-    /// fixings in the same wave is still processed in it, as the singleton
-    /// it has become if it has.
+    /// Rows left with at most one term go first, in queue order, then the
+    /// others. A singleton row states its var's range exactly, while a
+    /// multi-term row deduces from bounds; processed first, the singleton
+    /// pins its var before a forcing row can fix it at another bound that
+    /// the singleton allows only within its tolerance. A multi-term row that
+    /// loses terms to the singletons' fixings is still processed in the same
+    /// wave, as the singleton it may have become.
     pub(crate) fn primal_wave(&mut self, rows: &mut [Row]) -> Result<(), Error> {
         let wave = std::mem::take(&mut self.queue);
         let mut multi_term = Vec::with_capacity(wave.len());
@@ -600,12 +569,11 @@ impl Work<'_> {
             let hi_side = row_hi.is_finite() && wact.ninf_l == 0;
             let lo_side = row_lo.is_finite() && wact.ninf_u == 0;
 
-            // Infeasibility: the working box holds every point the engine
-            // may return (its bounds are tolerance-valid implications),
-            // widened by the bound slack; a row that its best corner cannot
-            // meet within the budget at that corner is a proof. Moving away
-            // from the corner raises the activity faster than it raises the
-            // tolerance, so the corner is the decisive point.
+            // Infeasibility: the working box, widened by the bound slack, holds
+            // every point the engine may return (its bounds are tolerance-valid
+            // implications), so a row its best corner cannot meet within the
+            // budget at that corner is a proof. The corner decides: moving away
+            // from it raises the activity faster than the tolerance.
             let budget_l = if hi_side {
                 self.budget(wact.abs_l + row.rhs_mag(row_hi) + fold)
             } else {
@@ -631,15 +599,13 @@ impl Work<'_> {
                 return Err(Error::Infeasible);
             }
 
-            // Forcing: judged over the EMITTED bounds, the exact values the
-            // reduced problem carries, equal to the row bound within the
-            // round-off of the sum. Every feasible point then has each var
-            // at its extreme, and fixing it there is exact, as long as the
-            // room the row's budget leaves each var off its extreme is room
-            // nothing can resolve (see `forcing_is_exact`). The corner may
-            // exceed the bound by the budget (the fixed point is then the
-            // best point there is). The working activity, which dominates
-            // the emitted one, is a cheap precheck.
+            // Forcing: over the EMITTED bounds, which the reduced problem
+            // carries, the corner meets the row bound within the round-off of
+            // the sum, so every feasible point has each var at its extreme and
+            // fixing it there is exact, if the room left each var is room
+            // nothing resolves (`forcing_is_exact`). The corner may pass the
+            // bound by the budget (the fixed point is then the best there is).
+            // The working activity, which dominates, is a cheap precheck.
             let mut eact: Option<Activity> = None;
             if hi_side && wact.l >= row_hi - budget_l {
                 let e = eact.get_or_insert_with(|| self.activity(row, false));
@@ -692,14 +658,11 @@ impl Work<'_> {
                 }
             }
 
-            // Redundancy: judged against EMITTED bounds only — material that
-            // provably remains in the reduced problem — so dropping is never
-            // justified by a deduction that the drop itself would orphan,
-            // and against the bound slack, so that a point the engine may
-            // return still meets the dropped row. Cheap precheck first:
-            // working activities dominate emitted ones (L_e <= L_w,
-            // U_e >= U_w), so if the working side already fails there is no
-            // need to compute the emitted activity at all.
+            // Redundancy: judged against the EMITTED bounds only, so a drop is
+            // never justified by a deduction the drop itself would orphan, and
+            // with the bound slack, so a point the engine may return still
+            // meets the dropped row. Working activities dominate emitted ones
+            // (L_e <= L_w, U_e >= U_w), so the working check is a precheck.
             let w_lo_red =
                 !row_lo.is_finite() || (wact.ninf_l == 0 && wact.l - wact.slack_l >= row_lo);
             let w_hi_red =
@@ -731,16 +694,14 @@ impl Work<'_> {
                 }
             }
 
-            // Per-term implied bounds from working activities, each relaxed
-            // by the row's allowance at the corner where the bound is
-            // attained (this term at the bound, the rest at its extreme),
-            // plus the round-off of computing the rest by cancellation
-            // against this term's own range (at a bound of `i32::MIN` the rest
-            // of `x + 0.4 y` carried 2e-7, and `floor` made that a unit), plus
-            // the bound slack, so that it holds for every point the engine may
-            // return (see `allowance`). Bounds tightened earlier in this loop
-            // are not folded into `wact`: the stale activity is looser, hence
-            // still valid.
+            // Per-term implied bounds from working activities, each relaxed by
+            // the row's allowance at the corner where the bound is attained
+            // (this term at the bound, the rest at its extreme), by the
+            // round-off of computing the rest by cancellation against this
+            // term's own range, and by the bound slack, so that it holds for
+            // every point the engine may return. Bounds tightened earlier in
+            // this loop are not folded into `wact`: the stale activity is
+            // looser, hence still valid.
             for i in 0..row.vars.len() {
                 let (v, a) = (row.vars[i], row.coeffs[i]);
                 let (cmin, cmax) = term_range(a, self.wlo[v], self.whi[v]);
@@ -791,14 +752,13 @@ impl Work<'_> {
         Ok(())
     }
 
-    /// Savelsbergh coefficient improvement on one-sided rows for strict
-    /// binaries: rewrite the (coefficient, bound) pair so the vacuous branch
-    /// of the implication becomes exactly bound-tight. Integer points are
-    /// preserved exactly (the binding branch's content is reproduced to the
-    /// last bit and the vacuous branch is relaxed outward by the round-off
-    /// of the activity and the bound slack, so every point the engine may
-    /// return for the original row satisfies the rewritten one); the LP
-    /// relaxation tightens. Mip mode only.
+    /// Savelsbergh coefficient tightening on one-sided rows for strict
+    /// binaries (Mip mode only): rewrite the (coefficient, bound) pair so the
+    /// vacuous branch of the implication becomes exactly bound-tight. The LP
+    /// relaxation tightens and integer points are kept exactly: the binding
+    /// branch is reproduced to the last bit, and the vacuous one is relaxed by
+    /// the activity's round-off and the bound slack, so every point the engine
+    /// may return for the original row satisfies the rewritten one.
     pub(crate) fn tighten_binary_coeffs(&mut self, rows: &mut [Row]) -> bool {
         let mut changed = false;
         for (r, row) in rows.iter_mut().enumerate() {
@@ -946,17 +906,16 @@ impl Work<'_> {
         changed
     }
 
-    /// Dual fixing: a variable whose objective coefficient and constraint
-    /// signs make one direction of movement never-helpful is pinned to the
-    /// opposite (finite) bound. Optimum-preserving, not feasible-set-
-    /// preserving — Mip mode with `allow_dual` only. An infinite target
-    /// bound means "possibly unbounded"; that verdict belongs to the
-    /// simplex, so such vars are skipped.
+    /// Dual fixing: a var whose objective coefficient and row signs make one
+    /// direction of movement never helpful is fixed at the opposite (finite)
+    /// bound. It keeps an optimum, not the feasible set, so it runs in Mip
+    /// mode with `allow_dual` only. An infinite target bound means "possibly
+    /// unbounded", a verdict for the simplex, so such vars are skipped.
     ///
     /// The target bound is always an EMITTED bound: a working lower bound on
-    /// `v` can only ever be derived from a row that also blocks decreasing
-    /// `v` (Ge with a>0, Le with a<0, or Eq), so `!bad_dec` implies `wlo ==
-    /// elo` (mirrored for the upper side).
+    /// `v` can only be derived from a row that also blocks decreasing `v` (Ge
+    /// with a>0, Le with a<0, or Eq), so `!bad_dec` implies `wlo == elo`
+    /// (mirrored for the upper side).
     pub(crate) fn dual_fix(&mut self, rows: &[Row], obj: &[f64]) -> bool {
         let n = self.wlo.len();
         let mut bad_dec = vec![false; n];

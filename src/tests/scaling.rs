@@ -1,21 +1,17 @@
 //! Property tests that feasible-by-construction, bounded models solve at every
 //! variable magnitude and coefficient range.
 //!
-//! A point `x*` is drawn first; every variable's bounds bracket its `x*`
-//! value, every equality's right-hand side is the activity at `x*`, and every
-//! inequality's right-hand side is on the side `x*` satisfies. All bounds are
-//! finite, so the model is bounded, and `x*` is a feasible point of the model
-//! as written (within the round-off of computing its activities, which the
-//! oracle accounts for). The contract a solution must meet is in `oracle.rs`.
+//! A point `x*` is drawn first; bounds bracket it, equalities' right-hand
+//! sides are the activity at `x*`, and inequalities' lie on the side `x*`
+//! satisfies. All bounds are finite. The contract a solution must meet is in
+//! `oracle.rs`.
 //!
-//! Two coefficient regimes are drawn separately. With coefficients between
-//! `1e-1` and `1e1` the tolerances leave the objective little room, so the
-//! solution's objective is held to the objective at `x*`. With coefficients
-//! from `1e-8` to `1e4` a row satisfied to `1e-7` lets a variable with a `1e-8`
-//! coefficient move by ten units, and that freedom propagates through the
-//! other rows into the objective; the wide properties therefore solve the
-//! model with its objective but assert only that it solves and the solution
-//! is feasible.
+//! With coefficients between `1e-1` and `1e1` the tolerances leave the
+//! objective little room, so the solution's objective is held to the objective
+//! at `x*`. With coefficients from `1e-8` to `1e4`, a row met to `1e-7` lets a
+//! variable with a `1e-8` coefficient move by ten units, and that freedom
+//! reaches the objective, so the wide properties assert only that the model
+//! solves to a feasible point.
 
 #[cfg(test)]
 mod tests_scaling {
@@ -31,8 +27,7 @@ mod tests_scaling {
         hegel::Settings::new().test_cases(TEST_CASES)
     }
 
-    /// Up to six variables and five rows per model; sized to keep the four
-    /// properties within about a minute together.
+    /// Sized to keep the four properties within about a minute together.
     const TEST_CASES: u64 = 5_000;
 
     /// Largest decimal exponent of a variable's magnitude: values up to 1e9.
@@ -198,11 +193,8 @@ mod tests_scaling {
         assert_solves_within_contract(model);
     }
 
-    /// The oracle without the comparison with the objective at `x*`: the
-    /// model is solved with its objective (so the optimization runs), and
-    /// status, bounds, rows and the reported objective's consistency are
-    /// checked. (It used to zero the objective instead, which solved a pure
-    /// feasibility problem and never exercised the primal simplex.)
+    /// The oracle without the comparison with the objective at `x*`; the
+    /// model is still solved with its objective, so the optimization runs.
     fn check_feasibility(model: &Model) {
         assert_solves_feasibly_within_contract(model);
     }
@@ -225,13 +217,11 @@ mod tests_scaling {
         check_with_objective(&model.0);
     }
 
-    // KNOWN LIMITATIONS (`ARCHITECTURE.md` §7): searched deeply, the wide MILP
-    // regime still reaches models the engine gets wrong (the classes listed
-    // there), so this property finds counterexamples on some draws. Ignored rather
-    // than `#[should_panic]` because it is a random search: most runs pass, so
-    // asserting failure would itself be flaky. Run it with
-    // `cargo test --lib -- --ignored` to keep searching; a model it finds is pinned
-    // in `magnitudes.rs` by the convention described there.
+    // KNOWN LIMITATIONS (`ARCHITECTURE.md` §7): the wide MILP regime reaches
+    // models the engine gets wrong (the classes listed there), so some draws
+    // fail. Ignored rather than `#[should_panic]` because most runs pass. Run
+    // it with `cargo test --lib -- --ignored`; pin a model it finds in
+    // `magnitudes.rs` by the convention described there.
     #[ignore = "known limitations: wide coefficients (ARCHITECTURE §7)"]
     #[hegel::test(settings())]
     fn a_feasible_bounded_milp_with_wide_coefficients_solves(tc: hegel::TestCase) {

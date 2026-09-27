@@ -1,7 +1,6 @@
-//! API-level presolve tests: the observable behavior of `Problem::solve` /
-//! `Solution` must be identical with presolve on and off, on models that
-//! exercise each reduction, including the post-solve edit paths that make
-//! baked-in reductions risky in the first place.
+//! API-level presolve tests: `Problem::solve` and `Solution` must behave the
+//! same with presolve on and off, on models exercising each reduction and the
+//! post-solve edit paths.
 
 #[cfg(test)]
 mod tests_presolve_api {
@@ -43,16 +42,10 @@ mod tests_presolve_api {
         with
     }
 
-    /// The answer is held to every row as the user wrote it, the ones
-    /// presolve dropped included, on every path: the MIP search, the pure-LP
-    /// solve, and an LP resumed after an interrupt. Presolve drops
-    /// `-10 x3 >= 0` here, and the engine may leave x3 above its bound of 0 by
-    /// its bound tolerance, which the dropped row sees ten times over
-    /// (1.13e-7 against 1e-7). The MIP path used to return that point as
-    /// Optimal, and so did an LP after a resume: only the first pure-LP
-    /// solve checked the rows as written. (Presolve no longer drops that row:
-    /// the engine's bound tolerance of x3, ten times over, is more than the
-    /// row can take, so it stays a row.)
+    /// The answer satisfies every row as the user wrote it on every path: the
+    /// MIP search, the pure-LP solve and an LP resumed after an interrupt.
+    /// `-10 x3 >= 0` sees x3's bound tolerance ten times over, more than the
+    /// row can take, so presolve must keep it as a row rather than a bound.
     #[test]
     fn answers_satisfy_the_rows_presolve_dropped_on_every_path() {
         init();
@@ -101,8 +94,8 @@ mod tests_presolve_api {
         );
     }
 
-    /// LP with a redundant row, a singleton row and a forcing structure: the
-    /// presolved solver ends with zero rows, and the optimum must not move.
+    /// An LP with a singleton row and a redundant row: presolve must not move
+    /// the optimum.
     #[test]
     fn lp_reductions_preserve_optimum() {
         init();
@@ -182,8 +175,8 @@ mod tests_presolve_api {
         assert_eq!(without.unwrap_err(), Error::Unbounded);
     }
 
-    /// LP live edits on a presolved solution: rows were dropped from the live
-    /// solver, later edits must still give the exact from-scratch answer.
+    /// Edits to a presolved LP solution, whose live solver lacks the dropped
+    /// rows, still give the from-scratch answer.
     #[test]
     fn lp_add_constraint_after_presolved_solve() {
         init();
@@ -193,14 +186,14 @@ mod tests_presolve_api {
         p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 100.0); // redundant, dropped
         let sol = solution(p.solve());
         assert_eq!(sol.objective(), 20.0);
-        // Edit: now make the dropped-row world tighter than bounds.
+        // Edit: a row that, unlike the dropped one, binds.
         let sol = solution(sol.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 12.0));
         assert_eq!(sol.objective(), 12.0);
     }
 
-    /// LP fix_var against a presolve-tightened bound: fixing to a value that
-    /// presolve proved infeasible must report Infeasible (that is the correct
-    /// verdict — no feasible point has that value).
+    /// `fix_var` to a value no feasible point has is `Infeasible` after a
+    /// presolved LP solve, and a fix inside the range still works
+    /// incrementally.
     #[test]
     fn lp_fix_var_outside_tightened_bound_is_infeasible() {
         init();
@@ -211,7 +204,7 @@ mod tests_presolve_api {
         p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 20.0);
         let sol = solution(p.solve());
         assert_eq!(sol.objective(), 4.0);
-        // x = 5 violates the (presolved-away) row: Infeasible either way.
+        // x = 5 violates 2x <= 8.
         assert_eq!(sol.fix_var(x, 5.0).unwrap_err(), Error::Infeasible);
 
         // And a fix INSIDE the tightened range keeps working incrementally.
@@ -251,9 +244,8 @@ mod tests_presolve_api {
         assert_eq!(sol.objective(), 19.0);
     }
 
-    /// A MILP whose objective-only variables get dual-fixed: same optimum,
-    /// and warm-started (hinted) solves — where dual fixing is disabled —
-    /// agree too.
+    /// Dual fixing of objective-only vars keeps the optimum, and a hinted
+    /// solve, where dual fixing is off, agrees.
     #[test]
     fn milp_dual_fixing_and_warm_start_agree() {
         init();
@@ -280,7 +272,7 @@ mod tests_presolve_api {
     }
 
     /// Big-M rows: coefficient tightening must preserve the optimum of a
-    /// fixed-charge model (and beat the raw formulation to it).
+    /// fixed-charge model.
     #[test]
     fn milp_fixed_charge_big_m() {
         init();
@@ -297,9 +289,8 @@ mod tests_presolve_api {
         p.add_constraint(&[(s1, 1.0), (o1, -1000.0)], ComparisonOp::Le, 0.0);
         p.add_constraint(&[(s2, 1.0), (o2, -1000.0)], ComparisonOp::Le, 0.0);
         let sol = assert_same_objective(&p);
-        // Approximate: the objective includes CONTINUOUS supply vars whose
-        // LP values carry path-dependent float dust; bit-exactness was never
-        // the MILP objective contract. Integer var values stay exact.
+        // Approximate: the continuous supply vars carry path-dependent
+        // round-off. The integer values stay exact.
         assert!(
             (sol.objective() - 120.0).abs() < 1e-6,
             "{}",
@@ -375,13 +366,12 @@ mod tests_presolve_api {
         assert_eq!(sol.objective(), 12.0);
     }
 
-    /// An implied bound is computed by cancellation (`rest = activity − own
-    /// term`), and at a bound of `i32::MIN` (the documented "no bound" of an
-    /// integer var) the own term is 2^31: the rest carried a round-off of
-    /// 2e-7 that the bound's relaxation, sized for the rest alone, did not
-    /// cover, and `floor` turned it into a whole unit. `x ≤ 3.4 − 0.4 y` with
-    /// `y ≥ 1` became `x ≤ 2`: a wrong optimum (2 for 3), and with the row as
-    /// an equality, `Infeasible`.
+    /// An implied bound computed by cancellation (`rest = activity − own
+    /// term`) is relaxed for the round-off of the whole activity: beside a
+    /// bound of `i32::MIN` (an integer var's "no bound") the rest carries 2e-7
+    /// of it, which `floor` would turn into a whole unit, making
+    /// `x ≤ 3.4 − 0.4 y` with `y ≥ 1` into `x ≤ 2` (and the equality
+    /// `Infeasible`).
     #[test]
     fn implied_integer_bound_survives_cancellation_against_a_huge_bound() {
         init();
@@ -397,10 +387,9 @@ mod tests_presolve_api {
     }
 
     /// A forcing row may fix its vars at their extremes only when that cuts
-    /// nothing a var could resolve: here the row's minimum falls 1.5e-5 short
-    /// of its bound, within the round-off of a magnitude of 4e9, but that
-    /// sliver is a real range of 0.015 for `y`. Presolve fixed `y = 0` and
-    /// reported an optimum of 0 for one of 15.02.
+    /// nothing a var could resolve: the row's minimum falls 1.5e-5 short of
+    /// its bound, within the round-off of a magnitude of 4e9, but that sliver
+    /// is a range of 0.015 for `y` (optimum 15.02, not 0).
     #[test]
     fn forcing_row_does_not_cut_a_range_a_var_can_resolve() {
         init();
@@ -419,7 +408,7 @@ mod tests_presolve_api {
     /// A singleton row is a bound only as loose as the row: `0.01 x = 0.01 +
     /// 1e-9` accepts `x` within 1e-5 of 1.0000001, and fixing `x` there made
     /// the row `x = 1`, which the model meets within 1e-9, look inconsistent
-    /// (`Infeasible`, but only with the rows in this order).
+    /// in one row order.
     #[test]
     fn singleton_row_keeps_the_tolerance_of_the_row() {
         init();
@@ -437,11 +426,10 @@ mod tests_presolve_api {
         }
     }
 
-    /// A singleton row must not be dropped as implied by its var's bound when
-    /// the engine's bound tolerance, times the row's coefficient, breaks the
-    /// row: `-20 x1 >= 0` with `x1 <= 0` let x1 sit 1e-8 above zero, which
-    /// the dropped row saw as 2e-7 against 1e-7. (The model is feasible at
-    /// the origin.)
+    /// A singleton row implied by its var's bound is kept when the bound
+    /// tolerance, times the row's coefficient, breaks it: x1 may sit 1e-8
+    /// above its bound of 0, which `-20 x1 >= 0` sees as 2e-7 against 1e-7.
+    /// (The model is feasible at the origin.)
     #[test]
     fn singleton_row_tighter_than_its_bound_tolerance_is_kept() {
         init();
@@ -473,10 +461,9 @@ mod tests_presolve_api {
     }
 
     /// A row whose vars are all fixed is judged at the magnitude the engine
-    /// sees, that of the right-hand side as written plus the fixed terms:
-    /// `x + y = 2e9 + 1.5e-5` at `x = y = 1e9` is within the round-off of
-    /// its magnitude of 4e9, but presolve measured the right-hand side left
-    /// after substitution (1.5e-5) and declared the model infeasible.
+    /// sees (the rhs as written plus the fixed terms), not at the rhs left
+    /// after substitution: `x + y = 2e9 + 1.5e-5` at `x = y = 1e9` is within
+    /// the round-off of 4e9.
     #[test]
     fn all_substituted_row_is_judged_at_its_full_magnitude() {
         init();
@@ -490,9 +477,8 @@ mod tests_presolve_api {
         assert_eq!(sol[x], 1e9);
     }
 
-    /// Found by the wide-coefficient LP property: an equality at 1.34e8 with
-    /// a 1e-8 coefficient. The engine solves it; presolve declared it
-    /// infeasible.
+    /// An equality at 1.34e8 with a 1e-8 coefficient is feasible; presolve
+    /// declared it infeasible.
     #[test]
     fn equality_at_1e8_with_a_tiny_coefficient_is_feasible() {
         init();
@@ -509,13 +495,10 @@ mod tests_presolve_api {
     }
 
     /// A row whose vars presolve fixed is judged against the full contract,
-    /// as an empty input row is and as the boundary checks the dropped row,
-    /// not against the engine's half (C5-18). The forcing row
-    /// `x1 + 100 x4 = 8388700` fixes `x1` at its lower bound `-2^-30` and
-    /// `x4` at 83887, which leaves `-100 x1 + x4 / 1000 = 83.887` a residual
-    /// of 9.3e-8: within the 1e-7 the answer is held to, and presolve,
-    /// holding it to 5e-8, declared the model infeasible. (Without presolve
-    /// the engine puts `x1` at zero.)
+    /// as an empty input row is, not against the engine's half: the forcing
+    /// row `x1 + 100 x4 = 8388700` fixes `x1` at `-2^-30` and `x4` at 83887,
+    /// leaving `-100 x1 + x4 / 1000 = 83.887` a residual of 9.3e-8, within
+    /// 1e-7 but not 5e-8.
     #[test]
     fn all_substituted_row_is_judged_at_the_full_contract() {
         init();
@@ -528,13 +511,10 @@ mod tests_presolve_api {
         assert_eq!(sol[x4], 83887.0);
     }
 
-    /// Singleton rows go first in each wave, as in HiGHS's fast presolve
-    /// loop (C5-25). Processed in index order, the forcing row
-    /// `x1 + 100 x4 = 8388700` came first and fixed `x1` at its lower bound
-    /// `-2^-30`, which `-100 x1 = 0` then held to half its contract (see
-    /// the test above) and declared infeasible; taken first, the singleton
-    /// pins `x1` at zero and the other row becomes a singleton in `x4`.
-    /// Found by the wide-coefficient MILP property.
+    /// Singleton rows go first in each wave: taken first, `-100 x1 = 0` pins
+    /// `x1` at zero and `x1 + 100 x4 = 8388700` becomes a singleton in `x4`.
+    /// In index order, that forcing row fixed `x1` at `-2^-30`, which the
+    /// singleton then declared infeasible.
     #[test]
     fn singleton_row_is_processed_before_a_forcing_row() {
         init();

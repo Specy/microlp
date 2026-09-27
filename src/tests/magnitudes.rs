@@ -1,29 +1,16 @@
-//! Regressions found by fuzzing feasible-by-construction models across variable
-//! magnitudes and coefficient ranges (see `scaling.rs` for the properties).
+//! Regression tests on feasible-by-construction models across variable
+//! magnitudes and coefficient ranges (the properties are in `scaling.rs`).
 //! Each model is written around a point `x*` that satisfies every bound and
-//! every row within the documented tolerance, and every bound is finite, so
+//! every row within the documented tolerance, and its objective is bounded, so
 //! `solve()` must return an optimal solution whose rows hold within that
 //! tolerance and whose objective is no worse than at `x*` — the contract in
 //! `oracle.rs`.
 //!
-//! A model the engine gets wrong when it is found, and that cannot be fixed
-//! at once, is pinned here as a KNOWN LIMITATION with `#[should_panic]`: the
-//! test records today's answer, so that fixing it shows up as a FAILING test
-//! rather than passing unnoticed; the attribute is then deleted (the body
-//! already asserts the right answer) and it is an ordinary regression test.
-//! See §7 of `ARCHITECTURE.md`. Five fixtures were pinned this way and all
-//! five were fixed: a presolve forcing rule, a skipped verification, a dual
-//! ratio test that took "no pivot" for a proof of infeasibility (the
-//! `wide_chain` fixtures), the row tolerance a var left behind at a huge
-//! bound, and a fixed var's huge coefficient in a row added after the fix.
-//! Twelve are pinned today: a forcing row whose fixing another row can tell
-//! apart, two models of the phases alternating over a row repaired through
-//! round-off, a vertex off its bound by round-off with nothing to move, a
-//! MILP node whose feasible LP no var can repair, three models whose only
-//! room is a coefficient of round-off size (an LP, its MILP and the LP with
-//! that var unbounded), and four whose only room is such a coefficient of
-//! a basic var (an LP and its MILP, with presolve on and off), all reported
-//! infeasible before and failing loudly now.
+//! A model the engine gets wrong and that cannot be fixed at once is pinned
+//! here as a KNOWN LIMITATION with `#[should_panic]`, which records today's
+//! answer: a fix then shows up as a FAILING test, and deleting the attribute
+//! (the body already asserts the right answer) makes it an ordinary
+//! regression test. See §7 of `ARCHITECTURE.md`.
 
 #[cfg(test)]
 mod regression_tests {
@@ -70,13 +57,10 @@ mod regression_tests {
     }
 
     /// One equality row whose coefficients span eleven orders of magnitude,
-    /// with variable magnitudes up to 1e6. The row's tolerance is 1.3e-7. This
-    /// holds today, but only by the pivot path taken: an implementation whose
-    /// eta file stored the pivot row's factor as `1 - 1/pivot` reached a
-    /// pivot of 7e6 here and reported the basic variable off by 5.7e-7 from
-    /// the value the row implies — nine significant digits lost between the
-    /// final basis and the reported values. The row must hold regardless of
-    /// the path.
+    /// with variable magnitudes up to 1e6, must hold within its tolerance of
+    /// 1.3e-7 whatever the pivot path: an eta file storing the pivot row's
+    /// factor as `1 - 1/pivot` would reach a pivot of 7e6 here and report the
+    /// basic variable 5.7e-7 off the row.
     #[test]
     fn single_row_wide_coefficients_holds_the_row() {
         check(Model {
@@ -111,10 +95,9 @@ mod regression_tests {
         });
     }
 
-    /// Four rows pinning one variable of magnitude 7e6. Two of the equalities
-    /// are consistent with each other only to 1.3e-8 — the rounding of their
-    /// right-hand sides at 1e8 activity — which is well inside the documented
-    /// `1e-7`. The solve answers `Infeasible`.
+    /// Four rows pin one variable of magnitude 7e6, and two of the equalities
+    /// agree only to 1.3e-8, the rounding of their right-hand sides at 1e8
+    /// activity, well inside the documented `1e-7`: feasible, not `Infeasible`.
     #[test]
     fn single_variable_pinned_by_two_equalities_at_1e7_is_feasible() {
         check(Model {
@@ -146,9 +129,9 @@ mod regression_tests {
         });
     }
 
-    /// Three variables of magnitudes 5e4 to 7e8 under three equalities; the
-    /// rounding of the right-hand sides is within the round-off allowance of
-    /// their 1e10 activities. The solve answers `Infeasible`.
+    /// Three variables of magnitudes 5e4 to 7e8 under three equalities whose
+    /// right-hand sides are rounded within the round-off allowance of their
+    /// 1e10 activities: feasible, not `Infeasible`.
     #[test]
     fn three_equalities_at_1e9_are_feasible() {
         check(Model {
@@ -180,10 +163,9 @@ mod regression_tests {
     }
 
     /// An integer variable in `[-7, -6]` pinned to `-7` by two equality rows
-    /// whose activities are 2e8: their rounding puts the relaxation's value
-    /// 2e-8 outside the bound, far inside the documented tolerance, yet the
-    /// relaxation is declared infeasible and so is the model. `x* = (-7,
-    /// -1.885e8)` is an integer feasible point.
+    /// of activity 2e8, whose rounding puts the relaxation's value 2e-8
+    /// outside the bound, far inside the documented tolerance: neither the
+    /// relaxation nor the model is infeasible (`x* = (-7, -1.885e8)`).
     #[test]
     fn integer_pinned_by_large_equalities_is_feasible() {
         check(Model {
@@ -214,8 +196,8 @@ mod regression_tests {
     }
 
     /// Four rows with coefficients from 1e-8 to 1e4 and one variable of
-    /// magnitude 8e4. The reported point violates two equality rows by 2.2e-4
-    /// and 1.2e-5 against a tolerance of 1e-7.
+    /// magnitude 8e4: the reported point must hold every row within `1e-7`,
+    /// not miss two equalities by 2.2e-4 and 1.2e-5.
     #[test]
     fn wide_coefficient_equalities_hold_at_1e5() {
         check(Model {
@@ -286,8 +268,8 @@ mod regression_tests {
 
     /// Maximize `x` under `y + 1e-11 x <= 1` with `x >= 0` unbounded above:
     /// the tiny coefficient is a genuine one, so `x` is bounded by `1e11` and
-    /// the model has an optimum. Treating every coefficient below `1e-10` as
-    /// zero answers `Unbounded`.
+    /// the model has an optimum, not `Unbounded` as it would be with every
+    /// coefficient below `1e-10` taken for zero.
     #[test]
     fn a_tiny_genuine_coefficient_bounds_the_objective() {
         let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
@@ -307,20 +289,13 @@ mod regression_tests {
     }
 
     /// `x0` is pinned to `2^28` by an equality whose other coefficient is
-    /// `1e-7`, so one row's terms span fifteen orders of magnitude, and
-    /// `x* = [268435456, 0]` satisfies both rows exactly.
-    ///
-    /// Once pinned as a known limitation, this was a presolve bug: the row's
-    /// round-off is `5e-6` while `x1`'s whole term range is `2.5e-8`, so the
-    /// minimum activity equals the bound to round-off wherever `x1` sits. The
-    /// forcing rule read that as "every var at its extreme" and fixed `x1` at
-    /// `0.25`, which made row 1 (`-x1 = 0`) inconsistent; the engine solves
-    /// the model exactly with presolve off. Forcing now requires every term
-    /// to be resolvable above the row's round-off (`Work::terms_resolvable`).
-    ///
-    /// Found by the wide-coefficient LP property in `scaling.rs`; committed
-    /// here because that property's counterexamples otherwise live only in
-    /// the gitignored `.hegel/` corpus.
+    /// `1e-7`, so the row's terms span fifteen orders of magnitude, and
+    /// `x* = [268435456, 0]` satisfies both rows exactly. The row's round-off,
+    /// `5e-6`, exceeds `x1`'s whole term range, `2.5e-8`, so its minimum
+    /// activity meets the bound wherever `x1` sits: presolve's forcing rule
+    /// must not read that as "every var at its extreme" and fix `x1` at `0.25`
+    /// against `-x1 = 0`. Forcing requires every term to be resolvable above
+    /// the row's round-off (`Work::terms_resolvable`).
     #[test]
     fn wide_coefficients_pinning_a_variable_at_2e8() {
         check(Model {
@@ -335,10 +310,10 @@ mod regression_tests {
     }
 
     /// The wide-coefficient chain of the fixtures below: five variables (one
-    /// integer, two fixed) under three rows whose coefficients run from
-    /// `1e-8` to `1e4`. Rows 0 and 2 tie `x3` to `x2`, `x3 ≈ 1e-13 (x2 -
-    /// shift)`, and `x3` lies in `[0, 1]`, so the rows hold only at `x2 =
-    /// shift` with `x3 = x4 = 0`; `x2`'s bounds are `[lo, hi]`.
+    /// integer, two fixed) under three rows whose coefficients run from `1e-8`
+    /// to `1e4`. Rows 0 and 2 tie `x3` to `x2`, `x3 ≈ 1e-13 (x2 - shift)`, and
+    /// `x3` lies in `[0, 1]`, so the rows hold only at `x2 = shift` with
+    /// `x3 = x4 = 0`; `x2`'s bounds are `[lo, hi]`.
     fn wide_chain(lo: f64, hi: f64, shift: f64) -> Model {
         Model {
             direction: OptimizationDirection::Maximize,
@@ -362,19 +337,13 @@ mod regression_tests {
         }
     }
 
-    /// Once pinned as a known limitation. `x* = 0` satisfies all three rows
-    /// exactly, yet the solve answered `Infeasible` with presolve on or off.
-    /// The start puts `x2` at its lower bound `-1000001`, and the only
-    /// tableau entry that can carry it back is `1.5e-15` against a row
-    /// maximum of `1.95`, below the round-off of computing the row: the dual
-    /// ratio test rightly refused it as a pivot, found no other, and took
-    /// "no pivot" for a proof of infeasibility. Moving `x2` needs no pivot:
-    /// its flip to `0` carries the leaving var of row 0 exactly the
-    /// `1.19e-11` (scaled) it is short. The dual ratio test flips boxed vars
-    /// now, including through such entries when the flip lands the leaving
-    /// var (checked through the column), and declares infeasibility only
-    /// when no flip can reach the bound. The integer var plays no part.
-    /// Found by the wide-coefficient MILP property in `scaling.rs`.
+    /// `x* = 0` satisfies all three rows exactly, and the solve must find a
+    /// solution with presolve on and off. The start puts `x2` at its lower
+    /// bound `-1000001`, and the only tableau entry that can carry it back is
+    /// `1.5e-15` against a row maximum of `1.95`, below the round-off of
+    /// computing the row: no pivot, but no proof of infeasibility either.
+    /// `x2`'s flip to `0` carries the leaving var of row 0 exactly the
+    /// `1.19e-11` (scaled) it is short. The integer var plays no part.
     #[test]
     fn wide_coefficients_reached_by_a_bound_flip() {
         check(wide_chain(-1000001.0, 0.0, 0.0));
@@ -382,9 +351,8 @@ mod regression_tests {
     }
 
     /// [`wide_coefficients_reached_by_a_bound_flip`] shifted so that `x2`'s
-    /// feasible value is the bound farther from zero, where a start at the
-    /// bound nearer zero (HiGHS's rule, which does solve the unshifted model)
-    /// begins: the flip does not depend on where the solve starts.
+    /// feasible value is the bound farther from zero: a start at the bound
+    /// nearer zero must flip too.
     #[test]
     fn wide_coefficients_reached_by_a_flip_to_the_bound_far_from_zero() {
         check(wide_chain(0.0, 1000001.0, 1000001.0));
@@ -401,12 +369,11 @@ mod regression_tests {
         assert_solves_within_contract_without_presolve(&wide_chain(-2000002.0, 1000001.0, 0.0));
     }
 
-    /// The chain with `x2` confined to `[-2e7, -1e7]`: `x3 ≈ 1e-13 x2` is
-    /// then at most `-1e-6`, beyond every tolerance, and even `x2`'s flip to
-    /// `-1e7` leaves row 0 short. With no var to enter and no flip that can
-    /// reach the bound, the row proves the model infeasible, and the answer
-    /// must stay `Infeasible`: moving vars through entries below round-off
-    /// must not turn a proof into a guess.
+    /// The chain with `x2` confined to `[-2e7, -1e7]`: `x3 ≈ 1e-13 x2` is then
+    /// at most `-1e-6`, beyond every tolerance, and even `x2`'s flip to `-1e7`
+    /// leaves row 0 short. The row proves the model infeasible, and moving
+    /// vars through entries below round-off must not turn that proof into a
+    /// guess.
     #[test]
     fn wide_coefficients_beyond_every_flip_are_infeasible() {
         for presolve in [true, false] {
@@ -421,17 +388,11 @@ mod regression_tests {
     }
 
     /// Variable magnitudes are around `8e6` and row 1's terms reach `1.3e8`.
-    /// The exactly integral optimum the engine finds must be reported, not
-    /// rejected by its own feasibility guard as an `InternalError`.
-    ///
-    /// Once pinned as a known limitation, this was a bookkeeping bug in the
-    /// verified termination: the sixth dual pivot filled the eta file, the
-    /// periodic refactorization recomputed the basic values, and the
-    /// recompute marked them verified. `verify_primal` then skipped its
-    /// residual check although the recomputed values missed row 2 by four
-    /// times its tolerance, and the guard caught what verification should
-    /// have refined. A recompute no longer counts as a verification. Found
-    /// by the narrow-coefficient MILP property in `scaling.rs`.
+    /// The exactly integral optimum must be reported, not rejected by the
+    /// engine's own feasibility guard as an `InternalError`. The recompute of
+    /// the periodic refactorization can leave the basic values missing row 2
+    /// by four times its tolerance, so it is no verification: `verify_primal`
+    /// must still refine them.
     #[test]
     fn exactly_integral_optimum_at_1e8_is_verified_before_it_is_reported() {
         check(Model {
@@ -466,14 +427,12 @@ mod regression_tests {
         });
     }
 
-    /// Variable magnitudes around `8.5e6`, found by the narrow-coefficient LP
-    /// property. Row 2's equality slack sat past its bound within its
-    /// tolerance when the primal simplex took a step that moved it further
-    /// out; the Harris bound granted it its whole tolerance again, measured
-    /// from the bound rather than from where it was, so the step carried it
-    /// to 1.3 times its tolerance. The phase exit rejected the point, the dual
-    /// phase undid the step, and after eight rounds of this the solve gave up
-    /// with `InternalError`.
+    /// Variable magnitudes around `8.5e6`. Row 2's equality slack sits past
+    /// its bound within its tolerance when a primal step moves it further
+    /// out: the Harris limit leaves it only the rest of its tolerance, counted
+    /// from where it sits. Granted its whole tolerance again, it ends at 1.3
+    /// times its tolerance, and the phases undo and redo the step until the
+    /// solve fails with `InternalError`.
     #[test]
     fn harris_allowance_is_measured_from_where_a_basic_var_sits() {
         check(Model {
@@ -503,16 +462,13 @@ mod regression_tests {
         });
     }
 
-    /// Found by the wide-coefficient MILP property: an integer var with a
-    /// coefficient of 1e-8 in an equality may leave the row's solution by up
-    /// to the row's tolerance over that coefficient, ten units here, and
-    /// presolve's integer rounding, holding integer points to the full
-    /// contract, kept the points exactly at it. The guard then evaluated
-    /// the row there a few ulps over the contract, and an exactly integral
-    /// candidate was rejected (`InternalError`). Integer rounding leaves the
-    /// guard the round-off of its own evaluation. (Tolerance leaves these
-    /// models real freedom in the objective, so only feasibility is
-    /// checked.)
+    /// An integer var with a coefficient of 1e-8 in an equality may leave the
+    /// row's solution by up to the row's tolerance over that coefficient, ten
+    /// units here. Presolve's integer rounding must leave the guard the
+    /// round-off of its own evaluation: a point exactly at the contract
+    /// evaluates a few ulps over it, and an exactly integral candidate is
+    /// rejected (`InternalError`). The tolerance leaves the objective real
+    /// freedom, so only feasibility is checked.
     #[test]
     fn integer_var_with_a_tiny_coefficient_keeps_the_guards_margin() {
         let check_feasible = |model: Model| {
@@ -533,13 +489,12 @@ mod regression_tests {
         });
     }
 
-    /// Found by the wide-coefficient properties once they kept their
-    /// objective: models whose only feasible region is reached through a
-    /// genuine pivot of 4e-15 to 2e-14 of its column (1e-8 beside 1e4 in a
-    /// row). Both computations of such a pivot agree exactly, which is what
-    /// tells it from a round-off entry of the same size (those come out
-    /// percents apart); refusing every pivot that small, as a threshold on
-    /// size alone did, made all three `Infeasible`.
+    /// Models whose only feasible region is reached through a genuine pivot
+    /// of 4e-15 to 2e-14 of its column (1e-8 beside 1e4 in a row). Both
+    /// computations of such a pivot agree exactly, which tells it from a
+    /// round-off entry of the same size (whose two computations differ by
+    /// percents); a threshold on size alone refuses it and answers
+    /// `Infeasible`.
     #[test]
     fn genuine_pivots_near_the_round_off_floor_are_taken() {
         let check_feasible = |model: Model| {
@@ -601,18 +556,14 @@ mod regression_tests {
         });
     }
 
-    /// Found by the wide-coefficient MILP property. The primal step that
-    /// lowers x3 is bounded both by `-2 x3 <= -1` and, through the Harris
-    /// relaxation, by the equality `x2 + 1e-7 x3 = 1.0000001` at its
-    /// tolerance: the ratio test took the step, the equality's slack ended
-    /// exactly at its tolerance, the phase exit's recomputation landed it an
-    /// ulp past, the dual phase undid the step, the primal phase redid it,
-    /// and after eight rounds the solve gave up (`InternalError`). The
-    /// Harris allowance was then cut by the round-off of recomputing a var;
-    /// now each round after the first cuts it a hundredfold, as SoPlex does
-    /// when its algorithms loop (`LOOP_HARRIS_REDUCTION`): in the third round
-    /// the slack, still at its tolerance, blocks the step (a zero one), and
-    /// the solve ends at the vertex `x3 = 1`.
+    /// The primal step that lowers x3 is bounded by `-2 x3 <= -1` and, through
+    /// the Harris relaxation, by the equality `x2 + 1e-7 x3 = 1.0000001` at its
+    /// tolerance: the step leaves the equality's slack exactly at its
+    /// tolerance, the phase exit's recomputation finds it an ulp past, and the
+    /// phases undo and redo the step. Each round after the first cuts the
+    /// Harris allowance a hundredfold (`LOOP_HARRIS_REDUCTION`): in the third
+    /// the slack blocks the step (a zero one), and the solve ends at the
+    /// vertex `x3 = 1`.
     #[test]
     fn harris_step_leaves_the_round_off_of_the_recomputation() {
         check(Model {
@@ -632,18 +583,14 @@ mod regression_tests {
         });
     }
 
-    /// Found by CI's run of the wide-coefficient LP property on the first
-    /// version of the primal simplex's bound shifting, which set a leaving
-    /// var onto its bound, taking the step backwards where it sat past it, as
-    /// HiGHS does. The fixed slack of `0.1 x1 + x2 = 0` sat basic `3e-17` off
-    /// its value, the round-off of the updates; the primal step that set it
-    /// onto it moved the entering slack of `10 x0 - 1e-8 x2 <= 0` by that over
-    /// an element of `7.8e-8`, `3.9e-10` past its bound (`1.3e-7` in user
-    /// units, beyond the contract); and the dual simplex's repair pivoted on
-    /// `1e-7` into a basis the factorization rejected (`Singular matrix`,
-    /// with presolve on). A step that would run backwards is zero, and a
-    /// fixed var leaving within its tolerance of its value stays where it
-    /// sits, through the cleanup too.
+    /// The fixed slack of `0.1 x1 + x2 = 0` sits basic `3e-17` off its value,
+    /// the round-off of the updates. A primal step setting it onto its value
+    /// would move the entering slack of `10 x0 - 1e-8 x2 <= 0` by that over an
+    /// element of `7.8e-8`, `3.9e-10` past its bound (`1.3e-7` in user units,
+    /// beyond the contract), and the repair would pivot into a singular basis.
+    /// So a step that would run backwards is zero, and a fixed var leaving
+    /// within its tolerance of its value stays where it sits, through the
+    /// cleanup too.
     #[test]
     fn a_fixed_slack_carrying_round_off_leaves_where_it_sits() {
         check(Model {
@@ -663,17 +610,12 @@ mod regression_tests {
         });
     }
 
-    /// Found by the deep run of the wide-coefficient MILP property on this
-    /// step's tree, and failing the same at 127db49 (the dual simplex's cost
-    /// shifting) and after: `8 phase rounds` where 1dcd664 solves it. In a
-    /// node LP whose branch left the integer `x0` at a bound, each dual phase
-    /// after the first started with `x0`'s reduced cost dual infeasible (the
-    /// shift of the zero dual step before it given back) and corrected it by
-    /// flipping `x0` to its other bound, a move the phase then could not
-    /// repair (no entering column for `x0`'s row) and undid through a zero
-    /// step, and the verification found the same row violated, round after
-    /// round. A phase that cleans up after another forces phase 2, as HiGHS's
-    /// cleanup calls do, and shifts `x0`'s cost instead of flipping it.
+    /// In a node LP whose branch left the integer `x0` at a bound, each dual
+    /// phase after the first starts with `x0`'s reduced cost dual infeasible
+    /// (the shift of the zero dual step before it given back). Flipping `x0`
+    /// to its other bound makes a move the phase cannot repair and undoes
+    /// through a zero step, round after round until `8 phase rounds`; a phase
+    /// that cleans up after another shifts `x0`'s cost instead.
     #[test]
     fn a_cleanup_dual_phase_shifts_a_boxed_var_rather_than_flipping_it() {
         check(Model {
@@ -705,23 +647,14 @@ mod regression_tests {
         });
     }
 
-    /// Found by the wide-coefficient MILP property (`milp_wide_2` of the
-    /// solver review's stress run, C2-17/C2-18): a solve that never
-    /// returned. With the integer vars fixed at 0 and -115, the four
-    /// equalities have zero right-hand sides and pin every continuous var at
-    /// zero, a primal degenerate vertex that the pivots reach only within
-    /// the rows' tolerances. The dual simplex went round a four-pivot cycle:
-    /// two regular pivots on one row handed a tolerance-level violation to
-    /// the other equality, and two pivots of its fixed slacks, absorbing the
-    /// violation, handed it back, each a dual step backwards, so the
-    /// objective rose and fell and the bases repeated forever. With cost
-    /// shifting those pivots take a zero dual step, but the shift of a fixed
-    /// slack is its whole reduced cost, given back when it leaves, and the
-    /// vertices still come back; the vertex hash sees a pivot lead to a
-    /// visited vertex right after the one before it did, makes that basis
-    /// change taboo, and the phase ends at the optimum (HiGHS: 0 at `x*`).
-    /// Without the hash the stall bound ends it in an error. The limit turns
-    /// a regression into a failure instead of a hang.
+    /// With the integer vars fixed at 0 and -115, the four equalities pin every
+    /// continuous var at zero, a primal degenerate vertex the pivots reach
+    /// only within the rows' tolerances. Two regular pivots can hand a
+    /// tolerance-level violation to the other equality and two absorbing
+    /// pivots of its fixed slacks hand it back, a cycle cost shifting does not
+    /// break: the vertex hash makes the repeated basis change taboo, and the
+    /// phase ends at the optimum, 0 at `x*`. The time limit turns a regression
+    /// into a failure instead of a hang.
     #[test]
     fn a_dual_simplex_that_cycled_reaches_the_optimum() {
         let model = Model {
@@ -787,22 +720,14 @@ mod regression_tests {
         assert_solves_within_contract_in_time(&model, Duration::from_secs(10));
     }
 
-    /// A huge cost must not make a feasible model infeasible (found by the
-    /// review of the dual simplex's cost perturbation). The model minimizes
-    /// `4 x0 - 1e300 x1 - 5 x2 + 5 x3 - x4 - 2 x5` over four rows, the first
-    /// two of which force `x1 = 2 x4 - 2 = 0`. The perturbation moved a cost
-    /// by about `1e-6 |c|^(5/4)`, which for `1e300` is infinite: the reduced
-    /// costs became infinite or not a number, the dual ratio test dropped
-    /// every such candidate, and a row left with none declared the model
-    /// infeasible, as an LP and as a MILP, with presolve on and off (for any
-    /// cost above about `2e251`). A cost of `1e20` or more now takes no part
-    /// in the perturbation, as none ever reaches HiGHS's (its
-    /// `infinite_cost`), and a reduced cost that is not a number fails the
-    /// ratio test loudly. With such a cost the multipliers are of its size
-    /// and the small costs are round-off beside them, so the objective is
-    /// only as good as that allows (4 is reported, 3 is optimal), which the
-    /// contract's objective slack, relative to the objective's extent, allows
-    /// too.
+    /// A huge cost must not make a feasible model infeasible. The model
+    /// minimizes `4 x0 - 1e300 x1 - 5 x2 + 5 x3 - x4 - 2 x5` over four rows,
+    /// the first two of which force `x1 = 2 x4 - 2 = 0`. Perturbed by about
+    /// `1e-6 |c|^(5/4)`, a cost above about `2e251` becomes infinite and the
+    /// reduced costs not numbers, so a cost of `1e20` or more takes no part in
+    /// the perturbation. The small costs are round-off beside the huge one, so
+    /// the objective is only that good (4 is reported, 3 is optimal), which
+    /// the contract's objective slack allows.
     #[test]
     fn a_huge_cost_leaves_a_feasible_model_feasible() {
         for integer in [false, true] {
@@ -863,19 +788,15 @@ mod regression_tests {
         }
     }
 
-    /// The differential fuzz's model `wide_lp-558` reaches its optimum
-    /// (HiGHS: 231413.21367), within the fuzz's `1e-6` relative, with
-    /// presolve on and off. Two decisions of the dual simplex rest on it,
-    /// and without either one the solve ends at 231413.844, the objective at
-    /// `x*` (`x1` at its lower bound instead of its upper), which the
-    /// contract's objective slack does not tell from the optimum: the
-    /// cleanup of a dual phase only restores the costs, so that
+    /// This model reaches its optimum, 231413.21367, within `1e-6` relative,
+    /// with presolve on and off, not 231413.844, the objective at `x*` (`x1`
+    /// at its lower bound instead of its upper), which the contract's
+    /// objective slack cannot tell from it. Two rules of the dual simplex rest
+    /// on it: the cleanup of a dual phase only restores the costs, so that
     /// `run_phases` verifies the values before it recomputes the reduced
-    /// costs and runs the primal phase (a cleanup that recomputed them
-    /// itself sent the primal phase onto unverified values and stale slack
-    /// tolerances); and an absorbing pivot takes the absorber whose shift
-    /// does the least harm when it is given back (here a fixed slack), not
-    /// the one with the largest entry.
+    /// costs and runs the primal phase; and an absorbing pivot takes the
+    /// absorber whose shift does the least harm when given back (here a fixed
+    /// slack), not the one with the largest entry.
     #[test]
     fn wide_lp_558_reaches_the_optimum() {
         let model = Model {
@@ -951,17 +872,14 @@ mod regression_tests {
         }
     }
 
-    /// The differential fuzz's model `wide_lp-1897` solves within the
-    /// contract, with presolve on and off (HiGHS reports -4019.66 at a point
-    /// outside this contract; here the answer is the objective at `x*`). It
-    /// rests on how a rebuild within a dual phase corrects a dual
-    /// infeasibility: by shifting the cost, a boxed var's too. A step
-    /// flipped a boxed var to its upper bound and the next left it dual
-    /// infeasible there (its entry was below the pivot floor, so it did not
-    /// bound the step); moving it back to its lower bound at the rebuild,
-    /// as HiGHS's correction does, returned the phase to a vertex it had
-    /// left, round a loop that the cycling detection ended in an
-    /// `InternalError`.
+    /// This model solves within the contract, with presolve on and off; the
+    /// answer is the objective at `x*`. It rests on a rebuild within a dual
+    /// phase correcting a dual infeasibility by shifting the cost, a boxed
+    /// var's too: a step flips a boxed var to its upper bound and the next
+    /// leaves it dual infeasible there (its entry, below the pivot floor, does
+    /// not bound the step), and moving it back to its lower bound would return
+    /// the phase to a vertex it left, round a loop the cycling detection ends
+    /// in an `InternalError`.
     #[test]
     fn wide_lp_1897_solves_within_the_contract() {
         let model = Model {
@@ -1057,14 +975,13 @@ mod regression_tests {
         assert_solves_within_contract_without_presolve(&model);
     }
 
-    /// A fixed var's huge coefficient must not silence the rest of its row
-    /// (C2-06). `min y` s.t. `1e17 f + y >= 1`, `f` fixed at zero: neither
-    /// scaling touches the row (a fixed column is left out of both), so the
-    /// dual ratio test saw the row `[1e17, 1]`. Its round-off scale was
-    /// taken over every entry, the fixed column's included, which made
-    /// `y`'s exact entry of one "noise", and the row a proof of
-    /// infeasibility, with presolve on (the row is kept as written) and off.
-    /// The scale now leaves out the columns the scalings left out.
+    /// A fixed var's huge coefficient must not silence the rest of its row.
+    /// `min y` s.t. `1e17 f + y >= 1`, `f` fixed at zero: neither scaling
+    /// touches the row (a fixed column is left out of both, and presolve keeps
+    /// the row as written), so the dual ratio test sees `[1e17, 1]`. Its
+    /// round-off scale leaves out the columns the scalings left out; over
+    /// `f`'s entry, it would make `y`'s exact one "noise" and the row a false
+    /// proof of infeasibility.
     #[test]
     fn a_fixed_vars_huge_coefficient_does_not_silence_its_row() {
         for presolve in [true, false] {
@@ -1088,22 +1005,15 @@ mod regression_tests {
         }
     }
 
-    /// The model above through the LP edit path (found by the second review
-    /// of R0, and pinned as a known limitation until the dual simplex needed
-    /// a proof to report infeasibility). `min y` s.t. `f + y >= 0`,
-    /// `f ∈ [0, 10]`, then `fix_var(f, 0)` and
-    /// `add_constraint(1e17 f + y >= 1)`: the added row leaves the now fixed
-    /// `f` out of its equilibration, so the dual ratio test meets `[1e17, 1]`
-    /// again, and its round-off scale leaves out only the columns fixed when
-    /// the solve began, so `f`'s entry sets a floor of 100 and `y`'s exact
-    /// entry of one is "noise": no candidate. The ratio test took that for a
-    /// proof of infeasibility, and the edit came back `Infeasible` (the
-    /// answer is `y = 1`), with presolve on and off, as at 1dcd664. The row's
-    /// certificate does not hold now (`y` has no upper bound), the row is
-    /// made taboo, and with no other row left the dual simplex takes SoPlex's
-    /// last resort, a pivot on an entry its regular test refuses but above
-    /// SoPlex's `lowstab`: `y`'s one. (The absolute pivot tolerances of R3
-    /// would make `y` a regular candidate.)
+    /// The model above reached through the LP edit path, from `f + y >= 0`
+    /// with `f ∈ [0, 10]`: `fix_var(f, 0)`, then
+    /// `add_constraint(1e17 f + y >= 1)`. The added row leaves the now fixed
+    /// `f` out of its equilibration, and the round-off scale leaves out only
+    /// the columns fixed when the solve began, so `f`'s entry sets a floor of
+    /// 100 and `y`'s exact one is "noise": no candidate, but no proof of
+    /// infeasibility either (`y` has no upper bound). With the row taboo and
+    /// no other left, the instable leave pivots on `y`'s one, above
+    /// `INSTABLE_PIVOT_TOL`, and the answer is `y = 1`.
     #[test]
     fn a_fixed_vars_huge_coefficient_in_an_added_row_does_not_silence_it() {
         for presolve in [true, false] {
@@ -1137,15 +1047,11 @@ mod regression_tests {
 
     /// A row whose coefficients span thirty orders of magnitude keeps its
     /// small genuine entry. `min -g + y` s.t. `big g + y >= 2 big`,
-    /// `g ∈ [0, 1]`, `y >= 0`: the optimum is `g = 1`, `y = big`. With the
-    /// column factors bounded to `2^±20`, as HiGHS bounds them (C4-14 of the
-    /// solver review), neither column could be scaled far enough and the
-    /// equilibrated row was `[1, 1.1e-18]` at `big = 1e30`: `y`'s entry lay
-    /// below the dual ratio test's round-off floor, `y` has no upper bound to
-    /// flip to, and the row came back as a proof of infeasibility (as an LP
-    /// with presolve on and off, and as a MILP with presolve off). HiGHS
-    /// never meets the row, since it refuses matrix entries of 1e15 or more;
-    /// this engine takes them, so its column factors are not bounded.
+    /// `g ∈ [0, 1]`, `y >= 0`: the optimum is `g = 1`, `y = big`. The engine
+    /// takes matrix entries this large, so its column factors are not
+    /// bounded: bounded to `2^±20`, they would leave the row `[1, 1.1e-18]` at
+    /// `big = 1e30`, `y`'s entry below the round-off floor with no bound to
+    /// flip to, and the row a false proof of infeasibility.
     #[test]
     fn a_row_spanning_thirty_orders_keeps_its_small_genuine_entry() {
         for big in [3e27, 1e28, 1e30] {
@@ -1179,21 +1085,14 @@ mod regression_tests {
         }
     }
 
-    /// Issue #3's model with `z ≤ B` for `B` of `3e14` to `4e15`, real
-    /// bounds below the bound infinity of 2^52, pinned as a known limitation
-    /// until the primal simplex shifted its bounds (ARCHITECTURE §7): `z`
-    /// starts at `B`, where the rows' tolerances are taken (about 2.5 in the
-    /// scaled row at 1e15), one dual pivot brings it down to 1.375, and
-    /// `3x + 2y + z ≤ 20`, violated by 1.375, passes as feasible within that
-    /// tolerance; the primal simplex then let the row's slack leave where it
-    /// sat, off its bound, and the boundary reported `InternalError("LP
-    /// solution violates constraint row 0 by 1.375")` (from 1dcd664 on). The
-    /// slack still leaves where it sits (a step that would run backwards is
-    /// zero), but the cleanup of the primal phase moves it onto its bound:
-    /// the bound it was left past is a perturbed one, or else its tolerance
-    /// at the current values is far below the one it was judged by
+    /// Issue #3's model with `z ≤ B` for `B` up to `4e15`, below the bound
+    /// infinity of 2^52. `z` starts at `B`, where the rows' tolerances are
+    /// taken (about 2.5 in the scaled row at 1e15), so `3x + 2y + z ≤ 20`
+    /// passes the dual phase violated by 1.375; the primal phase lets its
+    /// slack leave off its bound, and its cleanup must move the slack onto the
+    /// bound for the dual simplex to repair the row
     /// (`a_slack_left_off_its_bound_beyond_its_current_tolerance_moves_onto_it`
-    /// in `src/solver/tests.rs`), and the dual simplex repairs the row.
+    /// in `src/solver/tests.rs`).
     #[test]
     fn a_row_left_with_the_tolerance_of_a_huge_bound_is_repaired() {
         for bound in [1e14, 3e14, 1e15, 4e15] {
@@ -1223,24 +1122,14 @@ mod regression_tests {
     }
 
     /// KNOWN LIMITATION (ARCHITECTURE §7): the phases alternate over a row
-    /// only entries below the round-off floor can repair. `lp_wide_3` of the
-    /// solver review's stress run: the only feasible point is the origin, a
-    /// primal degenerate vertex. The dual phase ends there with `x0`'s
-    /// reduced cost dual infeasible; the primal step that lowers `x0` is
-    /// blocked, in exact arithmetic, by `-1e4 x2 + 1e-3 x3 >= 0`, whose
-    /// entry, a genuine `3e-15`, is below the round-off floor of the column
-    /// (largest entry 4), so the step of 32 passes it and ends the row
-    /// `1e-7` (twice its tolerance) short: its bound is shifted, and the
-    /// cleanup exposes the violation. The dual phase can repair the row only
-    /// by moving `x5` across its range through another such entry, which
-    /// gives the primal phase its step back; after eight rounds the solve
-    /// fails with `InternalError`. The same at 1dcd664, where the move was the
-    /// dual ratio test's flip-only stage (C2-10 of the solver review); now
-    /// the row's certificate proves nothing (the model is feasible), SoPlex's
-    /// instable leave finds no entry to pivot on, and the move is the dual
-    /// simplex's round-off repair, its last resort. What resolves it is a
-    /// pivot on the `3e-15` (a degenerate one, onto the optimal basis): the
-    /// absolute pivot tolerances with a refined row of step R3.
+    /// only entries below the round-off floor can repair, and the solve fails
+    /// with `8 phase rounds` where the answer is the origin, the only feasible
+    /// point. The primal step that lowers `x0` passes `-1e4 x2 + 1e-3 x3 >= 0`,
+    /// whose genuine `3e-15` is below its column's round-off floor (largest
+    /// entry 4), and leaves the row `1e-7` short; the dual phase's round-off
+    /// repair moves `x5` across its range through another such entry, which
+    /// gives the step back. The fix is a degenerate pivot on the `3e-15`,
+    /// which needs absolute pivot tolerances and a refined row.
     #[test]
     #[should_panic(expected = "8 phase rounds")]
     fn phases_alternating_over_a_row_repaired_through_round_off_is_a_known_limitation() {
@@ -1267,25 +1156,15 @@ mod regression_tests {
         });
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): the same class, found by the deep
-    /// run of the wide-coefficient MILP property on the primal simplex's
-    /// bound shifting, which exposed it. `min x0 - x1` s.t.
-    /// `-10 x0 - 1e-8 x1 - 10 x3 = 0`, `-1e-7 x0 + 1e4 x1 = 0`: the second row
-    /// makes `x1 = 1e-11 x0`, so `x1 >= 0` needs `x0 >= 0`, and the optimum
-    /// is 0. The primal step that lowers `x0` to -1 passes the row of `x1`
-    /// through an entry below the round-off floor of its column; the point it
-    /// reaches meets the engine's tolerances only off every vertex (the
-    /// equality at its tolerance and `x1` at its own, which its row's reserve
-    /// caps at `5e-12`), so the cleanup leaves `x1` beyond its tolerance, the
-    /// dual phase moves `x3` across its range through another entry below the
-    /// floor to repair it, and the primal step comes back, round after round.
-    /// Up to the degenerate clamp this step removed (C3-21), the solve
-    /// returned `x0 = -1` with the equality violated by exactly `1e-7`, the
-    /// whole contract and twice the engine's share: the clamp had set the
-    /// equality's slack to within its tolerance without moving anything else,
-    /// and the residual that left in the row passed the verification. The
-    /// same remedies apply (R3), or the full contract of R4, under which the
-    /// vertex that sets `x1` to `-1e-11` verifies.
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the same class. The second row
+    /// makes `x1 = 1e-11 x0`, so `x1 >= 0` needs `x0 >= 0` and the optimum is
+    /// 0; the solve fails with `8 phase rounds`. The primal step that lowers
+    /// `x0` to -1 passes `x1`'s row through an entry below its column's
+    /// round-off floor, to a point that meets the engine's tolerances only off
+    /// every vertex (the equality at its tolerance, `x1` at its own, capped at
+    /// `5e-12` by its row's reserve); the dual phase moves `x3` back through
+    /// another such entry. The fix is the one above, or the engine's
+    /// tolerances raised to the whole contract.
     #[test]
     #[should_panic(expected = "8 phase rounds")]
     fn an_equality_met_only_off_every_vertex_is_a_known_limitation() {
@@ -1310,18 +1189,13 @@ mod regression_tests {
     }
 
     /// KNOWN LIMITATION (ARCHITECTURE §7): a vertex that misses a bound by the
-    /// round-off of solving for it, by more than the tolerance the engine
-    /// holds the var to, with nothing left to move. `lp_wide_1` of the
-    /// property stress run of R1a: three equalities through
-    /// `x* = (0, -230094, 0)`; after two dual pivots every non-basic var is
-    /// an equality's fixed slack, and the vertex puts `x2` `3.3e-10` (scaled)
-    /// past its upper bound of zero, three times the tolerance its rows'
-    /// reserve caps it at. Up to the infeasibility proof, the dual ratio
-    /// test took "no var can enter" for a proof and the solve came back
-    /// `Infeasible` (with presolve on and off, as at 1dcd664). The row's
-    /// certificate, summed from the data, puts the gap at `-6.7e-14`: it
-    /// proves nothing (the vertex is off by round-off, not by the data), and
-    /// the solve fails loudly. The full contract of R4 accepts the vertex.
+    /// round-off of solving for it, beyond the tolerance the engine holds the
+    /// var to, with nothing left to move: the solve fails loudly where
+    /// `x* = (0, -230094, 0)` is feasible. After two dual pivots every
+    /// non-basic var is an equality's fixed slack, and `x2` sits `3.3e-10`
+    /// (scaled) past its upper bound, three times its tolerance; the row's
+    /// certificate proves nothing (a gap of `-6.7e-14`). The engine's
+    /// tolerances raised to the whole contract would accept the vertex.
     #[test]
     #[should_panic(expected = "no var can repair row")]
     fn a_vertex_off_its_bound_by_round_off_with_nothing_to_move_is_a_known_limitation() {
@@ -1346,22 +1220,14 @@ mod regression_tests {
     }
 
     /// KNOWN LIMITATION (ARCHITECTURE §7): a MILP whose node LP is feasible
-    /// but that no var can repair. `b3` of the property stress run of R1b:
-    /// `-0.1 x2 + x5 = 0`, `1e4 x4 - 1e-6 x5 <= 10000010003` and
-    /// `-1e4 x2 + 1e-8 x4 = 0.00500001`, with `x4 ∈ [500001, 1000002]`, pin
-    /// `x5` at zero (`x* = 0` but for `x4 = 500001`). At the root node the
-    /// vertex puts `x5` `3.05e-12` (scaled, `5e-8` in the user's units) past
-    /// its upper bound of zero, beyond the tolerance its rows' reserve caps
-    /// it at, and the only var that could move it is the slack of the
-    /// second row, unbounded, with an entry of `3.2e-16`, below every pivot
-    /// floor. Up to the infeasibility proof, the dual ratio test counted that
-    /// entry as zero and took the row for a proof, and the branch and bound
-    /// pruned the node: the MILP came back `Infeasible` (presolve on and
-    /// off). The certificate's gap is `-1.6e-22`, no proof, so the node is
-    /// not pruned: its LP fails loudly, and after the retry from the slack
-    /// basis so does the MILP. What would repair it is a pivot on the tiny
-    /// entry (the absolute pivot tolerances with a refined row of R3) or the
-    /// full contract of R4, under which the vertex verifies.
+    /// but that no var can repair fails loudly, where `x* = 0` but for
+    /// `x4 = 500001` is feasible. The rows pin `x5` at zero; the root vertex
+    /// puts it `3.05e-12` (scaled, `5e-8` in user units) past its upper bound,
+    /// beyond the tolerance its rows' reserve caps it at, and only the second
+    /// row's unbounded slack could move it, through an entry of `3.2e-16`,
+    /// below every pivot floor. The certificate proves nothing (a gap of
+    /// `-1.6e-22`), so the node must not be pruned. A pivot on the tiny entry,
+    /// or the engine's tolerances raised to the whole contract, would solve it.
     #[test]
     #[should_panic(expected = "no var can repair row")]
     fn a_node_lp_no_var_can_repair_is_not_pruned_and_is_a_known_limitation() {
@@ -1385,16 +1251,13 @@ mod regression_tests {
     }
 
     /// A MILP node whose LP misses a bound by less than the user's tolerance
-    /// but more than the engine's is proven infeasible and pruned, as HiGHS
-    /// prunes it. `max x0` s.t. `-1e-4 x0 - 1e4 x2 = 0`, `-0.1 x2 = 0` over
-    /// `x0 ∈ {-1, 0, 1}`, `x2 ∈ [-1, 0]`: the node `x0 <= -1` puts `x2` at
-    /// `1e-8`, past its bound of zero, beyond the tolerance its first row's
-    /// reserve caps it at but within the user's `1e-7`, and nothing can move.
-    /// Its certificate's gap is exactly that `1e-8`. A proof that asked the
-    /// gap to exceed the user's tolerance too left the node neither proven
-    /// nor solvable, and the MILP a loud error (found by the property stress
-    /// on such a proof); the proof asks what the simplex's own test asks, and
-    /// the optimum is `x0 = 1` (where `x2 = -1e-8`), as HiGHS finds.
+    /// but more than the engine's is proven infeasible and pruned. The node
+    /// `x0 <= -1` puts `x2` at `1e-8`, past its bound of zero, beyond the
+    /// tolerance its first row's reserve caps it at but within the user's
+    /// `1e-7`, and nothing can move; the certificate's gap is exactly that
+    /// `1e-8`. A proof that asks more than the simplex's own test leaves the
+    /// node neither proven nor solvable. The optimum is `x0 = 1` (where
+    /// `x2 = -1e-8`).
     #[test]
     fn a_node_infeasible_by_less_than_the_contract_is_pruned() {
         check(Model {
@@ -1408,23 +1271,13 @@ mod regression_tests {
         });
     }
 
-    /// A MILP node whose certificate carries a basic var's round-off on a
-    /// huge bound is proven infeasible all the same. `x3 ∈ [0, 64212616]` is
-    /// basic at the node `x1 >= 1`, which violates the second row by
-    /// thousands; the certificate's coefficient of `x3` was `1.45e-17`, the
-    /// round-off of terms of magnitude `0.19`, and times `x3`'s scaled bound
-    /// of `4.2e12` it alone closed the certificate's gap of `6.1e-5`: the
-    /// proof failed, nothing could move, and the MILP failed loudly (found by
-    /// the property stress). The refinement of the row of the basis inverse
-    /// the certificate starts from, added for the next model and kept to
-    /// twice the precision for [`multipliers_no_f64_holds_do_not_void_a_nodes_proof`],
-    /// leaves `x3` no coefficient at all after one step, and after the second
-    /// the noise of its solve, `7.7e-34`, some `3e-21` at that bound, and the
-    /// node is proven. (For a while
-    /// a coefficient of round-off size counted as zero whatever its var's
-    /// bound, which kept this proof too but also proved a feasible model
-    /// infeasible:
-    /// `a_round_off_coefficient_on_a_far_bound_is_no_proof_and_is_a_known_limitation`.)
+    /// A MILP node whose certificate carries a basic var's round-off on a huge
+    /// bound is proven infeasible all the same. `x3 ∈ [0, 64212616]` is basic
+    /// at the node `x1 >= 1`, which violates the second row by thousands.
+    /// Unrefined, the certificate gives `x3` the coefficient `1.45e-17`, the
+    /// round-off of terms of magnitude `0.19`, which times `x3`'s scaled bound
+    /// of `4.2e12` closes the gap of `6.1e-5`; the refined row leaves it
+    /// `7.7e-34`, some `3e-21` at that bound, and the node is proven.
     #[test]
     fn a_round_off_coefficient_on_a_huge_bound_does_not_void_a_nodes_proof() {
         check(Model {
@@ -1447,16 +1300,11 @@ mod regression_tests {
 
     /// A MILP node proven infeasible through an ill-conditioned basis. At the
     /// node `x1 <= -10` (of `x1 ∈ [-11, 0]`), whose rows allow `x1 >= -9.99`
-    /// only, the basis mixes coefficients from `1e-5` to `1e4`, and the row
-    /// of its inverse leaves the basic `x3 ∈ [-2848554, 0]` a certificate
-    /// coefficient of `8.4e-16`: the residual of the transposed solve,
-    /// `1.8e-14` of the terms it is summed from, above any fixed round-off
-    /// fraction, and times `x3`'s scaled bound of `3.6e8` exactly the gap of
-    /// `3.05e-7`. The proof failed, nothing could move, and the MILP failed
-    /// loudly (found by the property stress); one refinement of that row, as
-    /// HiGHS refines it, leaves `x3` the coefficient `1.7e-18` rounded to
-    /// `f64` and `2.5e-31` kept to twice the precision, a second none, and
-    /// the node proven.
+    /// only, the basis mixes coefficients from `1e-5` to `1e4`. The unrefined
+    /// row of its inverse leaves the basic `x3 ∈ [-2848554, 0]` a certificate
+    /// coefficient of `8.4e-16`, `1.8e-14` of its terms, which times `x3`'s
+    /// scaled bound of `3.6e8` is exactly the gap of `3.05e-7`; refined twice,
+    /// the row leaves `x3` none, and the node is proven.
     #[test]
     fn an_ill_conditioned_basis_does_not_void_a_nodes_proof() {
         check(Model {
@@ -1482,21 +1330,13 @@ mod regression_tests {
     }
 
     /// A MILP node whose certificate no `f64` multipliers combine exactly is
-    /// proven infeasible all the same. `max -x1` s.t.
-    /// `-2e-8 x1 - 12.5 x2 = 0` and `-2e-7 x0 - 1e-6 x1 + 162.5 x2 = 0` over
-    /// `x0 ∈ {0, 1}`, `x1 ∈ {-2, -1, 0}` and `x2 ∈ [-45451714, 0]`: the rows
-    /// pin `x1` at zero, and the node `x1 <= -1` misses them by `6.5e-7`
-    /// (scaled). Its certificate combines the rows with multipliers no `f64`
-    /// holds, and with the row of the basis inverse refined but rounded to
-    /// `f64`, as HiGHS rounds it, the basic `x2`'s coefficient was
-    /// `8.7e-17`, the representation error of the row beside terms of
-    /// magnitude `3.1`: counted at `x2`'s scaled bound of `-2.9e9`, it left a
-    /// gap of `4.0e-7`, short of the allowance `4e-7` by a hair, and the
-    /// MILP failed loudly (found by the property stress on a version that
-    /// counted such coefficients at finite bounds, as the proof must, but
-    /// rounded the refined row; two more nodes failed the same way, on
-    /// bounds of `6.9e6` and `2.4e8`). The refinement now keeps its
-    /// correction to twice the precision, and `x2`'s coefficient is zero.
+    /// proven infeasible all the same. The rows pin `x1` at zero, and the node
+    /// `x1 <= -1` misses them by `6.5e-7` (scaled). With the refined row of
+    /// the basis inverse rounded to `f64`, the basic `x2` keeps the row's
+    /// representation error, `8.7e-17` beside terms of `3.1`, which at `x2`'s
+    /// scaled bound of `-2.9e9` leaves the gap a hair short of the allowance
+    /// `4e-7`; kept to twice the precision, the refined row leaves `x2` no
+    /// coefficient.
     #[test]
     fn multipliers_no_f64_holds_do_not_void_a_nodes_proof() {
         check(Model {
@@ -1514,13 +1354,11 @@ mod regression_tests {
         });
     }
 
-    /// The model the review of the infeasibility proof built:
     /// `min -x - y - t - z` s.t. `x + y + z + q >= 3` and
     /// `t - (1 + 2^-50) z - q >= 1e-6` over `x, y, t ∈ [0, 1]` (integer if
-    /// asked), `z ∈ [z_min, 1]`, `q ∈ [-1e10, 1e10]` (`q` free, the review's
-    /// form, behaves the same). Together the rows ask
-    /// `x + y + t - 2^-50 z >= 3 + 1e-6`: only `z`'s coefficient `-2^-50`,
-    /// which the rows' own data leave, makes room for them, at
+    /// asked), `z ∈ [z_min, 1]`, `q ∈ [-1e10, 1e10]` (`q` free behaves the
+    /// same). Together the rows ask `x + y + t - 2^-50 z >= 3 + 1e-6`: only
+    /// `z`'s coefficient `-2^-50`, the rows' own data, makes room for them, at
     /// `z <= -2^50 · 1e-6 ≈ -1.13e9`, where the optimum is. The model is
     /// feasible in exact arithmetic at `x*`.
     fn room_through_a_round_off_coefficient(integer: bool, z_min: f64) -> Model {
@@ -1557,22 +1395,14 @@ mod regression_tests {
     }
 
     /// KNOWN LIMITATION (ARCHITECTURE §7): a feasible LP whose only room is a
-    /// coefficient of round-off size on a far bound.
-    /// [`room_through_a_round_off_coefficient`] with `z >= -2e9`: the dual
-    /// simplex ends with a row that only `z` can repair, through an entry of
-    /// `8.9e-16` beside ones, below every pivot floor. The row's certificate
-    /// gives `z` the coefficient `-2^-50`, round-off beside its terms (ones)
-    /// but the data's own. Counted as zero whatever its bound, as HiGHS
-    /// counts proof entries below `1e-14`, it proved the model infeasible
-    /// (a gap of `1e-6`), and the solve returned `Infeasible`, with presolve
-    /// on and off (as HiGHS does). Counted as it is, times `z`'s bound, it
-    /// leaves the certificate `7.8e-7` of room: no proof. Nothing repairs the
-    /// row either: the round-off repair does not move a var by a coefficient
-    /// below the round-off of its terms (moved by it, `z` goes to `-2e9`, and
-    /// the primal step, whose column's round-off floor hides the same entry,
-    /// takes it back, round after round), so the solve fails loudly. Only a
-    /// pivot on the entry, below every reference's pivot tolerance, solves
-    /// it.
+    /// coefficient of round-off size on a far bound fails loudly instead of
+    /// reaching its optimum. The dual simplex ends with a row only `z` can
+    /// repair, through an entry of `8.9e-16` beside ones, below every pivot
+    /// floor. The certificate's `-2^-50` for `z`, counted at `z >= -2e9`,
+    /// leaves `7.8e-7` of room (counted as zero, it would prove the model
+    /// infeasible), and the round-off repair does not move a var by a
+    /// coefficient below the round-off of its terms. Only a pivot on that
+    /// entry solves it.
     #[test]
     #[should_panic(expected = "no var can repair row")]
     fn a_round_off_coefficient_on_a_far_bound_is_no_proof_and_is_a_known_limitation() {
@@ -1580,10 +1410,9 @@ mod regression_tests {
     }
 
     /// KNOWN LIMITATION (ARCHITECTURE §7): the model of the test above with
-    /// `x, y, t` integer. Its root node's LP is that LP, and the branch and
-    /// bound pruned the node on the false proof: the MILP came back
-    /// `Infeasible` (presolve on and off). The node's LP fails loudly now,
-    /// and after the retry from the slack basis so does the MILP.
+    /// `x, y, t` integer, whose root node's LP is that LP: the node must not
+    /// be pruned on a false proof, and the MILP fails loudly (after the retry
+    /// from the slack basis) where it has an optimum.
     #[test]
     #[should_panic(expected = "no var can repair row")]
     fn a_node_lp_whose_room_is_round_off_is_not_pruned_and_is_a_known_limitation() {
@@ -1592,15 +1421,12 @@ mod regression_tests {
 
     /// KNOWN LIMITATION (ARCHITECTURE §7): the model of
     /// [`a_round_off_coefficient_on_a_far_bound_is_no_proof_and_is_a_known_limitation`]
-    /// with `z` unbounded below. A round-off coefficient on an infinite bound
-    /// once counted as zero for every var, HiGHS's concession, and the
-    /// certificate proved the feasible model infeasible, with presolve on and
-    /// off (HiGHS answers the same). A coefficient on an infinite bound counts
-    /// as zero now only where the error of the multipliers could make it
-    /// zero; this row of the basis inverse is exact, so `z`'s `-2^-50` makes
-    /// the certificate's range unbounded, and nothing is proven. Nothing
-    /// repairs the row either (the round-off repair moves no var toward an
-    /// infinite bound), and the solve fails loudly.
+    /// with `z` unbounded below. A coefficient on an infinite bound counts as
+    /// zero only where the multipliers' error could make it zero; this row of
+    /// the basis inverse is exact, so `z`'s `-2^-50` makes the certificate's
+    /// range unbounded and proves nothing, and the round-off repair moves no
+    /// var toward an infinite bound: the solve fails loudly where the model
+    /// has an optimum.
     #[test]
     #[should_panic(expected = "no var can repair row")]
     fn a_round_off_coefficient_on_an_infinite_bound_is_no_proof_and_is_a_known_limitation() {
@@ -1610,12 +1436,11 @@ mod regression_tests {
         ));
     }
 
-    /// The model the review of the basic vars' concession built:
     /// `min -L` s.t. `L + j + w = 1.000001`, `-(1 + 2^-50) j - w = 0` and
-    /// `j + v <= 0` over `L, v ∈ [0, 1]` (`L` integer if asked) and `j, w`
-    /// free. The first two rows ask `L - 2^-50 j = 1.000001`: only `j`'s
-    /// coefficient `-2^-50` makes room for them, at `j ≈ -1.13e9`, where the
-    /// optimum `L = 1` is. The model is feasible in exact arithmetic at `x*`.
+    /// `j + v <= 0` over `L, v ∈ [0, 1]` (`L` integer if asked) and `j, w` free.
+    /// The first two rows ask `L - 2^-50 j = 1.000001`: only `j`'s coefficient
+    /// `-2^-50` makes room for them, at `j ≈ -1.13e9`, where the optimum
+    /// `L = 1` is. The model is feasible in exact arithmetic at `x*`.
     fn room_through_a_basic_vars_coefficient(integer: bool) -> Model {
         Model {
             direction: OptimizationDirection::Minimize,
@@ -1642,34 +1467,23 @@ mod regression_tests {
         }
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): a feasible LP whose only room is
-    /// a basic var's coefficient of round-off size in what a certificate
-    /// leaves. [`room_through_a_basic_vars_coefficient`]: the dual simplex
-    /// ends at the basis `{j, w}` and the second row's slack, `1e-6` above
-    /// its bound of zero, and only the third row's slack, unbounded, could
-    /// repair that row, through an entry of `2^-50` beside ones, below every
-    /// pivot floor. The row of the basis inverse, `(1, 1, 2^-50)`, needs the
-    /// infinite side of that non-basic slack, so the certificate leaves the
-    /// third row out, and the free basic `j` keeps the coefficient `-2^-50`,
-    /// `4.4e-16` of its terms. The concession for a basic var's coefficient
-    /// on an infinite bound stopped at the `f64` round-off floor of its terms
-    /// and took it for a residual, and the certificate proved the model
-    /// infeasible (a gap of `1e-6`), with presolve on and off (HiGHS's LP
-    /// answers the same). A coefficient counts as zero now only where the
-    /// error of the multipliers could make it zero, and this row of the basis
-    /// inverse is exact: counted, the coefficient makes the range unbounded,
-    /// and nothing is proven. Nothing repairs the row either, and the solve
-    /// fails loudly. Only a pivot on the entry, below every reference's pivot
-    /// tolerance, solves it.
+    /// KNOWN LIMITATION (ARCHITECTURE §7): a feasible LP whose only room is a
+    /// basic var's coefficient of round-off size in what a certificate leaves
+    /// fails loudly instead of reaching `L = 1`. The dual simplex ends at the
+    /// basis `{j, w}` and the second row's slack, `1e-6` above its bound, which
+    /// only the third row's unbounded slack could repair, through an entry of
+    /// `2^-50` beside ones. The certificate leaves that row out (its multiplier
+    /// needs the slack's infinite side), so the free basic `j` keeps its exact
+    /// `-2^-50`, which makes the range unbounded: no proof. Only a pivot on
+    /// that entry solves it.
     #[test]
     #[should_panic(expected = "no var can repair row")]
     fn a_basic_vars_coefficient_left_by_a_row_left_out_is_no_proof_and_is_a_known_limitation() {
         check(room_through_a_basic_vars_coefficient(false));
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): the test above without presolve,
-    /// on the model as written, which ends at the same basis; it too was
-    /// proven infeasible, and it too fails loudly now.
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the test above without presolve, on
+    /// the model as written, which ends at the same basis and fails loudly too.
     #[test]
     #[should_panic(expected = "no var can repair row")]
     fn a_basic_vars_coefficient_left_by_a_row_left_out_without_presolve_is_a_known_limitation() {
@@ -1682,19 +1496,17 @@ mod regression_tests {
     }
 
     /// KNOWN LIMITATION (ARCHITECTURE §7): the model of the tests above with
-    /// `L` integer. Its root node's LP is that LP, and the branch and bound
-    /// pruned the node on the false proof: the MILP came back `Infeasible`
-    /// (presolve on and off), where its optimum is `L = 1` (HiGHS finds it).
-    /// The node's LP fails loudly now, and after the retry from the slack
-    /// basis so does the MILP.
+    /// `L` integer, whose root node's LP is that LP: the node must not be
+    /// pruned on a false proof, and the MILP fails loudly (after the retry
+    /// from the slack basis) where its optimum is `L = 1`.
     #[test]
     #[should_panic(expected = "no var can repair row")]
     fn a_node_lp_whose_room_is_a_basic_vars_coefficient_is_not_pruned_and_is_a_known_limitation() {
         check(room_through_a_basic_vars_coefficient(true));
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): the test above without presolve;
-    /// its root node was pruned the same way, and it fails loudly now too.
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the test above without presolve,
+    /// which fails loudly the same way.
     #[test]
     #[should_panic(expected = "no var can repair row")]
     fn a_node_lp_whose_room_is_a_basic_vars_coefficient_without_presolve_is_a_known_limitation() {
@@ -1707,14 +1519,11 @@ mod regression_tests {
     }
 
     /// KNOWN LIMITATION (ARCHITECTURE §7): presolve's forcing row
-    /// `x1 + 100 x4 = 8388700` fixes `x1` at its lower bound `-2^-30`, where
-    /// the row allows it within the row's tolerance, and
-    /// `-1000 x1 + x4 / 1000 = 83.887`, which pins `x1` at zero, then misses
-    /// by 9.3e-7, beyond the contract: a feasible model (`x1 = 0`,
-    /// `x4 = 83887`) comes back `Infeasible` with presolve on. The instance
-    /// the properties found (a coefficient of 100, the pinning row a
-    /// singleton) is fixed by processing singleton rows first and judging a
-    /// row whose vars are all fixed at the full contract; this one needs a
+    /// `x0 + 100 x1 = 8388700` fixes `x0` at its lower bound `-2^-30`, where
+    /// the row allows it within its tolerance, and
+    /// `-1000 x0 + x1 / 1000 = 83.887`, which pins `x0` at zero, then misses
+    /// by 9.3e-7, beyond the contract: a feasible model (`x0 = 0`,
+    /// `x1 = 83887`) comes back `Infeasible` with presolve on. The fix is a
     /// forcing test that accounts for the var's other rows.
     #[test]
     #[should_panic(expected = "returned Infeasible")]

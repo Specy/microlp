@@ -3,14 +3,11 @@
 //! Owns exactly one [`Solver`] per search. Branching changes variable bounds in
 //! place.
 //!
-//! This file is the lifecycle: how a search is built from a [`Problem`], how it
-//! is started, resumed and re-edited, and how a candidate is judged against the
-//! user's original rows. The pieces beside it:
-//!
-//! * [`options`] — the public option and report types.
-//! * [`state`] — [`MipState`], the resumable state a search carries.
-//! * [`search`] — node visiting, branching and the search loop.
-//! * [`branching`] / [`node`] / [`params`] — pseudocosts, tree nodes, constants.
+//! This file builds a search from a [`Problem`], starts, resumes and re-edits
+//! it, and judges a candidate against the user's rows. [`options`] holds the
+//! public option and report types, [`state`] the resumable [`MipState`],
+//! [`search`] the node loop, and [`branching`], [`node`] and [`params`] the
+//! pseudocosts, tree nodes and constants.
 
 pub(crate) mod branching;
 pub(crate) mod node;
@@ -32,11 +29,10 @@ use web_time::Instant;
 
 fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Error> {
     let deadline = options.time_limit.map(|d| Instant::now() + d);
-    // Presolve the search problem. `state.base` below stays the user's
-    // untouched problem, so post-solve edits keep composing against it; the
-    // presolved bounds become the ROOT bounds (branching resets to them).
-    // Dual fixing is optimum-preserving but not feasible-point-preserving,
-    // so it is disabled when a warm-start hint must be honored.
+    // Presolve what the search solves; `state.base` stays the user's problem,
+    // so post-solve edits keep composing against it. The presolved bounds
+    // become the root bounds. Dual fixing can exclude a feasible point, so a
+    // warm-start hint disables it.
     let presolved = if options.presolve {
         Some(crate::presolve::presolve(
             &problem.obj_coeffs,
@@ -164,8 +160,8 @@ pub(crate) fn candidate_variables_feasible(
     }
     values.iter().enumerate().all(|(v, &value)| {
         let (lo, hi) = bounds(v);
-        // The contract on a bound, the same rule and the same comparison as
-        // the engine's and the LP path's.
+        // The contract on a bound: the same check as the engine's and the LP
+        // path's.
         value.is_finite()
             && !lo.is_nan()
             && !hi.is_nan()
@@ -177,11 +173,10 @@ pub(crate) fn candidate_variables_feasible(
 }
 
 /// Cheap feasibility check of a value vector against base + fixes: bounds,
-/// domains, and every user-scale constraint row, under the same contract the
-/// solver's boundary applies ([`crate::solver::row_violation`]). The bounds
-/// are the ones the solve works with, as `Problem` stores them (each bound
-/// from 2^52 on infinite, [`crate::solver::entry_bounds`]), so an incumbent
-/// the engine found beyond such a bound survives an edit. This is a
+/// domains, and every user-scale constraint row, under the boundary's contract
+/// ([`crate::solver::row_violation`]). The bounds are those `Problem` stores (a
+/// bound from 2^52 on is infinite, [`crate::solver::entry_bounds`]), so an
+/// incumbent the engine found beyond such a bound survives an edit. This is a
 /// warm-start prefilter; adoption re-validates the candidate through the
 /// active solver.
 pub(crate) fn incumbent_feasible(

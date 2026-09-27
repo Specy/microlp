@@ -226,10 +226,9 @@ fn lu_rand() {
     }
 }
 
-/// A basis with an empty column is singular, and that is the answer with
-/// trace logging on too: the trace of the matrix's excess entries,
-/// `nnz - size`, ran before the empty-column check and underflowed (a panic
-/// in a debug build).
+/// A basis with an empty column is singular with trace logging on too: the
+/// trace of the matrix's excess entries, `nnz - size`, must not run before
+/// the empty-column check, where it underflows (a panic in a debug build).
 #[test]
 fn lu_empty_column_is_singular_with_trace_logging() {
     init();

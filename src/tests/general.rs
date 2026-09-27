@@ -91,16 +91,13 @@ mod tests_general {
         assert_eq!(sol.objective(), 6.0);
     }
 
-    /// Rows whose data alone decide them get the same verdict on every path
-    /// into the engine (pure LP and MIP, presolve on and off, and added to a
-    /// solved LP), under the one contract: an empty row has activity zero
-    /// and is held to the feasibility tolerance like any row; an infinite
-    /// right-hand side on the side a row leaves open is no constraint, and
-    /// on the side it constrains, one no point meets; a coefficient or
-    /// right-hand side that is not a number, or an infinite coefficient,
-    /// makes a row no point satisfies. (Presolve used to drop NaN rows and
-    /// rows bounded by an infinity, the engine accepted `x ≤ -∞` under an
-    /// infinite tolerance, and the two disagreed on empty rows.)
+    /// Rows whose data alone decide them get one verdict on every path (pure
+    /// LP and MIP, presolve on and off, added to a solved LP): an empty row
+    /// has activity zero and is held to the feasibility tolerance like any
+    /// row; an infinite right-hand side is no constraint on the side the row
+    /// leaves open and unsatisfiable on the side it constrains; a NaN
+    /// coefficient or right-hand side, or an infinite coefficient, makes the
+    /// row unsatisfiable.
     #[test]
     fn rows_whose_data_decide_them_get_one_verdict_on_every_path() {
         init();
@@ -167,7 +164,7 @@ mod tests_general {
             );
         }
 
-        // A bound that is not a number: the engine's verdict with presolve too.
+        // A NaN bound: `Infeasible` with presolve on and off.
         for milp in [false, true] {
             for presolve in [true, false] {
                 let mut problem = Problem::new(OptimizationDirection::Minimize);
@@ -189,13 +186,10 @@ mod tests_general {
         }
     }
 
-    /// A free var whose objective coefficient is zero is optimal wherever it
-    /// sits: no move of it changes the objective. Counting it as dual
-    /// infeasible made the primal simplex enter it along a direction that
-    /// improves nothing, and with no bound in the way the step was infinite:
-    /// a free var in no row made a bounded model `Unbounded`, one in a row
-    /// drove the values to infinity (`InternalError`), and two of them in one
-    /// row swapped in and out of the basis forever.
+    /// A free var with a zero objective coefficient is optimal wherever it
+    /// sits. Counted as dual infeasible, it entered along a direction that
+    /// improves nothing, with an infinite step: a bounded model came back
+    /// `Unbounded` or `InternalError`, or cycled.
     #[test]
     fn free_variables_with_a_zero_cost_are_optimal_anywhere() {
         init();
@@ -229,7 +223,8 @@ mod tests_general {
             assert_eq!(solution(problem.solve().unwrap()).objective(), 5.0);
         }
         {
-            // Two of them alone in a row: this one never returned.
+            // Two of them alone in a row; the time limit turns a cycle into a
+            // failure.
             let mut problem = Problem::new(OptimizationDirection::Maximize);
             let x = problem.add_var(0.0, (-inf, inf));
             let y = problem.add_var(0.0, (-inf, inf));
@@ -242,13 +237,11 @@ mod tests_general {
         }
     }
 
-    /// An unbounded LP (HiGHS agrees) whose improving ray had exactly one
-    /// row that could "block" it, through a round-off entry of 1.4e-15 of the
-    /// column's largest. The primal ratio test took it as the pivot, with a
-    /// step of 1.6e15, into a basis the factorization then refused
-    /// (`InternalError("Singular matrix")`): its row and column computations
-    /// were 2% apart, which the agreement check let through as agreement
-    /// within round-off although the element was itself at that level.
+    /// An unbounded LP whose improving ray meets its one blocking row only
+    /// through a round-off entry (1.4e-15 of the column's largest). That
+    /// entry is no pivot: its row and column computations, 2% apart, pass as
+    /// agreeing only because the element itself is at the round-off level.
+    /// Taken, it led into a singular basis.
     #[test]
     fn unbounded_ray_is_not_blocked_by_a_round_off_entry() {
         init();
@@ -312,13 +305,11 @@ mod tests_general {
         }
     }
 
-    /// Found by differential fuzzing against HiGHS: an improving column whose
-    /// only blocking row had its basic var sitting past its bound within
-    /// tolerance. The engine refused the column as "not an improving
-    /// direction", since setting the leaving var onto its bound would have
-    /// moved the entering var backwards out of its own bounds, and reported
-    /// Optimal 3e-3 short of the optimum (-6.19413 for -6.19720). In a
-    /// degenerate step the leaving var now leaves where it sits.
+    /// An improving column whose only blocking row has its basic var past its
+    /// bound within tolerance: in that degenerate step the leaving var leaves
+    /// where it sits. Setting it onto its bound would move the entering var
+    /// backwards out of its bounds, and refusing the column instead stopped
+    /// the simplex 3e-3 short of the optimum.
     #[test]
     fn a_degenerate_step_past_a_bound_does_not_stop_the_simplex() {
         init();
@@ -771,7 +762,7 @@ mod tests_general {
     }
 
     /// A model from `(objective, lower, upper, integer)` vars and
-    /// `(terms, sense, rhs)` rows, as the differential fuzzing writes them.
+    /// `(terms, sense, rhs)` rows.
     fn fuzz_model(
         direction: OptimizationDirection,
         vars: &[(f64, f64, f64, bool)],
@@ -795,15 +786,13 @@ mod tests_general {
         problem
     }
 
-    /// Infeasible models (HiGHS agrees) whose dual simplex reaches a row
-    /// whose only helping entry is round-off: 1.1e-16, the residue of two
-    /// parallel rows cancelling, beside a slack's entry of 1.05 that cannot
-    /// help. Every entry of a row comes from the same transposed solve, so
-    /// the round-off scale of the row is taken over the entries that cannot
-    /// help too; taken over the helping entries alone, or dropped from the
-    /// fallback to vars that absorb the move, it let the residue through as
-    /// a pivot, with a step of 4.5e15, into a basis the factorization
-    /// refused (`InternalError("Singular matrix")`).
+    /// Infeasible models whose dual simplex reaches a row whose only helping
+    /// entry is round-off (1.1e-16, the residue of two parallel rows
+    /// cancelling) beside a slack's entry of 1.05 that cannot help. Every
+    /// entry of the row comes from one transposed solve, so its round-off
+    /// scale is taken over all of them, also in the fallback to vars that
+    /// absorb the move; over the helping entries alone, the residue became a
+    /// pivot into a singular basis.
     #[test]
     fn infeasible_row_is_not_repaired_through_a_round_off_entry() {
         init();
@@ -937,17 +926,13 @@ mod tests_general {
         }
     }
 
-    /// An infeasible LP of the differential fuzz (`int_lp-155`, HiGHS
-    /// agrees) whose certificate, without presolve, combines three rows and
-    /// leaves the free basic `x2` a residual of the multipliers, zero for the
-    /// exact row of the basis inverse: `1.2e-32` of its terms from the row
-    /// refined once. On an infinite bound no count of it exists, and any
-    /// count but zero leaves the certificate's range unbounded: counted as it
-    /// was, it voided the proof, and the solve failed loudly. The second step
-    /// of the refinement leaves it exactly zero, and the concession for a
-    /// coefficient the multipliers' error could make zero would cover it
-    /// too. With presolve the row that proves it alone, `-4 x0 - 4 x1 >= 4`
-    /// over `x0, x1 >= 0`, is found before the engine runs.
+    /// An infeasible LP whose certificate, without presolve, combines three
+    /// rows and leaves the free basic `x2` a residual that is zero for the
+    /// exact row of the basis inverse (`1.2e-32` of its terms, refined once).
+    /// On an infinite bound any nonzero count leaves the certificate's range
+    /// unbounded and voids the proof; the row refined twice makes it exactly
+    /// zero, and the multipliers' error bound would cover it too. Presolve
+    /// finds `-4 x0 - 4 x1 >= 4` over `x0, x1 >= 0`, which proves it alone.
     #[test]
     fn a_basic_free_vars_residual_does_not_void_a_proof() {
         init();
@@ -981,20 +966,14 @@ mod tests_general {
         }
     }
 
-    /// An infeasible LP of the differential fuzz (`int_lp-970`, HiGHS
-    /// agrees) whose certificate leaves out a row whose slack is non-basic:
-    /// that slack's entry in the leaving row is zero, and the refined row of
-    /// the basis inverse carries it as noise (`-7.9e-31` refined once), whose
-    /// sign asks for the slack's infinite side. With the row left out, as
-    /// HiGHS leaves it out (without that the proof failed), the basic `x0`,
-    /// unbounded above, keeps a residual: `3.7e-31` of its terms from the row
-    /// refined once, zero from the row refined twice. A rule that withdrew
-    /// the concession from every var of a row left out while its slack is
-    /// non-basic, taking such a slack's multiplier for the model's own, left
-    /// the proof on the once-refined row void and the solve a loud error,
-    /// with presolve on and off; whether a coefficient counts as zero is
-    /// judged by the error of the multipliers instead, which such a noise
-    /// lies within.
+    /// An infeasible LP whose certificate must leave out a row with a
+    /// non-basic slack: the slack's entry in the leaving row is zero, and the
+    /// refined row of the basis inverse carries it as noise (`-7.9e-31`)
+    /// whose sign asks for the slack's infinite side. Without the row, the
+    /// basic `x0`, unbounded above, keeps a residual (`3.7e-31` of its terms,
+    /// refined once). Whether that counts as zero is judged by the
+    /// multipliers' error, which it lies within; withdrawing the concession
+    /// from every var of such a row voided the proof.
     #[test]
     fn a_residual_left_by_a_row_left_out_does_not_void_a_proof() {
         init();
@@ -1029,16 +1008,13 @@ mod tests_general {
         }
     }
 
-    /// An infeasible LP of the differential fuzz (`int_lp-1145`, HiGHS
-    /// agrees) whose proof needs a non-basic var's coefficient on an infinite
-    /// bound to count as zero. Once refined, the row of the basis inverse
-    /// that proves it gives the non-basic `x3` (`x3 >= 0`, unbounded above),
-    /// whose tableau entry is zero, the coefficient zero; the second
-    /// correction, spread over the row by its solve, leaves it `3.6e-33` of
-    /// its terms. That lies within the bound the refinement puts on the
-    /// multipliers' error, and counts as zero, as a basic var's residual
-    /// does: a concession for basic vars only voided the proof, and the
-    /// solve failed loudly, with presolve on and off.
+    /// An infeasible LP whose proof needs a non-basic var's coefficient on an
+    /// infinite bound to count as zero: `x3` (`x3 >= 0`, unbounded above) has
+    /// a zero tableau entry, but the refinement's second correction leaves
+    /// its coefficient `3.6e-33` of its terms. That lies within the bound the
+    /// refinement puts on the multipliers' error and counts as zero, as a
+    /// basic var's residual does; a concession for basic vars only voided the
+    /// proof.
     #[test]
     fn a_non_basic_vars_residual_does_not_void_a_proof() {
         init();
@@ -1121,12 +1097,11 @@ mod tests_general {
         }
     }
 
-    /// A MILP whose relaxation is unbounded (HiGHS agrees), where the
-    /// improving column meets the one row whose basic var could block it
-    /// through a round-off entry of -4.4e-16, next to a genuine entry in a
-    /// row that cannot block. The primal ratio test's round-off scale is the
-    /// whole column: taken over the rows that can block alone, the entry was
-    /// a pivot with a step of 5.6e15 into a singular basis.
+    /// A MILP whose relaxation is unbounded, where the improving column meets
+    /// the one row that could block it through a round-off entry (-4.4e-16)
+    /// next to a genuine entry in a row that cannot. The primal ratio test
+    /// takes its round-off scale over the whole column; over the blocking
+    /// rows alone, the entry became a pivot into a singular basis.
     #[test]
     fn unbounded_relaxation_is_not_blocked_by_a_round_off_entry() {
         init();

@@ -1,8 +1,6 @@
-//! The complete, resumable state of one branch & bound search.
-//!
-//! [`MipState`] is what a solve carries between nodes and what a resumed or
-//! post-solve-edited call picks back up; it owns the single [`Solver`]
-//! instance the whole search pivots on.
+//! [`MipState`], the resumable state of one branch & bound search: what a
+//! solve carries between nodes and a resume or post-solve edit picks back up.
+//! It owns the single [`Solver`] the whole search pivots on.
 
 use super::branching;
 use super::node::Node;
