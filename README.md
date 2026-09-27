@@ -76,7 +76,9 @@ upper bound. A bound that large meant as a real bound is therefore not one,
 and a solution can lie beyond it. Each bound is judged on its own, so
 `(5e15, f64::MAX)` means `x >= 5e15`; only bounds with `min >= max` are kept
 as given, so a variable fixed at such a value stays fixed and an empty range
-stays infeasible.
+stays infeasible. A constraint's right-hand side is not cut off: it is used as
+given, so a bound that large can be written as a constraint such as
+`x <= 5e15`.
 
 The left-hand side of a constraint can be given as a slice of
 `(variable, coefficient)` pairs, as any iterator of such pairs, or as a
@@ -96,7 +98,7 @@ problem.add_constraint(lhs, ComparisonOp::Eq, 0.0);
 
 ## Solving and reading the solution
 
-`solve()` tries to find the optimal solution, it returns `Error::Infeasible` when the constraints contradict each other and `Error::Unbounded` when the objective can grow forever. Invalid numeric options return `Error::InvalidOptions`, and unrecoverable numerical failures return `Error::InternalError`.
+`solve()` tries to find the optimal solution, it returns `Error::Infeasible` when the constraints contradict each other and `Error::Unbounded` when the objective can grow forever. Invalid numeric options return `Error::InvalidOptions`, a NaN or infinite objective coefficient returns `Error::InvalidOperation`, and unrecoverable numerical failures return `Error::InternalError`.
 
 When a solver decides to produce a solution it might be for different reasons:
 

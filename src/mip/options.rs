@@ -51,15 +51,18 @@ pub struct SolveOptions {
     /// exact-fixing branching rather than admitting an infeasible point.
     /// Must be finite and in the half-open range `[0, 0.5)`.
     pub int_tol: f64,
-    /// Optional (partial) starting assignment used to seed the incumbent.
-    /// An infeasible or incomplete hint is ignored. Default `None`.
+    /// Optional (partial) starting assignment used to seed the incumbent. The
+    /// variables it leaves out are completed by an LP; a hint that is invalid or
+    /// infeasible, or whose completion is fractional or fails, is ignored.
+    /// Default `None`.
     pub warm_start: Option<Vec<(Variable, f64)>>,
     /// Enable presolve, which reduces the problem before the search starts
     /// (tightening bounds, dropping redundant rows, fixing variables). It
     /// never removes variables and keeps at least one optimum, so the problem
-    /// you observe through [`crate::Solution`] is unchanged. Disable it only
-    /// to compare raw solver behavior or to rule it out when investigating a
-    /// numerical issue. Default `true`.
+    /// you observe through [`crate::Solution`] is unchanged. If presolve finds
+    /// the problem infeasible, the problem is solved without it. Disable it
+    /// only to compare raw solver behavior or to rule it out when
+    /// investigating a numerical issue. Default `true`.
     pub presolve: bool,
     /// Edit the tolerances used by the solver, most callers
     /// should leave this at [`Tolerances::default`]; override an individual

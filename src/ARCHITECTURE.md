@@ -106,7 +106,8 @@ These normalizations happen at the boundary and hold everywhere inside:
   2^52 when `|a|` is near one, so a larger bound written for infinity changes the answer once
   a var sits at it. The price: a bound of 2^52 or more meant as a bound is none (`max x` with
   `x ≤ 5e15` is `Unbounded`), even where small coefficients would let the rows resolve it.
-  Both sides are pinned in `src/tests/regressions.rs`.
+  Both sides are pinned in `src/tests/regressions.rs`. A row's right-hand side is not cut
+  off: it is used as given, so the same `x ≤ 5e15` written as a row binds.
 - **Every constraint row gets a slack variable.** A row `a·x ≤ b` becomes `a·x + s = b`
   with `s ∈ [0, +∞)`; `≥` gives `s ∈ (−∞, 0]`; `=` gives `s ∈ [0,0]`. So the `Solver`'s
   variable universe is `num_vars` *structural* variables followed by one slack per row
@@ -145,6 +146,9 @@ These normalizations happen at the boundary and hold everywhere inside:
   engine's tolerance contract (§7), and presolve hands the rows it dropped or rewrote to
   the engine as they were written, for the checks at the boundary (§3.1): a reduction
   that is wrong shows as a loud error, never as a returned point that violates a row.
+  When presolve finds the model infeasible, the solve goes on with the model as written
+  (`presolve::unless_infeasible`, logged at debug level), so the verdict is the engine's,
+  which returns `Infeasible` only on a proof, or the search's.
 
 `prepare_row` is the single row-normalization contract used by both `Solver::try_new` and
 incremental `Solver::add_constraint`. It settles the rows whose data alone decide them
@@ -478,9 +482,13 @@ LP-complete the rest, and if the completion is integral, adopt it **through the 
 feasibility guard as every other incumbent** — hints get no shortcut. Then restore the root
 state *exactly* (bounds back, root basis reloaded, everything recomputed) so the search
 starts from the true relaxation. Hints are advisory by design: unknown variables,
-out-of-range values, infeasible or fractional completions all just drop the hint with a
-debug log — a bad hint must never break a solve. An error discovered while evaluating the
-hint is held until the temporary bounds and root basis have been restored, then propagated.
+out-of-range values, infeasible or fractional completions, and completions that fail with an
+engine error all just drop the hint with a debug log — a bad hint must never break a solve.
+Dropping one costs at most speed, since the search solves the whole model without it (a node
+LP's error, after its retry, stays fatal: skipping a node could lose the optimum). Only the
+`Unbounded` verdict a completion can give during unboundedness classification (§5.4) is
+returned, once the temporary bounds and root basis have been restored; an error restoring
+them propagates.
 
 A warm start seeds the *incumbent*, which powers pruning; it does **not** carry the search
 tree. Restarting the same model with an unchanged hint and the same deterministic node
@@ -708,7 +716,10 @@ user units:
   engine does moves it);
 - each wave of the worklist processes the rows left with at most one term first, so a
   singleton pins its var before a multi-term row deduces anything about it;
-- infeasibility is declared only when no point the engine could accept exists.
+- infeasibility is declared only when no point the engine could accept exists, as far as
+  the reductions can tell: they fix vars within the tolerances and take the fixed values as
+  exact from then on, so the verdict is not final, and the solve goes on with the model as
+  written, where the engine decides.
 
 The layering rule: the engine's tolerances decide *simplex* questions; `int_tol` decides
 *integrality* questions; `feasibility` is the contract presolve, the engine and *solution
@@ -778,14 +789,15 @@ below the floor, or the round-off of a computed vertex, for a row no var can rep
   well-conditioned bases) counts as zero, and could make a proof of a feasible model.
 - *The tolerance*: the gap is compared with the tolerance the engine holds the leaving var
   to (`var_tols`), the one by which the dual simplex found the row violated, every other
-  term counting as exact, so the proof says that no point the simplex could accept exists.
-  Any other tolerance leaves a band where a row is violated for the simplex but not
-  infeasible for the proof, and nothing can act on it: the user's absolute tolerance as a
-  floor fails loudly on nodes infeasible by less than the contract
-  (`a_node_infeasible_by_less_than_the_contract_is_pruned`), and every term's contract
-  tolerance summed on nodes whose rows disagree by less than their tolerances together. The
-  price is the engine's half budget: a model whose only points lie between the engine's
-  share of the contract and the contract itself is reported infeasible.
+  term counting as exact, so the proof says that no point has that var within its
+  tolerance and every other term within its bounds. Any other tolerance leaves a band where
+  a row is violated for the simplex but not infeasible for the proof, and nothing can act
+  on it: the user's absolute tolerance as a floor fails loudly on nodes infeasible by less
+  than the contract (`a_node_infeasible_by_less_than_the_contract_is_pruned`), and every
+  term's contract tolerance summed on nodes whose rows disagree by less than their
+  tolerances together. The price: a model is reported infeasible when its points all need
+  more room than that, on the leaving var (beyond the engine's share of its contract) or on
+  another term (rows that agree only within their tolerances; see the known limitations).
 - *A failed proof* makes the row taboo, recorded as a bad basis change with no entering var,
   and the phase goes on with the other rows; a rebuild lifts the taboo, and the row is tried
   again on fresh data.
@@ -948,17 +960,25 @@ Known limitations:
   primal step comes back, until the solve fails with `InternalError` after
   `MAX_PHASE_ROUNDS`; a degenerate pivot on the tiny entry would resolve it, which needs
   absolute pivot tolerances;
-- presolve's forcing-row rule can fix a var at a bound its row allows within the row's
-  tolerance while another row with other terms pins it elsewhere, its coefficient
-  amplifying the forcing row's slack beyond the contract (`-1000 x1 + x4 / 1000 = 83.887`
-  beside `x1 + 100 x4 = 8388700`), and so report a feasible model `Infeasible`;
+- presolve can fix a var within its row's tolerance at a value that another row amplifies
+  beyond the contract (`x2` fixed at `-1.5e-12`, the round-off of
+  `x1 - x2 - 0.1 x4 = -16384.1`, makes `-x2 - 1e-5 x3 <= 0` the bound `x3 >= 1.5e-7`, which
+  `x3 = x2` contradicts); where presolve sees the contradiction, the solve falls back to the
+  model as written, but where only the engine does, a feasible model is reported
+  `Infeasible`;
 - a feasible model whose only room is a coefficient of round-off size that its rows' own
   data leave (`x + y + z + q >= 3` and `t - (1 + 2^-50) z - q >= 1e-6` over
   `x, y, t ∈ [0, 1]` need `z <= -2^50 · 1e-6`) fails loudly, and in a MIP its node is not
   pruned: the certificate counts `z`'s coefficient and proves nothing, and nothing but a
   pivot on `2^-50` beside ones, below every pivot tolerance, repairs the row. The same holds
   where the coefficient is a basic var's, left by a row the certificate leaves out
-  (`L + j + w = 1.000001`, `-(1 + 2^-50) j - w = 0` and `j + v <= 0`, `j` and `w` free).
+  (`L + j + w = 1.000001`, `-(1 + 2^-50) j - w = 0` and `j + v <= 0`, `j` and `w` free);
+- the infeasibility proof grants the leaving var its tolerance and every other term none,
+  so a model whose points all need more is reported `Infeasible`: a row missed beyond the
+  engine's share of its contract, or rows that agree only within their tolerances, as at a
+  MILP node whose equalities, taken as exact, keep `x1` at least `7e-5` from the node's
+  value 1, where a point meets every row within half its contract (the same LP with `x1`
+  fixed from the start solves).
 
 The convention for such models is to pin each as a `#[should_panic]` test named
 `..._is_a_known_limitation` in `src/tests/magnitudes.rs` (beside the engine's unit tests when
@@ -974,6 +994,7 @@ classes above stand (a random search cannot assert its own failure); run it with
 
 | Situation | Behavior |
 |---|---|
+| An objective coefficient is NaN or infinite | `InvalidOperation` from `solve_with`, before presolve and the engine (the value as the user gave it, with the var's index) |
 | Root LP unbounded on a MILP | run a resumable zero-objective integer-feasibility search; any integer point proves `Unbounded`, exhaustion proves `Infeasible` |
 | Node LP infeasible | prune (correct: the engine returns `Infeasible` only on a proof, §7) |
 | A violated row no var can repair and whose certificate proves nothing, after the rebuild, the taboo and the last resorts | `InternalError`, never `Infeasible`; on a node LP, the one slack-basis retry, then the error |
@@ -989,8 +1010,9 @@ classes above stand (a random search cannot assert its own failure); run it with
 | Deadline mid-LP | requeue the node unsolved; return `Interrupted` |
 | Limit with no incumbent | `SolveOutcome::Interrupted`; only reason, stats, and resume are exposed |
 | Search exhausted, no incumbent | `Err(Infeasible)` |
-| Warm-start hint invalid, out of range, infeasible, fractional, or limited | hint dropped (debug log), solve proceeds cold |
-| Unexpected solver error while evaluating a warm start | restore root bounds and basis, then propagate the error |
+| Presolve finds the model infeasible | solve the model as written, without presolve (debug log): the engine or the search decides |
+| Warm-start hint invalid, out of range, infeasible, fractional, or limited, or its LP completion fails with an engine error | hint dropped (debug log), root bounds and basis restored, solve proceeds cold |
+| Error while restoring the root after a warm start | propagated: it belongs to the main search |
 | Edit makes the problem infeasible | `Err(Infeasible)` from the re-solve — on the *composed base problem*, never on leaf state |
 
 The standing project policy: when something cannot be done properly, fail loudly

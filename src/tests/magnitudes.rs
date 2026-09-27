@@ -1271,6 +1271,69 @@ mod regression_tests {
         });
     }
 
+    /// A MILP whose integer `x1` has one feasible value, 1, where the rows hold
+    /// only within their tolerances: `x*` misses the widest row (magnitude
+    /// `2e10`) by `1.2e-6`, within half its contract, and the others by less.
+    fn integer_value_met_within_the_rows_tolerances() -> Model {
+        let model = Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(1.0, 0, 0),
+                int(-1.0, 0, 2),
+                real(-1.0, -1048577.625000061, -1048575.0000000596),
+                real(1.0, 0.0, 0.0),
+                real(-1.0, -1.0, 1.0),
+                real(0.0, 0.0, 0.0),
+            ],
+            rows: vec![
+                row(
+                    &[(1, -2e-8), (2, -10.0), (4, -0.00175)],
+                    ComparisonOp::Eq,
+                    10485760.000000576,
+                ),
+                row(&[(1, -1e-6), (4, 1.0)], ComparisonOp::Eq, -1e-6),
+                row(
+                    &[(1, -0.01), (2, -10000.0), (4, 0.5)],
+                    ComparisonOp::Eq,
+                    10485759999.990595,
+                ),
+                row(&[(2, 1.0)], ComparisonOp::Eq, -1048576.0000000596),
+            ],
+            xstar: vec![0.0, 1.0, -1048576.0000000596, 0.0, 0.0, 0.0],
+        };
+        // A point within the contract exists, so `Infeasible` is wrong.
+        assert!(xstar_is_feasible(&model), "fixture error: rows at x*");
+        for (v, &x) in model.vars.iter().zip(&model.xstar) {
+            assert!(
+                x >= v.lo && x <= v.hi && (!v.integer || x == x.round()),
+                "fixture error: bounds at x*"
+            );
+        }
+        model
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the node `x1 = 1` is pruned on a
+    /// proof that takes the rows as exact. In the node's basis `x1` is basic,
+    /// and the three equalities that hold it, combined, keep it at least
+    /// `7e-5` from 1, beyond its tolerance: the proof grants the leaving var
+    /// its tolerance and the rows none, so the MILP is reported `Infeasible`
+    /// where `x*` is optimal.
+    #[test]
+    #[should_panic(expected = "returned Infeasible")]
+    fn a_node_feasible_only_within_its_rows_tolerances_is_pruned_and_is_a_known_limitation() {
+        check(integer_value_met_within_the_rows_tolerances());
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the test above without presolve,
+    /// which prunes the node the same way.
+    #[test]
+    #[should_panic(expected = "returned Infeasible")]
+    fn a_node_feasible_only_within_its_rows_tolerances_without_presolve_is_a_known_limitation() {
+        assert_solves_within_contract_without_presolve(
+            &integer_value_met_within_the_rows_tolerances(),
+        );
+    }
+
     /// A MILP node whose certificate carries a basic var's round-off on a huge
     /// bound is proven infeasible all the same. `x3 ∈ [0, 64212616]` is basic
     /// at the node `x1 >= 1`, which violates the second row by thousands.
@@ -1518,16 +1581,13 @@ mod regression_tests {
         assert_solves_within_contract_without_presolve(&model);
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): presolve's forcing row
-    /// `x0 + 100 x1 = 8388700` fixes `x0` at its lower bound `-2^-30`, where
-    /// the row allows it within its tolerance, and
+    /// Presolve's forcing row `x0 + 100 x1 = 8388700` fixes `x0` at its lower
+    /// bound `-2^-30`, where the row allows it within its tolerance, and
     /// `-1000 x0 + x1 / 1000 = 83.887`, which pins `x0` at zero, then misses
-    /// by 9.3e-7, beyond the contract: a feasible model (`x0 = 0`,
-    /// `x1 = 83887`) comes back `Infeasible` with presolve on. The fix is a
-    /// forcing test that accounts for the var's other rows.
+    /// by `9.3e-7`: presolve finds the model infeasible. The solve must go on
+    /// with the model as written and reach the optimum `x0 = 0`, `x1 = 83887`.
     #[test]
-    #[should_panic(expected = "returned Infeasible")]
-    fn forcing_row_fixing_a_var_another_row_pins_is_a_known_limitation() {
+    fn forcing_row_fixing_a_var_another_row_pins() {
         check(Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![
@@ -1539,6 +1599,156 @@ mod regression_tests {
                 row(&[(0, -1000.0), (1, 1e-3)], ComparisonOp::Eq, 83.887),
             ],
             xstar: vec![0.0, 83887.0],
+        });
+    }
+
+    /// The rows of the test above added to a solved MILP one edit at a time:
+    /// the second edit's re-solve presolves the edited model, finds it
+    /// infeasible, and must go on with it as written.
+    #[test]
+    fn forcing_rows_added_by_edits_are_solved_as_written() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+        let x0 = problem.add_var(-1.0, (-(2.0f64.powi(-30)), 1.0));
+        let x1 = problem.add_integer_var(1.0, (83887, 83888));
+        let solution = |outcome: Result<crate::SolveOutcome, Error>| {
+            outcome
+                .expect("the solve must succeed")
+                .into_solution()
+                .expect("the solve must return a solution")
+        };
+        let sol = solution(problem.solve());
+        let sol =
+            solution(sol.add_constraint([(x0, -1.0), (x1, -100.0)], ComparisonOp::Eq, -8388700.0));
+        let sol =
+            solution(sol.add_constraint([(x0, -1000.0), (x1, 1e-3)], ComparisonOp::Eq, 83.887));
+        assert_eq!(sol.var_value(x1), 83887.0);
+        assert!(
+            sol.var_value(x0).abs() <= 1e-9,
+            "x0 = {}",
+            sol.var_value(x0)
+        );
+    }
+
+    /// MILPs that presolve finds infeasible, each feasible within the
+    /// contract: a forcing row's round-off at its magnitude leaves a var room
+    /// that the forcing rule does not count (`1e-7 x4` at `1e9`, `2e-8 x3` at
+    /// `5e8`, a unit of `1.375e-4 x1` at `1.4e10`, `x2`'s `7.45e-9` lost at
+    /// `6.7e7`), so the rule fixes the var at a bound where another row
+    /// contradicts it. The solve must go on with the model as written.
+    #[test]
+    fn milps_presolve_finds_infeasible_are_solved_as_written() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(-1.0, 0, 0),
+                int(0.0, -1, 0),
+                real(1.0, -3.5762786865234375e-7, -3.5762786865234375e-7),
+                real(0.0, 562122509.5000763, 562122509.5000763),
+                real(0.0, -1.0, 214.0),
+                real(1.0, 0.0, 0.0),
+            ],
+            rows: vec![
+                row(
+                    &[(3, -1.0), (4, -1.0)],
+                    ComparisonOp::Eq,
+                    -562122509.5000763,
+                ),
+                row(
+                    &[(1, -1.0), (2, -1.0), (3, -1.91015625), (4, 1e-7)],
+                    ComparisonOp::Eq,
+                    -1073741824.7872548,
+                ),
+            ],
+            xstar: vec![
+                0.0,
+                0.0,
+                -3.5762786865234375e-7,
+                562122509.5000763,
+                0.0,
+                0.0,
+            ],
+        });
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(1.0, 536871, 536871),
+                real(-1.0, 0.0, 0.0),
+                real(-1.0, -1.0, 0.0),
+                real(-1.0, -532.0, 5.0),
+                real(0.0, 0.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(2, -1.0), (3, -1.0)], ComparisonOp::Eq, -2.0),
+                row(
+                    &[(0, -1000.0), (2, -0.001), (3, 2e-8)],
+                    ComparisonOp::Eq,
+                    -536870999.9989998,
+                ),
+            ],
+            xstar: vec![536871.0, 0.0, -1.0, 3.0, 0.0],
+        });
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(-1.0, -2, 3),
+                int(-1.0, -1, 2),
+                real(-1.0, 681878.0, 681879.0),
+            ],
+            rows: vec![
+                row(&[(0, -1.0), (1, 1.5)], ComparisonOp::Eq, 0.0),
+                row(
+                    &[(1, 0.0001375), (2, 20000.0)],
+                    ComparisonOp::Eq,
+                    13637560000.0,
+                ),
+            ],
+            xstar: vec![0.0, 0.0, 681878.0],
+        });
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(1.0, 0, 0),
+                real(1.0, 3355444.0, 3355445.0),
+                real(1.0, -7.450580596923828e-9, 1.0),
+            ],
+            rows: vec![
+                row(&[(1, -20.0), (2, -1.0)], ComparisonOp::Eq, -67108880.0),
+                row(&[(1, 1.0), (2, -20.0)], ComparisonOp::Eq, 3355444.0),
+            ],
+            xstar: vec![0.0, 3355444.0, 0.0],
+        });
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): presolve fixes `x2` at
+    /// `-1.5e-12`, the round-off of solving `x1 - x2 - 0.1 x4 = -16384.1` at
+    /// the fixed `x1` and `x4`, and `-x2 - 1e-5 x3 <= 0` then becomes the
+    /// bound `x3 >= 1.5e-7`, which `-x2 + x3 = 0` contradicts beyond the
+    /// contract. Presolve's own checks pass, and the engine proves the
+    /// reduced model infeasible, where `x2 = x3 = 0` meets every row as
+    /// written. The fix is a presolve that counts a fixing's round-off where
+    /// a coefficient amplifies it.
+    #[test]
+    #[should_panic(expected = "returned Infeasible")]
+    fn a_fixings_round_off_amplified_into_a_bound_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(1.0, 0.0, 0.0),
+                real(-1.0, -16384.0, -16384.0),
+                real(1.0, -1.0, 0.0),
+                real(-1.0, -1.0, 1.0),
+                real(-1.0, 1.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(2, -1.0), (3, -1e-5)], ComparisonOp::Le, 0.0),
+                row(&[(2, -1.0), (3, 1.0)], ComparisonOp::Eq, 0.0),
+                row(
+                    &[(1, 1.0), (2, -1.0), (4, -0.1)],
+                    ComparisonOp::Eq,
+                    -16384.1,
+                ),
+            ],
+            xstar: vec![0.0, -16384.0, 0.0, 0.0, 1.0],
         });
     }
 }

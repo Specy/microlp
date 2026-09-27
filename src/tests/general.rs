@@ -186,6 +186,51 @@ mod tests_general {
         }
     }
 
+    /// A NaN or infinite objective coefficient is refused before the solve on
+    /// every path, with a message that names the var and the value as the user
+    /// gave it (a `Maximize` cost is stored negated). Solved, such a cost makes
+    /// the reduced costs non-finite: an `InternalError`, or an infinite or NaN
+    /// objective reported as optimal.
+    #[test]
+    fn a_non_finite_objective_coefficient_is_an_invalid_operation() {
+        init();
+        for cost in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for direction in [
+                OptimizationDirection::Minimize,
+                OptimizationDirection::Maximize,
+            ] {
+                for milp in [false, true] {
+                    for presolve in [true, false] {
+                        let mut problem = Problem::new(direction);
+                        let y = problem.add_var(1.0, (0.0, 5.0));
+                        let x = problem.add_var(cost, (0.0, 1.0));
+                        if milp {
+                            problem.add_integer_var(1.0, (0, 3));
+                        }
+                        problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 1.0);
+                        let label =
+                            format!("cost {cost}, {direction:?}, milp {milp}, presolve {presolve}");
+                        let got = problem.solve_with(SolveOptions {
+                            presolve,
+                            ..SolveOptions::default()
+                        });
+                        match got {
+                            Err(Error::InvalidOperation(message)) => assert!(
+                                message.contains("variable 1")
+                                    && message.contains(&format!(" {cost}")),
+                                "{label}: {message}"
+                            ),
+                            other => panic!(
+                                "{label}: expected InvalidOperation, got {:?}",
+                                other.map(|_| "solved")
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A free var with a zero objective coefficient is optimal wherever it
     /// sits. Counted as dual infeasible, it entered along a direction that
     /// improves nothing, with an infinite step: a bounded model came back
