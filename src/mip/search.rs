@@ -214,13 +214,11 @@ enum NodeLp {
 ///
 /// Robustness valve: if the first `reoptimize` fails with an internal error class
 /// — anything that is neither [`Error::Infeasible`] nor [`Error::Unbounded`], e.g.
-/// a singular LU produced by numerical degradation during pivoting, or a row the
-/// dual simplex can neither repair nor prove infeasible — fall back ONCE to the
-/// all-slack basis (which is documented to always load) and re-solve the node
-/// from scratch, then take that retry's outcome as final. The retry cannot loop:
-/// it is attempted at most once and its own internal error is propagated rather
-/// than retried again. Only [`Error::Infeasible`] prunes the node (see
-/// [`NodeLp::Infeasible`]).
+/// a row the dual simplex can neither repair nor prove infeasible — fall back ONCE
+/// to the all-slack basis and re-solve the node from scratch, then take that
+/// retry's outcome as final. The retry cannot loop: it is attempted at most once
+/// and its own internal error is propagated rather than retried again. Only
+/// [`Error::Infeasible`] prunes the node (see [`NodeLp::Infeasible`]).
 fn solve_node_lp(state: &mut MipState) -> Result<NodeLp, Error> {
     state.solver.deadline = state.deadline;
     let err = match state.solver.reoptimize() {
@@ -232,7 +230,7 @@ fn solve_node_lp(state: &mut MipState) -> Result<NodeLp, Error> {
                 "bounded B&B node reported unbounded".to_string(),
             ))
         }
-        // Internal/singular error class: fall through to the one-shot slack retry.
+        // Any other error class: fall through to the one-shot slack retry.
         Err(e) => e,
     };
 
@@ -241,10 +239,7 @@ fn solve_node_lp(state: &mut MipState) -> Result<NodeLp, Error> {
         err
     );
     let slack = state.solver.slack_basis();
-    state
-        .solver
-        .load_basis(&slack)
-        .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
+    state.solver.load_basis(&slack)?;
     match state.solver.reoptimize() {
         Ok(StopReason::Finished) => Ok(NodeLp::Solved),
         Ok(StopReason::Limit) => Ok(NodeLp::Limit),
@@ -287,11 +282,11 @@ fn pop_node(state: &mut MipState) -> Option<Node> {
 /// Returns `Ok(None)` on the normal path (the caller proceeds to build the root
 /// node). `Err` is either the `Unbounded` verdict, when the completion is the
 /// integer point an unboundedness classification looks for, or an error
-/// restoring the root. Returns `Ok(Some(TerminationReason::TimeLimit))` only when
-/// the restore of the root basis fails AND the deadline strikes mid-restore:
-/// rather than let the caller read an unfinished `cur_obj_val` as the root bound,
-/// it un-sets `root_solved` so a resume re-enters `initial_solve` and continues
-/// honestly from the solver's feasibility flags.
+/// restoring the root. Returns `Ok(Some(TerminationReason::TimeLimit))` when the
+/// deadline strikes during the re-solve of the restored root basis: rather than
+/// let the caller read an unfinished `cur_obj_val` as the root bound, it un-sets
+/// `root_solved` so a resume re-enters `initial_solve` and continues honestly
+/// from the solver's feasibility flags.
 pub(crate) fn try_warm_start(
     state: &mut MipState,
     hints: &[(crate::Variable, f64)],
@@ -363,8 +358,9 @@ pub(crate) fn try_warm_start(
         );
     }
 
-    // Restore the root state exactly: bounds back, then the optimal root basis
-    // (load_basis recomputes everything, discarding the hint solve).
+    // Restore the root state: bounds back, then the optimal root basis
+    // (load_basis recomputes everything, discarding the hint solve), re-solved
+    // in case the load had to repair it, which otherwise only verifies it.
     for v in applied {
         let (lo, hi) = state.root_bounds[v];
         state
@@ -372,23 +368,17 @@ pub(crate) fn try_warm_start(
             .set_var_bounds(v, lo, hi)
             .expect("root bounds cannot cross");
     }
-    if state.solver.load_basis(&root_basis).is_err() {
-        let slack = state.solver.slack_basis();
-        state
-            .solver
-            .load_basis(&slack)
-            .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
-        if state.solver.reoptimize()? == StopReason::Limit {
-            // A limit during the root re-solve leaves `cur_obj_val` unsuitable
-            // as a root bound. Mark the root unsolved and return Interrupted;
-            // `initialize_root` continues `initial_solve` from the solver's
-            // feasibility flags on resume.
-            state.root_solved = false;
-            if let Some(verdict) = verdict {
-                return Err(verdict);
-            }
-            return Ok(Some(TerminationReason::TimeLimit));
+    state.solver.load_basis(&root_basis)?;
+    if state.solver.reoptimize()? == StopReason::Limit {
+        // A limit during the root re-solve leaves `cur_obj_val` unsuitable
+        // as a root bound. Mark the root unsolved and return Interrupted;
+        // `initialize_root` continues `initial_solve` from the solver's
+        // feasibility flags on resume.
+        state.root_solved = false;
+        if let Some(verdict) = verdict {
+            return Err(verdict);
         }
+        return Ok(Some(TerminationReason::TimeLimit));
     }
     if let Some(verdict) = verdict {
         return Err(verdict);
@@ -466,13 +456,8 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
     }
 
     let warm = state.last_solved_id == Some(node.parent_id);
-    if !warm && state.solver.load_basis(&node.basis).is_err() {
-        debug!("basis load failed; falling back to slack basis");
-        let slack = state.solver.slack_basis();
-        state
-            .solver
-            .load_basis(&slack)
-            .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
+    if !warm {
+        state.solver.load_basis(&node.basis)?;
     }
 
     match solve_node_lp(state)? {

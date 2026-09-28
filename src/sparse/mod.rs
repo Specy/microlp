@@ -2,7 +2,6 @@ use crate::helpers::to_dense;
 use sprs::CsMat;
 #[cfg(test)]
 use sprs::CsVec;
-use std::fmt::{Display, Formatter};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SparseVec {
@@ -326,19 +325,6 @@ impl std::fmt::Debug for TriangleMat {
 pub struct Perm {
     pub(crate) orig2new: Vec<usize>,
     pub(crate) new2orig: Vec<usize>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Error {
-    SingularMatrix,
-}
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let r = match self {
-            Error::SingularMatrix => "Singular matrix",
-        };
-        write!(f, "{}", r)
-    }
 }
 
 #[cfg(test)]

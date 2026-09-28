@@ -78,10 +78,10 @@ pub(crate) const INSTABLE_PIVOT_TOL: f64 = 1e-10;
 
 /// Relative disagreement between the pivot element computed through the
 /// pivot row (`row_coeffs[col]`) and through the pivot column
-/// (`col_coeffs[row]`) above which the factorization is not trusted for the
-/// pivot: the two are the same number in exact arithmetic and agree to about
-/// `1e-12` at a legitimate pivot, while a pivot on round-off noise disagrees
-/// by tens of percent.
+/// (`col_coeffs[row]`) above which the element is in doubt (see
+/// `PivotChoice::Inconsistent`): the two are the same number in exact
+/// arithmetic and agree to about `1e-12` at a legitimate pivot, while a pivot
+/// on round-off noise disagrees by tens of percent.
 pub(crate) const PIVOT_AGREEMENT_TOL: f64 = 1e-7;
 
 /// Iterative refinement steps [`super::Solver::verify_primal`] may apply to

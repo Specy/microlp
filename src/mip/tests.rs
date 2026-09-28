@@ -496,3 +496,40 @@ fn warm_start_drops_a_hint_whose_completion_fails() {
         );
     }
 }
+
+/// The restore after a warm start re-solves the root basis, which the load
+/// repairs when a fresh factorization finds it singular. `min -x + y + z` s.t.
+/// `x + y <= 1`, `x + (1 + 2^-48) y >= 1`, `x >= 0`, `y` free and `z` binary:
+/// the root LP ends at its optimum, `-1` at `(1, 0, 0)`, with the basis
+/// `{x, y}` on the eta file. The restore's fresh factorization finds it
+/// singular and repairs it (`y` is added first, so that `x` goes out) into
+/// `(0, 1, 0)`, a feasible integral point of objective `1`. The hint `x = 0`
+/// completes to about `1`, so a root node built without the re-solve would
+/// close at that incumbent.
+#[test]
+fn warm_start_re_solves_a_root_basis_its_restore_repairs() {
+    for presolve in [true, false] {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let y = problem.add_var(1.0, (f64::NEG_INFINITY, f64::INFINITY));
+        let x = problem.add_var(-1.0, (0.0, f64::INFINITY));
+        let z = problem.add_binary_var(1.0);
+        problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 1.0);
+        let slanted = 1.0 + 2f64.powi(-48);
+        problem.add_constraint([(x, 1.0), (y, slanted)], ComparisonOp::Ge, 1.0);
+        let options = SolveOptions {
+            presolve,
+            warm_start: Some(vec![(x, 0.0)]),
+            ..SolveOptions::default()
+        };
+        let solution = match problem.solve_with(options) {
+            Ok(outcome) => outcome.into_solution().unwrap(),
+            Err(err) => panic!("presolve {presolve}: {err:?}"),
+        };
+        assert_eq!(solution.status(), SolutionStatus::Optimal);
+        let (objective, x, y, z) = (solution.objective(), solution[x], solution[y], solution[z]);
+        assert!(
+            (objective + 1.0).abs() < 1e-9 && (x - 1.0).abs() < 1e-9 && y.abs() < 1e-9 && z == 0.0,
+            "presolve {presolve}: objective {objective} at ({x}, {y}, {z})"
+        );
+    }
+}

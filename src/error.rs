@@ -26,12 +26,6 @@ impl From<StructureError> for Error {
     }
 }
 
-impl From<crate::sparse::Error> for Error {
-    fn from(value: crate::sparse::Error) -> Self {
-        Error::InternalError(value.to_string())
-    }
-}
-
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let msg = match self {

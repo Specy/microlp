@@ -546,7 +546,7 @@ impl Solver {
         let dual_tols = orig_obj_coeffs.iter().map(|c| dual_tol(c.abs())).collect();
 
         let mut scratch = ScratchSpace::with_capacity(num_constraints);
-        let lu_factors = lu_factorize(
+        let (lu_factors, replaced) = lu_factorize(
             basic_vars.len(),
             |c| {
                 orig_constraints_csc
@@ -557,7 +557,8 @@ impl Solver {
             },
             LU_STABILITY_THRESHOLD,
             &mut scratch,
-        )?;
+        );
+        debug_assert!(replaced.is_empty(), "the slack basis is the identity");
         let lu_factors_transp = lu_factors.transpose();
 
         let res = Self {
@@ -947,10 +948,108 @@ impl Solver {
     /// current numbers themselves are in doubt (a pivot disagreement, a stall
     /// before declaring infeasibility), so nothing is gated.
     fn rebuild(&mut self) -> Result<(), Error> {
-        self.basis_solver
-            .reset(&self.orig_constraints_csc, &self.basic_vars)?;
+        self.factorize();
         self.recalc_basic_var_vals()?;
         self.recalc_obj_coeffs()
+    }
+
+    /// Factorize the basis afresh, and repair it if the factorization finds
+    /// it singular: each dependent var leaves the basis for the slack of a row
+    /// that no pivot took ([`Self::replace_with_slack`]). Returns whether it
+    /// repaired the basis, which moves the vertex: the caller then recomputes
+    /// the values and the reduced costs.
+    ///
+    /// # Panics
+    ///
+    /// If a singular basis has inconsistent bookkeeping (a var basic in two
+    /// positions makes the basis singular too): a repair would hide the bug
+    /// and leave the var both basic and non-basic.
+    fn factorize(&mut self) -> bool {
+        let replaced = self
+            .basis_solver
+            .reset(&self.orig_constraints_csc, &self.basic_vars);
+        if replaced.is_empty() {
+            return false;
+        }
+        for (pos, &var) in self.basic_vars.iter().enumerate() {
+            assert!(
+                matches!(self.var_states[var], VarState::Basic(p) if p == pos),
+                "basis bookkeeping is corrupt: var {var} at basis position {pos} has state {:?}",
+                self.var_states[var]
+            );
+        }
+        self.cycle_guard.note_repair();
+        for &(pos, row) in &replaced {
+            self.replace_with_slack(pos, row);
+        }
+        true
+    }
+
+    /// Make the slack of `row` basic at position `pos` in place of the var
+    /// there, as the factors already have it. The var leaves at the working
+    /// bound nearest its value (0 if free), with its cost shift given back and
+    /// its edge weights reset, and within a phase the change back is taboo
+    /// ([`CycleGuard::add_singular_change`]). The values and reduced costs
+    /// are left for the caller to recompute.
+    fn replace_with_slack(&mut self, pos: usize, row: usize) {
+        let var = self.basic_vars[pos];
+        let slack = self.num_vars + row;
+        // A basic slack's unit column takes its own row as the pivot unless an
+        // earlier column did, so a row left without a pivot has its slack
+        // non-basic.
+        let VarState::NonBasic(col) = self.var_states[slack] else {
+            unreachable!("the factorization left the row of the basic slack {slack} unpivoted");
+        };
+        assert_eq!(
+            self.nb_vars[col],
+            slack,
+            "basis bookkeeping is corrupt: slack {slack}'s non-basic position {col} holds another var"
+        );
+        let val = self.basic_var_vals[pos];
+        let (min, max) = self.working_bounds(var);
+        let new_val = match (min.is_finite(), max.is_finite()) {
+            (true, true) if val - min <= max - val => min,
+            (true, true) => max,
+            (true, false) => min,
+            (false, true) => max,
+            (false, false) => 0.0,
+        };
+        debug!(
+            "basis repair: var {var} at {val:e} in row {pos} depends on the others; the slack of \
+             row {row} replaces it, and it leaves at {new_val:e}"
+        );
+
+        if self.nb_var_states[col].at_upper() {
+            self.cycle_guard.apply(VertexChange::Upper(slack));
+        }
+        let (slack_min, slack_max) = self.working_bounds(slack);
+        self.basic_vars[pos] = slack;
+        self.var_states[slack] = VarState::Basic(pos);
+        self.basic_var_mins[pos] = slack_min;
+        self.basic_var_maxs[pos] = slack_max;
+
+        let state = self.nonbasic_state(var, new_val);
+        if state.at_upper() {
+            self.cycle_guard.apply(VertexChange::Upper(var));
+        }
+        self.nb_vars[col] = var;
+        self.var_states[var] = VarState::NonBasic(col);
+        self.nb_var_vals[col] = new_val;
+        self.nb_var_states[col] = state;
+        self.cycle_guard.apply(VertexChange::Basic(var));
+        self.cycle_guard.apply(VertexChange::Basic(slack));
+        self.cycle_guard.add_singular_change(pos, slack, var);
+
+        // A zero dual step's shift lives only while its var is basic.
+        self.cost_shifts[var] = 0.0;
+        if self.enable_dual_steepest_edge {
+            self.dual_edge_sq_norms[pos] = 1.0;
+        }
+        if self.enable_primal_steepest_edge {
+            self.primal_edge_sq_norms[col] = 1.0;
+        }
+        self.values_dirty = true;
+        self.reduced_costs_dirty = true;
     }
 
     /// The periodic refactorization: a fresh factorization, and the basic
@@ -959,10 +1058,13 @@ impl Solver {
     /// every row would not improve them and, next to a bound, can move a var
     /// by a round-off amount the rows allow but its own tolerance does not.
     /// The reduced costs are left to their incremental updates; the phase
-    /// exit recomputes them exactly.
+    /// exit recomputes them exactly. A repaired basis is a new vertex, whose
+    /// values and reduced costs are recomputed, as in a rebuild.
     fn refactorize(&mut self) -> Result<(), Error> {
-        self.basis_solver
-            .reset(&self.orig_constraints_csc, &self.basic_vars)?;
+        if self.factorize() {
+            self.recalc_basic_var_vals()?;
+            return self.recalc_obj_coeffs();
+        }
         // The residual check costs a pass over the matrix and a small basis is
         // refactorized almost every pivot, so check once per turnover of the
         // basis (one pivot per row). The phase exit always checks.
@@ -1020,7 +1122,10 @@ impl Solver {
     /// through the factorization, then a fresh one, and a residual that
     /// survives both is an `InternalError` (the basis cannot represent its own
     /// vertex). Recomputes the objective from the values; returns whether they
-    /// are within their bounds, and sets `is_primal_feasible` to match.
+    /// are within their bounds, and sets `is_primal_feasible` to match. A
+    /// fresh factorization that repairs the basis leaves another vertex, with
+    /// its values, reduced costs and feasibility flags recomputed: that is no
+    /// verification, and the answer is `false`.
     fn verify_primal(&mut self) -> Result<bool, Error> {
         if !self.values_dirty {
             // Verified values that nothing has touched since; only the
@@ -1035,8 +1140,13 @@ impl Solver {
         }
         if !hold {
             debug!("verify: residual persists through the factorization; refactorizing");
-            self.basis_solver
-                .reset(&self.orig_constraints_csc, &self.basic_vars)?;
+            if self.factorize() {
+                self.recalc_basic_var_vals()?;
+                self.recalc_obj_coeffs()?;
+                self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
+                self.is_dual_feasible = self.calc_dual_infeasibility().0 == 0;
+                return Ok(false);
+            }
             self.recalc_basic_var_vals()?;
             hold = self.check_rows(&mut residuals) || self.refine(&mut residuals);
             if !hold {
@@ -1151,8 +1261,9 @@ impl Solver {
         Basis(statuses)
     }
 
-    /// The all-slack basis (identity basis matrix). Loading it cannot fail with a
-    /// singular factorization, so it is the universal fallback.
+    /// The all-slack basis (identity basis matrix): the start a node LP's
+    /// retry solves from. A non-basic var sits at its lower bound if finite,
+    /// else at its upper bound, else at 0.
     pub(crate) fn slack_basis(&self) -> Basis {
         let mut statuses = Vec::with_capacity(self.num_total_vars());
         for var in 0..self.num_vars {
@@ -1182,12 +1293,13 @@ impl Solver {
     /// bound (else 0) rather than rejected — the branch & bound driver relies on this
     /// when loading a parent basis after changing variable bounds.
     ///
+    /// A basis the factorization finds singular is repaired
+    /// ([`Self::factorize`]): a dependent var leaves at the value
+    /// [`Self::slack_basis`] would give it.
+    ///
     /// # Errors
     ///
-    /// If this returns `Err`, the solver's internal state is unspecified and must
-    /// not be used for solving until a subsequent successful `load_basis` restores
-    /// it (the all-slack basis from [`Self::slack_basis`] always loads
-    /// successfully and is the designated recovery path).
+    /// `InternalError` for a basis of the wrong shape, with the state untouched.
     pub(crate) fn load_basis(&mut self, basis: &Basis) -> Result<(), Error> {
         let n = self.num_total_vars();
         let m = self.num_constraints();
@@ -1201,6 +1313,7 @@ impl Solver {
         );
 
         self.basic_vars.clear();
+        self.basic_var_vals.clear();
         self.basic_var_mins.clear();
         self.basic_var_maxs.clear();
         self.nb_vars.clear();
@@ -1210,10 +1323,20 @@ impl Solver {
         for var in 0..n {
             match basis.0[var] {
                 VarStatus::Basic => {
+                    let (min, max) = (self.orig_var_mins[var], self.orig_var_maxs[var]);
                     self.var_states[var] = VarState::Basic(self.basic_vars.len());
                     self.basic_vars.push(var);
-                    self.basic_var_mins.push(self.orig_var_mins[var]);
-                    self.basic_var_maxs.push(self.orig_var_maxs[var]);
+                    // Until the recompute below, the value the slack basis
+                    // gives the var, where it goes if the repair takes it out.
+                    self.basic_var_vals.push(if min.is_finite() {
+                        min
+                    } else if max.is_finite() {
+                        max
+                    } else {
+                        0.0
+                    });
+                    self.basic_var_mins.push(min);
+                    self.basic_var_maxs.push(max);
                 }
                 ref status => {
                     let min = self.orig_var_mins[var];
@@ -1260,8 +1383,7 @@ impl Solver {
             }
         }
 
-        self.basis_solver
-            .reset(&self.orig_constraints_csc, &self.basic_vars)?;
+        self.factorize();
 
         // Steepest-edge reference reset (standard practice after a warm-start load;
         // only affects pivot ordering quality, not correctness).
@@ -1396,9 +1518,11 @@ impl Solver {
                 // taken as zero, see `choose_pivot`) and, with the bounds
                 // perturbed, zero steps are the exception, so a phase that
                 // progresses lowers the objective (a rebuild moves it by
-                // round-off either way). One that has not fallen beyond
-                // round-off since the last check, or is not a number, is taken
-                // to be stuck in a cycle the vertex hash has not caught.
+                // round-off either way, and a basis repair by any amount, so
+                // a repair shortly before a check can end the phase here, a
+                // rare and loud end). One that has not fallen beyond round-off
+                // since the last check, or is not a number, is taken to be
+                // stuck in a cycle the vertex hash has not caught.
                 let obj = self.cur_obj_val;
                 let resolution = ROUNDOFF_FLOOR * obj.abs().max(stall_reference.abs());
                 let fallen = stall_reference - obj > resolution;
@@ -1418,11 +1542,7 @@ impl Solver {
                     // differ; if nothing moved since the last rebuild, the
                     // phase is stuck.
                     if refreshed_since_step {
-                        return Err(Error::InternalError(
-                            "primal simplex cycles: every basis change left returns to visited \
-                             vertices"
-                                .to_string(),
-                        ));
+                        return Err(self.stuck_error("primal"));
                     }
                     debug!("optimize iter {iter}: only taboo vars can enter; rebuilding");
                     self.rebuild_primal()?;
@@ -1488,18 +1608,13 @@ impl Solver {
                     refreshed_since_step = false;
                     excluded_col = None;
                 }
-                PivotChoice::Inconsistent { row, tiny } => {
+                PivotChoice::Inconsistent { row } => {
                     if !self.factorization_is_fresh() {
                         debug!("optimize iter {iter}: pivot row/column disagreement; rebuilding");
                         self.rebuild_primal()?;
-                    } else if tiny {
+                    } else {
                         debug!("optimize iter {iter}: entry at row {row} is round-off; excluded");
                         excluded_rows.push(row);
-                    } else {
-                        return Err(Error::InternalError(
-                            "pivot element disagrees between row and column on a fresh factorization"
-                                .to_string(),
-                        ));
                     }
                 }
             }
@@ -1536,7 +1651,11 @@ impl Solver {
     /// Drop the records of bad basis changes whose row the step just made (the
     /// entering var's move `entering_diff` along `col_coeffs`, a pivot or a
     /// bound flip) moved by at least the row's tolerance: the state the change
-    /// was bad in is gone (see [`CycleGuard::forget_moved_rows`]).
+    /// was bad in is gone (see [`CycleGuard::forget_moved_rows`]). It runs
+    /// after the pivot, so the change back that a repair at the pivot's
+    /// refactorization records goes too if the step moved its row: the phase
+    /// may take that change again, on the eta file, rather than run out of
+    /// changes.
     fn forget_moved_rows(&mut self, entering_diff: f64) {
         let (col_coeffs, basic_vars, var_tols) =
             (&self.col_coeffs, &self.basic_vars, &self.var_tols);
@@ -1636,9 +1755,10 @@ impl Solver {
                 // makes zero steps rare, so a phase that progresses raises the
                 // dual objective of the working costs over many iterations (a
                 // shift moves it either way, and is given back when its var
-                // leaves). One that has not risen beyond round-off since the
-                // last check, or is not a number, is taken to be stuck in a
-                // cycle the vertex hash missed (see `STALL_ITERATIONS`).
+                // leaves; a basis repair moves it by any amount). One that has
+                // not risen beyond round-off since the last check, or is not a
+                // number, is taken to be stuck in a cycle the vertex hash
+                // missed (see `STALL_ITERATIONS`).
                 let obj = self.cur_obj_val;
                 let resolution = ROUNDOFF_FLOOR * obj.abs().max(stall_reference.abs());
                 let risen = obj - stall_reference > resolution;
@@ -1690,11 +1810,7 @@ impl Solver {
                                 self.basic_vars[row]
                             )));
                         }
-                        return Err(Error::InternalError(
-                            "dual simplex cycles: every basis change left returns to visited \
-                             vertices"
-                                .to_string(),
-                        ));
+                        return Err(self.stuck_error("dual"));
                     }
                     debug!(
                         "restore feasibility iter {iter}: only taboo rows are violated; rebuilding"
@@ -1795,9 +1911,12 @@ impl Solver {
             // The pivot element is known through the row (transposed solve)
             // and the column (forward solve); a disagreement means one is
             // round-off. With pivots stacked on the factorization, rebuild and
-            // redo the iteration; on a fresh one, a tiny entry is round-off
-            // and its column is excluded for this row, and otherwise the basis
-            // itself is numerically unusable.
+            // redo the iteration. On a fresh one, an entry that either
+            // computation finds tiny, or that they give opposite signs, is
+            // round-off, and its column is excluded for this row: the row
+            // chose it, and the step divides by the column's element. Any
+            // other is taken, with the column's element below; a basis it
+            // leaves singular is repaired at the next factorization.
             let a_col = self.col_coeff_at(row);
             let scale = self
                 .row_coeffs
@@ -1813,19 +1932,21 @@ impl Solver {
                     );
                     self.rebuild_dual()?;
                     instable_tried = None;
-                } else if a_row.abs() < PIVOT_REL_TOL * scale {
+                    continue;
+                }
+                let floor = PIVOT_REL_TOL * scale;
+                if a_row.abs() < floor || a_col.abs() < floor || (a_row > 0.0) != (a_col > 0.0) {
                     debug!(
-                        "restore feasibility iter {iter}: entry {a_row:e} of column {col} in \
-                         row {row} is round-off; excluded"
+                        "restore feasibility iter {iter}: entry of column {col} in row {row} is \
+                         round-off ({a_row:e} vs {a_col:e}); excluded"
                     );
                     excluded_cols.push(col);
-                } else {
-                    return Err(Error::InternalError(
-                        "pivot element disagrees between row and column on a fresh factorization"
-                            .to_string(),
-                    ));
+                    continue;
                 }
-                continue;
+                debug!(
+                    "restore feasibility iter {iter}: pivot row/column disagreement \
+                     ({a_row:e} vs {a_col:e}) on a fresh factorization; pivoting"
+                );
             }
             // The flips the step passed come first. They move basic values,
             // not the basis, so the pivot column stays valid and the entering
@@ -1930,6 +2051,20 @@ impl Solver {
                 .any(|r| self.cycle_guard.is_taboo(r) && !self.basic_var_within_bounds(r))
     }
 
+    /// The loud end of the `phase` ("dual" or "primal") when fresh data leave
+    /// only taboo basis changes, naming a basis the factorization found
+    /// singular if a change left leads to one.
+    fn stuck_error(&self, phase: &str) -> Error {
+        Error::InternalError(if self.cycle_guard.any_taboo_singular() {
+            format!(
+                "{phase} simplex: every basis change left leads to a singular basis or returns \
+                 to visited vertices"
+            )
+        } else {
+            format!("{phase} simplex cycles: every basis change left returns to visited vertices")
+        })
+    }
+
     pub(crate) fn add_constraint(
         &mut self,
         coeffs: CsVec,
@@ -2013,13 +2148,19 @@ impl Solver {
         self.orig_constraints = new_orig_constraints;
         self.orig_constraints_csc = self.orig_constraints.to_csc();
 
-        self.basis_solver
-            .reset(&self.orig_constraints_csc, &self.basic_vars)?;
+        if self.enable_dual_steepest_edge {
+            // A placeholder, so that every row has its weight when the
+            // factorization's repair resets some; the new row's is set below.
+            self.dual_edge_sq_norms.push(1.0);
+        }
+        let repaired = self.factorize();
 
         if self.enable_primal_steepest_edge || self.enable_dual_steepest_edge {
-            // existing tableau rows didn't change, so we calc the last row
-            // and add its contribution to the sq. norms.
-            self.calc_row_coeffs(self.num_constraints() - 1);
+            // The new row's contribution to the weights. The existing tableau
+            // rows are unchanged unless the factorization repaired the basis;
+            // then the weights are approximate, and they only steer pricing.
+            let new_row = self.num_constraints() - 1;
+            self.calc_row_coeffs(new_row);
 
             if self.enable_primal_steepest_edge {
                 for (c, &coeff) in self.row_coeffs.iter() {
@@ -2028,9 +2169,11 @@ impl Solver {
             }
 
             if self.enable_dual_steepest_edge {
-                self.dual_edge_sq_norms
-                    .push(self.inv_basis_row_coeffs.sq_norm());
+                self.dual_edge_sq_norms[new_row] = self.inv_basis_row_coeffs.sq_norm();
             }
+        }
+        if repaired {
+            self.recalc_basic_var_vals()?;
         }
 
         self.is_primal_feasible = false;
@@ -2314,6 +2457,10 @@ impl Solver {
 
             // The pivot-element cross-check of the dual phase (see
             // `dual_phase`): the column gave `pivot_coeff`, the row must agree.
+            // On fresh factors only the column's element is tested: it chose
+            // the row and sets the step, size and direction, while the row's
+            // feeds the reduced costs, which the phase exit recomputes, and the
+            // edge weights, which are floored and checked.
             let row_max_all = self
                 .row_coeffs
                 .iter()
@@ -2321,10 +2468,14 @@ impl Solver {
                 .fold(0.0, f64::max);
             let a_row = *self.row_coeffs.get(entering_c);
             if !Self::pivots_agree(a_row, pivot_coeff, col_max_all.max(row_max_all)) {
-                return Ok(PivotChoice::Inconsistent {
-                    row,
-                    tiny: pivot_coeff.abs() < PIVOT_REL_TOL * col_max_all,
-                });
+                if !self.factorization_is_fresh() || pivot_coeff.abs() < PIVOT_REL_TOL * col_max_all
+                {
+                    return Ok(PivotChoice::Inconsistent { row });
+                }
+                debug!(
+                    "primal ratio test: pivot row/column disagreement ({a_row:e} vs \
+                     {pivot_coeff:e}) on a fresh factorization; pivoting"
+                );
             }
 
             // The step takes the leaving var exactly onto its working bound,

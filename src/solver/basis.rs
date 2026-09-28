@@ -8,7 +8,7 @@
 use crate::{
     lu::{lu_factorize, LUFactors, ScratchSpace},
     sparse::{ScatteredVec, SparseMat, SparseVec},
-    CsVec, Error,
+    CsVec,
 };
 
 use super::tolerances::LU_STABILITY_THRESHOLD;
@@ -22,10 +22,11 @@ pub(crate) enum PivotChoice {
     /// The pivot element at `row` computed through the row and through the
     /// column disagree (see [`super::PIVOT_AGREEMENT_TOL`]). With pivots
     /// stacked on the factorization it must be rebuilt before choosing again;
-    /// on a fresh one the entry is noise if `tiny` (relative to the column)
-    /// and the row is then excluded for the column, else the factorization
-    /// itself is unusable.
-    Inconsistent { row: usize, tiny: bool },
+    /// on a fresh one the entry is tiny beside its column, noise, and the row
+    /// is excluded for the column. A larger entry that disagrees on a fresh
+    /// factorization is taken with the column's element: a basis it leaves
+    /// singular is repaired at the next factorization.
+    Inconsistent { row: usize },
 }
 
 #[derive(Debug)]
@@ -180,15 +181,19 @@ impl BasisSolver {
         }
     }
 
+    /// Factorize the basis `basic_vars` afresh, with no etas. Returns the
+    /// `(position, row)` pairs of a singular basis's dependent columns, whose
+    /// places the factors give to the unit columns of those rows
+    /// ([`lu_factorize`]): the caller makes the basis match.
     pub(crate) fn reset(
         &mut self,
         orig_constraints_csc: &CsMat,
         basic_vars: &[usize],
-    ) -> Result<(), Error> {
+    ) -> Vec<(usize, usize)> {
         self.scratch.clear_sparse(basic_vars.len());
         self.eta_matrices.clear_and_resize(basic_vars.len());
         self.rhs.clear_and_resize(basic_vars.len());
-        self.lu_factors = lu_factorize(
+        let (lu_factors, replaced) = lu_factorize(
             basic_vars.len(),
             |c| {
                 orig_constraints_csc
@@ -199,9 +204,10 @@ impl BasisSolver {
             },
             LU_STABILITY_THRESHOLD,
             &mut self.scratch,
-        )?;
+        );
+        self.lu_factors = lu_factors;
         self.lu_factors_transp = self.lu_factors.transpose();
-        Ok(())
+        replaced
     }
 
     pub(crate) fn solve<'a>(

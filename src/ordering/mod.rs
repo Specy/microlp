@@ -7,20 +7,14 @@ mod cols_queue;
 
 use cols_queue::ColsQueue;
 
-use crate::sparse::{Error, Perm};
+use crate::sparse::Perm;
 
-/// Simplest preordering: order columns based on their size
-pub fn order_simple<'a>(
-    size: usize,
-    get_col: impl Fn(usize) -> &'a [usize],
-) -> Result<Perm, Error> {
+/// Simplest preordering: order columns based on their size. An empty column
+/// ranks with the columns of one entry; the factorization finds it dependent.
+pub fn order_simple<'a>(size: usize, get_col: impl Fn(usize) -> &'a [usize]) -> Perm {
     let mut cols_queue = ColsQueue::new(size);
     for c in 0..size {
-        let col = get_col(c);
-        if col.is_empty() {
-            return Err(Error::SingularMatrix);
-        }
-        cols_queue.add(c, col.len() - 1);
+        cols_queue.add(c, get_col(c).len().saturating_sub(1));
     }
 
     let mut new2orig = Vec::with_capacity(size);
@@ -37,7 +31,7 @@ pub fn order_simple<'a>(
         orig2new[orig] = new;
     }
 
-    Ok(Perm { orig2new, new2orig })
+    Perm { orig2new, new2orig }
 }
 
 #[cfg(test)]

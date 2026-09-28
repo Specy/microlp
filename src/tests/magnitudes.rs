@@ -556,6 +556,368 @@ mod regression_tests {
         });
     }
 
+    /// LPs whose solve pivots on an entry some `1e-15` of its column (genuine,
+    /// or round-off that both computations share) into a basis the
+    /// factorization finds singular. The basis is repaired, a slack in place
+    /// of the dependent column, and the solve goes on to an answer within the
+    /// contract, with presolve on and off.
+    #[test]
+    fn lps_through_a_basis_the_factorization_finds_singular_solve() {
+        let check_on_and_off = |model: Model| {
+            assert!(xstar_is_feasible(&model), "fixture error");
+            assert_solves_within_contract(&model);
+            assert_solves_within_contract_without_presolve(&model);
+        };
+        check_on_and_off(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, 0.0, 0.0),
+                real(-1.0, 0.0, 1.0),
+                real(0.0, -1.0, 50.0),
+                real(1.0, -1.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(2, -1.0), (3, 10000.0)], ComparisonOp::Eq, -50.0),
+                row(&[(1, 1.0), (3, -1e-5)], ComparisonOp::Eq, 0.0),
+                row(&[(1, -1e-8), (2, -20000.0)], ComparisonOp::Le, 0.0),
+            ],
+            xstar: vec![0.0, 0.0, 50.0, 0.0],
+        });
+        check_on_and_off(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(0.0, 0.0, 0.0),
+                real(1.0, 0.0, 0.0),
+                real(0.0, 0.0, 262144.0),
+                real(-1.0, 0.0, 0.0),
+                real(1.0, 0.0, 1.0),
+                real(-1.0, -262146.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(2, 1000.0), (5, -0.01)], ComparisonOp::Eq, 0.0),
+                row(&[(2, 1.0), (4, -1e-6), (5, -0.0001)], ComparisonOp::Ge, 0.0),
+                row(&[(2, 1.0), (4, -1.0), (5, 1.0)], ComparisonOp::Ge, -1.0),
+            ],
+            xstar: vec![0.0; 6],
+        });
+        check_on_and_off(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, -1.0, 0.0),
+                real(-1.0, -20.0, 0.0),
+                real(1.0, 0.0, 0.0),
+                real(0.0, -1.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(0, -1e-6), (3, -10000.0)], ComparisonOp::Eq, -0.0),
+                row(&[(1, -1e-7)], ComparisonOp::Le, 1.0),
+                row(&[(0, -20.0), (1, 1.0), (3, -1e-8)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![0.0; 4],
+        });
+        check_on_and_off(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(1.0, 0.0, 1.0),
+                real(1.0, 0.0, 8388608.0),
+                real(-1.0, 0.0, 1.0),
+                real(0.0, 0.0, 0.0),
+                real(0.0, 0.0, 0.0),
+                real(-1.0, -1.0, 0.0),
+            ],
+            rows: vec![
+                row(
+                    &[(0, -0.5), (1, 100.0), (2, 1.0), (5, 10000.0)],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+                row(&[(1, 1.0), (5, -1e-5)], ComparisonOp::Eq, 0.0),
+                row(&[(2, -2.0)], ComparisonOp::Le, 0.0),
+                row(
+                    &[(0, 1000.0), (1, -1e-8), (2, -1750.0)],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+            ],
+            xstar: vec![0.0; 6],
+        });
+        check_on_and_off(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(0.0, -2.0, 0.0),
+                real(0.0, 0.0, 1.0),
+                real(1.0, 0.0, 1.0),
+                real(0.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(1, 1.0), (2, -0.1)], ComparisonOp::Eq, 0.0),
+                row(&[(0, -1.0), (3, -1.0)], ComparisonOp::Eq, -0.0),
+                row(&[(0, 10.0), (1, -1e-8)], ComparisonOp::Le, 0.0),
+                row(&[(0, -1e-7), (2, -10000.0)], ComparisonOp::Eq, -0.0),
+            ],
+            xstar: vec![0.0; 4],
+        });
+        check_on_and_off(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(0.0, 0.0, 1.0),
+                real(1.0, 5001.0, 10002.0),
+                real(0.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(0, -1e-6), (1, 1.0)], ComparisonOp::Le, 10002.0),
+                row(&[(0, 10000.0), (2, 0.1)], ComparisonOp::Eq, 0.0),
+                row(&[(1, -100.0)], ComparisonOp::Ge, -1000101.0),
+                row(
+                    &[(1, -1e-6), (2, 10000.0)],
+                    ComparisonOp::Eq,
+                    -0.005000999999999999,
+                ),
+            ],
+            xstar: vec![0.0, 5001.0, 0.0],
+        });
+        check_on_and_off(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(1.0, 0.0, 0.0),
+                real(-1.0, -2.0, 0.0),
+                real(0.0, -1.0, 0.0),
+                real(0.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(1, -100.0), (2, 1.0), (3, -100.0)], ComparisonOp::Eq, 0.0),
+                row(&[(1, -1e-7), (3, 1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(2, -10000.0), (3, -1e-8)], ComparisonOp::Ge, -0.0),
+            ],
+            xstar: vec![0.0; 4],
+        });
+    }
+
+    /// MILPs of the class above, whose root or node LP meets the singular
+    /// basis.
+    #[test]
+    fn milps_through_a_basis_the_factorization_finds_singular_solve() {
+        let check_on_and_off = |model: Model| {
+            assert!(xstar_is_feasible(&model), "fixture error");
+            assert_solves_within_contract(&model);
+            assert_solves_within_contract_without_presolve(&model);
+        };
+        check_on_and_off(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(-1.0, -1, 0),
+                int(0.0, 0, 0),
+                real(0.0, -1.0, 0.0),
+                real(1.0, 0.0, 1.0),
+                real(0.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(2, -1.0), (3, -1.0)], ComparisonOp::Eq, -0.0),
+                row(&[(3, -10.0), (4, -1e-8)], ComparisonOp::Le, 0.0),
+                row(
+                    &[(0, -0.001), (2, -1e-8), (4, 10000.0)],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+            ],
+            xstar: vec![0.0; 5],
+        });
+        check_on_and_off(Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(-1.0, -3, 0),
+                real(-1.0, 0.0, 4.2147712653317626e-8),
+                real(-1.0, 0.0, 301.0),
+            ],
+            rows: vec![
+                row(&[(0, -1e-8), (2, -1.0)], ComparisonOp::Le, 0.0),
+                row(&[(0, -2e-8), (1, 1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(0, -1.0), (1, -1e-8), (2, -0.01)], ComparisonOp::Eq, -0.0),
+                row(&[(2, 100.0)], ComparisonOp::Ge, 0.0),
+            ],
+            xstar: vec![0.0; 3],
+        });
+        check_on_and_off(Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(0.0, 0, 0),
+                int(-1.0, 0, 2),
+                real(-1.0, 0.0, 1.0),
+                real(-1.0, 0.0, 53688.0),
+            ],
+            rows: vec![
+                row(&[(1, 1.0), (3, -0.001)], ComparisonOp::Ge, 0.0),
+                row(&[(2, -1e-7), (3, 20000.0)], ComparisonOp::Eq, 0.0),
+                row(&[(1, -1e-7), (2, -1.0), (3, 1.0)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![0.0; 4],
+        });
+        check_on_and_off(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(0.0, -1, 0),
+                real(0.0, 0.0, 0.0),
+                real(-1.0, -1.0, 0.0),
+                real(0.0, 0.0, 0.0),
+                real(-1.0, -1.0, 0.0),
+                real(0.0, 0.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(0, -1.0), (2, 10.0)], ComparisonOp::Eq, 0.0),
+                row(&[(2, 1e-5), (4, 10000.0)], ComparisonOp::Eq, 0.0),
+                row(&[(0, 1000.0), (4, -1e-8)], ComparisonOp::Le, 0.0),
+            ],
+            xstar: vec![0.0; 6],
+        });
+        check_on_and_off(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(-1.0, -27, 0),
+                int(-1.0, -16, 0),
+                real(-1.0, -1.0, 0.0),
+                real(0.0, 0.0, 0.0),
+                real(-1.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(
+                    &[(1, -1e-5), (2, -10000.0), (4, -1.0)],
+                    ComparisonOp::Eq,
+                    -0.0,
+                ),
+                row(
+                    &[(0, -100.0), (1, 165.625), (2, -1e-6)],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+                row(&[(0, 1.0), (4, -10.0)], ComparisonOp::Le, 0.0),
+            ],
+            xstar: vec![0.0; 5],
+        });
+        check_on_and_off(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(-1.0, 0, 0),
+                real(1.0, -2.0, 9.0),
+                real(-1.0, 4194304.0, 4194304.0),
+                real(-1.0, -1.0, 0.0),
+                real(0.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(1, -1.0), (4, 1.0)], ComparisonOp::Eq, 2.0),
+                row(
+                    &[(1, -1.125e-7), (2, -2.0)],
+                    ComparisonOp::Eq,
+                    -8388607.999999775,
+                ),
+                row(
+                    &[(2, -1.0), (3, -0.0001), (4, -1.0)],
+                    ComparisonOp::Le,
+                    -4194304.0,
+                ),
+                row(
+                    &[(1, -1e-5), (2, 1.0), (4, 1.0)],
+                    ComparisonOp::Eq,
+                    4194304.00002,
+                ),
+            ],
+            xstar: vec![0.0, -2.0, 4194304.0, 0.0, 0.0],
+        });
+    }
+
+    /// `min -x + y` s.t. `x + y <= 1`, `x + (1 + 2^-48) y >= 1`, `x >= 0`, `y`
+    /// free: the optimum is `-1` at `(1, 0)`, and its only optimal basis,
+    /// `{x, y}`, is one the factorization finds singular. The primal step that
+    /// completes it pivots on an entry `2^-48` of its column, and the repair at
+    /// the step's refactorization takes `y` out. The step moved `y`'s row,
+    /// which drops the record of the change back, so the phase takes `y` in
+    /// again, on the eta file, and ends at the optimum instead of on the
+    /// change's taboo.
+    #[test]
+    fn an_optimal_basis_the_factorization_finds_singular_is_reached_on_the_eta_file() {
+        for presolve in [true, false] {
+            let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+            let x = problem.add_var(-1.0, (0.0, f64::INFINITY));
+            let y = problem.add_var(1.0, (f64::NEG_INFINITY, f64::INFINITY));
+            problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 1.0);
+            let slanted = 1.0 + 2f64.powi(-48);
+            problem.add_constraint([(x, 1.0), (y, slanted)], ComparisonOp::Ge, 1.0);
+            let solution = match problem.solve_with(SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            }) {
+                Ok(outcome) => outcome.into_solution().unwrap(),
+                Err(err) => panic!("presolve {presolve}: {err:?}"),
+            };
+            let (objective, x, y) = (solution.objective(), solution[x], solution[y]);
+            assert!(
+                (objective + 1.0).abs() < 1e-9 && (x - 1.0).abs() < 1e-9 && y.abs() < 1e-9,
+                "presolve {presolve}: objective {objective} at ({x}, {y})"
+            );
+        }
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): a model whose optimum is reached
+    /// only through a basis the factorization finds singular fails loudly,
+    /// where `x*`, at `x2 = 5000`, is optimal. `x2`, the last var that
+    /// improves the objective, is blocked only by an entry some `1e-14` of its
+    /// column: the pivot on it leaves a singular basis, the repair takes `x2`
+    /// out, and the phase comes back to that basis by another route until only
+    /// changes to it are left.
+    #[test]
+    #[should_panic(expected = "leads to a singular basis")]
+    fn an_optimum_reached_only_through_a_singular_basis_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(0.0, 0.0, 0.0),
+                real(0.0, 0.0, 0.0),
+                real(1.0, 5000.0, 10000.0),
+                real(-1.0, -1.0, 1.0),
+                real(1.0, 0.0, 0.0),
+                real(1.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(3, -0.01), (5, 1.0)], ComparisonOp::Eq, 0.0),
+                row(
+                    &[(2, 1e-5), (3, 10000.0), (5, -1.0)],
+                    ComparisonOp::Eq,
+                    0.05,
+                ),
+                row(&[(2, 10000.0), (5, -1e-7)], ComparisonOp::Le, 99999950.0),
+            ],
+            xstar: vec![0.0, 0.0, 5000.0, 0.0, 0.0, 0.0],
+        });
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): a model whose optimal basis the
+    /// factorization finds singular fails loudly, where the origin, its only
+    /// feasible point, is optimal. The last primal step pivots on an entry
+    /// some `1e-14` of its column into that basis (a 1-norm condition of about
+    /// `4.5e14` in the scaled data); the repair takes the entering var back
+    /// out, and the change back stays taboo, since the step, a zero one, moved
+    /// no row.
+    #[test]
+    #[should_panic(expected = "leads to a singular basis")]
+    fn an_optimal_basis_the_factorization_finds_singular_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(-1.0, -1.0, 0.0),
+                real(-1.0, 0.0, 0.0),
+                real(-1.0, 0.0, 1.0),
+                real(-1.0, 0.0, 1000001171.0),
+                real(0.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(0, -1.0), (2, -1.0)], ComparisonOp::Eq, -0.0),
+                row(&[(2, -1e-8), (3, -1000.0)], ComparisonOp::Le, 0.0),
+                row(&[(0, 1.0), (4, -1e-7)], ComparisonOp::Eq, 0.0),
+                row(&[(3, -1e-6), (4, 1000.0)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![0.0; 5],
+        });
+    }
+
     /// The primal step that lowers x3 is bounded by `-2 x3 <= -1` and, through
     /// the Harris relaxation, by the equality `x2 + 1e-7 x3 = 1.0000001` at its
     /// tolerance: the step leaves the equality's slack exactly at its
