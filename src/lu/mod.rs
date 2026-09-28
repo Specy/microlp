@@ -1,4 +1,4 @@
-use crate::sparse::{Error, Perm, ScatteredVec, SparseMat, TriangleMat};
+use crate::sparse::{Perm, ScatteredVec, SparseMat, TriangleMat};
 use std::cmp::Ordering;
 
 use crate::solver::LU_SINGULAR_REL;
@@ -118,12 +118,22 @@ impl LUFactors {
     }
 }
 
+/// Factorize the square matrix whose columns `get_col` gives, with threshold
+/// pivoting at `stability_coeff`.
+///
+/// A column is dependent when the part of it left to pivot on is below
+/// [`LU_SINGULAR_REL`] of its largest transformed entry (or not a normal
+/// number): it is skipped, and the factors are completed at the end, each
+/// dependent column paired with a row that no pivot took, whose unit column
+/// takes its place (a pivot of one, no elimination, exact since the row was
+/// never eliminated). Returns the factors of the matrix so repaired and the
+/// pairs `(column, row)` it replaced, none for a nonsingular matrix.
 pub fn lu_factorize<'a>(
     size: usize,
     get_col: impl Fn(usize) -> (&'a [usize], &'a [f64]),
     stability_coeff: f64,
     scratch: &mut ScratchSpace,
-) -> Result<LUFactors, Error> {
+) -> (LUFactors, Vec<(usize, usize)>) {
     // Implementation of the Gilbert-Peierls algorithm:
     //
     // Gilbert, John R., and Tim Peierls. "Sparse partial pivoting in time
@@ -132,16 +142,15 @@ pub fn lu_factorize<'a>(
     //
     // https://ecommons.cornell.edu/bitstream/handle/1813/6623/86-783.pdf
 
-    // The ordering rejects an empty column (a singular matrix), after which
-    // every column has an entry and the excess below cannot underflow.
-    let col_perm = super::ordering::order_simple(size, |c| get_col(c).0)?;
+    let col_order = super::ordering::order_simple(size, |c| get_col(c).0);
 
     let mat_nnz = (0..size).map(|c| get_col(c).0.len()).sum::<usize>();
     trace!(
         "lu_factorize: starting, matrix size: {}, nnz: {} (excess: {})",
         size,
         mat_nnz,
-        mat_nnz - size,
+        // Negative with an empty column.
+        mat_nnz as isize - size as isize,
     );
 
     let mut orig_row2elt_count = vec![0; size];
@@ -159,8 +168,14 @@ pub fn lu_factorize<'a>(
 
     let mut new2orig_row = (0..size).collect::<Vec<_>>();
     let mut orig2new_row = new2orig_row.clone();
+    // The columns in the order they took their pivots; the dependent ones
+    // follow them once the factors are completed.
+    let mut new2orig_col = Vec::with_capacity(size);
+    let mut dependent = Vec::new();
 
-    for (i_col, &orig_col) in col_perm.new2orig.iter().enumerate() {
+    for &orig_col in &col_order.new2orig {
+        // The position of the next pivot: the columns pivoted so far.
+        let i_col = new2orig_col.len();
         let mat_col = get_col(orig_col);
 
         // Solve the equation L'_j * x = a_j (x will be in scratch.rhs).
@@ -217,7 +232,8 @@ pub fn lu_factorize<'a>(
             }
 
             if !max_abs.is_normal() || max_abs < LU_SINGULAR_REL * col_max {
-                return Err(Error::SingularMatrix);
+                dependent.push(orig_col);
+                continue;
             }
 
             // Choose among eligible pivot rows one with the least elements.
@@ -272,6 +288,22 @@ pub fn lu_factorize<'a>(
 
         upper.seal_column();
         lower.seal_column();
+        new2orig_col.push(orig_col);
+    }
+
+    // The rows no pivot took hold the positions after the pivoted ones: each
+    // dependent column gets the next, and that row's unit column replaces it.
+    let mut replaced = Vec::with_capacity(dependent.len());
+    for orig_col in dependent {
+        replaced.push((orig_col, new2orig_row[new2orig_col.len()]));
+        upper_diag.push(1.0);
+        upper.seal_column();
+        lower.seal_column();
+        new2orig_col.push(orig_col);
+    }
+    let mut orig2new_col = vec![0; size];
+    for (new, &orig) in new2orig_col.iter().enumerate() {
+        orig2new_col[orig] = new;
     }
 
     // permute rows of lower to "new" indices.
@@ -305,10 +337,13 @@ pub fn lu_factorize<'a>(
             orig2new: orig2new_row,
             new2orig: new2orig_row,
         }),
-        col_perm: Some(col_perm),
+        col_perm: Some(Perm {
+            orig2new: orig2new_col,
+            new2orig: new2orig_col,
+        }),
     };
 
-    Ok(res)
+    (res, replaced)
 }
 
 #[derive(Clone, Debug)]

@@ -602,6 +602,9 @@ fn slack_basis_load_then_reoptimize_reaches_optimum() {
     assert!(float_eq(solver.cur_obj_val, 8.0));
 }
 
+/// `load_basis` fails only on a basis of the wrong shape (a singular one loads
+/// repaired: `a_singular_basis_loads_repaired`), and then leaves the state
+/// untouched: the solver goes on from where it was, with no reload.
 #[test]
 fn load_basis_rejects_wrong_shape() {
     init();
@@ -616,13 +619,230 @@ fn load_basis_rejects_wrong_shape() {
     )
     .unwrap();
     solver.initial_solve().unwrap();
-    // 2 total vars (1 structural + 1 slack); a basis with zero Basic entries is invalid.
-    let bad = Basis(vec![VarStatus::AtLower, VarStatus::AtLower]);
-    assert!(solver.load_basis(&bad).is_err());
-    // Solver must still be usable via the slack-basis fallback path.
-    let slack = solver.slack_basis();
-    solver.load_basis(&slack).unwrap();
+    let state = format!("{solver:?}");
+    use VarStatus::{AtLower, Basic};
+    // Two total vars (one structural, one slack) and one row.
+    for bad in [vec![AtLower, AtLower], vec![Basic, Basic], vec![Basic]] {
+        let result = solver.load_basis(&Basis(bad.clone()));
+        assert!(matches!(result, Err(Error::InternalError(_))), "{bad:?}");
+        assert_eq!(format!("{solver:?}"), state, "{bad:?}");
+    }
+    let iterations = solver.lp_iterations;
     assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
+    assert_eq!(solver.lp_iterations, iterations);
+}
+
+/// A basis the factorization finds singular loads repaired and solves. `x`
+/// and `y` have the same column in `x + y <= 4`, `2 x + 2 y <= 10`, so
+/// `{x, y}` is singular: the load makes `y` non-basic at its lower bound, the
+/// value the slack basis gives it, with the second row's slack in its place,
+/// records nothing outside a phase, and the re-solve reaches the optimum `-8`
+/// at `y = 4`.
+#[test]
+fn a_singular_basis_loads_repaired() {
+    init();
+    let mut solver = Solver::try_new(
+        &[-1.0, -2.0],
+        &[0.0, 0.0],
+        &[10.0, 10.0],
+        &[
+            (to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 4.0),
+            (to_sparse(&[2.0, 2.0]), ComparisonOp::Le, 10.0),
+        ],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    use VarStatus::{AtLower, Basic};
+    solver
+        .load_basis(&Basis(vec![Basic, Basic, AtLower, AtLower]))
+        .unwrap();
+    assert!(matches!(solver.var_states[0], VarState::Basic(_)));
+    assert!(matches!(solver.var_states[3], VarState::Basic(_)));
+    assert!(matches!(solver.var_states[1], VarState::NonBasic(_)));
+    assert_eq!(solver.get_value(1), 0.0);
+    assert!(!solver.cycle_guard.any_taboo());
+    assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
+    assert!(float_eq(solver.cur_obj_val, -8.0));
+    assert!(float_eq(solver.get_value(1), 4.0));
+}
+
+/// The optimum of `min -2 x - y` s.t. `x + y <= 4`, `x - y <= 0`: `-6` at
+/// `x = y = 2`, with the basis `{x, y}`.
+fn optimum_with_x_and_y_basic() -> Solver {
+    let mut sol = Solver::try_new(
+        &[-2.0, -1.0],
+        &[0.0, 0.0],
+        &[10.0, 10.0],
+        &[
+            (to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 4.0),
+            (to_sparse(&[1.0, -1.0]), ComparisonOp::Le, 0.0),
+        ],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(sol.initial_solve().unwrap(), StopReason::Finished);
+    assert!(
+        matches!(sol.var_states[0], VarState::Basic(_))
+            && matches!(sol.var_states[1], VarState::Basic(_)),
+        "fixture: x and y are basic"
+    );
+    sol
+}
+
+/// Plant `y`'s entry in the second row equal to its entry in the first, in the
+/// column and the row data: the basis `{x, y}` is singular for the next
+/// factorization, and the model is now `x + y <= 4`, `x + y <= 0`, whose
+/// optimum is `0` at the origin.
+fn plant_y_parallel_to_x(sol: &mut Solver) {
+    let a = *sol.orig_constraints_csc.get(0, 1).unwrap();
+    *sol.orig_constraints_csc.get_mut(1, 1).unwrap() = a;
+    *sol.orig_constraints.get_mut(1, 1).unwrap() = a;
+}
+
+/// A repair within a phase makes the change back bad and taboo: the dual
+/// simplex may not take the slack's row out, nor the primal simplex put the
+/// var back in, and once a rebuild lifts the taboo, the change is taboo again
+/// as soon as it is chosen. The plant makes `{x, y}` singular for a rebuild
+/// at the optimum.
+#[test]
+fn a_repair_within_a_phase_makes_the_change_back_taboo() {
+    init();
+    let mut sol = optimum_with_x_and_y_basic();
+    plant_y_parallel_to_x(&mut sol);
+
+    sol.begin_dual_phase(true).unwrap();
+    sol.rebuild().unwrap();
+    let var = (0..2)
+        .find(|&v| matches!(sol.var_states[v], VarState::NonBasic(_)))
+        .expect("the repair takes x or y out");
+    let (slack, row) = (2..4)
+        .find_map(|s| match sol.var_states[s] {
+            VarState::Basic(row) => Some((s, row)),
+            VarState::NonBasic(_) => None,
+        })
+        .expect("a slack replaces it");
+    assert!(sol.cycle_guard.is_taboo(row) && sol.cycle_guard.is_taboo_entering(var));
+    sol.cycle_guard.clear_taboo();
+    assert!(!sol.cycle_guard.any_taboo());
+    let here = sol.cycle_guard.hash_after(std::iter::empty());
+    assert!(sol.cycle_guard.is_bad_change(row, slack, var, here));
+    sol.end_dual_phase();
+}
+
+/// A var the repair takes out gives back the cost shift of the zero dual step
+/// it entered on, as a var that leaves by a pivot does: a shift lives only
+/// while its var is basic. Both basic vars carry a shift when the plant makes
+/// `{x, y}` singular for a rebuild within a dual phase; the var taken out has
+/// none left, and the one still basic keeps its own.
+#[test]
+fn a_var_the_repair_takes_out_gives_back_its_cost_shift() {
+    init();
+    let mut sol = optimum_with_x_and_y_basic();
+    plant_y_parallel_to_x(&mut sol);
+    sol.begin_dual_phase(true).unwrap();
+    let shifts = [0.5, 0.25];
+    sol.cost_shifts[..2].copy_from_slice(&shifts);
+    sol.costs_modified = true;
+
+    sol.rebuild().unwrap();
+    let out = (0..2)
+        .find(|&v| matches!(sol.var_states[v], VarState::NonBasic(_)))
+        .expect("the repair takes x or y out");
+    let kept = 1 - out;
+    assert!(matches!(sol.var_states[kept], VarState::Basic(_)));
+    assert_eq!(sol.cost_shifts[out], 0.0);
+    assert_eq!(sol.cost_shifts[kept], shifts[kept]);
+    sol.end_dual_phase();
+}
+
+/// `verify_primal`'s second rung repairs a basis the fresh factorization finds
+/// singular. With the plant, the values no longer satisfy the rows, the
+/// refinement through the old factors cannot make them, and the fresh
+/// factorization finds `{x, y}` singular. The vertex the repair reaches is no
+/// verification: the answer is `false`, with the feasibility flags measured on
+/// it (it is neither primal nor dual feasible), and the re-solve reaches the
+/// planted model's optimum.
+#[test]
+fn verify_primal_repairs_a_basis_its_fresh_factorization_finds_singular() {
+    init();
+    let mut sol = optimum_with_x_and_y_basic();
+    plant_y_parallel_to_x(&mut sol);
+    sol.values_dirty = true;
+
+    assert!(!sol.verify_primal().unwrap());
+    assert!(
+        (0..2).any(|v| matches!(sol.var_states[v], VarState::NonBasic(_))),
+        "the repair takes x or y out"
+    );
+    assert!(!sol.is_primal_feasible && sol.calc_primal_infeasibility().0 > 0);
+    assert!(!sol.is_dual_feasible && sol.calc_dual_infeasibility().0 > 0);
+    assert_eq!(sol.reoptimize().unwrap(), StopReason::Finished);
+    assert!(float_eq(sol.cur_obj_val, 0.0));
+}
+
+/// `add_constraint` repairs a basis its factorization finds singular, and
+/// recomputes the values before the re-solve. With the plant, adding `x <= 3`
+/// factorizes `{x, y}` and the new row's slack: singular, and repaired. The
+/// re-solve reaches the planted model's optimum within its rows; with a
+/// deadline already passed, it stops before its first step, on values that
+/// satisfy the rows.
+#[test]
+fn add_constraint_repairs_a_basis_its_factorization_finds_singular() {
+    init();
+    for stopped in [false, true] {
+        let mut sol = optimum_with_x_and_y_basic();
+        plant_y_parallel_to_x(&mut sol);
+        if stopped {
+            sol.deadline = Some(Instant::now());
+        }
+        let stop = sol
+            .add_constraint(to_sparse(&[1.0, 0.0]), ComparisonOp::Le, 3.0)
+            .unwrap();
+        assert!(
+            (0..2).any(|v| matches!(sol.var_states[v], VarState::NonBasic(_))),
+            "the repair takes x or y out"
+        );
+        if stopped {
+            assert_eq!(stop, StopReason::Limit);
+            let mut residuals = Vec::new();
+            assert!(sol.check_rows(&mut residuals), "residuals {residuals:?}");
+        } else {
+            assert_eq!(stop, StopReason::Finished);
+            assert!(float_eq(sol.cur_obj_val, 0.0));
+            let x = [sol.get_value(0), sol.get_value(1)];
+            assert!(sol.first_violated_row(&x).is_none());
+        }
+    }
+}
+
+/// A var basic in two positions makes the basis singular, and a repair would
+/// hide the bug: it would take one copy out and leave the var basic and
+/// non-basic at once. At the optimum, one basic var is planted in the other's
+/// position, and the rebuild fails loudly.
+#[test]
+#[should_panic(expected = "basis bookkeeping is corrupt")]
+fn a_singular_basis_with_a_var_basic_twice_is_not_repaired() {
+    init();
+    let mut sol = optimum_with_x_and_y_basic();
+    sol.basic_vars[1] = sol.basic_vars[0];
+    let _ = sol.rebuild();
+}
+
+/// The same check on the non-basic side: at the optimum, `y` is made parallel
+/// to `x`, a genuine singular basis, and two non-basic positions are swapped,
+/// so the slack the repair takes in names a position another var holds.
+#[test]
+#[should_panic(expected = "basis bookkeeping is corrupt")]
+fn a_singular_basis_with_a_slack_out_of_place_is_not_repaired() {
+    init();
+    let mut sol = optimum_with_x_and_y_basic();
+    plant_y_parallel_to_x(&mut sol);
+    sol.nb_vars.swap(0, 1);
+    let _ = sol.rebuild();
 }
 
 /// Tied breakpoints form one Harris group, whose largest entry is the pivot,
@@ -1416,6 +1636,43 @@ fn dual_phase_fails_loudly_when_only_taboo_changes_are_left() {
     sol.end_dual_phase();
     assert!(
         matches!(&result, Err(Error::InternalError(msg)) if msg.contains("cycles")),
+        "{result:?}"
+    );
+}
+
+/// The loud end of a phase that fresh data leave only taboo changes names a
+/// singular basis when one of them leads to one. The model of the test above,
+/// with its one change planted as the change back of a basis repair.
+#[test]
+fn dual_phase_names_a_singular_basis_when_only_its_change_is_left() {
+    init();
+    let mut sol = Solver::try_new(
+        &[1.0, 2.0],
+        &[0.0, 0.0],
+        &[10.0, 10.0],
+        &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 1.0)],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    sol.begin_dual_phase(false).unwrap();
+    let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
+    sol.calc_row_coeffs(row);
+    let (col, _) = sol
+        .choose_entering_col_dual(row, leaving_new_val, &[], false)
+        .unwrap()
+        .step()
+        .entering;
+    let (leaving, entering) = (sol.basic_vars[row], sol.nb_vars[col]);
+    sol.cycle_guard.add_singular_change(row, leaving, entering);
+    // A phase that ran on instead would stop at the limit, and fail below.
+    sol.deadline = Some(Instant::now() + Duration::from_secs(10));
+    let result = sol.dual_phase();
+    sol.end_dual_phase();
+    assert!(
+        matches!(&result, Err(Error::InternalError(msg))
+            if msg.contains("leads to a singular basis")),
         "{result:?}"
     );
 }
@@ -2410,7 +2667,7 @@ fn rows_excluded_as_round_off_for_one_column_block_another() {
     assert!(
         matches!(
             sol.choose_pivot(x0, &[], 1.0).unwrap(),
-            PivotChoice::Inconsistent { row: 0, tiny: true }
+            PivotChoice::Inconsistent { row: 0 }
         ),
         "fixture: x0's entry in the first row is found round-off"
     );
@@ -2433,6 +2690,129 @@ fn rows_excluded_as_round_off_for_one_column_block_another() {
     assert_eq!(sol.primal_phase(1.0).unwrap(), (StopReason::Finished, true));
     assert!(matches!(sol.var_states[0], VarState::Basic(_)));
     assert!(matches!(sol.var_states[1], VarState::Basic(_)));
+}
+
+/// On a fresh factorization, a pivot element whose row and column
+/// computations disagree beyond round-off, and that is not tiny beside its
+/// column, is taken with the column's element; a basis it leaves singular
+/// would be repaired. Planted: `x`'s entry in `x <= 4` is `0.5` in the
+/// column data and `1` in the row data, and the primal phase pivots on it.
+#[test]
+fn a_primal_pivot_whose_computations_disagree_on_fresh_factors_is_taken() {
+    init();
+    let mut sol = Solver::try_new(
+        &[-1.0],
+        &[0.0],
+        &[f64::INFINITY],
+        &[(to_sparse(&[1.0]), ComparisonOp::Le, 4.0)],
+        &[VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(sol.col_scales, [1.0], "fixture: no column scaling");
+    assert_eq!(sol.row_scales, [1.0], "fixture: no row scaling");
+    *sol.orig_constraints_csc.get_mut(0, 0).unwrap() = 0.5;
+    sol.begin_primal_phase(true);
+    let x = sol.price_primal().unwrap().unwrap();
+    let PivotChoice::Pivot(info) = sol.choose_pivot(x, &[], 1.0).unwrap() else {
+        panic!("x enters");
+    };
+    assert_eq!(info.elem.as_ref().unwrap().coeff, 0.5);
+    assert_eq!(sol.primal_phase(1.0).unwrap(), (StopReason::Finished, true));
+    sol.end_primal_phase().unwrap();
+    assert!(matches!(sol.var_states[0], VarState::Basic(_)));
+}
+
+/// The dual simplex's counterpart: `x`'s entry in `x >= 1` is `0.5` in the
+/// column data and `1` in the row data, and the violated row is repaired by
+/// a pivot on it, with the column's element.
+#[test]
+fn a_dual_pivot_whose_computations_disagree_on_fresh_factors_is_taken() {
+    init();
+    let mut sol = Solver::try_new(
+        &[1.0],
+        &[0.0],
+        &[f64::INFINITY],
+        &[(to_sparse(&[1.0]), ComparisonOp::Ge, 1.0)],
+        &[VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(sol.col_scales, [1.0], "fixture: no column scaling");
+    assert_eq!(sol.row_scales, [1.0], "fixture: no row scaling");
+    *sol.orig_constraints_csc.get_mut(0, 0).unwrap() = 0.5;
+    sol.begin_dual_phase(true).unwrap();
+    let result = sol.dual_phase();
+    sol.end_dual_phase();
+    assert_eq!(result.unwrap(), StopReason::Finished);
+    assert!(matches!(sol.var_states[0], VarState::Basic(_)));
+}
+
+/// On a fresh factorization, the dual ratio test excludes as round-off an
+/// entry whose column computation is zero, instead of dividing the step by
+/// it. In `x + y >= 1` with `min x + 2 y`, `x` (the smaller ratio) has its
+/// entry planted as `1` in the row data and `0` in the column data: `x` is
+/// excluded, and `y` repairs the row.
+#[test]
+fn a_dual_pivot_whose_column_element_is_zero_is_excluded() {
+    init();
+    let mut sol = Solver::try_new(
+        &[1.0, 2.0],
+        &[0.0, 0.0],
+        &[f64::INFINITY, f64::INFINITY],
+        &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 1.0)],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(sol.col_scales, [1.0, 1.0], "fixture: no column scaling");
+    assert_eq!(sol.row_scales, [1.0], "fixture: no row scaling");
+    *sol.orig_constraints_csc.get_mut(0, 0).unwrap() = 0.0;
+    sol.begin_dual_phase(true).unwrap();
+    let result = sol.dual_phase();
+    sol.end_dual_phase();
+    assert_eq!(result, Ok(StopReason::Finished));
+    assert!(matches!(sol.var_states[0], VarState::NonBasic(_)));
+    assert!(matches!(sol.var_states[1], VarState::Basic(_)));
+    assert!(float_eq(sol.get_value(1), 1.0));
+}
+
+/// On a fresh factorization, the dual ratio test also excludes an entry whose
+/// row and column computations have opposite signs: the step would take the
+/// entering var past its bound. In `x >= 1` with `min x`, `x`'s entry is
+/// planted as `1` in the row data and `-0.5` in the column data. `x`, the
+/// row's only candidate, is excluded, so the row's slack stays basic and the
+/// phase ends loudly on the row, where the step with `-0.5` would move `x` to
+/// `-2`.
+#[test]
+fn a_dual_pivot_whose_computations_differ_in_sign_is_excluded() {
+    init();
+    let mut sol = Solver::try_new(
+        &[1.0],
+        &[0.0],
+        &[f64::INFINITY],
+        &[(to_sparse(&[1.0]), ComparisonOp::Ge, 1.0)],
+        &[VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(sol.col_scales, [1.0], "fixture: no column scaling");
+    assert_eq!(sol.row_scales, [1.0], "fixture: no row scaling");
+    *sol.orig_constraints_csc.get_mut(0, 0).unwrap() = -0.5;
+    sol.begin_dual_phase(true).unwrap();
+    let result = sol.dual_phase();
+    sol.end_dual_phase();
+    assert!(
+        matches!(&result, Err(Error::InternalError(msg))
+            if msg.contains("no var can repair row 0")),
+        "{result:?}"
+    );
+    assert!(matches!(sol.var_states[0], VarState::NonBasic(_)));
+    assert_eq!(sol.get_value(0), 0.0);
 }
 
 /// The cleanup of a primal phase moves a slack left off its bound beyond its

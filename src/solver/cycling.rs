@@ -1,7 +1,8 @@
 //! Cycling and stall detection for both simplex phases: a hash of the
 //! vertices the phase visits, with a taboo on a basis change that keeps
-//! revisiting them (see [`CycleGuard`]), and a bound on the iterations
-//! without progress (`STALL_ITERATIONS`).
+//! revisiting them or leads to a basis the factorization found singular (see
+//! [`CycleGuard`]), and a bound on the iterations without progress
+//! (`STALL_ITERATIONS`).
 //!
 //! Perturbation makes zero steps rare and shifting keeps steps from going
 //! backwards, but neither rules out a cycle. In a dual phase a shift moves
@@ -27,20 +28,35 @@ use super::mix;
 /// pivot, so ten thousand iterations without progress mean a stuck phase,
 /// not a slow one. The measure is the objective alone, so a phase that
 /// progresses without improving it fails too: an unperturbed near-optimal
-/// start on a degenerate problem (a zero objective never moves), or a check
-/// that falls while a large shift holds the objective back.
+/// start on a degenerate problem (a zero objective never moves), a check that
+/// falls while a large shift holds the objective back, or one shortly after a
+/// basis repair moved it back (a repair moves a var to a bound, and the
+/// objective by any amount).
 pub(crate) const STALL_ITERATIONS: u64 = 10_000;
 
-/// A basis change found to repeat vertices: while it is taboo, its row is
-/// not chosen to leave (dual simplex) and its entering var not chosen to
-/// enter (primal simplex). A row of the dual simplex that no var can repair
-/// and that does not prove the model infeasible is recorded with no
-/// entering var.
+/// Why a basis change is bad. A change found bad twice keeps the greater
+/// reason in this order, so one that leads to a singular basis stays one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum BadReason {
+    /// It leads to a visited vertex right after a change that did too.
+    Cycling,
+    /// No var can repair its row of the dual simplex, and the row does not
+    /// prove the model infeasible: a change with no entering var.
+    FailedProof,
+    /// It leads to a basis the factorization found singular: the change back
+    /// of a basis repair, or a cycling change in a phase that repaired its
+    /// basis, which can lead back to that basis by another route.
+    Singular,
+}
+
+/// A bad basis change: while it is taboo, its row is not chosen to leave
+/// (dual simplex) and its entering var not chosen to enter (primal simplex).
 #[derive(Clone, Debug)]
 struct BadBasisChange {
     row: usize,
     leaving: usize,
     entering: Option<usize>,
+    reason: BadReason,
     taboo: bool,
 }
 
@@ -88,6 +104,12 @@ impl VertexChange {
 /// refactorizations: the eta file outgrows the factors every few pivots on a
 /// small basis, and a record dropped that often would never outlive the
 /// cycle it records.
+///
+/// A basis repair within a phase records the change back as bad
+/// ([`Self::add_singular_change`]), and a cycling change later in the phase
+/// is recorded as singular too, since it can lead back to the singular basis
+/// by another route: the loud end then names that cause
+/// ([`Self::any_taboo_singular`]).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CycleGuard {
     /// Whether a phase is running: only then is the vertex tracked.
@@ -96,6 +118,8 @@ pub(crate) struct CycleGuard {
     hash: u64,
     /// The hashes of the vertices this phase has reached by a pivot.
     visited: HashSet<u64>,
+    /// Whether a basis repair happened in this phase.
+    repaired: bool,
     /// Basis changes made in this phase.
     pivots: u64,
     /// The pivot count at which the last basis change leading to a visited
@@ -113,6 +137,7 @@ impl CycleGuard {
         self.hash = self.hash_after(vertex);
         self.visited.clear();
         self.visited.insert(self.hash);
+        self.repaired = false;
         self.pivots = 0;
         self.last_revisit = None;
         self.bad_changes.clear();
@@ -147,8 +172,8 @@ impl CycleGuard {
     /// Whether the basis change of `row` (basic var `leaving`) to `entering`,
     /// leading to the vertex hashed `next`, is bad: it is on the list of bad
     /// changes, or it leads to a visited vertex right after the previous
-    /// change did too (cycling). Either way the change is made taboo and the
-    /// caller skips it.
+    /// change did too (cycling; singular if the phase has repaired its
+    /// basis). Either way the change is made taboo and the caller skips it.
     pub(crate) fn is_bad_change(
         &mut self,
         row: usize,
@@ -158,11 +183,16 @@ impl CycleGuard {
     ) -> bool {
         if self.visited.contains(&next) {
             if self.last_revisit.is_some_and(|p| self.pivots == p + 1) {
+                let reason = if self.repaired {
+                    BadReason::Singular
+                } else {
+                    BadReason::Cycling
+                };
                 debug!(
                     "simplex cycling: basis change {leaving} out, {entering} in (row {row}) \
-                     revisits a vertex again; taboo"
+                     revisits a vertex again ({reason:?}); taboo"
                 );
-                self.add_bad_change(row, leaving, Some(entering));
+                self.add_bad_change(row, leaving, Some(entering), reason);
                 return true;
             }
             self.last_revisit = Some(self.pivots);
@@ -180,17 +210,27 @@ impl CycleGuard {
         }
     }
 
-    fn add_bad_change(&mut self, row: usize, leaving: usize, entering: Option<usize>) {
+    fn add_bad_change(
+        &mut self,
+        row: usize,
+        leaving: usize,
+        entering: Option<usize>,
+        reason: BadReason,
+    ) {
         match self
             .bad_changes
             .iter_mut()
             .find(|c| c.row == row && c.leaving == leaving && c.entering == entering)
         {
-            Some(change) => change.taboo = true,
+            Some(change) => {
+                change.taboo = true;
+                change.reason = change.reason.max(reason);
+            }
             None => self.bad_changes.push(BadBasisChange {
                 row,
                 leaving,
                 entering,
+                reason,
                 taboo: true,
             }),
         }
@@ -200,7 +240,23 @@ impl CycleGuard {
     /// the row does not prove the model infeasible, and make the row taboo,
     /// so that the dual simplex goes on with the other rows.
     pub(crate) fn add_failed_proof(&mut self, row: usize, leaving: usize) {
-        self.add_bad_change(row, leaving, None);
+        self.add_bad_change(row, leaving, None, BadReason::FailedProof);
+    }
+
+    /// Note, while a phase runs, that a basis repair happened in it.
+    pub(crate) fn note_repair(&mut self) {
+        if self.active {
+            self.repaired = true;
+        }
+    }
+
+    /// Record, while a phase runs, that the change of `row` (basic var
+    /// `leaving`, a slack a basis repair put there) to `entering` (the var
+    /// the repair took out) makes the basis singular, and make it taboo.
+    pub(crate) fn add_singular_change(&mut self, row: usize, leaving: usize, entering: usize) {
+        if self.active {
+            self.add_bad_change(row, leaving, Some(entering), BadReason::Singular);
+        }
     }
 
     /// Whether `row` may not be chosen to leave, in the dual simplex.
@@ -213,7 +269,7 @@ impl CycleGuard {
     pub(crate) fn is_unproven(&self, row: usize) -> bool {
         self.bad_changes
             .iter()
-            .any(|c| c.taboo && c.row == row && c.entering.is_none())
+            .any(|c| c.taboo && c.row == row && c.reason == BadReason::FailedProof)
     }
 
     /// Whether `var` may not be chosen to enter, in the primal simplex.
@@ -226,6 +282,15 @@ impl CycleGuard {
     /// Whether any change is taboo.
     pub(crate) fn any_taboo(&self) -> bool {
         self.bad_changes.iter().any(|c| c.taboo)
+    }
+
+    /// Whether a taboo change leads to a basis the factorization found
+    /// singular: when only taboo changes are left, the cause the loud end
+    /// names.
+    pub(crate) fn any_taboo_singular(&self) -> bool {
+        self.bad_changes
+            .iter()
+            .any(|c| c.taboo && c.reason == BadReason::Singular)
     }
 
     /// Lift every taboo, keeping the records (at every rebuild).

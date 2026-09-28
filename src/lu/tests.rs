@@ -34,13 +34,13 @@ fn lu_simple() {
     );
 
     let mut scratch = ScratchSpace::with_capacity(mat.rows());
-    let lu = lu_factorize(
+    let (lu, replaced) = lu_factorize(
         mat.rows(),
         |c| mat.outer_view([1, 0, 3][c]).unwrap().into_raw_storage(),
         0.9,
         &mut scratch,
-    )
-    .unwrap();
+    );
+    assert!(replaced.is_empty());
     let lu_transp = lu.transpose();
 
     let l_nondiag_ref = [
@@ -90,62 +90,113 @@ fn lu_simple() {
     }
 }
 
+/// Factorize `mat` (square, columns in their own order) at `stability_coeff`.
+fn factorize(mat: &CsMat<f64>, stability_coeff: f64) -> (LUFactors, Vec<(usize, usize)>) {
+    let mut scratch = ScratchSpace::with_capacity(mat.rows());
+    lu_factorize(
+        mat.rows(),
+        |c| mat.outer_view(c).unwrap().into_raw_storage(),
+        stability_coeff,
+        &mut scratch,
+    )
+}
+
+/// `lu` must factorize `mat` with each column of `replaced` swapped for the
+/// unit column of its row: solves with it and its transpose, on small
+/// integers, are exact.
+fn assert_factorizes_the_repaired_matrix(
+    lu: &LUFactors,
+    mat: &CsMat<f64>,
+    replaced: &[(usize, usize)],
+) {
+    let size = mat.rows();
+    // The repaired matrix, dense, by columns.
+    let mut cols = vec![vec![0.0; size]; size];
+    for (c, col) in cols.iter_mut().enumerate() {
+        match replaced
+            .iter()
+            .find(|&&(replaced_col, _)| replaced_col == c)
+        {
+            Some(&(_, r)) => col[r] = 1.0,
+            None => {
+                for (r, &val) in mat.outer_view(c).unwrap().iter() {
+                    col[r] = val;
+                }
+            }
+        }
+    }
+    let x: Vec<f64> = (1..=size).map(|i| i as f64).collect();
+    let mut scratch = ScratchSpace::with_capacity(size);
+
+    let mut rhs = vec![0.0; size];
+    for (col, &x_c) in cols.iter().zip(&x) {
+        for (r, &val) in col.iter().enumerate() {
+            rhs[r] += val * x_c;
+        }
+    }
+    lu.solve_dense(&mut rhs, &mut scratch);
+    assert_eq!(rhs, x, "B x = b");
+
+    let mut rhs_t: Vec<f64> = cols
+        .iter()
+        .map(|col| col.iter().zip(&x).map(|(val, x_r)| val * x_r).sum())
+        .collect();
+    lu.transpose().solve_dense(&mut rhs_t, &mut scratch);
+    assert_eq!(rhs_t, x, "B^T y = c");
+}
+
+/// A dependent column is replaced by the unit column of the row no pivot
+/// took, and the factors are those of the matrix so repaired. The second
+/// and third columns are parallel, symbolically (the last row is empty) and
+/// numerically (the third column is 1.5 times the second): the third is
+/// taken after the second, its remaining part is zero, and the last row
+/// gets no pivot.
 #[test]
-fn lu_singular() {
+fn lu_completes_a_singular_matrix_with_unit_columns() {
     init();
-    let size = 3;
-
-    {
-        let symbolically_singular = mat_from_triplets(
-            size,
-            size,
-            &[(0, 0, 1.0), (1, 0, 1.0), (1, 1, 2.0), (1, 2, 3.0)],
-        );
-
-        let mut scratch = ScratchSpace::with_capacity(size);
-        let err = lu_factorize(
-            size,
-            |c| {
-                symbolically_singular
-                    .outer_view(c)
-                    .unwrap()
-                    .into_raw_storage()
-            },
-            0.9,
-            &mut scratch,
-        );
-        assert_eq!(err.unwrap_err(), Error::SingularMatrix);
+    let symbolically_singular =
+        mat_from_triplets(3, 3, &[(0, 0, 1.0), (1, 0, 1.0), (1, 1, 2.0), (1, 2, 3.0)]);
+    let numerically_singular = mat_from_triplets(
+        3,
+        3,
+        &[
+            (0, 0, 1.0),
+            (1, 0, 1.0),
+            (1, 1, 2.0),
+            (1, 2, 3.0),
+            (2, 0, 2.0),
+            (2, 1, 2.0),
+            (2, 2, 3.0),
+        ],
+    );
+    for mat in [symbolically_singular, numerically_singular] {
+        let (lu, replaced) = factorize(&mat, 0.9);
+        assert_eq!(replaced, [(2, 2)]);
+        assert_factorizes_the_repaired_matrix(&lu, &mat, &replaced);
     }
+}
 
-    {
-        let numerically_singular = mat_from_triplets(
-            size,
-            size,
-            &[
-                (0, 0, 1.0),
-                (1, 0, 1.0),
-                (1, 1, 2.0),
-                (1, 2, 3.0),
-                (2, 0, 2.0),
-                (2, 1, 2.0),
-                (2, 2, 3.0),
-            ],
-        );
-
-        let mut scratch = ScratchSpace::with_capacity(size);
-        let err = lu_factorize(
-            size,
-            |c| {
-                numerically_singular
-                    .outer_view(c)
-                    .unwrap()
-                    .into_raw_storage()
-            },
-            0.9,
-            &mut scratch,
-        );
-        assert_eq!(err.unwrap_err(), Error::SingularMatrix);
-    }
+/// Two dependent columns (the second is twice the first, the fourth four
+/// times the third) take the two rows no pivot took, in the order the
+/// columns were found dependent.
+#[test]
+fn lu_completes_a_rank_deficiency_of_two() {
+    init();
+    let mat = mat_from_triplets(
+        4,
+        4,
+        &[
+            (0, 0, 1.0),
+            (1, 0, 1.0),
+            (0, 1, 2.0),
+            (1, 1, 2.0),
+            (2, 2, 1.0),
+            (2, 3, 4.0),
+        ],
+    );
+    let (lu, replaced) = factorize(&mat, 0.1);
+    assert_eq!(replaced, [(3, 1), (1, 3)]);
+    assert_factorizes_the_repaired_matrix(&lu, &mat, &replaced);
 }
 
 #[test]
@@ -171,13 +222,13 @@ fn lu_rand() {
     // TODO: random permutation?
     let cols: Vec<_> = (0..size).collect();
 
-    let lu = lu_factorize(
+    let (lu, replaced) = lu_factorize(
         size,
         |c| mat.outer_view(cols[c]).unwrap().into_raw_storage(),
         0.1,
         &mut scratch,
-    )
-    .unwrap();
+    );
+    assert!(replaced.is_empty());
     let lu_transp = lu.transpose();
 
     let multiplied = &lu.lower.to_csmat() * &lu.upper.to_csmat();
@@ -226,25 +277,18 @@ fn lu_rand() {
     }
 }
 
-/// A basis with an empty column is singular with trace logging on too: the
-/// trace of the matrix's excess entries, `nnz - size`, must not run before
-/// the empty-column check, where it underflows (a panic in a debug build).
+/// An empty column is dependent, with trace logging on too: the trace of
+/// the matrix's excess entries, `nnz - size`, is negative here and must not
+/// underflow (a panic in a debug build).
 #[test]
-fn lu_empty_column_is_singular_with_trace_logging() {
+fn lu_completes_an_empty_column_with_trace_logging() {
     init();
     let mat = mat_from_triplets(3, 3, &[(0, 0, 1.0), (1, 1, 1.0)]);
     let previous = log::max_level();
     log::set_max_level(log::LevelFilter::Trace);
-    let res = std::panic::catch_unwind(|| {
-        let mut scratch = ScratchSpace::with_capacity(3);
-        lu_factorize(
-            3,
-            |c| mat.outer_view(c).unwrap().into_raw_storage(),
-            0.9,
-            &mut scratch,
-        )
-        .map(|_| ())
-    });
+    let res = std::panic::catch_unwind(|| factorize(&mat, 0.9));
     log::set_max_level(previous);
-    assert_eq!(res.unwrap(), Err(Error::SingularMatrix));
+    let (lu, replaced) = res.unwrap();
+    assert_eq!(replaced, [(2, 2)]);
+    assert_factorizes_the_repaired_matrix(&lu, &mat, &replaced);
 }

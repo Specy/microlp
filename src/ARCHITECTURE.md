@@ -184,6 +184,13 @@ the next phase removes the infeasibility that uncovers. A vertex hash makes a ba
 that keeps returning to visited vertices taboo, and a stall bound ends a phase whose
 objective does not move (`src/solver/cycling.rs`); both end in a loud error, never a hang.
 
+A basis the factorization finds singular is repaired wherever it is factorized: each
+dependent column is replaced by the slack of a row no pivot took, whose unit column completes
+the factors (`src/lu/`), the dependent var leaves the basis at its working bound nearest its
+value (0 if free), and the values and reduced costs are recomputed. Within a phase, the change
+back is taboo (§7), unless the step whose refactorization found the basis singular moved its
+row.
+
 The dual simplex returns `Infeasible` only on a proof (`src/solver/proof.rs`): a certificate
 summed from the model's data that leaves a gap beyond the tolerance of the violated row's
 basic var. A row that no var can repair and whose certificate proves nothing is made taboo;
@@ -237,9 +244,9 @@ scratch, LU refactorized, feasibility flags recomputed honestly. Two contracts m
   has since moved is remapped (nearest finite bound, else 0) rather than rejected — B&B
   jumps load a parent basis **after** applying different bounds, so this is load-bearing
   by design, not sloppiness.
-- *On `Err`, solver state is unspecified* and must be restored by a subsequent successful
-  load. `slack_basis()` (all slacks basic = identity basis matrix) always loads successfully
-  and is the designated recovery everywhere.
+- *A singular basis loads repaired* (§3): a dependent var leaves at the value the slack basis
+  gives a non-basic var (the lower bound if finite, else the upper, else 0). `load_basis`
+  fails only on a basis of the wrong shape, a bug, and leaves the state untouched then.
 
 **`reported_values()`** — the verified point in user units, fixed vars at their value: what
 every read-out and every candidate starts from.
@@ -373,11 +380,10 @@ cost of the visit: **is the solver already sitting at this node's parent's optim
   only if a coefficient the data leave lay within that error (some `1e-30` of its terms in
   well-conditioned bases) and, times its var's value, made room at every point of the node.
 - `Err(Unbounded)` → impossible for a bounded node → surfaced as `InternalError`.
-- Any other error, such as a singular LU from numerical degradation, or a row the dual
-  simplex can neither repair nor prove infeasible → **retry once from
-  the slack basis** (identity, cannot fail to load),
-  re-solving the node from scratch; a second failure propagates. The retry is per-node-visit
-  — it cannot mask a systematic failure.
+- Any other error, such as a row the dual simplex can neither repair nor prove infeasible
+  → **retry once from the slack basis** (all slacks basic), re-solving the node from
+  scratch; a second failure propagates. The retry is per-node-visit — it cannot mask a
+  systematic failure.
 - `Ok(Limit)` → the deadline fired mid-solve → the node is pushed back **unsolved** and the
   search returns `Interrupted`. Nothing uses the coherent but non-optimal state as a solved
   node: the next visit starts from its own bounds + basis data.
@@ -480,10 +486,11 @@ degradation per unit of fractionality observed across solved child nodes.
 right after the root LP: fix the hinted variables to their (rounded, bounds-checked) values,
 LP-complete the rest, and if the completion is integral, adopt it **through the same
 feasibility guard as every other incumbent** — hints get no shortcut. Then restore the root
-state *exactly* (bounds back, root basis reloaded, everything recomputed) so the search
-starts from the true relaxation. Hints are advisory by design: unknown variables,
-out-of-range values, infeasible or fractional completions, and completions that fail with an
-engine error all just drop the hint with a debug log — a bad hint must never break a solve.
+state (bounds back, root basis reloaded, everything recomputed, and re-solved, which only
+verifies it unless the load had to repair it) so the search starts from the true
+relaxation. Hints are advisory by design: unknown variables, out-of-range values,
+infeasible or fractional completions, and completions that fail with an engine error all
+just drop the hint with a debug log — a bad hint must never break a solve.
 Dropping one costs at most speed, since the search solves the whole model without it (a node
 LP's error, after its retry, stays fatal: skipping a node could lose the optimum). Only the
 `Unbounded` verdict a completion can give during unboundedness classification (§5.4) is
@@ -651,8 +658,8 @@ floored at that quantity's round-off:
 | Is a reduced cost zero? | `dual_tol`: `EPS` floored at the round-off of `|c_j| + Σ|a_ij y_i|`, refreshed with the multipliers. | `EPS = 1e-10` |
 | Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it: `ENTRY_ROUNDOFF` of its column's largest entry (primal test), or of its row's largest entry over the columns not excluded that the scalings made comparable (dual test: all but those of vars fixed when the model entered the engine, which keep the user's units, so a fixed column's `1e17` cannot make a genuine `1` noise; an entry that cannot help still counts, as it shares the round-off of the row's solve). A genuine entry of at least `PIVOT_REL_TOL` of the largest genuine one among the vars that could enter and are not excluded (rows that could block, in the primal test) is preferred; a smaller one pivots only when nothing larger will do. In the primal test every genuine entry bounds the step, each basic var's Harris allowance counted from where it sits (see *Anti-degeneracy and cycling in the primal simplex*). In the dual test a boxed var the step passes is flipped instead of entering (*Bound flipping*), a row with no candidate is no verdict (next row), and the last resort takes any entry of at least `INSTABLE_PIVOT_TOL` (*Infeasibility only from a proof*). | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7`, `INSTABLE_PIVOT_TOL = 1e-10` |
 | Does a row that no var can repair prove the model infeasible? | only through its certificate, summed from the model's data, whose gap must exceed the tolerance the engine holds the row's basic var to; on an infinite bound a coefficient counts as zero only within the error of the multipliers, which the refinement bounds only where it converged (see *Infeasibility only from a proof*). | `REFINEMENT_CONVERGED = 2^-53` |
-| Do the row and column computations of the pivot element agree? | to `PIVOT_AGREEMENT_TOL` relatively, or to `ENTRY_ROUNDOFF` of the computations' scale for an element above `LU_SINGULAR_REL` of that scale (below it, round-off agrees with anything of its size, so only relative agreement tells a genuine element from noise). Else rebuild (stale factorization) or exclude the entry as noise (fresh one), only for the column (primal test) or row (dual test) it was judged in and until the next pivot: carried to another column, an exclusion could hide a genuine blocking row. Once they agree, the column's element serves the primal step, the eta file and both steepest-edge updates, which apply it with the rest of the column, and the row's the dual simplex's reduced-cost update, which runs along the row. | `PIVOT_AGREEMENT_TOL = 1e-7` |
-| Is the LU pivot column singular? | eligible part below `LU_SINGULAR_REL` of the column's largest transformed entry. | `= ROUNDOFF_FLOOR` |
+| Do the row and column computations of the pivot element agree? | to `PIVOT_AGREEMENT_TOL` relatively, or to `ENTRY_ROUNDOFF` of the computations' scale for an element above `LU_SINGULAR_REL` of that scale (below it, round-off agrees with anything of its size, so only relative agreement tells a genuine element from noise). Else rebuild (stale factorization), or, on a fresh one, exclude a noise entry, only for the column (primal test) or row (dual test) it was judged in and until the next pivot: carried to another column, an exclusion could hide a genuine blocking row. Noise is a column's element below `PIVOT_REL_TOL` of its column in the primal test; in the dual test, which chose the entry by the row's element and divides the step by the column's, either element below `PIVOT_REL_TOL` of the row and column, or the two of opposite signs. Any other entry is taken, with the column's element: a basis it leaves singular is repaired (§3). Once they agree, the column's element serves the primal step, the eta file and both steepest-edge updates, which apply it with the rest of the column, and the row's the dual simplex's reduced-cost update, which runs along the row. | `PIVOT_AGREEMENT_TOL = 1e-7` |
+| Is the LU pivot column singular? | eligible part below `LU_SINGULAR_REL` of the column's largest transformed entry; the column is then replaced by the slack of a row no pivot took (the repair, §3). | `= ROUNDOFF_FLOOR` |
 
 Two rules complete the model. **Absorption:** when no var can enter a violated row's pivot
 regularly, a non-basic continuous var or slack may enter by crossing its bound (or its fixed
@@ -874,12 +881,20 @@ and objective value of the phase is the working costs'.
   to leave) until a rebuild; a bad change seen again is taboo at once; a record is dropped
   once a pivot moves its row by the row's tolerance. A rebuild lifts the taboos but keeps
   the records, which last the phase, since the engine refactorizes too often for a record
-  dropped at refactorization to outlive its cycle. When a rebuild leaves only taboo rows
-  violated, none of which failed an infeasibility proof (those get the last resorts), the
-  phase fails with an `InternalError`.
+  dropped at refactorization to outlive its cycle. A basis repair within the phase records
+  its change back as bad, taboo at once. The rows a step moved are forgotten after its
+  refactorization, so the record of a repair that the step's refactorization made goes too if
+  the step moved its row: the phase may then take the change again, on the eta file, rather
+  than run out of changes. A cycling change later in the phase is recorded as singular too,
+  since it can lead back to that basis by another route. When a rebuild leaves only taboo
+  rows violated, none of which failed an infeasibility proof (those get the last resorts), the
+  phase fails with an `InternalError`, which names a singular basis when a change left leads
+  to one.
 - *Stall bound*: every `STALL_ITERATIONS` (10,000) iterations of a phase, the working
   objective must have risen beyond round-off, or the phase fails with an `InternalError`, so
-  a cycle the hash misses ends loudly instead of never.
+  a cycle the hash misses ends loudly instead of never. A basis repair moves a var to a bound
+  and so the objective by any amount: one shortly before a check can end a phase that
+  progresses as stalled, rarely and loudly.
 
 **Anti-degeneracy and cycling in the primal simplex** (`src/solver/bounds.rs`,
 `src/solver/cycling.rs`). A primal phase works on *working bounds* (`working_mins`,
@@ -923,9 +938,12 @@ and objective value of the phase is the working costs'.
   entries of the vars past their bounds and pass over a row at its bound with a larger entry.
 - *Cycling*: the vertex hash of the dual simplex, with the taboo on the change's entering
   var, which is not priced until a rebuild lifts the taboo; when a rebuild leaves only taboo
-  vars to enter, the phase fails with an `InternalError`. The stall bound applies too, the
-  objective having to fall. Every step is forward or zero, so the objective of a primal
-  phase never rises (a rebuild moves it by round-off).
+  vars to enter, the phase fails with an `InternalError`, which names a singular basis as in
+  the dual simplex. The stall bound applies too, the objective having to fall. Every step is
+  forward or zero, so the objective of a primal phase rises only by the round-off of a
+  rebuild, or by a basis repair, which moves a var to a bound and so the objective by any
+  amount: a repair shortly before a stall check can end the phase as stalled, rarely and
+  loudly.
 
 The phase-1 artificial objective of a cold start that is neither primal nor dual feasible is
 perturbed like any costs in force.
@@ -936,14 +954,17 @@ Known limitations:
   and below `INSTABLE_PIVOT_TOL`, of a var unbounded in its direction (so no move can test
   the entry), ends in an `InternalError`, and in a MIP, after the node's slack-basis retry,
   so does the solve: the certificate proves nothing, nothing checks such an entry reliably
-  before the pivot, and a pivot on round-off leaves a basis the factorization rejects;
+  before the pivot, and a pivot on round-off leaves a basis the factorization finds
+  singular;
 - a feasible model whose vertex misses a bound by the round-off of solving for it, by more
   than the tolerance the engine holds the var to, with every non-basic var fixed, ends in an
   `InternalError`: the certificate's gap is round-off, no proof, and nothing can move, though
   the vertex meets the full contract;
-- a pivot on a genuine but tiny element can leave a basis the factorization rejects,
-  reported as `InternalError("Singular matrix")`; the engine has no basis repair (replacing
-  the dependent columns by slacks and continuing);
+- a feasible model whose optimum the simplex reaches only through a basis the factorization
+  finds singular, after a pivot on an entry some `1e-14` of its column, can end in an
+  `InternalError` that names a singular basis: the repair takes a column out, and the phase
+  can run out of changes that do not lead back to that basis (the change back stays taboo
+  when the step into that basis moved no row);
 - the primal ratio test's round-off scale is its column's largest entry, so a genuine
   blocking entry below `ENTRY_ROUNDOFF` of a huge entry in rows that cannot block counts as
   noise and a bounded LP can come back `Unbounded`; a scale over the blocking rows alone
@@ -952,8 +973,9 @@ Known limitations:
 - the cycling detection ends a cycle it cannot break, and the stall bound a stalled phase,
   in an `InternalError` rather than an answer; the stall bound, measured on the working
   objective alone, would also end a phase that progresses for `STALL_ITERATIONS` iterations
-  without improving it (an unperturbed, near-optimal start on a zero objective, or a check
-  that falls while a large shift holds the objective down);
+  without improving it (an unperturbed, near-optimal start on a zero objective, a check
+  that falls while a large shift holds the objective down, or one shortly after a basis
+  repair moved it back);
 - the phases can alternate over a row that only entries below the round-off floor can
   repair: the primal step passes a genuine entry below its column's floor and leaves the row
   beyond its tolerance, the dual simplex repairs it through another such entry, and the
@@ -999,13 +1021,14 @@ classes above stand (a random search cannot assert its own failure); run it with
 | Node LP infeasible | prune (correct: the engine returns `Infeasible` only on a proof, §7) |
 | A violated row no var can repair and whose certificate proves nothing, after the rebuild, the taboo and the last resorts | `InternalError`, never `Infeasible`; on a node LP, the one slack-basis retry, then the error |
 | Node LP unbounded | impossible when the node is bounded → `InternalError` |
-| Singular LU during a node LP | retry once from the slack basis; then propagate |
+| A basis the factorization finds singular (after a pivot on an entry tiny beside its column, or loaded) | repaired: the slack of a row no pivot took replaces each dependent column, and the solve goes on; within a phase the change back is taboo, unless the step whose refactorization found the basis singular moved its row (§3, §7) |
+| Basis bookkeeping found inconsistent when a singular basis is repaired (a var basic twice, or a slack's non-basic position held by another var) | panic: a bug, never repaired |
 | Exactly-integral candidate failing the guard | `InternalError` (the engine verified the same point; see §5.4) |
 | Verified state unreachable (`MAX_PHASE_ROUNDS` alternations, or a basis that cannot represent its vertex) | `InternalError`, never an unverified optimum |
 | A reduced cost the primal simplex would price or the dual ratio test would weigh, an entry of the dual ratio test's row or of the primal ratio test's column (or the value of a basic var it moves), or a steepest-edge weight, is not finite | `InternalError`: such a value would silently corrupt a verdict (a NaN compares false with every tolerance, so a NaN reduced cost could end a phase as optimal); a weight is checked before its floor, which would make a NaN finite |
-| `load_basis` failure on a jump | load the slack basis (infallible) and solve the node from scratch |
+| A basis of the wrong shape given to `load_basis` | `InternalError` (a bug), propagated |
 | Phase-1 stall (“no entering column”) | rebuild (fresh LU + recomputed values and reduced costs, dual infeasibilities corrected) and retry once per stall; declare `Infeasible` only if the row, on fresh data, proves it (§7) |
-| Simplex cycling: after a rebuild, every basis change left (a violated row's in the dual simplex, an entering var's in the primal) is taboo (it keeps leading to visited vertices) | `InternalError`, never a hang; on a node LP, the one slack-basis retry |
+| Simplex cycling: after a rebuild, every basis change left (a violated row's in the dual simplex, an entering var's in the primal) is taboo (it keeps leading to visited vertices, or to a basis the factorization found singular) | `InternalError`, never a hang, naming a singular basis when a change leads to one; on a node LP, the one slack-basis retry |
 | Simplex stalled: the objective of a phase has not improved in `STALL_ITERATIONS` iterations | `InternalError`, never a hang |
 | Deadline mid-LP | requeue the node unsolved; return `Interrupted` |
 | Limit with no incumbent | `SolveOutcome::Interrupted`; only reason, stats, and resume are exposed |
@@ -1026,10 +1049,10 @@ answer is strictly worse than its crash.
 Three rings, innermost first:
 
 1. **Unit tests** in each module: the solver primitives (bound changes vs fresh solves,
-   basis round-trips, slack-basis recovery), driver behaviors (optimum finding, infeasible
-   detection, deterministic node-limit interruption/resume, exact-exhaustion status),
-   pseudocost/selection arithmetic, and each presolve reduction with the tolerance policy
-   it follows (`src/presolve/`; `src/tests/presolve_api.rs` checks the reductions end to
+   basis round-trips, the repair of a singular basis), driver behaviors (optimum finding,
+   infeasible detection, deterministic node-limit interruption/resume, exact-exhaustion
+   status), pseudocost/selection arithmetic, and each presolve reduction with the tolerance
+   policy it follows (`src/presolve/`; `src/tests/presolve_api.rs` checks the reductions end to
    end through the public API, edits and resumes included). Several encode adversarially
    verified invariants (e.g. the warm-start liveness test *fails if the hint wiring is
    disconnected*).
