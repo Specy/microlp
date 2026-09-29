@@ -85,10 +85,10 @@ impl VertexChange {
 /// vars sit. The hash is the XOR of a term per basic var and a term per
 /// non-basic var at its upper bound, so a pivot or a bound flip toggles a
 /// term or two. A hash of the basic set alone would not do: the
-/// bound-flipping ratio test and the round-off repair
-/// (`Solver::round_off_repair`) move boxed vars without a basis change, so a
-/// basic set can come back at another vertex, and a set hash would report a
-/// revisit there, a wrong verdict that nothing recovers from
+/// bound-flipping ratio test and the certificate repair
+/// (`Solver::certificate_repair`) move non-basic vars without a basis
+/// change, so a basic set can come back at another vertex, and a set hash
+/// would report a revisit there, a wrong verdict that nothing recovers from
 /// (`vertex_hash_makes_a_repeated_basis_change_taboo` pins the difference).
 ///
 /// A basis change to a visited vertex may still be progress, so cycling is

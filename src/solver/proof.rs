@@ -33,7 +33,7 @@
 //! contract) or on another term (rows that agree only within their
 //! tolerances, which the certificate takes as exact).
 
-use super::{Solver, ROUNDOFF_FLOOR};
+use super::{at_bound, Solver, ROUNDOFF_FLOOR};
 
 /// A compensated double: the unevaluated sum `hi + lo` of two `f64`, which
 /// carries about twice the precision of one. Only the accumulation of
@@ -220,7 +220,7 @@ impl Certificate {
     /// `ROUNDOFF_FLOOR` of the magnitude of the terms it was summed from.
     /// That says what the rest of the engine can see of the coefficient (its
     /// tableau entry included), not whether it is there: the certificate is
-    /// exact for its multipliers ([`Solver::round_off_repair`]).
+    /// exact for its multipliers ([`Solver::certificate_repair`]).
     fn is_round_off(&self, var: usize, p: f64) -> bool {
         p.abs() <= ROUNDOFF_FLOOR * self.magnitudes[var]
     }
@@ -529,15 +529,26 @@ impl Solver {
     /// The last resort of the dual simplex for a violated `row` that no var
     /// can repair, not even by a pivot on an unstable entry, and that does
     /// not prove the model infeasible (see [`Self::dual_phase`]): the
-    /// non-basic vars whose entries the ratio tests took for round-off, and
-    /// that can close the gap, move, flipped to their other bound, or (the
-    /// last one, if a flip would carry the leaving var past its other bound)
-    /// only partway, where it stays non-basic between its bounds. The moves
-    /// are applied through the vars' columns and kept only if the leaving var
-    /// then lands within its tolerance; returns whether it did (the moves are
-    /// undone if not). The `wide_chain` fixtures of `src/tests/magnitudes.rs`
-    /// need it: their only repair moves a var through an entry of `1.5e-15`
-    /// beside `1.95`.
+    /// non-basic vars that can close the gap move, first to their bound in
+    /// the direction that helps (flipped, or the last one, if a flip would
+    /// carry the leaving var past its other bound, only partway, where it
+    /// stays non-basic between its bounds), then, if that is not enough,
+    /// past it within their tolerance, as far as they still count as at it.
+    /// The moves are applied through the vars' columns and kept only if the
+    /// leaving var then lands within its tolerance; returns whether it did
+    /// (the moves are undone if not).
+    ///
+    /// The `wide_chain` fixtures of `src/tests/magnitudes.rs` need the
+    /// flips: their only repair moves a var through an entry of `1.5e-15`
+    /// beside `1.95`, below every pivot floor. The tolerances are the room
+    /// of a vertex that misses a bound by the round-off of solving for it
+    /// where every var that could move it is at the bound that blocks it (an
+    /// equality's slack, say)
+    /// (`a_vertex_off_its_bound_by_round_off_is_repaired_within_the_slacks_tolerances`).
+    /// An integer var never leaves its bound, as it never absorbs, and a
+    /// fixed structural var never leaves its value: it is reported there, so
+    /// its tolerance is the reserve its rows keep for that snap, and moved
+    /// too, it would spend the reserve a basic fixed var's drift may need.
     ///
     /// The moves are read off the certificate, not off the tableau row: a var
     /// takes part only where its coefficient is finite and not round-off
@@ -551,10 +562,10 @@ impl Solver {
     /// the round-off floors of the ratio tests hide such an entry from the
     /// rest of the engine, so the primal step would take the move back and
     /// the phases would alternate until `MAX_PHASE_ROUNDS`.
-    pub(super) fn round_off_repair(&mut self, row: usize) -> bool {
+    pub(super) fn certificate_repair(&mut self, row: usize) -> bool {
         let refined = self.refined_basis_inverse_row(row);
         let leaving_new_val = self.leaving_target(row);
-        let Some(moves) = self.round_off_moves(&refined, row, leaving_new_val) else {
+        let Some(moves) = self.certificate_moves(&refined, row, leaving_new_val) else {
             return false;
         };
         let undo: Vec<(usize, f64)> = moves
@@ -567,8 +578,11 @@ impl Solver {
             return false;
         }
         trace!(
-            "dual round-off repair: {} vars moved, var {} of row {row} lands at {:e}",
-            moves.len(),
+            "dual certificate repair: vars moved {:?}, var {} of row {row} lands at {:e}",
+            moves
+                .iter()
+                .map(|&(c, val)| (self.nb_vars[c], val))
+                .collect::<Vec<_>>(),
             self.basic_vars[row],
             self.basic_var_vals[row],
         );
@@ -581,11 +595,11 @@ impl Solver {
         true
     }
 
-    /// The moves of [`Self::round_off_repair`] that bring the basic var of
+    /// The moves of [`Self::certificate_repair`] that bring the basic var of
     /// `row` to `leaving_new_val`, within its tolerance, read off the
-    /// certificate of the multipliers of `refined`; `None` if the vars that
-    /// can help cannot.
-    fn round_off_moves(
+    /// certificate of the multipliers of `refined`, as (col, value); `None`
+    /// if the vars that can help cannot.
+    fn certificate_moves(
         &self,
         refined: &RefinedRow,
         row: usize,
@@ -611,8 +625,10 @@ impl Solver {
             )
         };
         // The vars that can help, as (col, coefficient, bound it moves to,
-        // how far moving there carries the leaving var).
-        let mut helpers: Vec<(usize, f64, f64, f64)> = self
+        // whether it sits there already, its tolerance there). A var helps
+        // by moving up where its coefficient is positive, down where it is
+        // negative.
+        let helpers: Vec<(usize, f64, f64, bool, f64)> = self
             .nb_vars
             .iter()
             .enumerate()
@@ -621,37 +637,119 @@ impl Solver {
                 if !p.is_finite() || cert.is_round_off(var, p) {
                     return None;
                 }
-                // A var helps by moving up where its coefficient is
-                // positive, down where it is negative.
-                let state = &self.nb_var_states[c];
-                let (blocked, bound) = if p > 0.0 {
-                    (state.at_max, self.orig_var_maxs[var])
+                let (state, tols) = (&self.nb_var_states[c], self.var_tols[var]);
+                let (at_bound, bound, tol) = if p > 0.0 {
+                    (state.at_max, self.orig_var_maxs[var], tols.hi)
                 } else {
-                    (state.at_min, self.orig_var_mins[var])
+                    (state.at_min, self.orig_var_mins[var], tols.lo)
                 };
-                let capacity = p.abs() * (bound - self.nb_var_vals[c]).abs();
-                (!blocked && capacity.is_finite() && capacity > 0.0)
-                    .then_some((c, p, bound, capacity))
+                bound.is_finite().then_some((c, p, bound, at_bound, tol))
             })
             .collect();
-        helpers.sort_by(|a, b| b.3.total_cmp(&a.3));
-        let mut moved = 0.0;
-        let mut moves = Vec::new();
-        for (c, p, bound, capacity) in helpers {
-            let rest = need - moved;
-            if rest <= target_tol {
+        let mut moves = Moves {
+            need,
+            target_tol,
+            room_past_target,
+            moved: 0.0,
+            list: Vec::new(),
+        };
+        // First to the bounds.
+        moves.take(
+            helpers
+                .iter()
+                .filter(|h| !h.3)
+                .map(|&(c, p, bound, _, _)| (c, p, self.nb_var_vals[c], bound))
+                .collect(),
+        );
+        // Then, if that is not enough, past them within their tolerances.
+        // An integer var stays on its bound, and a fixed structural var at
+        // its value (see the doc above).
+        if !moves.landed() {
+            let band = helpers
+                .iter()
+                .filter(|&&(c, _, _, _, tol)| {
+                    let var = self.nb_vars[c];
+                    tol > 0.0 && !self.is_integer(var) && !self.is_reported_at_bound(var)
+                })
+                .map(|&(c, p, bound, _, tol)| {
+                    // Every var a first move takes reaches its bound.
+                    let from = if moves.list.iter().any(|&(col, _)| col == c) {
+                        bound
+                    } else {
+                        self.nb_var_vals[c]
+                    };
+                    (c, p, from, band_edge(bound, tol, p > 0.0))
+                })
+                .collect();
+            moves.take(band);
+        }
+        moves.landed().then_some(moves.list)
+    }
+}
+
+/// The moves [`Solver::certificate_moves`] collects: how far the leaving var
+/// must go (`need`), within `target_tol`, and may overshoot
+/// (`room_past_target`), how far the moves so far carry it, and the moves,
+/// as (col, value).
+struct Moves {
+    need: f64,
+    target_tol: f64,
+    room_past_target: f64,
+    moved: f64,
+    list: Vec<(usize, f64)>,
+}
+
+impl Moves {
+    /// Whether the moves so far bring the leaving var within its tolerance
+    /// of its target.
+    fn landed(&self) -> bool {
+        self.need - self.moved <= self.target_tol
+    }
+
+    /// Take the `candidates` (col, coefficient, from, to), largest reach
+    /// first, each all the way or, where that would carry the leaving var
+    /// past its other bound, the last one just far enough, until the leaving
+    /// var lands. A later move of a col replaces its earlier one.
+    fn take(&mut self, candidates: Vec<(usize, f64, f64, f64)>) {
+        let mut candidates: Vec<(usize, f64, f64, f64, f64)> = candidates
+            .into_iter()
+            .filter(|&(_, p, from, to)| (to - from) * p > 0.0)
+            .map(|(c, p, from, to)| (c, p, from, to, p.abs() * (to - from).abs()))
+            .filter(|&(.., reach)| reach.is_finite())
+            .collect();
+        candidates.sort_by(|a, b| b.4.total_cmp(&a.4));
+        for (c, p, from, to, reach) in candidates {
+            if self.landed() {
                 break;
             }
-            if capacity <= rest + room_past_target {
-                moved += capacity;
-                moves.push((c, bound));
+            let rest = self.need - self.moved;
+            let value = if reach <= rest + self.room_past_target {
+                self.moved += reach;
+                to
             } else {
-                let cur = self.nb_var_vals[c];
                 let step = rest / p.abs();
-                moves.push((c, if bound > cur { cur + step } else { cur - step }));
-                moved = need;
+                self.moved = self.need;
+                if to > from {
+                    from + step
+                } else {
+                    from - step
+                }
+            };
+            match self.list.iter_mut().find(|(col, _)| *col == c) {
+                Some(entry) => entry.1 = value,
+                None => self.list.push((c, value)),
             }
         }
-        (need - moved <= target_tol).then_some(moves)
     }
+}
+
+/// The farthest value past `bound`, above it (`up`) or below, at which a var
+/// whose tolerance there is `tol` still counts as at that bound
+/// ([`at_bound`]): `bound ± tol`, less the round-off of that sum.
+fn band_edge(bound: f64, tol: f64, up: bool) -> f64 {
+    let mut edge = if up { bound + tol } else { bound - tol };
+    while !at_bound(edge, bound, tol) {
+        edge = if up { edge.next_down() } else { edge.next_up() };
+    }
+    edge
 }

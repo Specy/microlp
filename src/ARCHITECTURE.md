@@ -813,12 +813,18 @@ below the floor, or the round-off of a computed vertex, for a row no var can rep
   of at least `INSTABLE_PIVOT_TOL` (`1e-10`, scaled units) a candidate, for a row whose
   regular floors a huge entry sets: a var fixed by an edit keeps its column in the round-off
   scale (`a_fixed_vars_huge_coefficient_in_an_added_row_does_not_silence_it`). Then, if the
-  row is left again, comes the round-off repair (`Solver::round_off_repair`), for a row
-  whose only repair is a boxed var with an entry below every pivot floor (the `wide_chain`
-  fixtures of `src/tests/magnitudes.rs`): the non-basic vars whose certificate coefficients
-  are not round-off and that can move toward the row move there, largest reach first,
-  flipped, or the last one only partway (between its bounds, which a basis snapshot records
-  as `Free` and a load puts back at a bound, an open issue); the moves are kept only if the
+  row is left again, comes the certificate repair (`Solver::certificate_repair`): the
+  non-basic vars whose certificate coefficients are not round-off move toward the row, first
+  to their bound in that direction, largest reach first, flipped, or the last one only
+  partway (between its bounds, which a basis snapshot records as `Free` and a load puts back
+  at a bound, an open issue), then, if the row is still short, past it within their
+  tolerance, as far as they still count as at it (never an integer var, which never absorbs,
+  nor a fixed structural var, which is reported at its value: its tolerance is the reserve
+  its rows keep for that snap, and a second snap in the same row would exceed the contract).
+  The flips serve a row whose only repair is a boxed var with an entry below every pivot
+  floor (the `wide_chain` fixtures of `src/tests/magnitudes.rs`), the tolerances a vertex
+  that misses a bound by the round-off of solving for it where every var that could move it
+  is at the bound that blocks it (an equality's slack, say). The moves are kept only if the
   leaving var then lands, computed through their columns, and are tried once per row in a
   phase. A round-off coefficient moves nothing: the ratio tests do not see its entry, and
   the primal step would take the move back. After these, the phase fails loudly
@@ -874,7 +880,7 @@ and objective value of the phase is the working costs'.
   repeats in a cycle is the vertex, so the vertex is hashed: the XOR of a term per basic var
   and a term per non-basic var at its upper bound, so that a pivot and a bound flip each
   toggle terms (a hash of the basic set alone would take progress for a revisit, since bound
-  flips and the round-off repair move vars without a basis change, and a wrong verdict can
+  flips and the certificate repair move vars without a basis change, and a wrong verdict can
   end the phase in an error: `vertex_hash_makes_a_repeated_basis_change_taboo`). Every
   vertex a phase reaches by a pivot is recorded; when two consecutive basis changes both
   lead to visited vertices, the change is recorded as bad and its row made taboo (not chosen
@@ -952,14 +958,16 @@ Known limitations:
 
 - a feasible model whose only repair is a pivot on an entry below `ENTRY_ROUNDOFF` of its row
   and below `INSTABLE_PIVOT_TOL`, of a var unbounded in its direction (so no move can test
-  the entry), ends in an `InternalError`, and in a MIP, after the node's slack-basis retry,
-  so does the solve: the certificate proves nothing, nothing checks such an entry reliably
-  before the pivot, and a pivot on round-off leaves a basis the factorization finds
-  singular;
-- a feasible model whose vertex misses a bound by the round-off of solving for it, by more
-  than the tolerance the engine holds the var to, with every non-basic var fixed, ends in an
-  `InternalError`: the certificate's gap is round-off, no proof, and nothing can move, though
-  the vertex meets the full contract;
+  the entry), and whose other vars cannot absorb the miss within their tolerances, ends in
+  an `InternalError`, and in a MIP, after the node's slack-basis retry, so does the solve:
+  the certificate proves nothing, nothing checks such an entry reliably before the pivot,
+  and a pivot on round-off leaves a basis the factorization finds singular;
+- a feasible model whose vertex, computed through an ill-conditioned basis, misses a bound
+  by more than the other terms of the row's certificate can absorb within their tolerances,
+  though its exact values do not miss it, ends in an `InternalError` (in a MIP, the node's
+  slack-basis retry may reach the point from another basis): the certificate proves
+  nothing, and the moves of the certificate repair do not land the computed value
+  (`a_vertex_computed_past_its_bound_beyond_its_terms_tolerances_is_a_known_limitation`);
 - a feasible model whose optimum the simplex reaches only through a basis the factorization
   finds singular, after a pivot on an entry some `1e-14` of its column, can end in an
   `InternalError` that names a singular basis: the repair takes a column out, and the phase

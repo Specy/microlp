@@ -1488,9 +1488,9 @@ mod regression_tests {
     /// with `8 phase rounds` where the answer is the origin, the only feasible
     /// point. The primal step that lowers `x0` passes `-1e4 x2 + 1e-3 x3 >= 0`,
     /// whose genuine `3e-15` is below its column's round-off floor (largest
-    /// entry 4), and leaves the row `1e-7` short; the dual phase's round-off
-    /// repair moves `x5` across its range through another such entry, which
-    /// gives the step back. The fix is a degenerate pivot on the `3e-15`,
+    /// entry 4), and leaves the row `1e-7` short; the dual phase's
+    /// certificate repair moves `x5` across its range through another such
+    /// entry, which gives the step back. The fix is a degenerate pivot on the `3e-15`,
     /// which needs absolute pivot tolerances and a refined row.
     #[test]
     #[should_panic(expected = "8 phase rounds")]
@@ -1550,17 +1550,15 @@ mod regression_tests {
         });
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): a vertex that misses a bound by the
-    /// round-off of solving for it, beyond the tolerance the engine holds the
-    /// var to, with nothing left to move: the solve fails loudly where
-    /// `x* = (0, -230094, 0)` is feasible. After two dual pivots every
+    /// A vertex that misses a bound by the round-off of solving for it, beyond
+    /// the tolerance the engine holds the var to, is repaired within the
+    /// tolerance of a fixed slack. After two dual pivots every
     /// non-basic var is an equality's fixed slack, and `x2` sits `3.3e-10`
     /// (scaled) past its upper bound, three times its tolerance; the row's
-    /// certificate proves nothing (a gap of `-6.7e-14`). The engine's
-    /// tolerances raised to the whole contract would accept the vertex.
+    /// certificate proves nothing (a gap of `-6.7e-14`), and only a slack
+    /// moved within its tolerance lands `x2`. `x* = (0, -230094, 0)`.
     #[test]
-    #[should_panic(expected = "no var can repair row")]
-    fn a_vertex_off_its_bound_by_round_off_with_nothing_to_move_is_a_known_limitation() {
+    fn a_vertex_off_its_bound_by_round_off_is_repaired_within_the_slacks_tolerances() {
         check(Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![
@@ -1581,18 +1579,16 @@ mod regression_tests {
         });
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): a MILP whose node LP is feasible
-    /// but that no var can repair fails loudly, where `x* = 0` but for
-    /// `x4 = 500001` is feasible. The rows pin `x5` at zero; the root vertex
-    /// puts it `3.05e-12` (scaled, `5e-8` in user units) past its upper bound,
-    /// beyond the tolerance its rows' reserve caps it at, and only the second
-    /// row's unbounded slack could move it, through an entry of `3.2e-16`,
-    /// below every pivot floor. The certificate proves nothing (a gap of
-    /// `-1.6e-22`), so the node must not be pruned. A pivot on the tiny entry,
-    /// or the engine's tolerances raised to the whole contract, would solve it.
+    /// A MILP node LP that no pivot can repair is repaired within the
+    /// tolerance of a fixed slack, neither pruned nor failed. The rows pin
+    /// `x5` at zero; the root vertex puts it `3.05e-12` (scaled, `5e-8` in
+    /// user units) past its upper bound, beyond the tolerance its rows'
+    /// reserve caps it at, and only the second row's unbounded slack could
+    /// pivot, through an entry of `3.2e-16`, below every pivot floor. The
+    /// certificate proves nothing, and the first row's fixed slack, moved
+    /// within its tolerance, lands `x5`. `x* = 0` but for `x4 = 500001`.
     #[test]
-    #[should_panic(expected = "no var can repair row")]
-    fn a_node_lp_no_var_can_repair_is_not_pruned_and_is_a_known_limitation() {
+    fn a_node_lp_no_pivot_can_repair_is_repaired_within_a_slacks_tolerance() {
         check(Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
@@ -1610,6 +1606,113 @@ mod regression_tests {
             ],
             xstar: vec![0.0, 0.0, 0.0, 0.0, 500001.0, 0.0],
         });
+    }
+
+    /// A vertex whose basic var misses its bound by the round-off of rows of
+    /// magnitude `7.7e7` is repaired within the tolerances of two fixed
+    /// slacks. After five dual pivots `x2` is computed `2^-24` (scaled) below
+    /// its lower bound, beyond its tolerance, where the vertex is exactly
+    /// feasible (the certificate's gap is `-3e-33`); every var of its row is
+    /// fixed or at its bound in the direction that helps, and no one slack
+    /// can absorb the move. The slacks of the last two rows, each moved
+    /// within its tolerance, land `x2`. The optimum is `x*`'s, `77137`.
+    #[test]
+    fn a_basic_var_off_its_bound_by_its_rows_round_off_is_repaired() {
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(-1.0, 0.0, 1.0),
+                real(1.0, -1.0, 0.0),
+                real(1.0, 0.0, 1.0),
+                real(-1.0, 0.0, 2684355.000000002),
+                real(-1.0, -77137.0, -64653.999999999156),
+            ],
+            rows: vec![
+                row(
+                    &[(0, -1e-7), (1, -1.0), (2, -1.0), (3, 1.0), (4, 1000.0)],
+                    ComparisonOp::Eq,
+                    -77137000.0,
+                ),
+                row(&[(1, 100.0), (4, 1.0)], ComparisonOp::Eq, -77137.0),
+                row(&[(0, 1.0), (1, -0.0001), (2, -10.0)], ComparisonOp::Eq, 0.0),
+                row(&[(0, 1.0), (1, -1.0), (3, -1.0)], ComparisonOp::Eq, 0.0),
+                row(
+                    &[(0, -0.01), (2, -1.0), (3, 1.0), (4, -1.0)],
+                    ComparisonOp::Eq,
+                    77137.0,
+                ),
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 0.0, -77137.0],
+        };
+        assert!(xstar_is_feasible(&model), "fixture error: rows at x*");
+        assert_solves_within_contract_in_time(&model, Duration::from_secs(10));
+    }
+
+    /// A vertex off its bound by round-off whose only pivot is an entry below
+    /// round-off is repaired within the tolerance of a fixed slack. `x1` is
+    /// computed `3.05e-12` (scaled) past its upper bound, `6e-20` more than
+    /// the first row's slack could absorb alone; the second row's slack,
+    /// unbounded, reaches the row through `5e-16` only. The first row's slack
+    /// moved by its tolerance lands `x1` within its own.
+    #[test]
+    fn a_vertex_off_its_bound_behind_a_round_off_entry_is_repaired() {
+        let model = Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, 0.0, 0.0),
+                real(0.0, -1.0, 0.0),
+                real(0.0, 0.0, 1.0),
+                real(0.0, -1.0, 50000001.0),
+            ],
+            rows: vec![
+                row(&[(1, 1.0), (2, -0.001)], ComparisonOp::Eq, 0.0),
+                row(&[(1, -1e-8), (3, 1.0)], ComparisonOp::Ge, 0.0),
+                row(&[(2, 10000.0), (3, 1e-8)], ComparisonOp::Eq, 0.50000001),
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 50000001.0],
+        };
+        assert!(xstar_is_feasible(&model), "fixture error: rows at x*");
+        assert_solves_within_contract_in_time(&model, Duration::from_secs(10));
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): a vertex whose computed value
+    /// misses a bound by more than the other terms of its row's certificate
+    /// can absorb, though its exact value does not, fails loudly where `x*`
+    /// is feasible. The dual simplex ends at a vertex that computes `x0`
+    /// `3.7e-9` (scaled) past its upper bound of 0, the round-off of rows of
+    /// magnitude `4.9e6`, where the vertex is inside it (the certificate's
+    /// gap is `-1.2e-9`). `x1` and the first row's slack are at the bounds
+    /// that block them, and moved within their tolerances they carry `x0` by
+    /// `2e-9`, which with its own tolerance of `1e-9` leaves it `7e-10`
+    /// short. Values computed to the certificate's precision would accept
+    /// the vertex.
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn a_vertex_computed_past_its_bound_beyond_its_terms_tolerances_is_a_known_limitation() {
+        let model = Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(1.0, -1.0, 0.0),
+                real(0.0, -1.0, 0.0),
+                real(1.0, -27964045.0, -20294453.0),
+            ],
+            rows: vec![
+                row(
+                    &[(0, -200.0), (1, -10.0)],
+                    ComparisonOp::Le,
+                    5.960464477539063e-8,
+                ),
+                row(
+                    &[(0, -1.0), (1, 0.001), (2, -0.17500000000000002)],
+                    ComparisonOp::Eq,
+                    4893707.875000001,
+                ),
+                row(&[(1, -0.0001), (2, 1.0)], ComparisonOp::Ge, -27964045.0),
+            ],
+            xstar: vec![0.0, 0.0, -27964045.0],
+        };
+        assert!(xstar_is_feasible(&model), "fixture error: rows at x*");
+        assert_solves_feasibly_within_contract(&model);
     }
 
     /// A MILP node whose LP misses a bound by less than the user's tolerance
@@ -1825,7 +1928,7 @@ mod regression_tests {
     /// repair, through an entry of `8.9e-16` beside ones, below every pivot
     /// floor. The certificate's `-2^-50` for `z`, counted at `z >= -2e9`,
     /// leaves `7.8e-7` of room (counted as zero, it would prove the model
-    /// infeasible), and the round-off repair does not move a var by a
+    /// infeasible), and the certificate repair does not move a var by a
     /// coefficient below the round-off of its terms. Only a pivot on that
     /// entry solves it.
     #[test]
@@ -1849,7 +1952,7 @@ mod regression_tests {
     /// with `z` unbounded below. A coefficient on an infinite bound counts as
     /// zero only where the multipliers' error could make it zero; this row of
     /// the basis inverse is exact, so `z`'s `-2^-50` makes the certificate's
-    /// range unbounded and proves nothing, and the round-off repair moves no
+    /// range unbounded and proves nothing, and the certificate repair moves no
     /// var toward an infinite bound: the solve fails loudly where the model
     /// has an optimum.
     #[test]
