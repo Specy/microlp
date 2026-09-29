@@ -663,6 +663,16 @@ impl Solver {
         }
     }
 
+    /// Whether `var` is an integer structural var (slacks are continuous).
+    #[inline]
+    fn is_integer(&self, var: usize) -> bool {
+        var < self.num_vars
+            && matches!(
+                self.orig_var_domains[var],
+                VarDomain::Integer | VarDomain::Boolean
+            )
+    }
+
     /// A var's current value in the engine's scaled units.
     #[inline]
     fn internal_value(&self, var: usize) -> f64 {
@@ -683,11 +693,18 @@ impl Solver {
     /// ([`Self::check_rows`]). The engine's own bookkeeping never snaps.
     #[inline]
     fn reported_internal_value(&self, var: usize) -> f64 {
-        if self.orig_var_mins[var] == self.orig_var_maxs[var] {
+        if self.is_reported_at_bound(var) {
             self.orig_var_mins[var]
         } else {
             self.internal_value(var)
         }
+    }
+
+    /// Whether `var` is reported at its bound, not where the engine holds it:
+    /// a fixed structural var ([`Self::reported_internal_value`]).
+    #[inline]
+    fn is_reported_at_bound(&self, var: usize) -> bool {
+        var < self.num_vars && self.orig_var_mins[var] == self.orig_var_maxs[var]
     }
 
     /// The activity `Σ a_rj x_j` of row `r` over the structural vars at the
@@ -1697,8 +1714,8 @@ impl Solver {
     /// proof fails is made taboo. When only taboo rows are left on fresh data,
     /// one whose proof failed gets two last resorts: the ratio test with every
     /// entry of at least [`INSTABLE_PIVOT_TOL`] a candidate, then, once per
-    /// row in a phase, a move of the vars whose entries are below round-off
-    /// ([`Self::round_off_repair`]).
+    /// row in a phase, moves of the non-basic vars the row's certificate says
+    /// can help ([`Self::certificate_repair`]).
     ///
     /// The phase fails loudly rather than run forever or guess: when only
     /// taboo rows are left after a rebuild and no last resort remains, and
@@ -1706,8 +1723,9 @@ impl Solver {
     /// [`STALL_ITERATIONS`] iterations. The room an unrepaired row's
     /// certificate leaves then lies where no step reaches: in an entry below
     /// [`INSTABLE_PIVOT_TOL`] of a var with no bound in its direction, in a
-    /// coefficient below the round-off of its terms, or within the round-off
-    /// of the data (see the known limitations in ARCHITECTURE §7).
+    /// coefficient below the round-off of its terms, or beyond the values
+    /// computed through the basis (see the known limitations in ARCHITECTURE
+    /// §7).
     fn dual_phase(&mut self) -> Result<StopReason, Error> {
         let obj_str = if self.artificial_obj.is_some() {
             "artificial obj."
@@ -1725,13 +1743,13 @@ impl Solver {
         let mut excluded_row: Option<usize> = None;
         // The row the unstable-pivot last resort takes next, and the row it
         // was tried on since the data were last refreshed, which gets the
-        // round-off repair instead if it is left again. Only the unproven row
+        // certificate repair instead if it is left again. Only the unproven row
         // with the best score gets the last resorts: if they fail on it, the
         // phase fails without trying another (a loud error where there might
         // have been an answer, never a wrong answer).
         let mut instable_row: Option<usize> = None;
         let mut instable_tried: Option<usize> = None;
-        // The rows the round-off repair has repaired in this phase: a row
+        // The rows the certificate repair has repaired in this phase: a row
         // that needs it again fails the phase (see above).
         let mut repaired_rows: Vec<usize> = Vec::new();
         // The dual objective at the last stall check.
@@ -1794,10 +1812,10 @@ impl Solver {
                                 instable_row = Some(row);
                                 continue;
                             }
-                            // The unstable pivot was not taken: the round-off
-                            // repair, once per row in a phase, or nothing can
-                            // repair the row.
-                            if !repaired_rows.contains(&row) && self.round_off_repair(row) {
+                            // The unstable pivot was not taken: the
+                            // certificate repair, once per row in a phase, or
+                            // nothing can repair the row.
+                            if !repaired_rows.contains(&row) && self.certificate_repair(row) {
                                 repaired_rows.push(row);
                                 refreshed_since_pivot = false;
                                 instable_tried = None;
@@ -1862,7 +1880,7 @@ impl Solver {
                 }
                 Ok(DualRatioTest::NoCandidate) if instable => {
                     // Not even an unstable pivot: the row is left once more,
-                    // for the round-off repair (see above).
+                    // for the certificate repair (see above).
                     continue;
                 }
                 Ok(DualRatioTest::NoCandidate) if !refreshed_since_pivot => {
@@ -2695,11 +2713,7 @@ impl Solver {
                 return false;
             }
             let var = self.nb_vars[c];
-            let integer = var < self.num_vars
-                && matches!(
-                    self.orig_var_domains[var],
-                    VarDomain::Integer | VarDomain::Boolean
-                );
+            let integer = self.is_integer(var);
             // A slack's stored tolerance carries a round-off floor derived
             // at the last recomputation; what it may absorb is judged on
             // its row's magnitude at the current point. A structural var
@@ -3044,11 +3058,12 @@ impl Solver {
     }
 
     /// Move each non-basic column in `flips` to the value given with it (its
-    /// other bound, its perturbed bound when a primal phase starts, or a value
-    /// between its bounds for the last var the round-off repair moves), the
-    /// basis staying as it is, and carry the moves into the basic values,
-    /// `x_B -= B^-1 Σ Δx_c a_c`, through one solve with the combined column.
-    /// The objective moves by the reduced costs, as in a pivot.
+    /// other bound, its perturbed bound when a primal phase starts, or, for a
+    /// var the certificate repair moves, a value between its bounds or past
+    /// one within its tolerance), the basis staying as it is, and carry the
+    /// moves into the basic values, `x_B -= B^-1 Σ Δx_c a_c`, through one
+    /// solve with the combined column. The objective moves by the reduced
+    /// costs, as in a pivot.
     fn apply_flips(&mut self, flips: &[(usize, f64)]) {
         if flips.is_empty() {
             return;

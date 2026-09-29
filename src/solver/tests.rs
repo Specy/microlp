@@ -2208,10 +2208,11 @@ fn c2_06_through_an_edit() -> Solver {
 /// does not prove infeasibility: with the row taboo and nothing else left,
 /// the instable leave (a pivot the regular floors refuse, down to
 /// `INSTABLE_PIVOT_TOL`) pivots on `y`'s entry of one, and the phase ends at
-/// `y = 1`. That pivot refused (planted as a bad basis change), the round-off
-/// repair has nothing to move (`y` has no upper bound), and the phase fails
-/// loudly at once instead of retrying until its stall bound; a time limit
-/// turns running on into a failure.
+/// `y = 1`. That pivot refused (planted as a bad basis change), the
+/// certificate repair cannot land the row (`y` has no upper bound, and the
+/// fixed `f` may move only by its rows' reserve over `1e17`), and the phase
+/// fails loudly at once instead of retrying until its stall bound; a time
+/// limit turns running on into a failure.
 #[test]
 fn a_row_the_proof_leaves_open_gets_the_instable_leave_once() {
     init();
@@ -2248,6 +2249,97 @@ fn a_row_the_proof_leaves_open_gets_the_instable_leave_once() {
         "{result:?}"
     );
     assert!(sol.lp_iterations - iterations < 20, "{}", sol.lp_iterations);
+}
+
+/// `x + y >= 2 + 8e-8` over `x, y ∈ [0, 1]` (integer if asked), at the slack
+/// basis with `x = y = 0`: the row's slack is `8e-8` past its bound beyond
+/// its tolerance of `5e-8` even with both vars at their upper bounds.
+fn row_short_of_its_bounds_by_a_tolerance(integer: bool) -> Solver {
+    let domain = if integer {
+        VarDomain::Integer
+    } else {
+        VarDomain::Real
+    };
+    let sol = Solver::try_new(
+        &[1.0, 1.0],
+        &[0.0, 0.0],
+        &[1.0, 1.0],
+        &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 2.0 + 8e-8)],
+        &[domain.clone(), domain],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(
+        (sol.col_scales.as_slice(), sol.row_scales.as_slice()),
+        ([1.0, 1.0].as_slice(), [1.0].as_slice()),
+        "fixture: no scaling"
+    );
+    assert_eq!(sol.nb_var_vals, [0.0, 0.0], "fixture: x = y = 0");
+    let slack = sol.num_vars;
+    assert_eq!(sol.basic_vars, [slack], "fixture: the slack basis");
+    assert_eq!(sol.var_tols[slack], BoundTols::uniform(5e-8));
+    sol
+}
+
+/// The certificate repair moves the vars that can help to their bounds
+/// first, then past them within their tolerances, to the farthest value that
+/// still counts as at the bound: `x` and `y` flip to 1 and `x` moves on by
+/// its tolerance, `5e-8`, which lands the row's slack within its own. An
+/// integer var never leaves its bound, so with `x, y` integer the repair
+/// fails and puts them back.
+#[test]
+fn the_repair_moves_vars_past_their_bounds_within_their_tolerances() {
+    init();
+    let mut sol = row_short_of_its_bounds_by_a_tolerance(false);
+    let x_tol = sol.var_tols[0].hi;
+    assert_eq!(x_tol, 5e-8, "fixture: x's tolerance is its row's reserve");
+    assert!(sol.certificate_repair(0));
+    let x = sol.nb_var_vals[0];
+    assert!(
+        x > 1.0 && at_bound(x, 1.0, x_tol) && !at_bound(x.next_up(), 1.0, x_tol),
+        "x = {x:e}"
+    );
+    assert!(sol.nb_var_states[0].at_max && !sol.nb_var_states[0].at_min);
+    assert_eq!(sol.nb_var_vals[1], 1.0);
+    assert!(sol.basic_var_within_bounds(0), "{:?}", sol.basic_var_vals);
+
+    let mut sol = row_short_of_its_bounds_by_a_tolerance(true);
+    assert!(!sol.certificate_repair(0));
+    assert_eq!(sol.nb_var_vals, [0.0, 0.0]);
+    assert!(!sol.basic_var_within_bounds(0));
+}
+
+/// The certificate repair keeps a fixed structural var at its value: it is
+/// reported there, so its tolerance is the reserve its rows keep for that
+/// snap, not room. `x + y >= 2 + 1.2e-7` with `x ∈ [0, 1]` and `y` fixed at
+/// 1, at the slack basis: `x` flips to 1 and moves on by its tolerance,
+/// `5e-8`, which leaves the row's slack `7e-8` past its bound, beyond its
+/// tolerance; moving `y` by its own `5e-8` would land it, so the repair
+/// fails instead and puts `x` back.
+#[test]
+fn the_repair_keeps_a_fixed_var_at_its_value() {
+    init();
+    let mut sol = Solver::try_new(
+        &[1.0, 0.0],
+        &[0.0, 1.0],
+        &[1.0, 1.0],
+        &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 2.0 + 1.2e-7)],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(
+        (sol.col_scales.as_slice(), sol.row_scales.as_slice()),
+        ([1.0, 1.0].as_slice(), [1.0].as_slice()),
+        "fixture: no scaling"
+    );
+    assert_eq!(sol.nb_var_vals, [0.0, 1.0], "fixture: x = 0, y = 1");
+    assert_eq!(sol.basic_vars, [sol.num_vars], "fixture: the slack basis");
+    assert_eq!(sol.var_tols[1].lo, 5e-8, "fixture: y's tolerance");
+    assert!(!sol.certificate_repair(0));
+    assert_eq!(sol.nb_var_vals, [0.0, 1.0]);
 }
 
 /// The bound perturbation of a primal phase: every finite bound moves outward
