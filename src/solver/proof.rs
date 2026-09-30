@@ -36,11 +36,11 @@
 use super::{at_bound, Solver, ROUNDOFF_FLOOR};
 
 /// A compensated double: the unevaluated sum `hi + lo` of two `f64`, which
-/// carries about twice the precision of one. Only the accumulation of
-/// products is needed here ([`COMPENSATED_ERROR`] is the allowance for its
-/// round-off).
+/// carries about twice the precision of one. The proof accumulates products
+/// with it ([`COMPENSATED_ERROR`] is the allowance for their round-off), and
+/// presolve the bound of a row it rewrites.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(super) struct CDouble {
+pub(crate) struct CDouble {
     hi: f64,
     lo: f64,
 }
@@ -73,7 +73,7 @@ impl CDouble {
     }
 
     /// `self += v`.
-    fn add(&mut self, v: f64) {
+    pub(crate) fn add(&mut self, v: f64) {
         let (hi, c) = Self::two_sum(v, self.hi);
         self.hi = hi;
         self.lo += c;
@@ -104,6 +104,18 @@ impl CDouble {
     /// The nearest `f64`.
     pub(super) fn value(self) -> f64 {
         self.hi + self.lo
+    }
+
+    /// The nearest `f64` at or above the sum (`up`), or at or below it.
+    pub(crate) fn rounded(self, up: bool) -> f64 {
+        let (value, error) = Self::two_sum(self.hi, self.lo);
+        if up && error > 0.0 {
+            value.next_up()
+        } else if !up && error < 0.0 {
+            value.next_down()
+        } else {
+            value
+        }
     }
 }
 

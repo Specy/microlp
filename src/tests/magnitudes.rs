@@ -19,7 +19,7 @@ mod regression_tests {
         assert_solves_within_contract_in_time, assert_solves_within_contract_without_presolve,
         xstar_is_feasible, Model, Row, Var,
     };
-    use crate::{ComparisonOp, Error, OptimizationDirection, SolveOptions};
+    use crate::{ComparisonOp, Error, OptimizationDirection, SolveOptions, TerminationReason};
     use std::time::Duration;
 
     fn real(obj: f64, lo: f64, hi: f64) -> Var {
@@ -288,14 +288,71 @@ mod regression_tests {
         );
     }
 
+    /// `y = 1e5 x` with `x` in `[0, 5e-8]`, a whole range narrower than the
+    /// user's tolerance: maximizing `y` needs `x` at its upper bound, which
+    /// the solve must reach although every value of `x` lies within the
+    /// user's tolerance of both bounds. Taking `x` for fixed at 0 would answer
+    /// 0, `5e-3` below the exact optimum (ARCHITECTURE §7, `structural_tol`).
+    #[test]
+    fn a_continuous_var_narrower_than_its_tolerance_reaches_the_exact_optimum() {
+        let model = Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![real(0.0, 0.0, 5e-8), real(1.0, 0.0, 1.0)],
+            rows: vec![row(&[(1, 1.0), (0, -1e5)], ComparisonOp::Eq, 0.0)],
+            xstar: vec![5e-8, 5e-3],
+        };
+        assert_solves_within_contract_without_presolve(&model);
+        check(model);
+    }
+
+    /// The MILP form: `y + 1e4 x - z >= 4e-4` with `x` in `[0, 5e-8]`, `y` in
+    /// `[0, 1]` and `z` integer in `[0, 1]`. The minimum of `y` is 0, at `x`'s
+    /// upper bound (`1e4 · 5e-8 = 5e-4`), `z = 0`.
+    #[test]
+    fn a_continuous_var_narrower_than_its_tolerance_reaches_the_exact_optimum_of_a_milp() {
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![real(0.0, 0.0, 5e-8), real(1.0, 0.0, 1.0), int(0.0, 0, 1)],
+            rows: vec![row(
+                &[(1, 1.0), (0, 1e4), (2, -1.0)],
+                ComparisonOp::Ge,
+                4e-4,
+            )],
+            xstar: vec![5e-8, 0.0, 0.0],
+        };
+        assert_solves_within_contract_without_presolve(&model);
+        check(model);
+    }
+
+    /// `max 1e6 x + y` s.t. `y - x <= 0` with `x` in `[0, 5e-8]` and `y` in
+    /// `[0, 1]`: `x`'s whole range moves the row by no more than its reserve,
+    /// so the cap leaves `x` a tolerance as wide as that range, and the
+    /// at-bound state takes `x` for fixed at 0. The exact optimum,
+    /// `x = y = 5e-8`, is `5e-2` better, a gain that comes through the
+    /// objective, which no row shows (ARCHITECTURE §7).
+    #[test]
+    #[should_panic(expected = "is worse than the objective")]
+    fn a_continuous_var_narrower_than_its_tolerance_misses_its_objective_gain_is_a_known_limitation(
+    ) {
+        let model = Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![real(1e6, 0.0, 5e-8), real(1.0, 0.0, 1.0)],
+            rows: vec![row(&[(1, 1.0), (0, -1.0)], ComparisonOp::Le, 0.0)],
+            xstar: vec![5e-8, 5e-8],
+        };
+        assert_solves_within_contract_without_presolve(&model);
+        check(model);
+    }
+
     /// `x0` is pinned to `2^28` by an equality whose other coefficient is
     /// `1e-7`, so the row's terms span fifteen orders of magnitude, and
     /// `x* = [268435456, 0]` satisfies both rows exactly. The row's round-off,
     /// `5e-6`, exceeds `x1`'s whole term range, `2.5e-8`, so its minimum
-    /// activity meets the bound wherever `x1` sits: presolve's forcing rule
-    /// must not read that as "every var at its extreme" and fix `x1` at `0.25`
-    /// against `-x1 = 0`. Forcing requires every term to be resolvable above
-    /// the row's round-off (`Work::terms_resolvable`).
+    /// activity meets the bound wherever `x1` sits: read as "every var at its
+    /// extreme", that would fix `x1` at `0.25` against `-x1 = 0`. Presolve
+    /// fixes no continuous var, and fixes an integer var by a forcing row only
+    /// where every term of the row is resolvable above its round-off
+    /// (`Work::forcing_fixings`).
     #[test]
     fn wide_coefficients_pinning_a_variable_at_2e8() {
         check(Model {
@@ -2046,11 +2103,11 @@ mod regression_tests {
         assert_solves_within_contract_without_presolve(&model);
     }
 
-    /// Presolve's forcing row `x0 + 100 x1 = 8388700` fixes `x0` at its lower
-    /// bound `-2^-30`, where the row allows it within its tolerance, and
-    /// `-1000 x0 + x1 / 1000 = 83.887`, which pins `x0` at zero, then misses
-    /// by `9.3e-7`: presolve finds the model infeasible. The solve must go on
-    /// with the model as written and reach the optimum `x0 = 0`, `x1 = 83887`.
+    /// The forcing row `x0 + 100 x1 = 8388700` leaves `x0` a room of its
+    /// budget, `8.4e-8`, off its lower bound `-2^-30`, which
+    /// `-1000 x0 + x1 / 1000 = 83.887` amplifies past its own: fixed at the
+    /// bound, `x0` makes that row miss by `9.3e-7`. The solve must reach the
+    /// optimum `x0 = 0`, `x1 = 83887`.
     #[test]
     fn forcing_row_fixing_a_var_another_row_pins() {
         check(Model {
@@ -2068,10 +2125,10 @@ mod regression_tests {
     }
 
     /// The rows of the test above added to a solved MILP one edit at a time:
-    /// the second edit's re-solve presolves the edited model, finds it
-    /// infeasible, and must go on with it as written.
+    /// each edit's re-solve presolves the edited model again from the MILP's
+    /// base and must reach the optimum `x0 = 0`, `x1 = 83887`.
     #[test]
-    fn forcing_rows_added_by_edits_are_solved_as_written() {
+    fn forcing_rows_added_by_edits_are_presolved_again_and_solved() {
         let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
         let x0 = problem.add_var(-1.0, (-(2.0f64.powi(-30)), 1.0));
         let x1 = problem.add_integer_var(1.0, (83887, 83888));
@@ -2094,14 +2151,13 @@ mod regression_tests {
         );
     }
 
-    /// MILPs that presolve finds infeasible, each feasible within the
-    /// contract: a forcing row's round-off at its magnitude leaves a var room
-    /// that the forcing rule does not count (`1e-7 x4` at `1e9`, `2e-8 x3` at
-    /// `5e8`, a unit of `1.375e-4 x1` at `1.4e10`, `x2`'s `7.45e-9` lost at
-    /// `6.7e7`), so the rule fixes the var at a bound where another row
-    /// contradicts it. The solve must go on with the model as written.
+    /// MILPs whose forcing row's round-off at its magnitude leaves a var room
+    /// the corner does not show (`1e-7 x4` at `1e9`, `2e-8 x3` at `5e8`, a
+    /// unit of `1.375e-4 x1` at `1.4e10`, `x2`'s `7.45e-9` lost at `6.7e7`):
+    /// fixed at the corner, the var contradicts the other row. Each is
+    /// feasible within the contract and must solve.
     #[test]
-    fn milps_presolve_finds_infeasible_are_solved_as_written() {
+    fn milps_whose_forcing_rows_leave_round_off_room_solve() {
         check(Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![
@@ -2184,17 +2240,13 @@ mod regression_tests {
         });
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): presolve fixes `x2` at
-    /// `-1.5e-12`, the round-off of solving `x1 - x2 - 0.1 x4 = -16384.1` at
-    /// the fixed `x1` and `x4`, and `-x2 - 1e-5 x3 <= 0` then becomes the
-    /// bound `x3 >= 1.5e-7`, which `-x2 + x3 = 0` contradicts beyond the
-    /// contract. Presolve's own checks pass, and the engine proves the
-    /// reduced model infeasible, where `x2 = x3 = 0` meets every row as
-    /// written. The fix is a presolve that counts a fixing's round-off where
-    /// a coefficient amplifies it.
+    /// `x1 - x2 - 0.1 x4 = -16384.1` at the fixed `x1` and `x4` puts `x2` at
+    /// `-1.5e-12`, the round-off of solving it. Made the bound
+    /// `x3 >= 1.5e-7`, `-x2 - 1e-5 x3 <= 0` would take `x3`'s room there (its
+    /// budget over `1e-5`) from `-x2 + x3 = 0`, which then contradicts it
+    /// beyond the contract; `x2 = x3 = 0` meets every row as written.
     #[test]
-    #[should_panic(expected = "returned Infeasible")]
-    fn a_fixings_round_off_amplified_into_a_bound_is_a_known_limitation() {
+    fn a_fixings_round_off_is_not_amplified_into_a_bound() {
         check(Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![
@@ -2215,5 +2267,567 @@ mod regression_tests {
             ],
             xstar: vec![0.0, -16384.0, 0.0, 0.0, 1.0],
         });
+    }
+
+    /// `x1 - x3 = -524288` is forcing at `x3`'s bound of `2^-34`, half an ulp
+    /// its corner sum loses, and leaves `x3` a room of its budget, which
+    /// `-1000 x3 + x4 = 0` amplifies past its own: fixed at the bound, `x3`
+    /// needs `x4 = 5.8e-8`, beyond `x4 <= 0` by more than the engine holds
+    /// `x4` to. `x3 = x4 = 0` meets every row exactly.
+    #[test]
+    fn a_forcing_row_leaves_a_var_another_row_resolves() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, 0.0, 0.0),
+                real(-1.0, -524288.0, -524287.0),
+                real(1.0, 0.0, 0.0),
+                real(-1.0, -1.0, 2.0f64.powi(-34)),
+                real(-1.0, -1.0, 0.0),
+                real(0.0, 0.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(1, 1.0), (3, -1.0)], ComparisonOp::Eq, -524288.0),
+                row(&[(3, -1000.0), (4, 1.0)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![0.0, -524288.0, 0.0, 0.0, 0.0, 0.0],
+        });
+    }
+
+    /// Two forcing rows `x_i + y_i <= 0` whose rooms add up in a third row
+    /// (vars `x1, y1, w1, x2, y2, w2, z, u, z2, u2`; two equalities with `w_i`
+    /// put `x_i` at `4e-8`, two with `u` or `u2` put `z` or `z2` at 0). `x*`
+    /// has `x1 = x2 = 4e-8`, which the forcing rows accept within their
+    /// budget; fixed at 0, each var would be within every row's budget, and
+    /// both land in `0.9 x1 + 0.9 x2 + z + z2 = 7.2e-8`, which would then miss
+    /// by `7.2e-8`, beyond its budget. With `milp`, `u` and `u2` are integer.
+    fn two_rooms_in_one_kept_row(milp: bool) -> Model {
+        let (e, c) = (4e-8, 0.9);
+        let u = || {
+            if milp {
+                int(0.0, 0, 2)
+            } else {
+                real(0.0, 0.0, 2.0)
+            }
+        };
+        Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(0.0, 0.0, 1.0),
+                real(0.0, 0.0, 1.0),
+                real(0.0, 0.0, 2.0),
+                real(0.0, 0.0, 1.0),
+                real(0.0, 0.0, 1.0),
+                real(0.0, 0.0, 2.0),
+                real(0.0, -1.0, 1.0),
+                u(),
+                real(0.0, -1.0, 1.0),
+                u(),
+            ],
+            rows: vec![
+                row(&[(0, 1.0), (1, 1.0)], ComparisonOp::Le, 0.0),
+                row(&[(0, c), (2, 1.0)], ComparisonOp::Eq, 1.0 + c * e),
+                row(&[(0, c), (2, -1.0)], ComparisonOp::Eq, -1.0 + c * e),
+                row(&[(3, 1.0), (4, 1.0)], ComparisonOp::Le, 0.0),
+                row(&[(3, c), (5, 1.0)], ComparisonOp::Eq, 1.0 + c * e),
+                row(&[(3, c), (5, -1.0)], ComparisonOp::Eq, -1.0 + c * e),
+                row(
+                    &[(0, c), (3, c), (6, 1.0), (8, 1.0)],
+                    ComparisonOp::Eq,
+                    2.0 * c * e,
+                ),
+                row(&[(6, 1.0), (7, 1.0)], ComparisonOp::Eq, 1.0),
+                row(&[(6, 1.0), (7, -1.0)], ComparisonOp::Eq, -1.0),
+                row(&[(8, 1.0), (9, 1.0)], ComparisonOp::Eq, 1.0),
+                row(&[(8, 1.0), (9, -1.0)], ComparisonOp::Eq, -1.0),
+            ],
+            xstar: vec![e, 0.0, 1.0, e, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        }
+    }
+
+    /// `model`, with and without presolve, stopped by a zero time limit before
+    /// its verdict and resumed: an optimal solution at `x*`'s objective.
+    fn solves_resumed_at_the_objective_of_xstar(model: &Model) {
+        let (problem, _) = model.build();
+        for presolve in [true, false] {
+            let interrupted = problem
+                .solve_with(SolveOptions {
+                    presolve,
+                    time_limit: Some(Duration::ZERO),
+                    ..SolveOptions::default()
+                })
+                .unwrap();
+            assert!(
+                interrupted.solution().is_none(),
+                "fixture: the solve stops before its verdict (presolve {presolve})"
+            );
+            let resumed = interrupted
+                .resume_with(crate::ResumeOptions::default())
+                .unwrap_or_else(|err| panic!("the resume returned {err:?} (presolve {presolve})"))
+                .into_solution()
+                .unwrap();
+            assert_eq!(resumed.status(), crate::SolutionStatus::Optimal);
+            assert_eq!(resumed.objective(), model.objective_at(&model.xstar));
+        }
+    }
+
+    /// Presolve fixes neither forcing row's continuous vars, so the model
+    /// above solves, with and without presolve, also when a zero time limit
+    /// stops the solve before its verdict and a resume finishes it.
+    #[test]
+    fn rooms_of_forcing_rows_adding_up_in_a_kept_row_are_kept() {
+        let model = two_rooms_in_one_kept_row(false);
+        solves_resumed_at_the_objective_of_xstar(&model);
+        assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+    }
+
+    /// The MILP of the model above solves, with and without presolve, also
+    /// when a zero time limit stops the search before its root and a resume
+    /// finishes it.
+    #[test]
+    fn rooms_of_forcing_rows_adding_up_in_a_kept_row_of_a_milp_are_kept() {
+        let model = two_rooms_in_one_kept_row(true);
+        solves_resumed_at_the_objective_of_xstar(&model);
+        assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+    }
+
+    /// The MILP of the model above with a free var of cost -1 in no row: its
+    /// relaxation is unbounded, and the search that classifies it finds an
+    /// integer point, so the MILP is unbounded, with and without presolve.
+    #[test]
+    fn rooms_of_forcing_rows_adding_up_in_a_kept_row_of_an_unbounded_milp_are_kept() {
+        let mut model = two_rooms_in_one_kept_row(true);
+        model
+            .vars
+            .push(real(-1.0, f64::NEG_INFINITY, f64::INFINITY));
+        let (problem, _) = model.build();
+        for presolve in [true, false] {
+            let options = SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            };
+            assert_eq!(
+                problem.solve_with(options).map(|_| ()),
+                Err(Error::Unbounded),
+                "presolve {presolve}"
+            );
+        }
+    }
+
+    /// The model above without its kept row, which an edit then adds: as a
+    /// MILP, the edit's search solves the model as written, with and without
+    /// presolve.
+    #[test]
+    fn rooms_of_forcing_rows_adding_up_in_a_row_an_edit_adds_to_a_milp_are_kept() {
+        for presolve in [true, false] {
+            let edited = add_the_kept_row_by_an_edit(true, presolve)
+                .unwrap_or_else(|err| panic!("the edit returned {err:?} (presolve {presolve})"))
+                .into_solution()
+                .unwrap();
+            assert_eq!(edited.status(), crate::SolutionStatus::Optimal);
+            assert_eq!(edited.objective(), 0.0);
+        }
+    }
+
+    /// The LP of the test above: the edit works on the engine of the
+    /// presolved model, which keeps both forcing rows' vars their rooms.
+    #[test]
+    fn rooms_of_forcing_rows_adding_up_in_a_row_an_edit_adds_to_an_lp_are_kept() {
+        for presolve in [true, false] {
+            let edited = add_the_kept_row_by_an_edit(false, presolve)
+                .unwrap_or_else(|err| panic!("the edit returned {err:?} (presolve {presolve})"))
+                .into_solution()
+                .unwrap();
+            assert_eq!(edited.status(), crate::SolutionStatus::Optimal);
+            assert_eq!(edited.objective(), 0.0);
+        }
+    }
+
+    /// Solve [`two_rooms_in_one_kept_row`] without the row the two rooms add
+    /// up in, then add that row with `Solution::add_constraint`.
+    fn add_the_kept_row_by_an_edit(
+        milp: bool,
+        presolve: bool,
+    ) -> Result<crate::SolveOutcome, Error> {
+        let mut model = two_rooms_in_one_kept_row(milp);
+        let kept = model.rows.remove(6);
+        let (problem, vars) = model.build();
+        let solution = problem
+            .solve_with(SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            })
+            .expect("fixture: the model without the row solves")
+            .into_solution()
+            .unwrap();
+        let expr: Vec<_> = kept.terms.iter().map(|&(j, a)| (vars[j], a)).collect();
+        solution.add_constraint(expr, kept.op, kept.rhs)
+    }
+
+    /// The MILP above with an integer `k` of cost -1 whose `1.44e-7 k` the kept
+    /// row carries, which would need `k = 0.5` with `x1` and `x2` at 0, and
+    /// `3 a + 5 b <= 10` over integers in `[0, 2]` of cost -1, which the
+    /// search branches on.
+    fn two_rooms_behind_a_search() -> Model {
+        let (e, c) = (4e-8, 0.9);
+        let mut model = two_rooms_in_one_kept_row(true);
+        model
+            .vars
+            .extend([int(-1.0, 0, 3), int(-1.0, 0, 2), int(-1.0, 0, 2)]);
+        model.rows[6] = row(
+            &[(0, c), (3, c), (6, 1.0), (8, 1.0), (10, 4.0 * c * e)],
+            ComparisonOp::Eq,
+            2.0 * c * e,
+        );
+        model
+            .rows
+            .push(row(&[(11, 3.0), (12, 5.0)], ComparisonOp::Le, 10.0));
+        model.xstar.extend([0.0, 2.0, 0.0]);
+        model
+    }
+
+    /// [`two_rooms_behind_a_search`] is solved to optimality, with and without
+    /// presolve.
+    #[test]
+    fn rooms_of_forcing_rows_adding_up_behind_a_search_are_kept() {
+        let model = two_rooms_behind_a_search();
+        let (problem, _) = model.build();
+        for presolve in [true, false] {
+            let options = SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            };
+            let reason = problem.solve_with(options).unwrap().termination_reason();
+            assert_eq!(
+                reason,
+                TerminationReason::ProvenOptimal,
+                "presolve {presolve}"
+            );
+        }
+        assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+    }
+
+    /// [`two_rooms_behind_a_search`] with `x*` as a warm-start hint, whose
+    /// `x1 = 4e-8` only a model keeping `x1`'s room admits: under a budget of
+    /// no node, the root adopts the hint, with and without presolve.
+    #[test]
+    fn a_warm_start_hint_needing_the_rooms_of_forcing_rows_is_adopted() {
+        let model = two_rooms_behind_a_search();
+        let (problem, vars) = model.build();
+        let hint: Vec<_> = vars
+            .iter()
+            .copied()
+            .zip(model.xstar.iter().copied())
+            .collect();
+        for presolve in [true, false] {
+            let hinted = problem
+                .solve_with(SolveOptions {
+                    presolve,
+                    warm_start: Some(hint.clone()),
+                    node_limit: Some(0),
+                    ..SolveOptions::default()
+                })
+                .unwrap();
+            let solution = hinted.into_solution().unwrap_or_else(|i| {
+                panic!("the root must adopt the hint (presolve {presolve}): {i:?}")
+            });
+            assert_eq!(solution.objective(), model.objective_at(&model.xstar));
+        }
+    }
+
+    /// [`two_rooms_in_one_kept_row`] with `b` in `[0, 1]` of cost -1 whose
+    /// `7.2e-8 b` the kept row carries (right-hand side 0), an integer with
+    /// `milp`: `x*` has `b = 1`, which the model as written admits, and which
+    /// fixing `x1` and `x2` at 0 would exclude, the row then missing by
+    /// `7.2e-8 b`. The optimum is `x*`'s, with and without presolve.
+    fn an_optimum_needing_the_rooms_of_forcing_rows(milp: bool) {
+        let (e, c) = (4e-8, 0.9);
+        let mut model = two_rooms_in_one_kept_row(milp);
+        model.vars.push(if milp {
+            int(-1.0, 0, 1)
+        } else {
+            real(-1.0, 0.0, 1.0)
+        });
+        model.rows[6] = row(
+            &[(0, c), (3, c), (6, 1.0), (8, 1.0), (10, -2.0 * c * e)],
+            ComparisonOp::Eq,
+            0.0,
+        );
+        model.xstar.push(1.0);
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model it was built around"
+        );
+        assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn an_lp_optimum_needing_the_rooms_of_forcing_rows_is_found() {
+        an_optimum_needing_the_rooms_of_forcing_rows(false);
+    }
+
+    #[test]
+    fn a_milp_optimum_needing_the_rooms_of_forcing_rows_is_found() {
+        an_optimum_needing_the_rooms_of_forcing_rows(true);
+    }
+
+    /// The model of the tests above, without presolve, solves.
+    #[test]
+    fn rooms_of_forcing_rows_adding_up_in_a_kept_row_without_presolve() {
+        let model = two_rooms_in_one_kept_row(false);
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model it was built around"
+        );
+        assert_solves_within_contract_without_presolve(&model);
+    }
+
+    /// The big-M row `100 x + k1 w1 + k2 w2 + m y <= m + 500 + k1 + k2` over
+    /// `x ∈ [0, 10]`, a binary `y` and `w1, w2` fixed at 1 (`ks = [k1, k2]`),
+    /// and `1000 x >= 5000 + 10 e`, which needs the row `e` beyond its bound at
+    /// `y = 1`, `e` being `share` of the row's contract there. With `optimum`,
+    /// the second row is `1000 x >= (5000 + 10 e) z` over a binary `z` of cost
+    /// -1. `p - q + pin y >= pin` and `q - p + pin y >= pin` over
+    /// `p, q ∈ [0, pq]` exclude `y = 0` together; with `pin > pq`, each alone
+    /// does. Coefficient tightening rewrites the big-M row into about
+    /// `100 x + k1 w1 + k2 w2 + 500 y <= 1000 + k1 + k2`.
+    fn big_m_row_met_beyond_its_bound(
+        m: f64,
+        ks: [f64; 2],
+        pin: f64,
+        pq: f64,
+        share: f64,
+        optimum: bool,
+    ) -> Model {
+        let [k1, k2] = ks;
+        let bound = m + 500.0 + (k1 + k2);
+        let magnitude = bound.abs() + 500.0 + m + k1.abs() + k2.abs();
+        let e = share * 1e-7f64.max(1e-14 * magnitude);
+        let rhs = 5000.0 + 10.0 * e;
+        let mut model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(0.0, 0.0, 10.0),
+                int(0.0, 0, 1),
+                real(0.0, 0.0, pq),
+                real(0.0, 0.0, pq),
+                real(0.0, 1.0, 1.0),
+                real(0.0, 1.0, 1.0),
+            ],
+            rows: vec![
+                row(
+                    &[(0, 100.0), (4, k1), (5, k2), (1, m)],
+                    ComparisonOp::Le,
+                    bound,
+                ),
+                row(&[(0, 1000.0)], ComparisonOp::Ge, rhs),
+                row(&[(2, 1.0), (3, -1.0), (1, pin)], ComparisonOp::Ge, pin),
+                row(&[(2, -1.0), (3, 1.0), (1, pin)], ComparisonOp::Ge, pin),
+            ],
+            xstar: vec![5.0 + e / 100.0, 1.0, 0.0, 0.0, 1.0, 1.0],
+        };
+        if optimum {
+            model.vars.push(int(-1.0, 0, 1));
+            model.rows[1] = row(&[(0, 1000.0), (6, -rhs)], ComparisonOp::Ge, 0.0);
+            model.xstar.push(1.0);
+        }
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model it was built around"
+        );
+        model
+    }
+
+    /// [`big_m_row_met_beyond_its_bound`] at `M = 2.5e6` with fixed terms of
+    /// `1e8`, which make the big-M row's contract at `y = 1` its round-off,
+    /// `1.05e-6`, and `e` at `0.49` of it: within the engine's budget of the
+    /// row as written, so the rewrite must keep the point. Its binding branch
+    /// keeps the contract at the fixed terms' magnitude: at the rewritten
+    /// terms' alone both contracts are the absolute `1e-7`, and the rewritten
+    /// row, held to its budget, would reach only `5e-7`. `pq = 1e5` leaves `y`
+    /// unfixed, and `pin = 1e4` holds it within `5e-12` of 1 in the LP, where
+    /// rounding it moves the rewritten row, `500 y`, by `2.5e-9` at most.
+    #[test]
+    fn a_point_within_the_budget_of_a_big_m_row_with_fixed_terms_is_kept() {
+        for optimum in [false, true] {
+            let model = big_m_row_met_beyond_its_bound(2.5e6, [5e7, -5e7], 1e4, 1e5, 0.49, optimum);
+            assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+        }
+    }
+
+    /// [`big_m_row_met_beyond_its_bound`] at `M = 1.8e6` with fixed terms of
+    /// `4.7e5` and `-4.7e6`, where the big-M row's contract at `y = 1` is the
+    /// absolute `1e-7`, and `e` at `0.484` of it: within the engine's budget,
+    /// by less than an ulp of the fixed term `4.7e6`. The rewrite keeps
+    /// nothing for the contract, so the rewritten row at `y = 1` must be no
+    /// tighter than the row as written, by a single bit; carried in `f64`
+    /// through the fixed terms' fold, the rewrite and the unfold, its bound
+    /// came out an ulp short, and presolve on answered `Infeasible`, and
+    /// `z = 0` in the optimum form.
+    #[test]
+    fn a_point_within_the_budget_of_a_big_m_row_by_less_than_an_ulp_is_kept() {
+        for optimum in [false, true] {
+            let model = big_m_row_met_beyond_its_bound(
+                1805051.3787215224,
+                [469042.9001025199, -4706346.9724488305],
+                1e4,
+                1e5,
+                0.484,
+                optimum,
+            );
+            assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+        }
+    }
+
+    /// The big-M row `100 x + Σ m_i y_i + k w <= Σ m_i + 500 + k` over
+    /// `x ∈ [0, 10]`, binaries `y_i` and, with `k > 0`, an integer
+    /// `w ∈ [1, 2]` of cost 1, and `1000 x >= 5000 + 10 e`, which needs the
+    /// row `e` beyond its bound at `y = w = 1`, `e` being `share` of the row's
+    /// contract there. With `optimum`, the second row is
+    /// `1000 x >= (5000 + 10 e) z` over a binary `z` of cost -1.
+    /// `p_i - q_i + 1e4 y_i >= 1e4` and `q_i - p_i + 1e4 y_i >= 1e4` over
+    /// `p_i, q_i ∈ [0, 1e5]` exclude `y_i = 0` together. Coefficient
+    /// tightening rewrites the row once per binary, and once more after dual
+    /// fixing fixes `w` at 1.
+    fn big_m_row_rewritten_more_than_once(ms: &[f64], k: f64, share: f64, optimum: bool) -> Model {
+        let total: f64 = ms.iter().sum();
+        let e = share * 1e-7f64.max(1e-14 * (2.0 * total + 2.0 * k + 1000.0));
+        let rhs = 5000.0 + 10.0 * e;
+        let mut vars = vec![real(0.0, 0.0, 10.0)];
+        let mut xstar = vec![5.0 + e / 100.0];
+        let mut terms = vec![(0, 100.0)];
+        for &m in ms {
+            terms.push((vars.len(), m));
+            vars.push(int(0.0, 0, 1));
+            xstar.push(1.0);
+        }
+        if k > 0.0 {
+            terms.push((vars.len(), k));
+            vars.push(int(1.0, 1, 2));
+            xstar.push(1.0);
+        }
+        let mut rows = vec![
+            row(&terms, ComparisonOp::Le, total + 500.0 + k),
+            row(&[(0, 1000.0)], ComparisonOp::Ge, rhs),
+        ];
+        for y in 1..=ms.len() {
+            let (p, q) = (vars.len(), vars.len() + 1);
+            vars.extend([real(0.0, 0.0, 1e5), real(0.0, 0.0, 1e5)]);
+            xstar.extend([0.0, 0.0]);
+            rows.push(row(&[(p, 1.0), (q, -1.0), (y, 1e4)], ComparisonOp::Ge, 1e4));
+            rows.push(row(&[(p, -1.0), (q, 1.0), (y, 1e4)], ComparisonOp::Ge, 1e4));
+        }
+        if optimum {
+            rows[1] = row(&[(0, 1000.0), (vars.len(), -rhs)], ComparisonOp::Ge, 0.0);
+            vars.push(int(-1.0, 0, 1));
+            xstar.push(1.0);
+        }
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars,
+            rows,
+            xstar,
+        };
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model it was built around"
+        );
+        model
+    }
+
+    /// [`big_m_row_rewritten_more_than_once`] with one binary at
+    /// `m = 3.75e6` and `k = 2.5e6`, `e` at `0.45` of the row's contract at
+    /// `y = w = 1`, `1.25e-7`: within the engine's budget. The rewrite comes
+    /// before dual fixing fixes `w`, whose term the binding branch's contract
+    /// counts once it is fixed; at the rewrite's magnitudes alone both
+    /// contracts are the absolute `1e-7`.
+    #[test]
+    fn a_point_within_the_budget_of_a_big_m_row_whose_var_is_fixed_after_its_rewrite_is_kept() {
+        for optimum in [false, true] {
+            let model = big_m_row_rewritten_more_than_once(&[3.75e6], 2.5e6, 0.45, optimum);
+            assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+        }
+    }
+
+    /// [`big_m_row_rewritten_more_than_once`] with two binaries at
+    /// `m = 3.5e6`, `e` at `0.45` of the row's contract at `y1 = y2 = 1`,
+    /// `1.4e-7`: within the engine's budget. Each binary's rewrite alone
+    /// takes out of that contract less than the two together.
+    #[test]
+    fn a_point_within_the_budget_of_a_big_m_row_of_two_rewritten_binaries_is_kept() {
+        for optimum in [false, true] {
+            let model = big_m_row_rewritten_more_than_once(&[3.5e6, 3.5e6], 0.0, 0.45, optimum);
+            assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+        }
+    }
+
+    /// [`big_m_row_met_beyond_its_bound`] at `M = 5e7` with fixed terms of
+    /// `1e8` and `e` at `0.8` of the big-M row's contract. `pin = 100 < pq`,
+    /// so only the two pin rows together keep `y` at one, and presolve
+    /// rewrites `y`'s coefficient to about `500`.
+    fn big_m_row_presolve_rewrites(optimum: bool) -> Model {
+        big_m_row_met_beyond_its_bound(5e7, [5e7, -5e7], 100.0, 1000.0, 0.8, optimum)
+    }
+
+    /// [`big_m_row_met_beyond_its_bound`] at `M = 5e7` without fixed terms and
+    /// `e` at `0.8` of the big-M row's contract. `pin = 1e4 > pq`, so each pin
+    /// row alone keeps `y` at one, and presolve rounds `y`'s lower bound to 1.
+    fn big_m_row_presolve_fixes(optimum: bool) -> Model {
+        big_m_row_met_beyond_its_bound(5e7, [0.0, -0.0], 1e4, 1000.0, 0.8, optimum)
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): [`big_m_row_presolve_rewrites`].
+    /// With `y` at one the point needs the big-M row at `0.8` of its
+    /// contract, beyond the engine's budget, half the contract. It lies within
+    /// the engine's box only with `y` off its integer within `int_tol`, the
+    /// LP's `1 - 3e-14` under `5e7` moving the row the rest of the way, and
+    /// such a point is not guaranteed. Without presolve the search reaches it
+    /// through the LP; the rewritten coefficient takes that room away, and the
+    /// rewritten row held to its budget reaches `0.75` of the contract:
+    /// presolve on answers `Infeasible`.
+    #[test]
+    #[should_panic(expected = "solve() returned Infeasible")]
+    fn a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_a_known_limitation() {
+        let model = big_m_row_presolve_rewrites(false);
+        assert_solves_within_contract_without_presolve(&model);
+        check(model);
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the optimum form of
+    /// [`a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_a_known_limitation`]:
+    /// presolve on answers `z = 0`, of objective 0 against `x*`'s -1.
+    #[test]
+    #[should_panic(expected = "solve(): objective 0e0 is worse than the objective -1e0")]
+    fn an_optimum_needing_the_int_tol_of_a_binary_presolve_rewrites_is_a_known_limitation() {
+        let model = big_m_row_presolve_rewrites(true);
+        assert_solves_within_contract_without_presolve(&model);
+        check(model);
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): [`big_m_row_presolve_fixes`]. With
+    /// `y` at one the point needs the big-M row at `0.8` of its contract,
+    /// beyond the engine's budget, half the contract. It lies within the
+    /// engine's box only with `y` off its integer within `int_tol`, and such a
+    /// point is not guaranteed. Without presolve the search reaches it through
+    /// the LP; `y` fixed at 1 takes that room away, and the big-M row held to
+    /// its budget reaches half the contract: presolve on answers
+    /// `Infeasible`.
+    #[test]
+    #[should_panic(expected = "solve() returned Infeasible")]
+    fn a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation() {
+        let model = big_m_row_presolve_fixes(false);
+        assert_solves_within_contract_without_presolve(&model);
+        check(model);
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the optimum form of
+    /// [`a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation`]:
+    /// presolve on answers `z = 0`, of objective 0 against `x*`'s -1.
+    #[test]
+    #[should_panic(expected = "solve(): objective 0e0 is worse than the objective -1e0")]
+    fn an_optimum_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation() {
+        let model = big_m_row_presolve_fixes(true);
+        assert_solves_within_contract_without_presolve(&model);
+        check(model);
     }
 }

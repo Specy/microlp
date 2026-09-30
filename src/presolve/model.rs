@@ -29,6 +29,11 @@ pub(crate) struct Presolved {
     /// answer against them too (`Solver::set_validation_rows`), so a wrong
     /// reduction shows at the boundary.
     pub validation_rows: Vec<(CsVec, ComparisonOp, f64)>,
+    /// Whether this differs from the model as written: an integer bound
+    /// tightened or rounded, or a row dropped or rewritten. A model presolve
+    /// did not reduce is solved as written
+    /// ([`reduced_model`](super::reduced_model)).
+    pub reduced: bool,
     /// Reduction counters, read only by the unit tests (the debug log reads
     /// the working copy), hence the dead-code allowance.
     #[allow(dead_code)]
@@ -61,6 +66,24 @@ pub(crate) struct Row {
     /// Whether coefficient tightening rewrote the row. Every other surviving
     /// row is emitted as its input row, byte-identical.
     pub(crate) coeffs_touched: bool,
+    /// The binding branch of the row's rewrites that shrink its bound, if
+    /// any.
+    pub(crate) binding: Option<Binding>,
+}
+
+/// The binding branch of a row's coefficient-tightening rewrites that shrink
+/// its bound, their binaries at one (`Work::rewrite_room`): its magnitude over
+/// the bound, counted by [`Row::rhs_mag`] (which substitution leaves
+/// unchanged), and the binaries' terms.
+pub(crate) struct Binding {
+    /// The rewritten binaries.
+    pub(crate) binaries: Vec<usize>,
+    /// `|b| + Σ|a_k|` over the bound and the binaries' coefficients as
+    /// written, and as rewritten (the bound before its relaxation).
+    pub(crate) written: f64,
+    pub(crate) rewritten: f64,
+    /// The relaxation of the bound, at the fixed terms folded so far.
+    pub(crate) kept: f64,
 }
 
 impl Row {
@@ -69,6 +92,13 @@ impl Row {
     /// the engine evaluates the row with those terms in it.
     pub(crate) fn rhs_mag(&self, b: f64) -> f64 {
         (b + self.shift).abs()
+    }
+
+    /// Var `v`'s coefficient, among the terms or the fixed terms folded out.
+    pub(crate) fn coeff(&self, v: usize) -> Option<f64> {
+        let terms = self.vars.iter().zip(&self.coeffs);
+        let folded = self.folded.iter().map(|(u, a)| (u, a));
+        terms.chain(folded).find(|&(&u, _)| u == v).map(|(_, &a)| a)
     }
 }
 

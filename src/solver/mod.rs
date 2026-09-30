@@ -25,6 +25,7 @@ mod scaling;
 mod tolerances;
 
 pub(crate) use basis::*;
+pub(crate) use proof::CDouble;
 pub(crate) use scaling::*;
 pub(crate) use tolerances::*;
 
