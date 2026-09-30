@@ -57,12 +57,24 @@ pub struct SolveOptions {
     /// Default `None`.
     pub warm_start: Option<Vec<(Variable, f64)>>,
     /// Enable presolve, which reduces the problem before the search starts
-    /// (tightening bounds, dropping redundant rows, fixing variables). It
-    /// never removes variables and keeps at least one optimum, so the problem
-    /// you observe through [`crate::Solution`] is unchanged. If presolve finds
-    /// the problem infeasible, the problem is solved without it. Disable it
-    /// only to compare raw solver behavior or to rule it out when
-    /// investigating a numerical issue. Default `true`.
+    /// (dropping redundant rows and, for integer variables, tightening bounds,
+    /// fixing variables and tightening big-M coefficients). It never removes
+    /// variables or changes a continuous variable's bounds, and it keeps, up
+    /// to round-off, every point with each integer variable exactly integral
+    /// that meets each constraint within the part of
+    /// [`Tolerances::feasibility`] the simplex holds it to and each bound
+    /// within its tolerance, or, for a variable it fixes because of the
+    /// objective, at least one optimum. The problem you observe through
+    /// [`crate::Solution`] is the one you wrote: answers are checked against
+    /// it. A point beyond that part of the tolerance can be cut, and so can a
+    /// point within it only with an integer variable off its integer, within
+    /// `int_tol`: without presolve the MIP search can reach one through a
+    /// variable that presolve would fix or rewrite. So on a problem whose
+    /// every point needs that, presolve on can answer `Infeasible`, or a worse
+    /// objective, where presolve off finds a point. If presolve finds the
+    /// problem infeasible, the problem is solved without it. Disable it only to
+    /// compare raw solver behavior or to rule it out when investigating a
+    /// numerical issue. Default `true`.
     pub presolve: bool,
     /// Edit the tolerances used by the solver, most callers
     /// should leave this at [`Tolerances::default`]; override an individual

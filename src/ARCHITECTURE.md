@@ -65,7 +65,7 @@ Three principles shape everything:
 | `src/problem.rs` | `Problem`, `VarDomain`, and the solve entry points. Owns solve/edit timing and the pure-LP model-to-engine seam in `Problem::solve_with` (presolve, then `Solver::try_new`). |
 | `src/solution.rs`, `src/outcome.rs` | `Solution` (a validated assignment, its read-out and its post-solve edits) and `SolveOutcome` / `InterruptedSolve` (what a call returns and how it is resumed). |
 | `src/expr.rs`, `src/error.rs` | The model vocabulary (`OptimizationDirection`, `Variable`, `LinearExpr`, `ComparisonOp`) and the `Error` type. |
-| `src/presolve/` | Presolve: activity-based bound tightening, forcing / singleton / redundant-row elimination, variable fixing and substitution, and in MIP mode integer bound rounding, binary coefficient tightening and dual fixing — all on the original variable indices, so there is no postsolve (§2, §7). `mod.rs` holds the contract and the entry point, `work.rs` the reduction passes, `model.rs` the data, `params.rs` the constants. |
+| `src/presolve/` | Presolve's exact reductions: redundant-row elimination, and in MIP mode integer bound rounding and tightening, integer fixings (forcing and singleton rows, dual fixing) with substitution, and binary coefficient tightening; a continuous variable keeps its bounds. All on the original variable indices, so there is no postsolve (§2, §7). `mod.rs` holds the contract and the entry point, `work.rs` the reduction passes, `model.rs` the data, `params.rs` the constants. |
 | `src/solver/` | The simplex engine. `mod.rs` is `Solver` itself (bounded-variable primal/dual simplex, basis management, and the small contract surface the MIP layer uses); `tolerances.rs` the tolerance model; `scaling.rs` the scaled representation and the starting vertex; `basis.rs` the basis inverse and the pivot descriptions; `costs.rs` the dual simplex's working costs and `bounds.rs` the primal simplex's working bounds; `cycling.rs` the cycling and stall detection of both; `proof.rs` the infeasibility proof and its last resorts (§3, §7). |
 | `src/lu/`, `src/sparse/`, `src/ordering/` | LU factorization with eta-file updates, sparse containers, and the column ordering of the factorization (`order_simple`: the sparsest columns first, from the bucket queue in `ordering/cols_queue.rs`). |
 | `src/mip/mod.rs` | The branch & bound lifecycle: building a search from a `Problem`, starting / resuming / re-editing it, bound and gap accounting, and validating a candidate against the user's original rows. |
@@ -146,9 +146,19 @@ These normalizations happen at the boundary and hold everywhere inside:
   engine's tolerance contract (§7), and presolve hands the rows it dropped or rewrote to
   the engine as they were written, for the checks at the boundary (§3.1): a reduction
   that is wrong shows as a loud error, never as a returned point that violates a row.
-  When presolve finds the model infeasible, the solve goes on with the model as written
-  (`presolve::unless_infeasible`, logged at debug level), so the verdict is the engine's,
-  which returns `Infeasible` only on a proof, or the search's.
+  Every reduction is exact: it keeps, up to round-off, every point of the model as written
+  within the engine's box whose integer vars are exactly integral (each row within the
+  budget, each continuous var within its bound tolerance; dual fixing keeps an optimum), and
+  a continuous var keeps its bounds (§7). No other point is guaranteed: a point beyond the
+  box, within the contract, can be cut, and so can a point within the box only with an
+  integer var off its integer, within `int_tol`, which the search can reach without
+  presolve through its LP and which fixing the var, tightening its bounds or rewriting its
+  coefficient takes away (§7, known limitations). So an `Infeasible` the engine or the
+  search proves on the reduced model is final on every path (the solve, a resume, an edit),
+  but for a model whose every point needs the integrality tolerance. When presolve finds the
+  model infeasible, or reduces nothing, the solve goes on with the model as written
+  (`presolve::reduced_model`, logged at debug level), so the verdict is the engine's, which
+  returns `Infeasible` only on a proof, or the search's.
 
 `prepare_row` is the single row-normalization contract used by both `Solver::try_new` and
 incremental `Solver::add_constraint`. It settles the rows whose data alone decide them
@@ -654,7 +664,7 @@ floored at that quantity's round-off:
 | Comparison | Tolerance | Constants |
 |---|---|---|
 | Is a basic slack (row) within its bounds? | `slack_tol`: the engine's share (`ROW_BUDGET_SHARE`, ½) of the contract `row_tolerance(feasibility × r, m)` in the row's scaled units, at the row's magnitude `m = |b| + Σ|a_j x_j|` at the current values (refreshed whenever the rows are checked). The other half is the reserve: for the snap of an integer or fixed var, and for evaluating the row in another order of operations. | `ROUNDOFF_FLOOR = 1e-14`, `ROW_BUDGET_SHARE = 0.5` |
-| Is a structural var within / at its bounds? | `structural_tol`: the user contract in user units, but never more than any of its rows can absorb when the value is snapped to the bound (`snap_budget`: the row's reserve over the var's scaled coefficient, minimised over its rows), floored at the round-off of the bound magnitude. One rule for every var: it keeps a big-M row within contract when its binary is rounded, and a fixed var's reported value within the rows presolve substituted it out of. | |
+| Is a structural var within / at its bounds? | `structural_tol`: the user contract in user units, but never more than any of its rows can absorb when the value is snapped to the bound (`snap_budget`: the row's reserve over the var's scaled coefficient, minimised over its rows), floored at the round-off of the bound magnitude. One rule for every var: it keeps a big-M row within contract when its binary is rounded, and a fixed var's reported value within the rows presolve substituted it out of. The non-basic at-bound state counts a var within its tolerance of both bounds as fixed, so the cap also keeps a continuous var free to move wherever its whole range moves a row by more than that row's reserve (`a_continuous_var_narrower_than_its_tolerance_reaches_the_exact_optimum`); a gain such a var brings through the objective alone is lost (a known limitation, below). | |
 | Is a reduced cost zero? | `dual_tol`: `EPS` floored at the round-off of `|c_j| + Σ|a_ij y_i|`, refreshed with the multipliers. | `EPS = 1e-10` |
 | Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it: `ENTRY_ROUNDOFF` of its column's largest entry (primal test), or of its row's largest entry over the columns not excluded that the scalings made comparable (dual test: all but those of vars fixed when the model entered the engine, which keep the user's units, so a fixed column's `1e17` cannot make a genuine `1` noise; an entry that cannot help still counts, as it shares the round-off of the row's solve). A genuine entry of at least `PIVOT_REL_TOL` of the largest genuine one among the vars that could enter and are not excluded (rows that could block, in the primal test) is preferred; a smaller one pivots only when nothing larger will do. In the primal test every genuine entry bounds the step, each basic var's Harris allowance counted from where it sits (see *Anti-degeneracy and cycling in the primal simplex*). In the dual test a boxed var the step passes is flipped instead of entering (*Bound flipping*), a row with no candidate is no verdict (next row), and the last resort takes any entry of at least `INSTABLE_PIVOT_TOL` (*Infeasibility only from a proof*). | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7`, `INSTABLE_PIVOT_TOL = 1e-10` |
 | Does a row that no var can repair prove the model infeasible? | only through its certificate, summed from the model's data, whose gap must exceed the tolerance the engine holds the row's basic var to; on an infinite bound a coefficient counts as zero only within the error of the multipliers, which the refinement bounds only where it converged (see *Infeasibility only from a proof*). | `REFINEMENT_CONVERGED = 2^-53` |
@@ -708,25 +718,48 @@ user units:
 - a bound implied by a row is relaxed by the row's allowance (the budget, or for an integer
   var the full contract), plus the round-off of the cancellation it came from, over the
   coefficient, so it never cuts a point the engine may return;
-- a row becomes bounds only where the bounds keep what it does: a singleton row becomes its
-  implied bound itself (keeping the vertices the row makes) only where the engine's bound
-  tolerance keeps the dropped row within its budget; an equality fixes its var only where it
-  pins it within the var's own tolerance, so that rows agreeing only within their
-  tolerances are not made inconsistent; a forcing row, judged over the emitted bounds, fixes
-  its vars at their extremes only when every term's range is resolvable above the row's
-  round-off and the room the row leaves each var (its sliver plus the engine's share of the
-  absolute tolerance, over the coefficient) is room nothing resolves; and no conversion is
-  made whose round-off, amplified by the var's coefficient in another row, would exceed that
-  row's budget (only the simplex, balancing both rows, resolves that);
+- a continuous var keeps its bounds as written: presolve fixes none, by a forcing row, an
+  equality or dual fixing, and turns no row into bounds. Such a reduction takes from the var
+  the room the model as written leaves it (the row's allowance over the coefficient, or its
+  bound tolerance), and the rooms of several vars can add up in a row presolve keeps, beyond
+  that row's tolerance. A singleton row over a continuous var goes only where the var's
+  bounds, with its bound tolerance, meet it within its whole contract, less the round-off
+  of evaluating it (as the boundary checks it once dropped);
+- an integer var's bound implied by a row keeps every integral value that meets the row
+  within its full contract, the other vars within their working bounds: a singleton row
+  rounds the var's implied bounds, and a forcing row, judged over the emitted bounds, fixes
+  the var only where no other integer lies within the room the row leaves it (its sliver
+  and its full contract at its magnitude, round-off part included, over the coefficient)
+  and every term of the row is resolvable above its round-off. A continuous var's working
+  bound keeps only the budget of the row that implies it, so through it the points kept are
+  those within the budget;
+- coefficient tightening makes a big-M row's vacuous branch bound-tight, relaxed by the
+  activity's round-off and the bound slack, and relaxes its binding branch (the binaries of
+  the rewrites that shrink the bound at one) by the contract the rewrites take out of it:
+  the contract at the magnitude of the bound, those binaries' terms and the other fixed
+  terms as written, less the contract at the same rewritten. A term fixed after the
+  rewrites grows the relaxation with the contract. The rewritten row's bound is derived
+  from the one as written, less the cuts of the binding branch's coefficients, plus its
+  relaxation, in compensated arithmetic and rounded outward, so that branch is the row as
+  written relaxed, never tighter: carried in `f64` through the fold of the fixed terms, the
+  rewrites and back, the bound is off by their round-off, some ulps of the row's largest
+  term, which the vacuous branches' relaxation covers and the binding branch's does not.
+  The rest of the row adds the same magnitude to both contracts, so the rewritten row, held
+  to the engine's budget, keeps its own reserve within the row's contract, and keeps every
+  point of the row's budget whose binaries are exactly at one, up to half the round-off of
+  the magnitude of its unfixed other terms. A point within the budget only with a binary
+  off its integer, within `int_tol`, is not kept: the rewritten coefficient takes away the
+  room the offset gives the row;
 - a row all of whose vars are fixed is judged as the boundary will judge it once dropped: as
   written, at the fixed values, by `row_violation`, against the full contract (nothing the
   engine does moves it);
-- each wave of the worklist processes the rows left with at most one term first, so a
-  singleton pins its var before a multi-term row deduces anything about it;
 - infeasibility is declared only when no point the engine could accept exists, as far as
-  the reductions can tell: they fix vars within the tolerances and take the fixed values as
-  exact from then on, so the verdict is not final, and the solve goes on with the model as
-  written, where the engine decides.
+  the reductions can tell, and with no certificate, so the verdict is not final: the solve
+  goes on with the model as written, where the engine decides. The engine's `Infeasible` on
+  the reduced model is final but for a model whose every point needs the integrality
+  tolerance (§2, known limitations below): the reductions keep, up to round-off, a point
+  within the engine's box with its integer vars exactly integral wherever the model as
+  written has one.
 
 The layering rule: the engine's tolerances decide *simplex* questions; `int_tol` decides
 *integrality* questions; `feasibility` is the contract presolve, the engine and *solution
@@ -990,12 +1023,15 @@ Known limitations:
   primal step comes back, until the solve fails with `InternalError` after
   `MAX_PHASE_ROUNDS`; a degenerate pivot on the tiny entry would resolve it, which needs
   absolute pivot tolerances;
-- presolve can fix a var within its row's tolerance at a value that another row amplifies
-  beyond the contract (`x2` fixed at `-1.5e-12`, the round-off of
-  `x1 - x2 - 0.1 x4 = -16384.1`, makes `-x2 - 1e-5 x3 <= 0` the bound `x3 >= 1.5e-7`, which
-  `x3 = x2` contradicts); where presolve sees the contradiction, the solve falls back to the
-  model as written, but where only the engine does, a feasible model is reported
-  `Infeasible`;
+- the non-basic at-bound state counts a var within its tolerance of both bounds as fixed,
+  and the cap leaves a continuous var free only where its whole range moves a row by more
+  than that row's reserve, so a gain that comes through the objective alone is lost:
+  `max 1e6 x + y` s.t. `y - x <= 0` over `x ∈ [0, 5e-8]` answers 0 against `5e-2`
+  (`a_continuous_var_narrower_than_its_tolerance_misses_its_objective_gain_is_a_known_limitation`),
+  and `max 1e9 x + y` with `x` in no row and `y <= 0.5` answers `0.5` against `50.5`.
+  Presolve's redundancy drops can leave such a var in no row, uncapped, so presolve on can
+  miss a gain that presolve off finds under the dropped rows' caps. A state taken from the
+  basis, with non-basic values exactly at their bounds, would remove it;
 - a feasible model whose only room is a coefficient of round-off size that its rows' own
   data leave (`x + y + z + q >= 3` and `t - (1 + 2^-50) z - q >= 1e-6` over
   `x, y, t ∈ [0, 1]` need `z <= -2^50 · 1e-6`) fails loudly, and in a MIP its node is not
@@ -1008,7 +1044,19 @@ Known limitations:
   engine's share of its contract, or rows that agree only within their tolerances, as at a
   MILP node whose equalities, taken as exact, keep `x1` at least `7e-5` from the node's
   value 1, where a point meets every row within half its contract (the same LP with `x1`
-  fixed from the start solves).
+  fixed from the start solves);
+- a MILP point within the engine's box only with an integer var off its integer, within
+  `int_tol`, under a coefficient that makes the offset count (an LP value `1 - 3e-14` under
+  `5e7` moves its row by `1.6e-6`), is not guaranteed. The search reaches it without
+  presolve through its LP; presolve takes it away where it fixes the var, tightens its
+  bounds or rewrites its big-M coefficient, as a branch on the var does. So on a model whose
+  every point needs the integrality tolerance, presolve on answers `Infeasible`, or a worse
+  optimum, where presolve off finds one. The pinned models need their big-M row at `0.8` of
+  its contract with the binary at one, beyond the budget, the half of the contract the
+  engine holds rows to while it keeps the other half in reserve
+  (`a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_a_known_limitation`,
+  `a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation`, and their
+  optimum forms, `an_optimum_needing_...`).
 
 The convention for such models is to pin each as a `#[should_panic]` test named
 `..._is_a_known_limitation` in `src/tests/magnitudes.rs` (beside the engine's unit tests when
@@ -1123,8 +1171,9 @@ dives a specific home:
 - **More presolve.** `src/presolve/` keeps the variable set and works on original
   indices (§2), so new reductions need no mapping layer — but a reduction that removed or
   aggregated variables would, and it would have to stay valid under the live pure-LP edit
-  API or come with a deliberate rebuild policy. Any new reduction must decide against the
-  tolerance contract of §7 the way the existing ones do.
+  API or come with a deliberate rebuild policy. Any new reduction must be exact (keep, up
+  to round-off, every point within the engine's box with its integer vars exactly integral,
+  §2) and decide against the tolerance contract of §7 the way the existing ones do.
 - **Node propagation.** Propagation belongs inside `visit_node`, after target bounds are
   applied and before `solve_node_lp`. Deduced bounds must be stored on the `Node` so children
   inherit them, and `state.applied` must mirror every partial tightening even when a

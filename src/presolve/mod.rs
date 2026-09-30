@@ -1,5 +1,33 @@
 //! Presolve: problem reductions applied before the simplex / branch & bound
-//! starts.
+//! starts. Every reduction is exact: it keeps, up to round-off, every point
+//! of the model as written within the engine's box whose integer vars are
+//! exactly integral, the box holding each row to the budget the engine holds
+//! it to (*Tolerances*) and each continuous var to its bounds within their
+//! tolerance (dual fixing keeps an optimum instead: *Soundness by mode*):
+//!
+//! * a row the bounds make redundant is dropped;
+//! * an integer var's bounds are rounded and tightened, and an integer var is
+//!   fixed where its rows leave it one value, or by dual fixing;
+//! * a binary's big-M coefficient is tightened.
+//!
+//! A continuous var keeps its bounds as written: presolve fixes none and
+//! turns no row into bounds. Such a reduction would take from the var the
+//! room the model as written leaves it (the row's allowance over the
+//! coefficient, or its bound tolerance), and the rooms of several vars can
+//! add up in a row presolve keeps, beyond that row's tolerance.
+//!
+//! No other point is guaranteed. A point beyond the box, within the
+//! contract, can be cut: a continuous var's working bound keeps only the
+//! budget of the row that implies it, and what is deduced from that bound
+//! inherits it. So can a point within the box only with an integer var off
+//! its integer, within `int_tol`, under a coefficient that makes the offset
+//! count: an LP value `1 - 3e-14` under `5e7` moves its row by `1.6e-6`.
+//! Without presolve the MILP search can reach such a point through its LP;
+//! fixing the var, tightening its bounds or shrinking its coefficient takes
+//! that path away, as a branch on the var does. So where every point of a
+//! model needs the integrality tolerance, presolve on can answer
+//! `Infeasible`, or a worse optimum, where presolve off finds one
+//! (ARCHITECTURE §7, known limitations).
 //!
 //! The variable set never changes: a var presolve "removes" gets `lo == hi`
 //! bounds, which the simplex prices out, and its value is substituted out of
@@ -11,13 +39,11 @@
 //! # Working vs emitted bounds
 //!
 //! WORKING bounds collect every valid implication and drive further
-//! deductions. EMITTED bounds are what the reduced problem carries: only
-//! deductions whose source row is removed (singleton conversions, forcing
-//! fixings), integer roundings and variable fixings. A continuous bound
-//! implied by a kept row is not emitted, since it is redundant with the row
-//! and would only perturb the pivot order. A row is dropped only when
-//! implied by the EMITTED bounds, never by working bounds whose
-//! justification might be that very row.
+//! deductions. EMITTED bounds are what the reduced problem carries: a
+//! continuous var's bounds as written, and an integer var's rounded, implied
+//! or fixed bounds. A continuous bound implied by a row stays working-only. A
+//! row is dropped only when implied by the EMITTED bounds, never by working
+//! bounds whose justification might be that very row.
 //!
 //! # Tolerances
 //!
@@ -43,20 +69,33 @@
 //!   the incumbent guard's full contract), by the round-off of the activity
 //!   ([`ROUNDOFF_FLOOR`]` * m`, including what a cancellation leaves) and by
 //!   the slack, so it never cuts a point the engine may return.
-//! * A row becomes bounds (a singleton conversion, an equality or forcing
-//!   fixing) only where the bounds keep what the row does, as the engine and
-//!   the boundary would hold it (`Work::singleton_row`,
-//!   `Work::forcing_is_exact`).
+//! * An integer var's bound implied by a row keeps every integral value that
+//!   meets the row within its contract, the other vars within their working
+//!   bounds: a singleton row rounds the var's implied bounds, and a forcing
+//!   row fixes the var only where no other integer lies within the room the
+//!   row leaves it (its allowance at its magnitude, round-off part included,
+//!   over the coefficient). A continuous var's working bound keeps only the
+//!   budget of the row that implies it, so through it the points kept are
+//!   those within the budget.
+//! * A big-M row that coefficient tightening rewrites keeps, up to
+//!   round-off, every point of its binding branch within the budget, its
+//!   rewritten binaries exactly at one: the branch is relaxed by the contract
+//!   the rewrites take out of it at the magnitude of the row's fixed terms,
+//!   fixed before the rewrites or after them (`Work::rewrite_room`), and its
+//!   bound is derived from the one as written (`Work::rewritten_bound`).
 //! * A row whose vars are all fixed is judged exactly as the boundary judges
 //!   it once dropped ([`row_violation`], full contract): nothing the engine
 //!   does can move it.
-//! * Each worklist wave processes the rows with at most one term first, so a
-//!   singleton pins its var before a multi-term row deduces anything about it.
 //! * Every row presolve drops or rewrites is still checked against the answer
 //!   as written ([`Presolved::validation_rows`]), so a wrong rule fails loudly
 //!   at the boundary.
-//! * An `Infeasible` verdict is not final: the solve then goes on with the
-//!   model as written ([`unless_infeasible`]).
+//! * Presolve's own `Infeasible` carries no certificate, so it is not final:
+//!   the solve then goes on with the model as written ([`reduced_model`]),
+//!   where the engine decides on a proof. The engine's `Infeasible` on the
+//!   reduced model is final but for a model whose every point needs the
+//!   integrality tolerance (above): the reductions keep, up to round-off, a
+//!   point within the box with its integer vars exactly integral wherever the
+//!   model as written has one.
 //!
 //! [`row_violation`]: crate::solver::row_violation
 //!
@@ -91,7 +130,7 @@ use crate::{ComparisonOp, CsVec, Error, VarDomain};
 /// coefficients as stored on `Problem`; `feasibility` is the user's absolute
 /// feasibility tolerance, the contract every decision is made against.
 /// Returns `Err(Infeasible)` when the reductions find no acceptable point,
-/// which the solve does not take as final ([`unless_infeasible`]).
+/// which the solve does not take as final ([`reduced_model`]).
 #[allow(clippy::too_many_arguments)] // mirrors Solver::try_new's flat-arrays style
 pub(crate) fn presolve(
     obj_coeffs: &[f64],
@@ -162,6 +201,7 @@ pub(crate) fn presolve(
             alive: true,
             orig: orig as u32,
             coeffs_touched: false,
+            binding: None,
         });
     }
 
@@ -255,31 +295,12 @@ pub(crate) fn presolve(
             out.push(constraints[row.orig as usize].clone());
             continue;
         }
-        // Rewritten: restore the folded terms and shift the bounds back, so
-        // the row keeps its magnitude; the shift's round-off is within the
-        // relaxation the rewrite applied. The rewrite holds for integer
+        // Rewritten: the rewritten terms, the folded terms restored so that
+        // the row keeps its magnitude, and the bound derived from the one as
+        // written (`Work::rewritten_bound`). The rewrite holds for integer
         // points only, so the answer is also checked against the input row.
         validation_rows.push(constraints[row.orig as usize].clone());
-        let shift: f64 = row.folded.iter().map(|&(v, a)| a * work.elo[v]).sum();
-        let (op, rhs) = match (row.lo.is_finite(), row.hi.is_finite()) {
-            (false, true) => (ComparisonOp::Le, row.hi + shift),
-            (true, false) => (ComparisonOp::Ge, row.lo + shift),
-            (true, true) => {
-                // Substitution shifts both sides identically and every other
-                // transformation keeps rows one-sided, so a two-sided row is
-                // an Eq row to the last bit.
-                assert!(
-                    row.lo == row.hi,
-                    "presolve produced a two-sided row: [{}, {}] — this is a bug",
-                    row.lo,
-                    row.hi
-                );
-                (ComparisonOp::Eq, row.lo + shift)
-            }
-            (false, false) => {
-                unreachable!("a both-sides-infinite row is always dropped as redundant")
-            }
-        };
+        let (op, rhs) = work.rewritten_bound(row);
         let mut vars = row.vars.clone();
         let mut coeffs = row.coeffs.clone();
         for &(v, a) in &row.folded {
@@ -306,25 +327,42 @@ pub(crate) fn presolve(
         started.elapsed(),
     );
 
+    // A row kept unchanged is emitted as written, so the rows are the model's
+    // unless one was dropped or rewritten (a validation row) or dropped on
+    // input. Bounds compare as values: rounding an integer bound of 0 gives -0.
+    let reduced = work.elo != var_mins
+        || work.ehi != var_maxs
+        || !validation_rows.is_empty()
+        || out.len() != constraints.len();
+    debug_assert!(
+        (0..num_vars).all(|v| {
+            (mode == Mode::Mip && is_int_domain(&var_domains[v]))
+                || (work.elo[v] == var_mins[v] && work.ehi[v] == var_maxs[v])
+        }),
+        "presolve changed a continuous var's bounds"
+    );
     Ok(Presolved {
         var_mins: work.elo,
         var_maxs: work.ehi,
         constraints: out,
         validation_rows,
+        reduced,
         stats: work.stats,
     })
 }
 
-/// [`presolve`]'s result as the solve takes it: `None` for `Infeasible`, so
-/// that the model is solved as written. The reductions fix vars within the
-/// tolerances and then take the fixed values as exact, which can make a model
-/// feasible within the contract look infeasible; the engine returns
-/// `Infeasible` only on a proof, and a MILP's search decides from there.
-pub(crate) fn unless_infeasible(
-    result: Result<Presolved, Error>,
-) -> Result<Option<Presolved>, Error> {
+/// [`presolve`]'s result as the solve takes it: the reduced model, or `None`
+/// to solve the model as written. Presolve's `Infeasible` carries no
+/// certificate, so it is not final: the engine returns `Infeasible` only on a
+/// proof and a MILP's search decides from there. A model presolve did not
+/// reduce is solved as written.
+pub(crate) fn reduced_model(result: Result<Presolved, Error>) -> Result<Option<Presolved>, Error> {
     match result {
-        Ok(presolved) => Ok(Some(presolved)),
+        Ok(presolved) if presolved.reduced => Ok(Some(presolved)),
+        Ok(_) => {
+            debug!("presolve reduced nothing; solving the model as written");
+            Ok(None)
+        }
         Err(Error::Infeasible) => {
             debug!("presolve found the model infeasible; solving it as written");
             Ok(None)

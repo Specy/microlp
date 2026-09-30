@@ -215,6 +215,170 @@ mod tests_presolve_api {
         }
     }
 
+    /// An infeasible model the reductions do not see, `x - y >= r` and
+    /// `y - x >= r` over `x, y >= 0`, whose bounds each pass only raises,
+    /// with `w = 0.5` over `w` in `[0, 1]`: the engine proves it infeasible,
+    /// as an LP (`r = 0.1`) and a MILP (integer `x, y`, `r = 1`), presolve on
+    /// and off.
+    #[test]
+    fn an_infeasible_model_the_reductions_do_not_see_stays_infeasible() {
+        init();
+        for milp in [false, true] {
+            let mut p = Problem::new(OptimizationDirection::Minimize);
+            let (x, y, r) = if milp {
+                let x = p.add_integer_var(1.0, (0, i32::MAX));
+                (x, p.add_integer_var(1.0, (0, i32::MAX)), 1.0)
+            } else {
+                let x = p.add_var(1.0, (0.0, f64::INFINITY));
+                (x, p.add_var(1.0, (0.0, f64::INFINITY)), 0.1)
+            };
+            p.add_constraint([(x, 1.0), (y, -1.0)], ComparisonOp::Ge, r);
+            p.add_constraint([(x, -1.0), (y, 1.0)], ComparisonOp::Ge, r);
+            let w = p.add_var(0.0, (0.0, 1.0));
+            p.add_constraint([(w, 1.0)], ComparisonOp::Eq, 0.5);
+            let (with, without) = solve_both(&p);
+            for (presolve, result) in [(true, with), (false, without)] {
+                assert_eq!(
+                    result.map(|_| "solved"),
+                    Err(Error::Infeasible),
+                    "milp {milp}, presolve {presolve}"
+                );
+            }
+        }
+    }
+
+    /// A big-M MILP, `x_i <= 1000 y_i` over `x_i` in `[0, 1]` and binaries
+    /// `y_i`, with `sum x >= 4.5` and `sum y <= 4`: coefficient tightening
+    /// makes the root relaxation infeasible, a verdict a search without it
+    /// needs many nodes to reach, with and without a forcing row `v + w <= 0`
+    /// over `v, w` in `[0, 1]`, which presolve keeps as a row. Both end at
+    /// the root, within a budget of no node.
+    #[test]
+    fn an_infeasible_big_m_milp_is_proven_at_its_root() {
+        init();
+        for forcing in [false, true] {
+            let n = 8;
+            let mut p = Problem::new(OptimizationDirection::Minimize);
+            let xs: Vec<_> = (0..n).map(|_| p.add_var(0.0, (0.0, 1.0))).collect();
+            let ys: Vec<_> = (0..n).map(|_| p.add_binary_var(1.0)).collect();
+            for (&x, &y) in xs.iter().zip(&ys) {
+                p.add_constraint([(x, 1.0), (y, -1000.0)], ComparisonOp::Le, 0.0);
+            }
+            let sum = |vars: &[Variable]| vars.iter().map(|&v| (v, 1.0)).collect::<Vec<_>>();
+            p.add_constraint(sum(&xs), ComparisonOp::Ge, n as f64 / 2.0 + 0.5);
+            p.add_constraint(sum(&ys), ComparisonOp::Le, (n / 2) as f64);
+            if forcing {
+                let v = p.add_var(1.0, (0.0, 1.0));
+                let w = p.add_var(1.0, (0.0, 1.0));
+                p.add_constraint([(v, 1.0), (w, 1.0)], ComparisonOp::Le, 0.0);
+            }
+            let result = p.solve_with(SolveOptions {
+                node_limit: Some(0),
+                ..SolveOptions::default()
+            });
+            assert_eq!(
+                result.map(|outcome| outcome.termination_reason()),
+                Err(Error::Infeasible),
+                "forcing {forcing}"
+            );
+        }
+    }
+
+    /// The big-M row `100 x + M y <= M + 500` over `x` in `[0, 10]` and a
+    /// binary `y`, and `1000 x >= 5000 + 10 e`, which needs the row `e`
+    /// beyond its bound at `y = 1`; `p - q + 100 y >= 100` and
+    /// `q - p + 100 y >= 100` over `p, q` in `[0, 1000]` exclude `y = 0`
+    /// only together. With `optimum`, the second row is
+    /// `1000 x >= (5000 + 10 e) z` over a binary `z` of cost -1; with
+    /// `forcing`, `v + w <= 0` over `v, w` in `[0, 1]` is added. Coefficient
+    /// tightening rewrites the big-M row into about `100 x + 500 y <= 1000`,
+    /// whose contract is the absolute `1e-7`, where the row's at `y = 1` is
+    /// its round-off, `1e-14 (2 M + 1000)`.
+    fn big_m_binding(m: f64, e: f64, forcing: bool, optimum: bool) -> Problem {
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let x = p.add_var(0.0, (0.0, 10.0));
+        let y = p.add_binary_var(0.0);
+        let pp = p.add_var(0.0, (0.0, 1000.0));
+        let q = p.add_var(0.0, (0.0, 1000.0));
+        p.add_constraint([(x, 100.0), (y, m)], ComparisonOp::Le, m + 500.0);
+        let rhs = 5000.0 + 10.0 * e;
+        if optimum {
+            let z = p.add_binary_var(-1.0);
+            p.add_constraint([(x, 1000.0), (z, -rhs)], ComparisonOp::Ge, 0.0);
+        } else {
+            p.add_constraint([(x, 1000.0)], ComparisonOp::Ge, rhs);
+        }
+        p.add_constraint([(pp, 1.0), (q, -1.0), (y, 100.0)], ComparisonOp::Ge, 100.0);
+        p.add_constraint([(pp, -1.0), (q, 1.0), (y, 100.0)], ComparisonOp::Ge, 100.0);
+        if forcing {
+            let v = p.add_var(1.0, (0.0, 1.0));
+            let w = p.add_var(1.0, (0.0, 1.0));
+            p.add_constraint([(v, 1.0), (w, 1.0)], ComparisonOp::Le, 0.0);
+        }
+        p
+    }
+
+    /// A solve's answer: the objective of its optimal solution, or its error.
+    fn answer(result: Result<SolveOutcome, Error>) -> Result<f64, Error> {
+        result.map(|outcome| {
+            let solution = solution(Ok(outcome));
+            assert_eq!(solution.status(), SolutionStatus::Optimal);
+            solution.objective()
+        })
+    }
+
+    /// [`big_m_binding`] within the row's contract, `e` up to `7e-7` against
+    /// about `1e-6` at `M = 5e7`, where `7e-7` lies beyond the engine's budget
+    /// of the row as written: without presolve the search lands there by
+    /// rounding `y`. The rewritten row keeps the row's contract at `y = 1`
+    /// and, held to its own budget, `5e-8`, reaches all of it but `5e-8`:
+    /// presolve on and off find the point, and the optimum `z = 1`.
+    #[test]
+    fn a_big_m_rewrite_keeps_every_point_within_the_rows_contract() {
+        init();
+        for m in [5e7, 1e8] {
+            for e in [3e-7, 5e-7, 7e-7] {
+                for (forcing, optimum, objective) in
+                    [(false, false, 0.0), (true, false, 0.0), (false, true, -1.0)]
+                {
+                    let (with, without) = solve_both(&big_m_binding(m, e, forcing, optimum));
+                    for (presolve, result) in [(true, with), (false, without)] {
+                        assert_eq!(
+                            answer(result),
+                            Ok(objective),
+                            "M {m:e}, e {e:e}, forcing {forcing}, optimum {optimum}, presolve {presolve}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`big_m_binding`] `3e-8` beyond the row's contract: no point of the
+    /// rewritten row at `y = 1` passes the row as written, so presolve on and
+    /// off find none, and the optimum `z = 0`.
+    #[test]
+    fn a_big_m_rewrite_admits_no_point_beyond_the_rows_contract() {
+        init();
+        for m in [5e7, 1e8] {
+            let e = 1e-14 * (2.0 * m + 1000.0) + 3e-8;
+            for (forcing, optimum, expected) in [
+                (false, false, Err(Error::Infeasible)),
+                (true, false, Err(Error::Infeasible)),
+                (false, true, Ok(0.0)),
+            ] {
+                let (with, without) = solve_both(&big_m_binding(m, e, forcing, optimum));
+                for (presolve, result) in [(true, with), (false, without)] {
+                    assert_eq!(
+                        answer(result),
+                        expected,
+                        "M {m:e}, forcing {forcing}, optimum {optimum}, presolve {presolve}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Unboundedness must remain the simplex's verdict (dual fixing skips
     /// infinite bounds rather than misclassifying).
     #[test]
@@ -548,40 +712,23 @@ mod tests_presolve_api {
         }
     }
 
-    /// A row whose vars presolve fixed is judged against the full contract,
-    /// as an empty input row is, not against the engine's half: the forcing
-    /// row `x1 + 100 x4 = 8388700` fixes `x1` at `-2^-30` and `x4` at 83887,
-    /// leaving `-100 x1 + x4 / 1000 = 83.887` a residual of 9.3e-8, within
-    /// 1e-7 but not 5e-8.
+    /// `x0 = 0` fixes the integer `x0`, and `x0 + 3 x1 = 1`, left with the
+    /// continuous `x1`, stays a row, as `x1` keeps its bounds: the engine
+    /// meets it with `x1` at its lower bound, an ulp below `1/3`, as without
+    /// presolve.
     #[test]
-    fn all_substituted_row_is_judged_at_the_full_contract() {
+    fn a_row_an_integer_fixing_leaves_with_a_continuous_var_stays_a_row() {
         init();
         let mut p = Problem::new(OptimizationDirection::Maximize);
-        let x1 = p.add_var(-1.0, (-2.0f64.powi(-30), 1.0));
-        let x4 = p.add_var(1.0, (83887.0, 83888.0));
-        p.add_constraint(&[(x1, -1.0), (x4, -100.0)], ComparisonOp::Eq, -8388700.0);
-        p.add_constraint(&[(x1, -100.0), (x4, 1e-3)], ComparisonOp::Eq, 83.887);
-        let sol = assert_same_objective(&p);
-        assert_eq!(sol[x4], 83887.0);
-    }
-
-    /// Singleton rows go first in each wave: taken first, `-100 x1 = 0` pins
-    /// `x1` at zero and `x1 + 100 x4 = 8388700` becomes a singleton in `x4`.
-    /// In index order, that forcing row fixed `x1` at `-2^-30`, which the
-    /// singleton then declared infeasible.
-    #[test]
-    fn singleton_row_is_processed_before_a_forcing_row() {
-        init();
-        let mut p = Problem::new(OptimizationDirection::Maximize);
-        let _x0 = p.add_integer_var(0.0, (0, 0));
-        let x1 = p.add_var(-1.0, (-2.0f64.powi(-30), 1.0));
-        let _x2 = p.add_var(0.0, (0.0, 0.0));
-        let _x3 = p.add_var(-1.0, (0.0, 0.0));
-        let x4 = p.add_var(1.0, (83887.0, 83888.0));
-        p.add_constraint(&[(x1, -1.0), (x4, -100.0)], ComparisonOp::Eq, -8388700.0);
-        p.add_constraint(&[(x1, -100.0)], ComparisonOp::Eq, -0.0);
-        let sol = solution(p.solve_with(SolveOptions::default()));
-        assert_eq!((sol[x1], sol[x4]), (0.0, 83887.0));
+        let x0 = p.add_integer_var(0.0, (0, 1));
+        let below_a_third = f64::from_bits((1.0f64 / 3.0).to_bits() - 1);
+        let x1 = p.add_var(-1.0, (below_a_third, 1.0));
+        p.add_constraint([(x0, 1.0), (x1, 3.0)], ComparisonOp::Eq, 1.0);
+        p.add_constraint([(x0, 1.0)], ComparisonOp::Eq, 0.0);
+        let (with, without) = solve_both(&p);
+        let (with, without) = (solution(with), solution(without));
+        assert_eq!((without[x0], without[x1]), (0.0, below_a_third));
+        assert_eq!((with[x0], with[x1]), (without[x0], without[x1]));
         assert_same_objective(&p);
     }
 }

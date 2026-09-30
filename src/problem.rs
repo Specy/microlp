@@ -253,7 +253,7 @@ impl Problem {
             // Lp mode applies only feasible-set-exact reductions, so the live
             // solver stays sound under every later Solution edit.
             let presolved = if options.presolve {
-                presolve::unless_infeasible(presolve::presolve(
+                presolve::reduced_model(presolve::presolve(
                     &self.obj_coeffs,
                     &self.var_mins,
                     &self.var_maxs,

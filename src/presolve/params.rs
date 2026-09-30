@@ -16,11 +16,12 @@ pub(crate) const REDUNDANT_MARGIN: f64 = 1e-9;
 pub(crate) const COEFF_MIN_IMPROVE: f64 = 0.1;
 
 /// A long row is coefficient-tightened only when at most this many of its
-/// terms are eligible. The excess `U − b` is invariant under each
-/// application, so on a loose dense binary row every coefficient becomes
-/// eligible and the row collapses toward a cardinality constraint, a tighter
-/// but massively degenerate relaxation. What pays on long rows is the big-M
-/// signature, one or two oversized coefficients per row (`x − M·y ≤ 0`).
+/// terms are eligible. An application changes the excess `U − b` only by the
+/// round-off-sized room it keeps, so on a loose dense binary row every
+/// coefficient becomes eligible and the row collapses toward a cardinality
+/// constraint, a tighter but massively degenerate relaxation. What pays on
+/// long rows is the big-M signature, one or two oversized coefficients per
+/// row (`x − M·y ≤ 0`).
 pub(crate) const COEFF_TIGHTEN_ROW_CAP: usize = 2;
 
 /// Rows with at most this many terms are exempt from

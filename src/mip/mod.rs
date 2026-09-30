@@ -34,7 +34,7 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
     // become the root bounds. Dual fixing can exclude a feasible point, so a
     // warm-start hint disables it.
     let presolved = if options.presolve {
-        crate::presolve::unless_infeasible(crate::presolve::presolve(
+        crate::presolve::reduced_model(crate::presolve::presolve(
             &problem.obj_coeffs,
             &problem.var_mins,
             &problem.var_maxs,

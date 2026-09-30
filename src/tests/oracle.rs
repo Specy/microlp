@@ -274,8 +274,8 @@ fn check_contract_with(
     };
     assert!(
         !worse,
-        "objective {objective:e} is worse than the objective {at_star:e} at the feasible \
-         point the model was built around (slack {slack:e}):\n{}",
+        "{call}: objective {objective:e} is worse than the objective {at_star:e} at the \
+         feasible point the model was built around (slack {slack:e}):\n{}",
         model.source()
     );
 }
