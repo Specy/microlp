@@ -46,11 +46,12 @@ let y = problem.add_integer_var(2.0, (0, 3));
 problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
 problem.add_constraint(&[(x, 2.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
 
-// The optimum is 7, at x = 1, y = 3.
+// The optimum is 7, at x = 1, y = 3. An integer variable's value is
+// reported within `int_tol` of its integer: round it for an exact one.
 let solution = problem.solve().unwrap().into_solution().unwrap();
-assert_eq!(solution.objective(), 7.0);
-assert_eq!(solution.var_value(x), 1.0);
-assert_eq!(solution.var_value(y), 3.0);
+assert!((solution.objective() - 7.0).abs() < 1e-6);
+assert!((solution.var_value(x) - 1.0).abs() < 1e-6);
+assert_eq!(solution.var_value(y).round(), 3.0);
 ```
 
 ## Defining a problem
@@ -133,15 +134,20 @@ match problem.solve()? {
 }
 ```
 
-Values on a `Solution` are read per variable or by iterating. For integer and boolean
-variables `var_value` returns an exact integer, and the reported objective is
-computed from exactly the values you read:
+Values on a `Solution` are read per variable or by iterating, as the solver
+computed them, and the reported objective is computed from exactly the values
+you read. An integer or boolean variable's value lies within `int_tol` (default
+`1e-6`) of an integer, not necessarily on it: values like `0.9999999` are
+normal. One fixed at an integer (by its bounds, the search or an edit) lies on
+it. Use `.round()` where you need an exact integer, bearing in mind that
+rounded values need not meet the constraints: under a big-M constraint such as
+`x <= 1e7 * y`, a `y` of `1e-6` allows `x` up to 10, which `y` rounded to zero
+forbids. Keep big-M coefficients no larger than the model needs.
 
 ```rust
-let value = solution.var_value(x);   // rounded to an exact integer for
-                                     // integer/boolean variables
-let raw = solution.var_value_raw(x); // without the rounding
-let same = solution[x];              // indexing is equivalent to var_value_raw()
+let value = solution.var_value(x);           // as computed
+let count = solution.var_value(y).round();   // an exact integer
+let same = solution[x];                      // indexing is equivalent to var_value()
 
 for (var, value) in &solution {
     println!("{}: {}", var.idx(), value);
@@ -205,8 +211,12 @@ let outcome = problem.solve_with(options)?;
 * `warm_start`: a starting assignment (it may cover only some variables).
   A good one gives the solver an immediate solution to improve on. It is
   advisory: if it isn't usable it is ignored.
-* `int_tol`, `tolerances`: numeric tolerances. Values must be finite and non-negative, the feasibility
-  tolerance at least `1e-10`, and the two integrality tolerances below `0.5`.
+* `int_tol`, `tolerances`: numeric tolerances. A value within `int_tol` of an
+  integer counts as integral, and integer values are reported within it (a
+  fixed integer variable's on its integer); the feasibility tolerance is
+  absolute, for every variable bound and constraint.
+  Values must be finite and non-negative, the feasibility tolerance at least
+  `1e-10`, and the two integrality tolerances below `0.5`.
 
 ## Changing a solved problem
 

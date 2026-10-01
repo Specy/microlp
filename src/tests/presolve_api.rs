@@ -4,7 +4,34 @@
 
 #[cfg(test)]
 mod tests_presolve_api {
+    use crate::tests::oracle::{self, Model, Row, Var};
     use crate::*;
+
+    fn real(obj: f64, lo: f64, hi: f64) -> Var {
+        Var {
+            obj,
+            lo,
+            hi,
+            integer: false,
+        }
+    }
+
+    fn int(obj: f64, lo: i32, hi: i32) -> Var {
+        Var {
+            obj,
+            lo: lo as f64,
+            hi: hi as f64,
+            integer: true,
+        }
+    }
+
+    fn row(terms: &[(usize, f64)], op: ComparisonOp, rhs: f64) -> Row {
+        Row {
+            terms: terms.to_vec(),
+            op,
+            rhs,
+        }
+    }
 
     fn init() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -285,37 +312,53 @@ mod tests_presolve_api {
     }
 
     /// The big-M row `100 x + M y <= M + 500` over `x` in `[0, 10]` and a
-    /// binary `y`, and `1000 x >= 5000 + 10 e`, which needs the row `e`
-    /// beyond its bound at `y = 1`; `p - q + 100 y >= 100` and
-    /// `q - p + 100 y >= 100` over `p, q` in `[0, 1000]` exclude `y = 0`
-    /// only together. With `optimum`, the second row is
-    /// `1000 x >= (5000 + 10 e) z` over a binary `z` of cost -1; with
+    /// binary `y` (fixed at one with `y_fixed`), and `1000 x >= 5000 + 10 e`,
+    /// which needs the row `e` beyond its bound at `y = 1`;
+    /// `p - q + 100 y >= 100` and `q - p + 100 y >= 100` over `p, q` in
+    /// `[0, 1000]` exclude `y = 0` only together. With `optimum`, the second
+    /// row is `1000 x >= (5000 + 10 e) z` over a binary `z` of cost -1; with
     /// `forcing`, `v + w <= 0` over `v, w` in `[0, 1]` is added. Coefficient
     /// tightening rewrites the big-M row into about `100 x + 500 y <= 1000`,
     /// whose contract is the absolute `1e-7`, where the row's at `y = 1` is
     /// its round-off, `1e-14 (2 M + 1000)`.
-    fn big_m_binding(m: f64, e: f64, forcing: bool, optimum: bool) -> Problem {
-        let mut p = Problem::new(OptimizationDirection::Minimize);
-        let x = p.add_var(0.0, (0.0, 10.0));
-        let y = p.add_binary_var(0.0);
-        let pp = p.add_var(0.0, (0.0, 1000.0));
-        let q = p.add_var(0.0, (0.0, 1000.0));
-        p.add_constraint([(x, 100.0), (y, m)], ComparisonOp::Le, m + 500.0);
+    fn big_m_binding(m: f64, e: f64, forcing: bool, optimum: bool, y_fixed: bool) -> Model {
+        let y_lo = if y_fixed { 1 } else { 0 };
+        let mut vars = vec![
+            real(0.0, 0.0, 10.0),
+            int(0.0, y_lo, 1),
+            real(0.0, 0.0, 1000.0),
+            real(0.0, 0.0, 1000.0),
+        ];
         let rhs = 5000.0 + 10.0 * e;
+        let mut rows = vec![row(&[(0, 100.0), (1, m)], ComparisonOp::Le, m + 500.0)];
         if optimum {
-            let z = p.add_binary_var(-1.0);
-            p.add_constraint([(x, 1000.0), (z, -rhs)], ComparisonOp::Ge, 0.0);
+            vars.push(int(-1.0, 0, 1));
+            rows.push(row(&[(0, 1000.0), (4, -rhs)], ComparisonOp::Ge, 0.0));
         } else {
-            p.add_constraint([(x, 1000.0)], ComparisonOp::Ge, rhs);
+            rows.push(row(&[(0, 1000.0)], ComparisonOp::Ge, rhs));
         }
-        p.add_constraint([(pp, 1.0), (q, -1.0), (y, 100.0)], ComparisonOp::Ge, 100.0);
-        p.add_constraint([(pp, -1.0), (q, 1.0), (y, 100.0)], ComparisonOp::Ge, 100.0);
+        rows.push(row(
+            &[(2, 1.0), (3, -1.0), (1, 100.0)],
+            ComparisonOp::Ge,
+            100.0,
+        ));
+        rows.push(row(
+            &[(2, -1.0), (3, 1.0), (1, 100.0)],
+            ComparisonOp::Ge,
+            100.0,
+        ));
         if forcing {
-            let v = p.add_var(1.0, (0.0, 1.0));
-            let w = p.add_var(1.0, (0.0, 1.0));
-            p.add_constraint([(v, 1.0), (w, 1.0)], ComparisonOp::Le, 0.0);
+            let v = vars.len();
+            vars.extend([real(1.0, 0.0, 1.0), real(1.0, 0.0, 1.0)]);
+            rows.push(row(&[(v, 1.0), (v + 1, 1.0)], ComparisonOp::Le, 0.0));
         }
-        p
+        let xstar = vec![0.0; vars.len()];
+        Model {
+            direction: OptimizationDirection::Minimize,
+            vars,
+            rows,
+            xstar,
+        }
     }
 
     /// A solve's answer: the objective of its optimal solution, or its error.
@@ -328,52 +371,77 @@ mod tests_presolve_api {
     }
 
     /// [`big_m_binding`] within the row's contract, `e` up to `7e-7` against
-    /// about `1e-6` at `M = 5e7`, where `7e-7` lies beyond the engine's budget
-    /// of the row as written: without presolve the search lands there by
-    /// rounding `y`. The rewritten row keeps the row's contract at `y = 1`
-    /// and, held to its own budget, `5e-8`, reaches all of it but `5e-8`:
-    /// presolve on and off find the point, and the optimum `z = 1`.
+    /// about `1e-6` at `M = 5e7`: the engine holds a row to its whole contract
+    /// less the round-off of evaluating it, and the rewritten row keeps the
+    /// row's contract at `y = 1`, so presolve on and off find the point, and
+    /// the optimum `z = 1`, its value within `int_tol` of 1.
     #[test]
     fn a_big_m_rewrite_keeps_every_point_within_the_rows_contract() {
         init();
+        let int_tol = SolveOptions::default().int_tol;
         for m in [5e7, 1e8] {
             for e in [3e-7, 5e-7, 7e-7] {
                 for (forcing, optimum, objective) in
                     [(false, false, 0.0), (true, false, 0.0), (false, true, -1.0)]
                 {
-                    let (with, without) = solve_both(&big_m_binding(m, e, forcing, optimum));
+                    let (problem, _) = big_m_binding(m, e, forcing, optimum, false).build();
+                    let (with, without) = solve_both(&problem);
                     for (presolve, result) in [(true, with), (false, without)] {
-                        assert_eq!(
-                            answer(result),
-                            Ok(objective),
-                            "M {m:e}, e {e:e}, forcing {forcing}, optimum {optimum}, presolve {presolve}"
+                        let label = format!(
+                            "M {m:e}, e {e:e}, forcing {forcing}, optimum {optimum}, presolve \
+                             {presolve}"
                         );
+                        let got = answer(result).unwrap_or_else(|err| panic!("{label}: {err:?}"));
+                        assert!((got - objective).abs() <= int_tol, "{label}: {got}");
                     }
                 }
             }
         }
     }
 
-    /// [`big_m_binding`] `3e-8` beyond the row's contract: no point of the
-    /// rewritten row at `y = 1` passes the row as written, so presolve on and
-    /// off find none, and the optimum `z = 0`.
+    /// [`big_m_binding`] `3e-8` beyond the row's contract. No point with `y`
+    /// exactly at one meets the big-M row within its contract: with `y` fixed
+    /// there, presolve on and off find none. A point with an integer var off
+    /// its integer within `int_tol` can meet the rows, `M` times the offset
+    /// making room (`z` under one relaxes `1000 x >= (5000 + 10 e) z` too):
+    /// every answer, presolve on and off, meets the rows as written at its
+    /// values, whatever the rewrite made of the big-M row.
     #[test]
-    fn a_big_m_rewrite_admits_no_point_beyond_the_rows_contract() {
+    fn a_big_m_rewrite_admits_only_points_of_the_row_as_written() {
         init();
         for m in [5e7, 1e8] {
             let e = 1e-14 * (2.0 * m + 1000.0) + 3e-8;
-            for (forcing, optimum, expected) in [
-                (false, false, Err(Error::Infeasible)),
-                (true, false, Err(Error::Infeasible)),
-                (false, true, Ok(0.0)),
-            ] {
-                let (with, without) = solve_both(&big_m_binding(m, e, forcing, optimum));
-                for (presolve, result) in [(true, with), (false, without)] {
-                    assert_eq!(
-                        answer(result),
-                        expected,
-                        "M {m:e}, forcing {forcing}, optimum {optimum}, presolve {presolve}"
-                    );
+            for (forcing, optimum) in [(false, false), (true, false), (false, true)] {
+                for y_fixed in [true, false] {
+                    let label =
+                        format!("M {m:e}, forcing {forcing}, optimum {optimum}, y fixed {y_fixed}");
+                    let model = big_m_binding(m, e, forcing, optimum, y_fixed);
+                    let (problem, vars) = model.build();
+                    let (with, without) = solve_both(&problem);
+                    for (presolve, result) in [(true, with), (false, without)] {
+                        if y_fixed && !optimum {
+                            assert_eq!(
+                                answer(result),
+                                Err(Error::Infeasible),
+                                "{label}, presolve {presolve}"
+                            );
+                            continue;
+                        }
+                        let Ok(outcome) = result else {
+                            assert_eq!(result.map(|_| ()), Err(Error::Infeasible), "{label}");
+                            continue;
+                        };
+                        let solution = solution(Ok(outcome));
+                        let x: Vec<f64> = vars.iter().map(|&v| solution.var_value(v)).collect();
+                        for (i, r) in model.rows.iter().enumerate() {
+                            let violation = oracle::row_violation(r, &x);
+                            assert!(
+                                violation <= oracle::row_tolerance(r, &x),
+                                "{label}, presolve {presolve}: row {i} violated by \
+                                 {violation:e} at {x:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -477,8 +545,10 @@ mod tests_presolve_api {
         p.add_constraint(&[(a, 3.0), (b, 1.0)], ComparisonOp::Ge, 4.0);
         p.add_constraint(&[(pen, 1.0), (a, 1.0)], ComparisonOp::Le, 50.0);
         let plain = assert_same_objective(&p);
-        assert_eq!(plain.objective(), 11.0);
-        assert_eq!(plain.var_value(pen), 0.0);
+        // Values are within `int_tol` of their integers (costs 3, 4 and 5).
+        let int_tol = SolveOptions::default().int_tol;
+        assert!((plain.objective() - 11.0).abs() <= int_tol * 12.0);
+        assert!(plain.var_value(pen).abs() <= int_tol);
 
         // Hinted solve: a feasible non-optimal hint must not change the answer.
         let hinted = solution(p.solve_with(SolveOptions {
@@ -486,7 +556,7 @@ mod tests_presolve_api {
             ..SolveOptions::default()
         }));
         assert_eq!(hinted.status(), SolutionStatus::Optimal);
-        assert_eq!(hinted.objective(), 11.0);
+        assert!((hinted.objective() - 11.0).abs() <= int_tol * 12.0);
     }
 
     /// Big-M rows: coefficient tightening must preserve the optimum of a
@@ -663,10 +733,11 @@ mod tests_presolve_api {
         }
     }
 
-    /// Integer points are held to the full contract (the incumbent guard's),
-    /// so presolve's integer rounding may not cut one that meets it: `x + y
-    /// = 4 + 6e-8` holds within 1e-7 at (4, 0), but rounding against half
-    /// the tolerance moved each bound by a unit per pass until they crossed.
+    /// Presolve's integer rounding keeps every integral point within the
+    /// engine's box: `x + y = 4 + 6e-8` holds within 1e-7 at (4, 0), but
+    /// rounding against half the tolerance moved each bound by a unit per
+    /// pass until they crossed. The answer is the LP's point, within
+    /// `int_tol` of (4, 0).
     #[test]
     fn integer_rounding_keeps_points_the_guard_accepts() {
         init();
@@ -675,7 +746,8 @@ mod tests_presolve_api {
         let y = p.add_integer_var(1.0, (0, 10));
         p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Eq, 4.0 + 6e-8);
         let sol = assert_same_objective(&p);
-        assert_eq!(sol.objective(), 4.0);
+        let int_tol = SolveOptions::default().int_tol;
+        assert!((sol.objective() - 4.0).abs() <= int_tol * 2.0);
     }
 
     /// A row whose vars are all fixed is judged at the magnitude the engine

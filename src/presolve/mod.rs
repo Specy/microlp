@@ -2,8 +2,8 @@
 //! starts. Every reduction is exact: it keeps, up to round-off, every point
 //! of the model as written within the engine's box whose integer vars are
 //! exactly integral, the box holding each row to the budget the engine holds
-//! it to (*Tolerances*) and each continuous var to its bounds within their
-//! tolerance (dual fixing keeps an optimum instead: *Soundness by mode*):
+//! it to (*Tolerances*) and each var to its bounds within their tolerance
+//! (dual fixing keeps an optimum instead: *Soundness by mode*):
 //!
 //! * a row the bounds make redundant is dropped;
 //! * an integer var's bounds are rounded and tightened, and an integer var is
@@ -17,9 +17,10 @@
 //! add up in a row presolve keeps, beyond that row's tolerance.
 //!
 //! No other point is guaranteed. A point beyond the box, within the
-//! contract, can be cut: a continuous var's working bound keeps only the
-//! budget of the row that implies it, and what is deduced from that bound
-//! inherits it. So can a point within the box only with an integer var off
+//! contract by less than the round-off of evaluating a row, can be cut: a
+//! working bound keeps only the budget of the row that implies it, and what
+//! is deduced from that bound inherits it. So can a point within the box only
+//! with an integer var off
 //! its integer, within `int_tol`, under a coefficient that makes the offset
 //! count: an LP value `1 - 3e-14` under `5e7` moves its row by `1.6e-6`.
 //! Without presolve the MILP search can reach such a point through its LP;
@@ -52,31 +53,31 @@
 //! what is feasible:
 //!
 //! * The engine holds a row of magnitude `m` (`|b| + Σ|a_j x_j|`, `b` the
-//!   right-hand side as written, [`Row::rhs_mag`](model::Row::rhs_mag)) to a
-//!   budget of `ROW_BUDGET_SHARE * row_tolerance(feasibility, m)`, and the
-//!   boundary accepts the full `row_tolerance`. Presolve never introduces a
-//!   violation above the budget in a row the engine holds. `m` is taken at
-//!   the corner of the box the decision is about, never over the
-//!   whole box, so a bound of `f64::MAX` cannot inflate the tolerance of a
-//!   row evaluated at small values.
-//! * A continuous var may leave its EMITTED bounds by its bound tolerance
-//!   (as `Solver::first_violated_bound` allows); an integer var's adopted
-//!   value is exactly integral. An activity range therefore reaches
+//!   right-hand side as written, [`Row::rhs_mag`](model::Row::rhs_mag)) and
+//!   `n` terms to a budget of [`slack_tol`]`(feasibility, m, n)`, its
+//!   contract less the round-off of evaluating it, and the boundary accepts
+//!   the full `row_tolerance`. Presolve never introduces a violation above
+//!   the budget in a row the engine holds. `m` is taken at the corner of the
+//!   box the decision is about, never over the whole box, so a bound of
+//!   `f64::MAX` cannot inflate the tolerance of a row evaluated at small
+//!   values.
+//! * Every var may leave its EMITTED bounds by its bound tolerance (as
+//!   `Solver::first_violated_bound` allows), an integer var too: the engine
+//!   reports values as it computed them. An activity range therefore reaches
 //!   `slack = Σ|a_j| · bound_tol_j` beyond its bounds, which every verdict
-//!   and every dropped row accounts for.
+//!   and every dropped row accounts for (an integer var its emitted bounds
+//!   fix the engine holds exactly, so for it the slack only keeps more).
 //! * A working bound implied by a row is relaxed outward, over the
-//!   coefficient, by the row's allowance (the budget, or for an integer var
-//!   the incumbent guard's full contract), by the round-off of the activity
+//!   coefficient, by the row's budget, by the round-off of the activity
 //!   ([`ROUNDOFF_FLOOR`]` * m`, including what a cancellation leaves) and by
 //!   the slack, so it never cuts a point the engine may return.
 //! * An integer var's bound implied by a row keeps every integral value that
-//!   meets the row within its contract, the other vars within their working
-//!   bounds: a singleton row rounds the var's implied bounds, and a forcing
-//!   row fixes the var only where no other integer lies within the room the
-//!   row leaves it (its allowance at its magnitude, round-off part included,
-//!   over the coefficient). A continuous var's working bound keeps only the
-//!   budget of the row that implies it, so through it the points kept are
-//!   those within the budget.
+//!   meets the row within its budget, the other vars within their working
+//!   bounds: a singleton row rounds the var's implied bounds, and is dropped
+//!   only where those bounds, with their bound tolerance, meet it within its
+//!   whole contract less round-off; a forcing row fixes the var only where no
+//!   other integer lies within the room the row leaves it (its budget at its
+//!   magnitude, round-off part included, over the coefficient).
 //! * A big-M row that coefficient tightening rewrites keeps, up to
 //!   round-off, every point of its binding branch within the budget, its
 //!   rewritten binaries exactly at one: the branch is relaxed by the contract
@@ -85,7 +86,7 @@
 //!   bound is derived from the one as written (`Work::rewritten_bound`).
 //! * A row whose vars are all fixed is judged exactly as the boundary judges
 //!   it once dropped ([`row_violation`], full contract): nothing the engine
-//!   does can move it.
+//!   does can move it, since a var fixed on entry never leaves its value.
 //! * Every row presolve drops or rewrites is still checked against the answer
 //!   as written ([`Presolved::validation_rows`]), so a wrong rule fails loudly
 //!   at the boundary.
@@ -98,6 +99,7 @@
 //!   model as written has one.
 //!
 //! [`row_violation`]: crate::solver::row_violation
+//! [`slack_tol`]: crate::solver::slack_tol
 //!
 //! # Soundness by mode
 //!

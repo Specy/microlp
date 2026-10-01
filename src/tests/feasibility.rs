@@ -336,12 +336,11 @@ mod tests_feasibility {
         });
     }
 
-    /// A continuous var's bound tolerance is capped at the share of each row's
-    /// budget its coefficient can carry, as an integer var's is (see
-    /// [`crate::solver::structural_tol`]). With the full `1e-7`, `x0` could
-    /// sit at `-5.0000000000000004e-8`, below its bound of `-0.0`; row 1,
-    /// `-2 x0 <= 0`, saw that doubled, one ulp over its `1e-7`, and the
-    /// acceptance guard rejected the answer as `InternalError`.
+    /// A continuous var's bound slack reaches its rows through their
+    /// coefficients: `x0` may sit up to its tolerance below its bound of
+    /// `-0.0`, where row 1, `-2 x0 <= 0`, sees that doubled. The engine
+    /// verifies each row at the values it reports, so the answer must meet
+    /// the row as well as the bound.
     #[test]
     fn property_counterexample_with_bound_slack_one_ulp_over_the_row_budget() {
         use crate::tests::oracle::{assert_solves_within_contract, Model, Row, Var};

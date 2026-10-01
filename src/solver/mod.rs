@@ -140,19 +140,15 @@ pub(crate) struct Solver {
     /// ([`crate::Tolerances::feasibility`]), in user units.
     feasibility: f64,
     /// Per total var, the absolute tolerances (scaled units) within which the
-    /// var counts as at or within each of its bounds: [`structural_tol`] for
-    /// a structural var, refreshed when its bounds change, and [`slack_tol`]
+    /// var counts as within each of its bounds: [`structural_tol`] for a
+    /// structural var, refreshed when its bounds change, and [`slack_tol`]
     /// for a slack, refreshed whenever the rows are checked since its
-    /// round-off floor depends on the values.
+    /// round-off depends on the values.
     var_tols: Vec<BoundTols>,
     /// Per total var, the tolerance within which its reduced cost counts as
     /// zero ([`dual_tol`]); refreshed whenever the reduced costs are
     /// recomputed from the multipliers.
     dual_tols: Vec<f64>,
-    /// Per structural var, the smallest [`snap_budget`] over its rows (see
-    /// [`structural_tol`]); infinite for a var in no row. Changes only when a
-    /// row is added.
-    row_budgets: Vec<f64>,
     /// The user's rows, in user units, that presolve dropped (implied by the
     /// bounds it emitted) or rewrote (valid for integer points only). No pivot
     /// sees them; the boundary checks the answer against them
@@ -250,6 +246,9 @@ enum VarState {
     NonBasic(usize),
 }
 
+/// Where a non-basic var sits: at its lower bound, its upper bound, both (a
+/// fixed var), or neither (a free var at zero, or one the certificate repair
+/// moved partway).
 #[derive(Clone, Debug)]
 struct NonBasicVarState {
     at_min: bool,
@@ -257,6 +256,23 @@ struct NonBasicVarState {
 }
 
 impl NonBasicVarState {
+    /// The state of a non-basic var at `val` with bounds `min..max`: at a
+    /// bound when its value is that bound, and at both when they are equal.
+    /// A move puts a non-basic var exactly on a bound, but a var can sit past
+    /// one, within its tolerance: one that left the basis where it sat
+    /// (`hold_leaving_value`), which the primal cleanup leaves there, or one
+    /// the certificate repair moved (see `proof.rs`). It is at that bound,
+    /// and one strictly between its bounds (a partial repair move) is at
+    /// neither. No tolerance is involved, so a var whose range is narrower
+    /// than its tolerance is at one bound and can move to the other.
+    fn at(val: f64, min: f64, max: f64) -> Self {
+        let fixed = min == max;
+        Self {
+            at_min: fixed || val <= min,
+            at_max: fixed || val >= max,
+        }
+    }
+
     /// Whether a non-basic var in this state with reduced cost `d` offers no
     /// improving move beyond the tolerance `tol`: its cost pushes it against
     /// a bound it sits at, or moving it changes the objective by less than
@@ -355,21 +371,13 @@ impl Solver {
             .zip(&col_scales)
             .map(|(&b, &s)| b / s)
             .collect();
-        // Rows in scaled units, prepared up front so that the integer vars'
-        // rounding budgets are known before the tolerances are derived.
+        // Rows in scaled units.
         let is_fixed = |var: usize| unscaled_cols[var];
         let mut prepared_rows = Vec::with_capacity(constraints.len());
         for (coeffs, cmp_op, rhs) in constraints {
             let coeffs = scale_columns(coeffs.clone(), &col_scales);
             if let Some(row) = prepare_row(coeffs, *cmp_op, *rhs, feasibility, is_fixed)? {
                 prepared_rows.push(row);
-            }
-        }
-        let mut row_budgets = vec![f64::INFINITY; num_vars];
-        for row in &prepared_rows {
-            for (var, &coeff) in row.coeffs.iter() {
-                row_budgets[var] =
-                    row_budgets[var].min(snap_budget(feasibility, row.row_scale, coeff));
             }
         }
         let mut var_tols: Vec<BoundTols> = (0..num_vars)
@@ -379,7 +387,7 @@ impl Solver {
                     orig_var_mins[v],
                     orig_var_maxs[v],
                     feasibility,
-                    row_budgets[v],
+                    matches!(var_domains[v], VarDomain::Integer | VarDomain::Boolean),
                 )
             })
             .collect();
@@ -399,7 +407,6 @@ impl Solver {
 
             let min = orig_var_mins[v];
             let max = orig_var_maxs[v];
-            let tol = var_tols[v];
 
             // initially all user-created variables are non-basic
             var_states.push(VarState::NonBasic(nb_vars.len()));
@@ -407,7 +414,7 @@ impl Solver {
 
             // Choose an initial value, preferring a bound that keeps this
             // variable's reduced cost dual-feasible.
-            let (init_val, var_dual_feasible) = if at_bound(min, max, tol.lo.min(tol.hi)) {
+            let (init_val, var_dual_feasible) = if min == max {
                 // Fixed variable: the obj. coeff doesn't matter.
                 (min, true)
             } else {
@@ -420,10 +427,7 @@ impl Solver {
             nb_var_vals.push(init_val);
             obj_val += init_val * orig_obj_coeffs[v];
 
-            nb_var_states.push(NonBasicVarState {
-                at_min: at_bound(init_val, min, tol.lo),
-                at_max: at_bound(init_val, max, tol.hi),
-            });
+            nb_var_states.push(NonBasicVarState::at(init_val, min, max));
         }
 
         let mut constraint_coeffs = vec![];
@@ -466,9 +470,9 @@ impl Solver {
             }
             basic_var_vals.push(rhs - lhs_val);
             var_tols.push(BoundTols::uniform(slack_tol(
-                feasibility,
-                row_scale,
+                feasibility * row_scale,
                 magnitude,
+                coeffs.nnz(),
             )));
         }
 
@@ -576,7 +580,6 @@ impl Solver {
             feasibility,
             var_tols,
             dual_tols,
-            row_budgets,
             validation_rows: Vec::new(),
             deadline,
             operation_time_limit: None,
@@ -637,14 +640,14 @@ impl Solver {
         Ok(res)
     }
 
-    /// A var's current value in user units: the value that is reported.
+    /// A var's current value in user units: the value that is reported, as
+    /// the engine computed it. A fixed var's value is within its bound
+    /// tolerance of its value (a fixed integer var's on it, see
+    /// [`structural_tol`]), an integer var's within the search's integrality
+    /// tolerance of an integer; nothing is snapped, since a snapped value
+    /// would no longer be the point the rows were verified at.
     pub(crate) fn get_value(&self, var: usize) -> f64 {
-        let internal = if var < self.num_vars {
-            self.reported_internal_value(var)
-        } else {
-            self.internal_value(var)
-        };
-        internal * self.col_scale(var)
+        self.internal_value(var) * self.col_scale(var)
     }
 
     /// The structural values to report, in user units: the point the last
@@ -683,31 +686,6 @@ impl Solver {
         }
     }
 
-    /// A structural var's value as it is reported, in scaled units.
-    ///
-    /// A fixed var (`lo == hi`) is reported at its bound, not at its basis
-    /// value (which drifts within its tolerance when the var is basic), since
-    /// the rest of the crate relies on a fixed var being exact: presolve
-    /// substitutes fixed vars out of the rows it keeps. [`structural_tol`]
-    /// caps the drift by what the var's rows can absorb, so the snapped point
-    /// still meets the contract verified at the basis values
-    /// ([`Self::check_rows`]). The engine's own bookkeeping never snaps.
-    #[inline]
-    fn reported_internal_value(&self, var: usize) -> f64 {
-        if self.is_reported_at_bound(var) {
-            self.orig_var_mins[var]
-        } else {
-            self.internal_value(var)
-        }
-    }
-
-    /// Whether `var` is reported at its bound, not where the engine holds it:
-    /// a fixed structural var ([`Self::reported_internal_value`]).
-    #[inline]
-    fn is_reported_at_bound(&self, var: usize) -> bool {
-        var < self.num_vars && self.orig_var_mins[var] == self.orig_var_maxs[var]
-    }
-
     /// The activity `Σ a_rj x_j` of row `r` over the structural vars at the
     /// scaled values `x`, and the magnitude `|b_r| + Σ|a_rj x_j|` it was
     /// computed from. The engine's basic slacks ([`Self::check_rows`]) and the
@@ -728,11 +706,22 @@ impl Solver {
         (lhs, magnitude)
     }
 
+    /// The number of structural nonzeros of row `r`, which the round-off of
+    /// evaluating it grows with (see [`slack_tol`]).
+    fn row_terms(&self, r: usize) -> usize {
+        //guaranteed to be a valid index; the row holds its slack's entry too
+        self.orig_constraints.outer_view(r).unwrap().nnz() - 1
+    }
+
     /// The slack tolerance of row `r` at the current values (see
     /// [`slack_tol`]).
     fn current_slack_tol(&self, r: usize) -> f64 {
         let (_, magnitude) = self.row_activity(r, |v| self.internal_value(v));
-        slack_tol(self.feasibility, self.row_scales[r], magnitude)
+        slack_tol(
+            self.feasibility * self.row_scales[r],
+            magnitude,
+            self.row_terms(r),
+        )
     }
 
     /// Re-derive every reduced-cost tolerance from the magnitudes of the
@@ -840,7 +829,7 @@ impl Solver {
         self.orig_var_maxs[var] = max;
         if var < self.num_vars {
             self.var_tols[var] =
-                structural_tol(s, min, max, self.feasibility, self.row_budgets[var]);
+                structural_tol(s, min, max, self.feasibility, self.is_integer(var));
         }
         let tol = self.var_tols[var];
         match self.var_states[var] {
@@ -853,8 +842,21 @@ impl Solver {
                 }
             }
             VarState::NonBasic(col) => {
+                // The var stays at the bound its state names, now the new
+                // one; one that was fixed goes to the bound at which its
+                // reduced cost is dual feasible, and one between its bounds
+                // stays where it is if they still hold it.
                 let cur = self.nb_var_vals[col];
-                let new_val = cur.clamp(min, max);
+                let state = &self.nb_var_states[col];
+                let lower = [min, max].into_iter().find(|b| b.is_finite());
+                let upper = [max, min].into_iter().find(|b| b.is_finite());
+                let new_val = match (state.at_min, state.at_max) {
+                    (true, true) if self.nb_var_obj_coeffs[col] < 0.0 => upper,
+                    (true, _) => lower,
+                    (false, true) => upper,
+                    (false, false) => Some(cur.clamp(min, max)),
+                }
+                .unwrap_or(0.0);
                 if new_val != cur {
                     // Shift the non-basic var to the nearest bound and propagate the
                     // delta into basic values (same mechanism as fix_var's non-basic arm).
@@ -868,10 +870,7 @@ impl Solver {
                     self.is_primal_feasible = false;
                     self.values_dirty = true;
                 }
-                self.nb_var_states[col] = NonBasicVarState {
-                    at_min: at_bound(new_val, min, tol.lo),
-                    at_max: at_bound(new_val, max, tol.hi),
-                };
+                self.nb_var_states[col] = NonBasicVarState::at(new_val, min, max);
                 // A var at a loosened bound may no longer justify its reduced cost.
                 self.downgrade_dual_feasibility(col);
             }
@@ -1100,8 +1099,7 @@ impl Solver {
     /// Every basic slack is re-derived from its row, `s = b - Σ a_j x_j`,
     /// through [`Self::row_activity`], so a row's violation lives in its
     /// slack, where the dual simplex sees it and the boundary checks find the
-    /// same bits (up to the snap of fixed and integer vars, which stays within
-    /// the row's reserve); the slack tolerances are refreshed at these values.
+    /// same bits; the slack tolerances are refreshed at these values.
     /// `residuals` receives `b - Σ a_j x_j - s` per row, zero where the slack
     /// is basic: how far the basic structural values are from solving the
     /// rows whose slack is non-basic. Returns whether every residual is
@@ -1120,7 +1118,11 @@ impl Solver {
                 }
                 VarState::NonBasic(col) => implied - self.nb_var_vals[col],
             };
-            let tol = slack_tol(self.feasibility, self.row_scales[r], magnitude);
+            let tol = slack_tol(
+                self.feasibility * self.row_scales[r],
+                magnitude,
+                self.row_terms(r),
+            );
             self.var_tols[slack] = BoundTols::uniform(tol);
             // A NaN residual holds nothing.
             if residual.is_nan() || residual.abs() > tol {
@@ -1134,16 +1136,16 @@ impl Solver {
     /// Make the values satisfy the rows to within their tolerances and
     /// measure primal feasibility on them. The rows are evaluated through
     /// [`Self::check_rows`], as the boundary evaluates the reported point, so
-    /// a `Finished` state and the point handed out agree bit for bit up to
-    /// the snap of fixed and integer vars. Values within tolerance are kept
-    /// (moving last bits steers the branch & bound); drifted ones are refined
-    /// through the factorization, then a fresh one, and a residual that
-    /// survives both is an `InternalError` (the basis cannot represent its own
-    /// vertex). Recomputes the objective from the values; returns whether they
-    /// are within their bounds, and sets `is_primal_feasible` to match. A
-    /// fresh factorization that repairs the basis leaves another vertex, with
-    /// its values, reduced costs and feasibility flags recomputed: that is no
-    /// verification, and the answer is `false`.
+    /// a `Finished` state and the point handed out agree bit for bit. Values
+    /// within tolerance are kept (moving last bits steers the branch &
+    /// bound); drifted ones are refined through the factorization, then a
+    /// fresh one, and a residual that survives both is an `InternalError` (the
+    /// basis cannot represent its own vertex). Recomputes the objective from
+    /// the values; returns whether they are within their bounds, and sets
+    /// `is_primal_feasible` to match. A fresh factorization that repairs the
+    /// basis leaves another vertex, with its values, reduced costs and
+    /// feasibility flags recomputed: that is no verification, and the answer
+    /// is `false`.
     fn verify_primal(&mut self) -> Result<bool, Error> {
         if !self.values_dirty {
             // Verified values that nothing has touched since; only the
@@ -1389,14 +1391,10 @@ impl Solver {
                         }
                         VarStatus::Basic => unreachable!(),
                     };
-                    let tol = self.var_tols[var];
                     self.var_states[var] = VarState::NonBasic(self.nb_vars.len());
                     self.nb_vars.push(var);
                     self.nb_var_vals.push(val);
-                    self.nb_var_states.push(NonBasicVarState {
-                        at_min: at_bound(val, min, tol.lo),
-                        at_max: at_bound(val, max, tol.hi),
-                    });
+                    self.nb_var_states.push(NonBasicVarState::at(val, min, max));
                 }
             }
         }
@@ -1668,12 +1666,12 @@ impl Solver {
 
     /// Drop the records of bad basis changes whose row the step just made (the
     /// entering var's move `entering_diff` along `col_coeffs`, a pivot or a
-    /// bound flip) moved by at least the row's tolerance: the state the change
-    /// was bad in is gone (see [`CycleGuard::forget_moved_rows`]). It runs
-    /// after the pivot, so the change back that a repair at the pivot's
-    /// refactorization records goes too if the step moved its row: the phase
-    /// may take that change again, on the eta file, rather than run out of
-    /// changes.
+    /// bound flip) moved by more than the row's tolerance, at all for a row
+    /// whose basic var is held exactly: the state the change was bad in is
+    /// gone (see [`CycleGuard::forget_moved_rows`]). It runs after the pivot,
+    /// so the change back that a repair at the pivot's refactorization records
+    /// goes too if the step moved its row: the phase may take that change
+    /// again, on the eta file, rather than run out of changes.
     fn forget_moved_rows(&mut self, entering_diff: f64) {
         let (col_coeffs, basic_vars, var_tols) =
             (&self.col_coeffs, &self.basic_vars, &self.var_tols);
@@ -1683,7 +1681,7 @@ impl Solver {
                 .iter()
                 .find(|&(i, _)| i == r)
                 .map_or(0.0, |(_, &coeff)| coeff);
-            (coeff * entering_diff).abs() >= tol.lo.min(tol.hi)
+            (coeff * entering_diff).abs() > tol.lo.min(tol.hi)
         });
     }
 
@@ -2130,23 +2128,10 @@ impl Solver {
         }
         self.basic_var_vals.push(rhs - lhs_val);
         self.var_tols.push(BoundTols::uniform(slack_tol(
-            self.feasibility,
-            row_scale,
+            self.feasibility * row_scale,
             magnitude,
+            coeffs.nnz(),
         )));
-        for (var, &coeff) in coeffs.iter() {
-            let budget = snap_budget(self.feasibility, row_scale, coeff);
-            if budget < self.row_budgets[var] {
-                self.row_budgets[var] = budget;
-                self.var_tols[var] = structural_tol(
-                    self.col_scales[var],
-                    self.orig_var_mins[var],
-                    self.orig_var_maxs[var],
-                    self.feasibility,
-                    budget,
-                );
-            }
-        }
         // The new slack's reduced cost is exactly zero until the multipliers
         // are next recomputed.
         self.dual_tols.push(dual_tol(0.0));
@@ -2499,14 +2484,15 @@ impl Solver {
 
             // The step takes the leaving var exactly onto its working bound,
             // and a var fixed in the model onto its value, whatever the phase
-            // did to its working bounds. Where the leaving var sits past that
+            // did to its working bounds: an equality's slack then holds its
+            // row as computed, and a fixed integer var the value a row
+            // presolve rewrote relies on. Where the leaving var sits past that
             // target (within its tolerance, as the Harris pass allows), the
             // step would run backwards, moving the entering var and every
             // basic var against the improving direction by the overshoot over
-            // the element, past tolerances capped by what their rows can
-            // absorb. The step is zero instead, and the leaving var leaves
-            // where it sits, its working bound moved there
-            // (`hold_leaving_value`).
+            // the element, which a small element makes more than their
+            // tolerances. The step is zero instead, and the leaving var leaves
+            // where it sits (`hold_leaving_value`).
             let leaving_var = self.basic_vars[row];
             if self.orig_var_mins[leaving_var] == self.orig_var_maxs[leaving_var] {
                 leaving_new_val = self.orig_var_mins[leaving_var];
@@ -2699,33 +2685,38 @@ impl Solver {
 
         // Whether the non-basic var `c` could instead absorb the leaving
         // var's move by crossing the bound it sits at (or, if fixed, its
-        // value) by no more than its own tolerance, and so stay at its bound
-        // as the engine counts it. This hands a primal, round-off-level
-        // violation that a var cannot carry (an integer var, a tight bound)
-        // to one that can: without it, a model rounded at a level the row
-        // tolerances allow (an equality on a 1e9 activity pinning a var 3e-7
-        // past its bound) could only be reported infeasible. An integer var
-        // never absorbs: branching and rounding rely on it sitting exactly on
-        // its bounds. The var moves the way its bound forbids, so the pivot
-        // takes a zero dual step with the var's cost shifted, rather than a
-        // step `d_q / a_q` that would run backwards by any amount.
+        // value) by no more than its own tolerance. This hands a primal,
+        // round-off-level violation that a var cannot carry (an integer var, a
+        // tight bound) to one that can, such as an equality's slack: the
+        // infeasibility proof grants that other term no tolerance, so without
+        // it a model whose point needs the other term's room (an equality on a
+        // 2.7e8 activity pinning a var 2.4e-7 past its bound) could only be
+        // reported infeasible. An integer var never absorbs, as it never takes
+        // the certificate repair's band moves, and neither does a fixed
+        // structural var (see `certificate_moves`). The var moves the way its
+        // bound forbids, so the pivot takes a zero dual step with the var's
+        // cost shifted, rather than a step `d_q / a_q` that would run
+        // backwards by any amount.
         let absorbs = |c: usize, coeff: f64| -> bool {
             if coeff == 0.0 {
                 return false;
             }
             let var = self.nb_vars[c];
             let integer = self.is_integer(var);
-            // A slack's stored tolerance carries a round-off floor derived
-            // at the last recomputation; what it may absorb is judged on
-            // its row's magnitude at the current point. A structural var
-            // crosses the bound in the direction the pivot moves it.
+            let fixed = var < self.num_vars && self.orig_var_mins[var] == self.orig_var_maxs[var];
+            // The var is to stay within the tolerance the phase holds it to
+            // once basic, so that it is not violated in turn: its own, for a
+            // structural var the bound it crosses in the direction the pivot
+            // moves it; a slack's stored one, derived at the last
+            // recomputation, and no more than its row's at the current point.
             let tol = if var < self.num_vars {
                 self.var_tols[var].toward(leaving_move / coeff > 0.0)
             } else {
-                self.current_slack_tol(var - self.num_vars)
+                self.var_tols[var]
+                    .lo
+                    .min(self.current_slack_tol(var - self.num_vars))
             };
-            // The comparison itself is between two rounded quantities.
-            !integer && (leaving_move / coeff).abs() <= tol * (1.0 + ROUNDOFF_FLOOR)
+            !integer && !fixed && (leaving_move / coeff).abs() <= tol
         };
 
         // The round-off scale of the row: its largest entry over the columns
@@ -3092,17 +3083,12 @@ impl Solver {
         }
     }
 
-    /// The state of the non-basic `var` at `val`: at a bound when within its
-    /// tolerance of it. The bounds are the working bounds of a running
-    /// primal phase (see [`bounds`]), where a non-basic var sits at a moved
-    /// bound.
+    /// The state of the non-basic `var` at `val` ([`NonBasicVarState::at`]),
+    /// against its working bounds in a running primal phase (see [`bounds`]),
+    /// where a non-basic var sits at a moved bound.
     fn nonbasic_state(&self, var: usize, val: f64) -> NonBasicVarState {
-        let tol = self.var_tols[var];
         let (min, max) = self.working_bounds(var);
-        NonBasicVarState {
-            at_min: at_bound(val, min, tol.lo),
-            at_max: at_bound(val, max, tol.hi),
-        }
+        NonBasicVarState::at(val, min, max)
     }
 
     /// The state the basic `var` takes when it leaves the basis at `val`

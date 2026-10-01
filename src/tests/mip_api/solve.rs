@@ -39,14 +39,17 @@ fn zero_time_limit_without_incumbent_is_typed_as_interrupted() {
     );
 }
 
+/// An integer var's value is reported as computed, within `int_tol` of its
+/// integer.
 #[test]
-fn milp_solve_reports_optimal_and_rounds_values() {
+fn milp_solve_reports_optimal_and_near_integral_values() {
     let (p, a, b) = int_2var_problem();
     let sol = solution(p.solve().unwrap());
+    let int_tol = SolveOptions::default().int_tol;
     assert_eq!(sol.status(), SolutionStatus::Optimal);
     assert!((sol.objective() - 11.0).abs() < 1e-6);
-    assert_eq!(sol.var_value(a), 1.0);
-    assert_eq!(sol.var_value(b), 2.0);
+    assert!((sol.var_value(a) - 1.0).abs() <= int_tol);
+    assert!((sol.var_value(b) - 2.0).abs() <= int_tol);
     assert!(sol.stats().nodes_solved > 0);
     assert!(sol.stats().lp_iterations > 0);
 }

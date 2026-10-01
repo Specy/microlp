@@ -47,9 +47,16 @@ pub struct SolveOptions {
     /// `0.0` (prove exact optimality).
     pub mip_gap: f64,
     /// Integrality tolerance: a value within this distance of an integer counts
-    /// as integral. Default `1e-6`. A very loose `int_tol` mainly causes extra
-    /// exact-fixing branching rather than admitting an infeasible point.
-    /// Must be finite and in the half-open range `[0, 0.5)`.
+    /// as integral. A solution reports an integer or boolean variable's value
+    /// as the solver computed it, within this distance of an integer, not
+    /// necessarily on it: values like `0.9999999` are normal (one fixed at
+    /// an integer, by its bounds, the search or an edit, lies on it). Use
+    /// `.round()` where an exact integer is needed, bearing in mind that the
+    /// rounded values need not meet the constraints: under `x <= 1e7 * y`, a
+    /// `y` of `1e-6` allows `x` up to 10, which `y` rounded to zero forbids.
+    /// Keep a big-M coefficient times this tolerance small against the
+    /// quantities it bounds. Default `1e-6`. Must be finite and in the
+    /// half-open range `[0, 0.5)`.
     pub int_tol: f64,
     /// Optional (partial) starting assignment used to seed the incumbent. The
     /// variables it leaves out are completed by an LP; a hint that is invalid or
@@ -61,14 +68,14 @@ pub struct SolveOptions {
     /// fixing variables and tightening big-M coefficients). It never removes
     /// variables or changes a continuous variable's bounds, and it keeps, up
     /// to round-off, every point with each integer variable exactly integral
-    /// that meets each constraint within the part of
-    /// [`Tolerances::feasibility`] the simplex holds it to and each bound
-    /// within its tolerance, or, for a variable it fixes because of the
-    /// objective, at least one optimum. The problem you observe through
+    /// that meets each constraint within [`Tolerances::feasibility`] less the
+    /// round-off of evaluating it (the tolerance the simplex holds it to) and
+    /// each bound within its tolerance, or, for a variable it fixes because of
+    /// the objective, at least one optimum. The problem you observe through
     /// [`crate::Solution`] is the one you wrote: answers are checked against
-    /// it. A point beyond that part of the tolerance can be cut, and so can a
-    /// point within it only with an integer variable off its integer, within
-    /// `int_tol`: without presolve the MIP search can reach one through a
+    /// it. A point beyond that tolerance can be cut, and so can a point within
+    /// it only with an integer variable off its integer, within `int_tol`:
+    /// without presolve the MIP search can reach one through a
     /// variable that presolve would fix or rewrite. So on a problem whose
     /// every point needs that, presolve on can answer `Infeasible`, or a worse
     /// objective, where presolve off finds a point. If presolve finds the
@@ -181,15 +188,23 @@ pub struct Tolerances {
     /// The absolute feasibility tolerance of a solution: each variable may lie
     /// outside its bounds, and each row outside its feasible range, by at most
     /// this, or by the round-off of evaluating the bound or row in `f64` if
-    /// that is larger. The simplex holds every row to it, and it is checked on
-    /// a rounded-to-integer candidate before it becomes the incumbent, on a
-    /// pure-LP solution before it is returned, and on a previous incumbent to
-    /// decide whether it survives a [`crate::Solution`] edit.
+    /// that is larger. The simplex holds every bound to it (an integer
+    /// variable its bounds fix to its value exactly) and every row to it less
+    /// the round-off of evaluating the row, and it is checked on a candidate,
+    /// as computed, before it becomes the incumbent, on a pure-LP solution
+    /// before it is returned, and on a previous incumbent to decide whether it
+    /// survives a [`crate::Solution`] edit. Being absolute, it lets a variable
+    /// with a large coefficient move its rows far: a `y` `1e-7` above its
+    /// upper bound `u` lets `x <= 1e8 * y` hold at `x = 1e8 * u + 10`.
     /// Must be finite and at least `1e-10`. Default `1e-7`.
     pub feasibility: f64,
     /// Distance from the nearest integer within which an integer/boolean
-    /// variable's value is still treated as exactly that integer. Used by
-    /// the post-edit warm-start pre-filter's integrality check.
+    /// variable's value is still treated as exactly that integer: by the
+    /// post-edit warm-start pre-filter's integrality check, and by
+    /// [`crate::Solution::fix_var`], which fixes such a value at that integer.
+    /// A solution's integer values lie within [`SolveOptions::int_tol`] of an
+    /// integer (a fixed integer variable's on it), so with `int_tol` at most
+    /// this, as by default, `fix_var` accepts every value a solution reports.
     /// Must be finite and in the half-open range `[0, 0.5)`. Default `1e-5`.
     pub integrality_rounding: f64,
     /// Relative slack subtracted from the incumbent objective to form the

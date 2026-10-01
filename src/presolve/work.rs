@@ -5,7 +5,7 @@
 use super::model::{is_int_domain, term_range, Activity, Binding, Mode, PresolveStats, Row};
 use super::params::*;
 use crate::solver::{
-    bound_tolerance, row_tolerance, row_violation, CDouble, ROUNDOFF_FLOOR, ROW_BUDGET_SHARE,
+    bound_tolerance, row_tolerance, row_violation, slack_tol, CDouble, ROUNDOFF_FLOOR,
 };
 use crate::{ComparisonOp, CsVec, Error, VarDomain};
 
@@ -58,33 +58,24 @@ impl Work<'_> {
         self.elo[v] == self.ehi[v] && self.elo[v].is_finite()
     }
 
-    /// The engine's budget for a row of magnitude `magnitude` (module docs).
-    fn budget(&self, magnitude: f64) -> f64 {
-        ROW_BUDGET_SHARE * row_tolerance(self.feas, magnitude)
-    }
-
-    /// How far a row of magnitude `magnitude` may be violated at the points a
-    /// bound implied for var `v` must keep: the engine's budget, and for an
-    /// integer var, whose values that matter are incumbents', the full
-    /// contract the incumbent guard applies (rounding against the budget
-    /// alone would cut integer points the guard accepts).
-    fn allowance(&self, v: usize, magnitude: f64) -> f64 {
-        if self.is_int(v) {
-            row_tolerance(self.feas, magnitude)
-        } else {
-            self.budget(magnitude)
-        }
+    /// The engine's budget for `row` at magnitude `magnitude`: the tolerance
+    /// the engine holds the row to, its contract less the round-off of
+    /// evaluating it ([`slack_tol`], module docs).
+    fn budget(&self, row: &Row, magnitude: f64) -> f64 {
+        slack_tol(
+            self.feas,
+            magnitude,
+            self.constraints[row.orig as usize].0.nnz(),
+        )
     }
 
     /// Tolerance, in user units, within which the engine holds var `v` to its
-    /// emitted upper (`upper`) or lower bound (`Solver::first_violated_bound`);
-    /// zero for an integer var, whose adopted values are exactly integral.
+    /// emitted upper (`upper`) or lower bound (`Solver::first_violated_bound`),
+    /// an integer var's too: the engine reports values as it computed them.
+    /// One its emitted bounds fix the engine holds exactly, so for it the
+    /// tolerance only keeps more points.
     fn bound_tol(&self, v: usize, upper: bool) -> f64 {
-        if self.is_int(v) {
-            0.0
-        } else {
-            bound_tolerance(self.feas, if upper { self.ehi[v] } else { self.elo[v] })
-        }
+        bound_tolerance(self.feas, if upper { self.ehi[v] } else { self.elo[v] })
     }
 
     /// Activity range of `row` over the working or the emitted box.
@@ -130,8 +121,8 @@ impl Work<'_> {
     /// (`min_corner`: the minimum-activity one) is `sliver` short of its
     /// bound, at magnitude `mag`: each var at its extreme. `None` unless
     /// every var is an integer var with no other integer within the room the
-    /// row leaves it beyond its extreme (the sliver and the row's allowance
-    /// at its magnitude, over the coefficient), and every term can be told
+    /// row leaves it beyond its extreme (the sliver and the row's budget at
+    /// its magnitude, over the coefficient), and every term can be told
     /// apart from the round-off of the sum: a term whose whole range lies
     /// below the sliver plus that round-off is invisible to the row, which
     /// forces nothing about it. A continuous var keeps its bounds (module
@@ -156,7 +147,7 @@ impl Work<'_> {
                 } else {
                     self.elo[v]
                 };
-                let room = (sliver + self.allowance(v, mag)).max(0.0) / a.abs();
+                let room = (sliver + self.budget(row, mag)).max(0.0) / a.abs();
                 (self.is_int(v) && visible && room < 1.0).then_some((v, at))
             })
             .collect()
@@ -367,9 +358,9 @@ impl Work<'_> {
     }
 
     /// Singleton row `a·x ∈ [lo, hi]`: for an integer var, fold it into the
-    /// var's EMITTED bounds and drop it where the rounded bounds describe it
-    /// exactly; for a continuous var, which keeps its bounds, drop it where
-    /// they make it redundant. Returns whether the row was consumed.
+    /// var's EMITTED bounds; for either kind of var, drop it where the var's
+    /// emitted bounds make it redundant. Returns whether the row was
+    /// consumed.
     fn singleton_row(&mut self, row: &mut Row) -> Result<bool, Error> {
         let v = row.vars[0];
         let a = row.coeffs[0];
@@ -384,35 +375,30 @@ impl Work<'_> {
         // side as written, the var's term there (`|a·q| = |b|`), and the fixed
         // terms folded out of it.
         let fold = row.fold_scale;
-        let tight_mag = |b: f64| row.rhs_mag(b) + b.abs() + fold;
+        let finite_mag = |b: f64| {
+            if b.is_finite() {
+                row.rhs_mag(b) + b.abs() + fold
+            } else {
+                0.0
+            }
+        };
+        // How far past an implied bound the engine may take the var while it
+        // holds the row: the row's budget over `|a|`.
+        let room = |b: f64| self.budget(row, finite_mag(b)) / a.abs();
 
         if self.is_int(v) {
-            // The bounds keep every integral point the incumbent guard
-            // accepts (those meeting the row within its contract), widened by
-            // the round-off of the folded right-hand side. The row is dropped
-            // only where the contract less that round-off gives the same
-            // bounds, i.e. no integer point lies within round-off of the
-            // contract; otherwise the guard, with its own round-off, might
-            // reject a point the bounds admit (an `InternalError` on an
-            // exactly integral candidate), so the row stays.
-            let range = |widen: f64| {
-                let side_tol = |b: f64| {
-                    let mag = tight_mag(b);
-                    (row_tolerance(self.feas, mag) + widen * ROUNDOFF_FLOOR * mag).max(0.0)
-                        / a.abs()
-                };
-                let mut new_lo = self.elo[v];
-                let mut new_hi = self.ehi[v];
-                if qlo.is_finite() {
-                    new_lo = new_lo.max((qlo - side_tol(blo)).ceil());
-                }
-                if qhi.is_finite() {
-                    new_hi = new_hi.min((qhi + side_tol(bhi)).floor());
-                }
-                (new_lo, new_hi)
-            };
-            let (new_lo, new_hi) = range(1.0);
-            let unambiguous = range(-1.0) == (new_lo, new_hi);
+            // The rounded bounds keep every integral value that meets the row
+            // within its budget, widened by the round-off of the folded
+            // right-hand side.
+            let widened = |b: f64| room(b) + ROUNDOFF_FLOOR * finite_mag(b) / a.abs();
+            let mut new_lo = self.elo[v];
+            let mut new_hi = self.ehi[v];
+            if qlo.is_finite() {
+                new_lo = new_lo.max((qlo - widened(blo)).ceil());
+            }
+            if qhi.is_finite() {
+                new_hi = new_hi.min((qhi + widened(bhi)).floor());
+            }
             if new_lo > new_hi {
                 debug!(
                     "presolve: singleton row {} leaves integer var {v} no value: [{new_lo}, {new_hi}]",
@@ -421,37 +407,29 @@ impl Work<'_> {
                 return Err(Error::Infeasible);
             }
             self.emit_bounds(v, new_lo, new_hi);
-            if !unambiguous {
-                return Ok(false);
+        } else {
+            // The engine holds the var within its bound tolerance of its
+            // bounds, and the row, as long as it is kept, to its budget over
+            // `|a|` around the implied bound. The row's accepted set missing
+            // the var's, both taken with their tolerances, is a proof of
+            // infeasibility.
+            let (elo, ehi) = (self.elo[v], self.ehi[v]);
+            if qlo - room(blo) > ehi + self.bound_tol(v, true)
+                || qhi + room(bhi) < elo - self.bound_tol(v, false)
+            {
+                debug!(
+                    "presolve: singleton row {} misses var {v}'s bounds [{elo:e}, {ehi:e}]",
+                    row.orig
+                );
+                return Err(Error::Infeasible);
             }
-            row.alive = false;
-            self.stats.rows_dropped += 1;
-            return Ok(true);
-        }
-
-        // The engine holds the var within its bound tolerance of its bounds,
-        // and the row, as long as it is kept, to its budget over `|a|`
-        // around the implied bound. The row's accepted set missing the var's,
-        // both taken with their tolerances, is a proof of infeasibility.
-        let finite_mag = |b: f64| if b.is_finite() { tight_mag(b) } else { 0.0 };
-        let (elo, ehi) = (self.elo[v], self.ehi[v]);
-        let (btol_lo, btol_hi) = (
-            bound_tolerance(self.feas, elo),
-            bound_tolerance(self.feas, ehi),
-        );
-        let dlo = self.budget(finite_mag(blo)) / a.abs();
-        let dhi = self.budget(finite_mag(bhi)) / a.abs();
-        if qlo - dlo > ehi + btol_hi || qhi + dhi < elo - btol_lo {
-            debug!(
-                "presolve: singleton row {} misses var {v}'s bounds [{elo:e}, {ehi:e}]",
-                row.orig
-            );
-            return Err(Error::Infeasible);
         }
         // Once dropped, the row is checked at the boundary, where only the
         // var's bound tolerance can move it: it is redundant where every
         // value within that tolerance of the bounds meets it within its whole
         // contract, less the round-off of evaluating it.
+        let (elo, ehi) = (self.elo[v], self.ehi[v]);
+        let (btol_lo, btol_hi) = (self.bound_tol(v, false), self.bound_tol(v, true));
         let dropped_room = |b: f64| {
             let mag = finite_mag(b);
             (row_tolerance(self.feas, mag) - ROUNDOFF_FLOOR * mag).max(0.0) / a.abs()
@@ -501,12 +479,12 @@ impl Work<'_> {
             // budget at that corner is a proof. The corner decides: moving away
             // from it raises the activity faster than the tolerance.
             let budget_l = if hi_side {
-                self.budget(wact.abs_l + row.rhs_mag(row_hi) + fold)
+                self.budget(row, wact.abs_l + row.rhs_mag(row_hi) + fold)
             } else {
                 0.0
             };
             let budget_u = if lo_side {
-                self.budget(wact.abs_u + row.rhs_mag(row_lo) + fold)
+                self.budget(row, wact.abs_u + row.rhs_mag(row_lo) + fold)
             } else {
                 0.0
             };
@@ -540,7 +518,7 @@ impl Work<'_> {
                 if e.ninf_l == 0 {
                     let mag = e.abs_l + row.rhs_mag(row_hi) + fold;
                     let sliver = row_hi - e.l;
-                    if sliver <= ROUNDOFF_FLOOR * mag && -sliver <= self.budget(mag) {
+                    if sliver <= ROUNDOFF_FLOOR * mag && -sliver <= self.budget(row, mag) {
                         forced = self.forcing_fixings(row, sliver, mag, true);
                     }
                 }
@@ -550,7 +528,7 @@ impl Work<'_> {
                 if e.ninf_u == 0 {
                     let mag = e.abs_u + row.rhs_mag(row_lo) + fold;
                     let sliver = e.u - row_lo;
-                    if sliver <= ROUNDOFF_FLOOR * mag && -sliver <= self.budget(mag) {
+                    if sliver <= ROUNDOFF_FLOOR * mag && -sliver <= self.budget(row, mag) {
                         forced = self.forcing_fixings(row, sliver, mag, false);
                     }
                 }
@@ -601,7 +579,7 @@ impl Work<'_> {
             }
 
             // Per-term implied bounds from working activities, each relaxed by
-            // the row's allowance at the corner where the bound is attained
+            // the row's budget at the corner where the bound is attained
             // (this term at the bound, the rest at its extreme), by the
             // round-off of computing the rest by cancellation against this
             // term's own range, and by the bound slack, so that it holds for
@@ -628,7 +606,7 @@ impl Work<'_> {
                         let mag =
                             row.rhs_mag(row_hi) + rest_abs.max(0.0) + (row_hi - rl).abs() + fold;
                         let relax =
-                            (self.allowance(v, mag) + ROUNDOFF_FLOOR * wact.abs_l + wact.slack_l)
+                            (self.budget(row, mag) + ROUNDOFF_FLOOR * wact.abs_l + wact.slack_l)
                                 / a.abs();
                         if a > 0.0 {
                             self.tighten_upper(v, q, relax)?;
@@ -644,7 +622,7 @@ impl Work<'_> {
                         let mag =
                             row.rhs_mag(row_lo) + rest_abs.max(0.0) + (row_lo - ru).abs() + fold;
                         let relax =
-                            (self.allowance(v, mag) + ROUNDOFF_FLOOR * wact.abs_u + wact.slack_u)
+                            (self.budget(row, mag) + ROUNDOFF_FLOOR * wact.abs_u + wact.slack_u)
                                 / a.abs();
                         if a > 0.0 {
                             self.tighten_lower(v, q, relax)?;
@@ -666,13 +644,14 @@ impl Work<'_> {
     /// ([`Binding`]), plus the row's `fixed` terms but theirs, less the
     /// contract at the same with them `rewritten`. The rest of the row adds
     /// the same magnitude to both, which can only widen the difference. So
-    /// the bound relaxed by this, held to the engine's budget, keeps the
-    /// rewritten row's own reserve within the original row's contract, and
-    /// keeps every point of the original row's budget with those binaries
-    /// exactly at one, up to half the round-off of the magnitude of the row's
-    /// unfixed other terms, the bound itself being exact
-    /// ([`Self::rewritten_bound`]). A term fixed after the rewrites widens the
-    /// difference ([`Self::relax_binding`]).
+    /// the bound relaxed by this, held to the engine's budget, admits no point
+    /// of the binding branch beyond the original row's contract, and keeps
+    /// every point of the original row's budget with those binaries exactly
+    /// at one (the budget's round-off margin shrinks with the magnitude), up
+    /// to half the round-off of the magnitude of the row's unfixed other
+    /// terms, the bound itself being exact ([`Self::rewritten_bound`]). A term
+    /// fixed after the rewrites widens the difference
+    /// ([`Self::relax_binding`]).
     fn rewrite_room(&self, written: f64, rewritten: f64, fixed: f64) -> f64 {
         (row_tolerance(self.feas, written + fixed) - row_tolerance(self.feas, rewritten + fixed))
             .max(0.0)

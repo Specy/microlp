@@ -4,8 +4,8 @@
 use crate::solver::Solver;
 use crate::{
     mip, timed_lp_call, ComparisonOp, CsVec, Error, LinearExpr, OptimizationDirection,
-    ResumeOptions, SolutionStatus, SolveOptions, SolveOutcome, Stats, TerminationReason,
-    Tolerances, VarDomain, Variable,
+    ResumeOptions, SolutionStatus, SolveOptions, SolveOutcome, Stats, TerminationReason, VarDomain,
+    Variable,
 };
 
 #[derive(Clone)]
@@ -86,15 +86,22 @@ impl Solution {
         }
     }
 
-    /// Returns a variable's value without integer or boolean rounding.
+    /// Returns a variable's value, as the solver computed it.
     ///
-    /// For an integer or boolean variable, prefer [`Solution::var_value`] when
-    /// an exact domain value is desired.
+    /// The values meet the variable bounds and the constraints within
+    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility). An integer
+    /// or boolean variable's value is within [`SolveOptions::int_tol`] of an
+    /// integer, not necessarily on it: values like `0.9999999` are normal. One
+    /// fixed at an integer (by its bounds, the search or an edit) lies on it.
+    /// Use `.round()` where an exact integer is needed, bearing in mind that
+    /// the rounded values need not meet the constraints: under
+    /// `x <= 1e9 * y`, rounding a `y` of `1e-9` to zero moves the constraint
+    /// by `1`.
     ///
     /// # Panics
     ///
     /// Panics if `var` is out of range for this problem.
-    pub fn var_value_raw(&self, var: Variable) -> f64 {
+    pub fn var_value(&self, var: Variable) -> f64 {
         assert!(var.0 < self.num_vars);
         match &self.state {
             SolveState::Lp(_) => self.lp_values[var.0],
@@ -108,33 +115,15 @@ impl Solution {
         }
     }
 
-    /// Returns a variable's value, rounding integer and boolean variables.
-    ///
-    /// Real-valued variables are returned unchanged. Integer and boolean values
-    /// are rounded to the nearest integer.
+    /// Returns a variable's value: the same as [`Solution::var_value`], which
+    /// no longer rounds.
     ///
     /// # Panics
     ///
-    /// Panics if `var` is out of range or an integer value is farther than
-    /// [`Tolerances::integrality_rounding`] from its nearest integer.
-    pub fn var_value(&self, var: Variable) -> f64 {
-        let value = self.var_value_raw(var);
-        let domain = match &self.state {
-            SolveState::Lp(solver) => &solver.orig_var_domains[var.0],
-            SolveState::Mip(state) => &state.solver.orig_var_domains[var.0],
-        };
-        if matches!(domain, VarDomain::Integer | VarDomain::Boolean) {
-            let rounded = value.round();
-            let tolerance = Tolerances::default().integrality_rounding;
-            assert!(
-                (rounded - value).abs() < tolerance,
-                "Variable was expected to be an integer, got {}",
-                value
-            );
-            rounded
-        } else {
-            value
-        }
+    /// Panics if `var` is out of range for this problem.
+    #[deprecated(note = "values are reported as computed: use `Solution::var_value`")]
+    pub fn var_value_raw(&self, var: Variable) -> f64 {
+        self.var_value(var)
     }
 
     /// Returns the relative gap between this solution and the best proven bound.
@@ -164,10 +153,8 @@ impl Solution {
         }
     }
 
-    /// Iterates over all variables and their values in creation order.
-    ///
-    /// Values use the same integer and boolean rounding as
-    /// [`Solution::var_value`].
+    /// Iterates over all variables and their values in creation order, as
+    /// [`Solution::var_value`] returns them.
     pub fn iter(&self) -> SolutionIter<'_> {
         SolutionIter {
             solution: self,
@@ -257,10 +244,13 @@ impl Solution {
     /// A `min <= -2^52` or `max >= 2^52` counts as infinite here too (see
     /// [`Problem::add_var`](crate::Problem::add_var)), and the bound and domain
     /// checks allow the solve's tolerances, so any value this solution reports
-    /// is accepted: a value up to [`Tolerances::feasibility`] outside a bound
-    /// is fixed at that bound, and a value within
-    /// [`Tolerances::integrality_rounding`] of an integer is fixed at that
-    /// integer.
+    /// is accepted (for an integer variable, with
+    /// [`SolveOptions::int_tol`] at most
+    /// [`Tolerances::integrality_rounding`](crate::Tolerances::integrality_rounding),
+    /// as by default; one fixed at an integer lies on it): a value up to
+    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility) outside a
+    /// bound is fixed at that bound, and a value within `integrality_rounding`
+    /// of an integer is fixed at that integer.
     ///
     /// # Panics
     ///
@@ -378,10 +368,8 @@ impl Solution {
 impl std::ops::Index<Variable> for Solution {
     type Output = f64;
 
-    /// Returns a variable's unrounded value with `solution[var]` syntax.
-    ///
-    /// For an integer or boolean variable, use [`Solution::var_value`] when an
-    /// exact domain value is desired.
+    /// Returns a variable's value with `solution[var]` syntax, as
+    /// [`Solution::var_value`] returns it.
     ///
     /// # Panics
     ///
@@ -403,8 +391,8 @@ impl std::ops::Index<Variable> for Solution {
 
 /// Iterates over a [`Solution`]'s variables in creation order.
 ///
-/// Each item contains the variable and the same domain-aware value returned by
-/// [`Solution::var_value`].
+/// Each item contains the variable and the value [`Solution::var_value`]
+/// returns.
 #[derive(Debug, Clone)]
 pub struct SolutionIter<'a> {
     solution: &'a Solution,

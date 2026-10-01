@@ -29,16 +29,17 @@
 //! would leave a band where a row is violated for the simplex yet not
 //! infeasible for the proof, and nothing that can act on it. The price: a
 //! model is reported infeasible when its points all need more room than that,
-//! on the leaving var (a row missed by `6e-8`, beyond half of a `1e-7`
-//! contract) or on another term (rows that agree only within their
+//! on the leaving var (beyond its contract less the round-off of evaluating
+//! its row) or on another term (rows that agree only within their
 //! tolerances, which the certificate takes as exact).
 
-use super::{at_bound, Solver, ROUNDOFF_FLOOR};
+use super::{Solver, ROUNDOFF_FLOOR};
 
 /// A compensated double: the unevaluated sum `hi + lo` of two `f64`, which
 /// carries about twice the precision of one. The proof accumulates products
-/// with it ([`COMPENSATED_ERROR`] is the allowance for their round-off), and
-/// presolve the bound of a row it rewrites.
+/// with it ([`COMPENSATED_ERROR`] is the allowance for their round-off),
+/// presolve the bound of a row it rewrites, and the test oracle a row's
+/// residual.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct CDouble {
     hi: f64,
@@ -80,7 +81,7 @@ impl CDouble {
     }
 
     /// `self += a · b`, the product taken exactly.
-    pub(super) fn add_product(&mut self, a: f64, b: f64) {
+    pub(crate) fn add_product(&mut self, a: f64, b: f64) {
         let (p, e) = Self::two_product(a, b);
         self.add(p);
         self.lo += e;
@@ -102,7 +103,7 @@ impl CDouble {
     }
 
     /// The nearest `f64`.
-    pub(super) fn value(self) -> f64 {
+    pub(crate) fn value(self) -> f64 {
         self.hi + self.lo
     }
 
@@ -545,22 +546,22 @@ impl Solver {
     /// the direction that helps (flipped, or the last one, if a flip would
     /// carry the leaving var past its other bound, only partway, where it
     /// stays non-basic between its bounds), then, if that is not enough,
-    /// past it within their tolerance, as far as they still count as at it.
+    /// past it within their tolerance, where they stay at that bound.
     /// The moves are applied through the vars' columns and kept only if the
     /// leaving var then lands within its tolerance; returns whether it did
     /// (the moves are undone if not).
     ///
     /// The `wide_chain` fixtures of `src/tests/magnitudes.rs` need the
     /// flips: their only repair moves a var through an entry of `1.5e-15`
-    /// beside `1.95`, below every pivot floor. The tolerances are the room
-    /// of a vertex that misses a bound by the round-off of solving for it
-    /// where every var that could move it is at the bound that blocks it (an
-    /// equality's slack, say)
-    /// (`a_vertex_off_its_bound_by_round_off_is_repaired_within_the_slacks_tolerances`).
-    /// An integer var never leaves its bound, as it never absorbs, and a
-    /// fixed structural var never leaves its value: it is reported there, so
-    /// its tolerance is the reserve its rows keep for that snap, and moved
-    /// too, it would spend the reserve a basic fixed var's drift may need.
+    /// beside `1.95`, below every pivot floor. The tolerances are the room of
+    /// a row every var that could move sits at the bound that blocks, short
+    /// of its bound by a tolerance
+    /// (`the_repair_moves_vars_past_their_bounds_within_their_tolerances`).
+    /// An integer var never leaves its bound, where presolve's rewrite of a
+    /// big-M row holds exactly (past it, the row as written is tighter than
+    /// the rewritten one by the cut coefficient times the move), and a fixed
+    /// structural var never leaves its value, at which presolve checks the
+    /// rows it substituted it out of.
     ///
     /// The moves are read off the certificate, not off the tableau row: a var
     /// takes part only where its coefficient is finite and not round-off
@@ -681,7 +682,9 @@ impl Solver {
                 .iter()
                 .filter(|&&(c, _, _, _, tol)| {
                     let var = self.nb_vars[c];
-                    tol > 0.0 && !self.is_integer(var) && !self.is_reported_at_bound(var)
+                    let fixed =
+                        var < self.num_vars && self.orig_var_mins[var] == self.orig_var_maxs[var];
+                    tol > 0.0 && !self.is_integer(var) && !fixed
                 })
                 .map(|&(c, p, bound, _, tol)| {
                     // Every var a first move takes reaches its bound.
@@ -755,12 +758,11 @@ impl Moves {
     }
 }
 
-/// The farthest value past `bound`, above it (`up`) or below, at which a var
-/// whose tolerance there is `tol` still counts as at that bound
-/// ([`at_bound`]): `bound ± tol`, less the round-off of that sum.
+/// The farthest value past `bound`, above it (`up`) or below, within `tol`
+/// of it: `bound ± tol`, less the round-off of that sum.
 fn band_edge(bound: f64, tol: f64, up: bool) -> f64 {
     let mut edge = if up { bound + tol } else { bound - tol };
-    while !at_bound(edge, bound, tol) {
+    while (edge - bound).abs() > tol {
         edge = if up { edge.next_down() } else { edge.next_up() };
     }
     edge

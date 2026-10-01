@@ -149,10 +149,15 @@ pub(crate) fn effective_problem(base: &Problem, fixed: &BTreeMap<usize, f64>) ->
     p
 }
 
+/// Whether `values` (user units) meet the model's `bounds` within the
+/// contract of the absolute tolerance `feasibility`, and every integer var's
+/// lies within `integrality` of an integer. One its bounds fix (the search,
+/// an edit) needs no exception: the engine holds it exactly at its value.
 pub(crate) fn candidate_variables_feasible(
     values: &[f64],
     domains: &[VarDomain],
-    tolerances: &Tolerances,
+    feasibility: f64,
+    integrality: f64,
     mut bounds: impl FnMut(usize) -> (f64, f64),
 ) -> bool {
     if values.len() != domains.len() {
@@ -166,9 +171,9 @@ pub(crate) fn candidate_variables_feasible(
             && !lo.is_nan()
             && !hi.is_nan()
             && lo <= hi
-            && !crate::solver::outside_bounds(value, lo, hi, tolerances.feasibility)
+            && !crate::solver::outside_bounds(value, lo, hi, feasibility)
             && (!matches!(domains[v], VarDomain::Integer | VarDomain::Boolean)
-                || (value - value.round()).abs() <= tolerances.integrality_rounding)
+                || (value - value.round()).abs() <= integrality)
     })
 }
 
@@ -185,7 +190,8 @@ pub(crate) fn incumbent_feasible(
     values: &[f64],
     tolerances: &Tolerances,
 ) -> bool {
-    candidate_variables_feasible(values, &base.var_domains, tolerances, |v| {
+    let (feasibility, integrality) = (tolerances.feasibility, tolerances.integrality_rounding);
+    candidate_variables_feasible(values, &base.var_domains, feasibility, integrality, |v| {
         fixed
             .get(&v)
             .map_or((base.var_mins[v], base.var_maxs[v]), |&value| {

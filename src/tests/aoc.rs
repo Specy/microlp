@@ -306,7 +306,9 @@ mod tests_aoc {
             .expect("microlp solve failed")
             .into_solution()
             .expect("an unlimited bounded solve must return a solution");
-        vars.iter().map(|&var| solution.var_value(var) as i64).sum()
+        vars.iter()
+            .map(|&var| solution.var_value(var).round() as i64)
+            .sum()
     }
 
     fn part_2_microlp(input: &str) -> i64 {
