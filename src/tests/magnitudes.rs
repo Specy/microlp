@@ -1139,18 +1139,17 @@ mod regression_tests {
         assert_solves_within_contract_in_time(&model, Duration::from_secs(10));
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): the node `x0 = 2` holds only with
-    /// two terms past their bounds at once, each within its tolerance: `x1`
-    /// past its upper bound and the second equality's slack past zero, a
-    /// point no single absorption reaches. The two equalities' slacks absorb
-    /// the violation in turn, each carrying another basic var out of its
-    /// tolerance for a regular pivot to move the violation back, until every
-    /// violated row is taboo: the solve fails loudly ("dual simplex cycles",
-    /// at the node and from the slack basis), presolve on and off. The rows
-    /// lie within the recommended range.
+    /// The node `x0 = 2` holds only with two terms past their bounds at once,
+    /// each within its tolerance: `x1` past its upper bound and the second
+    /// equality's slack past zero, a point no single absorption reaches. One
+    /// equality's slack absorbs the violation; the other, which crossed its
+    /// bound once in the solve, does not absorb it back, so the slacks cannot
+    /// hand it back and forth until every row is taboo. The proof grants both
+    /// slacks their room and proves nothing, and the last resort widens the
+    /// other slack's bound: the node solves, presolve on and off. The rows lie
+    /// within the recommended range.
     #[test]
-    #[should_panic(expected = "dual simplex cycles")]
-    fn a_node_feasible_only_through_two_tolerances_at_once_is_a_known_limitation() {
+    fn a_node_feasible_only_through_two_tolerances_at_once_is_solved() {
         let model = Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
@@ -1636,19 +1635,16 @@ mod regression_tests {
         });
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): the phases alternate over a row
-    /// only entries below the round-off floor can repair, and the solve fails
-    /// with `8 phase rounds` where the origin is feasible. The better point,
-    /// `x3 = -1`, `x4 = 1000`, needs the equality `1e4 x2 - 1e-7 x3 = 0` at
-    /// exactly its whole contract, which the engine's tolerance stops short
-    /// of by the round-off of evaluating the row. The primal step toward it
-    /// passes that equality through an entry below its column's round-off
-    /// floor and leaves it beyond its tolerance; the dual phase takes `x3`
-    /// back, and the step comes again. The fix is a degenerate pivot on the
-    /// tiny entry, which needs absolute pivot tolerances.
+    /// The primal step toward the better point, `x3 = -1`, `x4 = 1000`,
+    /// passes the equality `1e4 x2 - 1e-7 x3 = 0` through an entry below its
+    /// column's round-off floor and leaves it beyond its tolerance. The dual
+    /// phase takes `x3` back through an absorption by the equality's slack,
+    /// and the step comes again. A var crosses a bound by absorbing once per
+    /// solve, so the second time `x2` absorbs instead, after which the step
+    /// leaves the equality within its tolerance: the solve ends at `999`, the
+    /// equality exact with `x2` `1e-11` past its bound.
     #[test]
-    #[should_panic(expected = "8 phase rounds")]
-    fn phases_alternating_over_an_equality_a_long_step_passes_is_a_known_limitation() {
+    fn an_equality_a_long_step_passes_below_its_floor_settles() {
         check(Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![
@@ -1664,6 +1660,38 @@ mod regression_tests {
                 row(&[(2, 10000.0), (3, -1e-7)], ComparisonOp::Eq, 0.0),
             ],
             xstar: vec![0.0; 5],
+        });
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the phases alternate over a basic
+    /// var that only an entry below the round-off floor can repair, and the
+    /// solve fails with `8 phase rounds` where the origin is feasible.
+    /// `-1e-8 x0 - 1e4 x1 = 0` puts `x1` at `-1e-12 x0`, which `x1 <= 0`
+    /// holds within its tolerance, `1e-7`, as far as `x0 = -1e5`. The primal
+    /// step flips `x2` to its lower bound, which carries `x0` to `-100010.01`
+    /// (`100 x0 - 1e-5 x1 - x2 = 0`) and `x1` to `1.0001e-7`, past its
+    /// tolerance, through an entry below its column's round-off floor. In the
+    /// dual phase only `x2` can repair `x1`'s row, through that entry: the
+    /// proof proves nothing, and the certificate repair flips `x2` back; the
+    /// step comes again. A degenerate pivot on the tiny entry would resolve
+    /// it, which needs absolute pivot tolerances. The rows lie outside the
+    /// recommended range (row dynamism `1e12`).
+    #[test]
+    #[should_panic(expected = "8 phase rounds")]
+    fn phases_alternating_over_a_var_a_bound_flip_passes_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, -100011.0, 0.0),
+                real(-1.0, -1.0, 0.0),
+                real(-1.0, -10001001.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(0, 100.0), (1, -1e-5), (2, -1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(1, -1.0), (2, -1000.0)], ComparisonOp::Ge, 0.0),
+                row(&[(0, -1e-8), (1, -10000.0)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![0.0; 3],
         });
     }
 
@@ -1905,67 +1933,66 @@ mod regression_tests {
         model
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): the node `x1 = 1` is pruned on a
-    /// proof that takes the rows as exact. In the node's basis `x1` is basic,
-    /// and the three equalities that hold it, combined, keep it at least
-    /// `7e-5` from 1, beyond its tolerance: the proof grants the leaving var
-    /// its tolerance and the rows none, so the MILP is reported `Infeasible`
-    /// where `x*` is optimal.
+    /// The node `x1 = 1` holds only within its rows' tolerances: in the
+    /// node's basis `x1` is basic, and the three equalities that hold it,
+    /// taken as exact, keep it at least `7e-5` from 1. The proof grants every
+    /// term of their certificate its room, so it proves nothing, the last
+    /// resort widens the bounds of the slacks that close the gap, and the
+    /// search reaches `x*`'s optimum.
     #[test]
-    #[should_panic(expected = "returned Infeasible")]
-    fn a_node_feasible_only_within_its_rows_tolerances_is_pruned_and_is_a_known_limitation() {
+    fn a_node_feasible_only_within_its_rows_tolerances_is_solved() {
         check(integer_value_met_within_the_rows_tolerances());
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): the test above without presolve,
-    /// which prunes the node the same way.
+    /// The test above without presolve.
     #[test]
-    #[should_panic(expected = "returned Infeasible")]
-    fn a_node_feasible_only_within_its_rows_tolerances_without_presolve_is_a_known_limitation() {
+    fn a_node_feasible_only_within_its_rows_tolerances_is_solved_without_presolve() {
         assert_solves_within_contract_without_presolve(
             &integer_value_met_within_the_rows_tolerances(),
         );
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): `2 x0 - x1 = 0`, `x1 - x2 = 0`
-    /// and `x2 = 2 + 1.8e-7` over a binary `x0`, with `-878 x0 >= -878`:
-    /// `x0 = 1` needs `x1 = x2 = 2 + 9e-8`, the first and third rows each
-    /// `9e-8` off, within their tolerances together, and `x0 = 0` meets
-    /// nothing. Presolve rewrites the last row and drops it; the root's LP
-    /// point has `x0 = 1 + 9e-8`, within its bound's tolerance, which the row
-    /// as written rejects, and the branch fixes `x0` at 1. There the engine
-    /// holds `x0` exactly, no single row can take its offset, and the proof,
-    /// which grants the leaving `x0` its tolerance, none, and the rows none,
-    /// prunes the node: `Infeasible` where `x*` is optimal. Without presolve
-    /// the root is pruned the same way, on an equality's slack.
+    /// `2 x0 - x1 = 0`, `x1 - x2 = 0` and `x2 = 2 + 1.8e-7` over a binary
+    /// `x0`, with `-878 x0 >= -878`: `x0 = 1` needs `x1 = x2 = 2 + 9e-8`, the
+    /// first and third rows each `9e-8` off, within their tolerances
+    /// together, and `x0 = 0` meets nothing. Presolve rewrites the last row
+    /// and drops it; the root's LP point has `x0 = 1 + 9e-8`, within its
+    /// bound's tolerance, which the row as written rejects, and the branch
+    /// fixes `x0` at 1, where the engine holds it exactly. No single row can
+    /// take its offset, so no vertex of the node's bounds meets the rows; the
+    /// proof grants both equalities their room and proves nothing, and the
+    /// last resort widens both slacks' bounds, where the node's LP finds the
+    /// point. Without presolve the root needs the same, on its equalities.
     #[test]
-    #[should_panic(expected = "returned Infeasible")]
-    fn a_node_fixing_a_binary_feasible_only_within_two_rows_tolerances_is_a_known_limitation() {
-        check(Model {
-            direction: OptimizationDirection::Minimize,
-            vars: vec![
-                int(0.0, 0, 1),
-                real(-1.0, 0.0, 100.0),
-                real(0.0, 0.0, 100.0),
-            ],
-            rows: vec![
-                row(&[(0, 2.0), (1, -1.0)], ComparisonOp::Eq, 0.0),
-                row(&[(1, 1.0), (2, -1.0)], ComparisonOp::Eq, 0.0),
-                row(&[(2, 1.0)], ComparisonOp::Eq, 2.00000018),
-                row(&[(0, -878.0)], ComparisonOp::Ge, -878.0),
-            ],
-            xstar: vec![1.0, 2.00000009, 2.00000009],
-        });
+    fn a_node_fixing_a_binary_feasible_only_within_two_rows_tolerances_is_solved() {
+        assert_solves_within_contract_in_time(
+            &Model {
+                direction: OptimizationDirection::Minimize,
+                vars: vec![
+                    int(0.0, 0, 1),
+                    real(-1.0, 0.0, 100.0),
+                    real(0.0, 0.0, 100.0),
+                ],
+                rows: vec![
+                    row(&[(0, 2.0), (1, -1.0)], ComparisonOp::Eq, 0.0),
+                    row(&[(1, 1.0), (2, -1.0)], ComparisonOp::Eq, 0.0),
+                    row(&[(2, 1.0)], ComparisonOp::Eq, 2.00000018),
+                    row(&[(0, -878.0)], ComparisonOp::Ge, -878.0),
+                ],
+                xstar: vec![1.0, 2.00000009, 2.00000009],
+            },
+            Duration::from_secs(60),
+        );
     }
 
     /// `x0 + 1e-5 x2 = 262144.00001`, with `x0` fixed at `2^18`, holds exactly
     /// only at `x2 = 1 + 1.8e-6`, past `x2 <= 1`, since its right-hand side is
     /// not representable, and `x*` meets it at `x2 = 1`, `1.8e-11` off, within
     /// its tolerance. The dual phase hands that miss to the equality's slack
-    /// (absorption), a later pivot takes the slack out of the basis, and the
-    /// slack absorbs it again. Refusing the second absorption would send the
-    /// row to the proof, which grants the slack none of its tolerance: the
-    /// model would be reported `Infeasible`, presolve on and off.
+    /// (absorption), and a later pivot takes the slack out of the basis. When
+    /// the miss comes back, the slack, which crossed its bound once in the
+    /// solve, does not absorb it again: the proof grants it its room and
+    /// proves nothing, and the last resort widens its bound.
     #[test]
     fn an_equality_whose_slack_must_absorb_twice_in_a_phase_solves() {
         let model = Model {
@@ -2002,8 +2029,9 @@ mod regression_tests {
     /// exactly only at `x4 = 1 - 4.6e-7`, since its right-hand side is not
     /// representable, while `-2.58 x4 <= -2.58` needs `x4 >= 1`. `x*` meets
     /// the equality at `x4 = 1`, `5.5e-9` off, within its tolerance. The
-    /// equality's slack absorbs a move, a regular pivot takes it out of the
-    /// basis, and it absorbs again on the way to the optimum.
+    /// equality's slack absorbs a move and a regular pivot takes it out of the
+    /// basis; the move it needs again goes to the proof, which grants the
+    /// slack its room, and the last resort widens its bound.
     #[test]
     fn an_lp_whose_equality_slack_must_absorb_twice_in_a_phase_solves() {
         let model = Model {
@@ -3062,16 +3090,18 @@ mod regression_tests {
         check(model);
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): [`big_m_row_met_beyond_its_bound`]
-    /// with `e` at `1.03` of the big-M row's contract, `3%` beyond it with `y`
-    /// at one. The point lies within the contract only with `y` off its
-    /// integer within `int_tol`: `x*` has `y = 1 - 3e-14`, whose offset times
-    /// `M = 5e7` makes the room. Without presolve the search reaches it
-    /// through the LP (`y = 1 - 2e-14`); presolve rewrites `y`'s coefficient
-    /// to about `500`, which takes that room away, and answers `Infeasible`.
+    /// [`big_m_row_met_beyond_its_bound`] with `e` at `1.03` of the big-M
+    /// row's contract, `3%` beyond it with `y` at one. The point lies within
+    /// the contract only with `y` off its integer within `int_tol`: `x*` has
+    /// `y = 1 - 3e-14`, whose offset times `M = 5e7` makes the room. Without
+    /// presolve the search reaches it through the LP (`y = 1 - 2e-14`).
+    /// Presolve rewrites `y`'s coefficient to about `500`; the root's LP then
+    /// needs the rows' tolerances, which the proof grants and the last resort
+    /// reaches: one pin row's widened slack lets `y` end `5e-10` under one,
+    /// within `int_tol`, where the rewritten row holds and the row as written
+    /// has room to spare.
     #[test]
-    #[should_panic(expected = "solve() returned Infeasible")]
-    fn a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_a_known_limitation() {
+    fn a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_found() {
         let model = big_m_row_met_beyond_its_bound(
             5e7,
             [5e7, -5e7],
@@ -3086,10 +3116,10 @@ mod regression_tests {
     }
 
     /// KNOWN LIMITATION (ARCHITECTURE §7): the model of
-    /// [`a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_a_known_limitation`]
+    /// [`a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_found`]
     /// without fixed terms and with each pin row alone keeping `y` at one:
-    /// presolve fixes `y` at 1, which takes the room away, and answers
-    /// `Infeasible`.
+    /// presolve fixes `y` at 1, where the engine holds it exactly, which
+    /// takes the room away, and answers `Infeasible`.
     #[test]
     #[should_panic(expected = "solve() returned Infeasible")]
     fn a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation() {

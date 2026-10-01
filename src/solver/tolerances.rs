@@ -10,9 +10,11 @@
 //! to its whole contract, an integer var its bounds fix to its value exactly
 //! ([`structural_tol`]), and reports the values as it computed them, so the
 //! point it reports passes the boundary's evaluation (the MIP candidate
-//! guard, the pure-LP validation) and one in another order. Everything else
-//! here is a property of `f64` and of the factorization, not of the
-//! contract.
+//! guard, the pure-LP validation) and one in another order. Where the dual
+//! simplex's last resort widens a bound by its var's tolerance, the bound
+//! holds that tolerance ([`band_edge`]) and the side keeps none, or for a
+//! slack only the evaluation margin ([`slack_margin`]). Everything else here
+//! is a property of `f64` and of the factorization, not of the contract.
 
 use crate::{ComparisonOp, CsVec};
 
@@ -283,9 +285,12 @@ const UNIT_ROUNDOFF: f64 = f64::EPSILON / 2.0;
 /// tolerance whenever it checks the rows, since the round-off follows the
 /// values.
 pub(crate) fn slack_tol(tol: f64, magnitude: f64, terms: usize) -> f64 {
-    let contract = row_tolerance(tol, magnitude);
-    let margin = ((terms as f64 + 2.0) * UNIT_ROUNDOFF * magnitude).min(0.5 * contract);
-    contract - margin
+    row_tolerance(tol, magnitude) - slack_margin(tol, magnitude, terms)
+}
+
+/// The evaluation margin [`slack_tol`] takes off a row's contract.
+pub(crate) fn slack_margin(tol: f64, magnitude: f64, terms: usize) -> f64 {
+    ((terms as f64 + 2.0) * UNIT_ROUNDOFF * magnitude).min(0.5 * row_tolerance(tol, magnitude))
 }
 
 /// Tolerances within which a structural var (column factor `scale`, scaled
@@ -316,6 +321,16 @@ pub(crate) fn structural_tol(
         lo: bound_tolerance(base, min),
         hi: bound_tolerance(base, max),
     }
+}
+
+/// The farthest value past `bound`, above it (`up`) or below, within `tol`
+/// of it: `bound ± tol`, less the round-off of that sum.
+pub(crate) fn band_edge(bound: f64, tol: f64, up: bool) -> f64 {
+    let mut edge = if up { bound + tol } else { bound - tol };
+    while (edge - bound).abs() > tol {
+        edge = if up { edge.next_down() } else { edge.next_up() };
+    }
+    edge
 }
 
 /// Tolerance within which a reduced cost counts as zero, given the magnitude
