@@ -12,12 +12,22 @@ fn is_int_domain(d: &VarDomain) -> bool {
     matches!(d, VarDomain::Integer | VarDomain::Boolean)
 }
 
-/// True if every integer-domained structural var is within `int_tol` of an integer.
+/// Whether an integer var with bounds `lo..hi` (integral) is fixed: then it
+/// cannot move, and the engine holds it exactly at its bound.
+fn fixed(lo: f64, hi: f64) -> bool {
+    hi - lo < 0.5
+}
+
+/// True if every integer-domained structural var the search can branch on
+/// is within `int_tol` of an integer.
 pub(crate) fn is_integral(solver: &Solver, domains: &[VarDomain], int_tol: f64) -> bool {
     domains
         .iter()
         .enumerate()
-        .filter(|(_, d)| is_int_domain(d))
+        .filter(|&(v, d)| {
+            let (lo, hi) = solver.get_var_bounds(v);
+            is_int_domain(d) && !fixed(lo, hi)
+        })
         .all(|(v, _)| fractionality(solver.get_value(v)) <= int_tol)
 }
 
@@ -93,11 +103,9 @@ pub(crate) fn choose_branch_var(
         }
         // A fixed var (lo == hi; integral bounds make hi - lo < 0.5 the
         // robust test) cannot move: branching on it reproduces the parent
-        // node verbatim. Its LP value can still carry sub-EPS basic noise
-        // (e.g. -5e-16 on a var fixed to 0), including when this function is
-        // called with int_tol = 0 after a rounded candidate is rejected.
+        // node verbatim. `is_integral` leaves it out too.
         let (lo, hi) = solver.get_var_bounds(v);
-        if hi - lo < 0.5 {
+        if fixed(lo, hi) {
             continue;
         }
         let val = solver.get_value(v);

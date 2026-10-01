@@ -56,7 +56,7 @@ mod tests_aoc2 {
         // Get solution values
         let values: Vec<i64> = press_counts
             .iter()
-            .map(|&var| sol.var_value(var) as i64)
+            .map(|&var| sol.var_value(var).round() as i64)
             .collect();
 
         let total: i64 = values.iter().sum();

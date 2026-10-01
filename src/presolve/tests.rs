@@ -378,11 +378,19 @@ fn dual_fixing_blocked_by_eq_row_and_infinite_bound() {
     assert_eq!(pre.var_mins[0], f64::NEG_INFINITY);
 }
 
+/// The relaxation of a rewrite's vacuous branch at a corner where the terms
+/// `coeffs` sit at bounds of tolerance `1e-7`, at the row's magnitude
+/// `magnitude`: the terms' bound slack and the round-off of the activity.
+fn vacuous_relaxation(coeffs: &[f64], magnitude: f64) -> f64 {
+    coeffs.iter().map(|a| a.abs() * 1e-7).sum::<f64>() + 1e-14 * magnitude
+}
+
 #[test]
 fn binary_coefficient_tightening_le_row() {
     // 10 x + y <= 12, x binary, y in [0, 5]: x=1 forces y <= 2 and x=0 is
-    // vacuous (5 <= 12) -> becomes (about) 3x + y <= 5. Integer content
-    // identical, LP relaxation strictly tighter.
+    // vacuous (5 <= 12) -> becomes 3x + y <= 5, relaxed by the terms' bound
+    // slack and the round-off. Integer content identical, LP relaxation
+    // strictly tighter.
     let cons = vec![(csvec(2, &[(0, 10.0), (1, 1.0)]), ComparisonOp::Le, 12.0)];
     let pre = presolve(
         &[0.0, -1.0],
@@ -402,8 +410,9 @@ fn binary_coefficient_tightening_le_row() {
     let a_x = coeffs.get(0).copied().unwrap();
     let a_y = coeffs.get(1).copied().unwrap();
     assert_eq!(a_y, 1.0);
-    assert!((a_x - 3.0).abs() < 1e-6, "10 -> ~3, got {}", a_x);
-    assert!((rhs - 5.0).abs() < 1e-6, "12 -> ~5, got {}", rhs);
+    let nz = vacuous_relaxation(&[10.0, 1.0], 15.0 + 12.0);
+    assert!((a_x - 3.0 - nz).abs() < 1e-9, "10 -> ~3, got {}", a_x);
+    assert!((rhs - 5.0 - nz).abs() < 1e-9, "12 -> ~5, got {}", rhs);
     // The binding branch is preserved exactly: rhs - a_x == 12 - 10.
     assert!((rhs - a_x - 2.0).abs() < 1e-9);
     assert_eq!(pre.stats.coeffs_tightened, 1);
@@ -413,7 +422,8 @@ fn binary_coefficient_tightening_le_row() {
 fn binary_coefficient_tightening_ge_row() {
     // -10 x + y >= -8, x binary, y in [0, 5]: x=1 forces y >= 2, x=0
     // vacuous (0 >= -8) -> lo' = rest_l = 0, a' = a + (rest_l - lo) =
-    // -10 + 8 = -2: becomes -2x + y >= 0.
+    // -10 + 8 = -2: becomes -2x + y >= 0, relaxed by the terms' bound slack
+    // and the round-off.
     let cons = vec![(csvec(2, &[(0, -10.0), (1, 1.0)]), ComparisonOp::Ge, -8.0)];
     let pre = presolve(
         &[0.0, 1.0],
@@ -431,8 +441,9 @@ fn binary_coefficient_tightening_ge_row() {
     let (coeffs, op, rhs) = &pre.constraints[0];
     assert!(matches!(op, ComparisonOp::Ge));
     let a_x = coeffs.get(0).copied().unwrap();
-    assert!((a_x + 2.0).abs() < 1e-6, "-10 -> ~-2, got {}", a_x);
-    assert!(rhs.abs() < 1e-6, "-8 -> ~0, got {}", rhs);
+    let nz = vacuous_relaxation(&[-10.0, 1.0], 10.0 + 8.0);
+    assert!((a_x + 2.0 + nz).abs() < 1e-9, "-10 -> ~-2, got {}", a_x);
+    assert!((rhs + nz).abs() < 1e-9, "-8 -> ~0, got {}", rhs);
     assert!(
         (rhs - a_x - 2.0).abs() < 1e-9,
         "x=1 branch must stay y >= 2"
@@ -444,7 +455,8 @@ fn knapsack_coefficient_tightening_shrinks_loose_coeff() {
     // 5x + 7y + 4z + 3w <= 14, binaries. y's coefficient is loose: when
     // y = 0 the rest can reach at most 12 < 14, so the row is equivalent
     // to 5x + 5y + 4z + 3w <= 12 on binary points (y = 1 still forces
-    // rest <= 7). x/z/w after the update: rest_u == b, so they stay.
+    // rest <= 7), relaxed by the terms' bound slack and the round-off. x/z/w
+    // after the update: rest_u == b, so they stay.
     let cons = vec![(
         csvec(4, &[(0, 5.0), (1, 7.0), (2, 4.0), (3, 3.0)]),
         ComparisonOp::Le,
@@ -465,10 +477,11 @@ fn knapsack_coefficient_tightening_shrinks_loose_coeff() {
     assert_eq!(pre.stats.coeffs_tightened, 1);
     assert_eq!(pre.constraints.len(), 1);
     let (coeffs, _, rhs) = &pre.constraints[0];
-    assert!((rhs - 12.0).abs() < 1e-6, "14 -> ~12, got {}", rhs);
+    let nz = vacuous_relaxation(&[5.0, 7.0, 4.0, 3.0], 19.0 + 14.0);
+    assert!((rhs - 12.0 - nz).abs() < 1e-9, "14 -> ~12, got {}", rhs);
     assert_eq!(coeffs.get(0).copied().unwrap(), 5.0);
     let a_y = coeffs.get(1).copied().unwrap();
-    assert!((a_y - 5.0).abs() < 1e-6, "7 -> ~5, got {}", a_y);
+    assert!((a_y - 5.0 - nz).abs() < 1e-9, "7 -> ~5, got {}", a_y);
     assert_eq!(coeffs.get(2).copied().unwrap(), 4.0);
     assert_eq!(coeffs.get(3).copied().unwrap(), 3.0);
     // y = 1 branch preserved exactly: rhs - a_y == 14 - 7.
@@ -750,9 +763,8 @@ fn cascading_substitution_reaches_fixpoint() {
 #[test]
 fn all_substituted_row_is_judged_at_the_full_contract() {
     // A row whose vars are all fixed is judged as the boundary judges it,
-    // against the full contract, not the engine's half: at x0 = -2^-30 and
-    // x1 = 83887, `-100 x0 + x1 / 1000 = 83.887` has a residual of 9.3e-8,
-    // within 1e-7 but not 5e-8.
+    // against the full contract: at x0 = -2^-30 and x1 = 83887,
+    // `-100 x0 + x1 / 1000 = 83.887` has a residual of 9.3e-8, within 1e-7.
     let x0 = -(2.0f64.powi(-30));
     let cons = vec![
         (
@@ -800,7 +812,7 @@ fn infinite_rhs_le_row_is_dropped_not_crashed() {
 /// budget. A fixing whose error another row amplifies past its budget, or a
 /// bound that cuts `xstar`, fails it.
 fn keeps(pre: &Presolved, cons: &[(CsVec, ComparisonOp, f64)], xstar: &[f64]) -> bool {
-    use crate::solver::{outside, outside_bounds, row_tolerance, slack_bounds, ROW_BUDGET_SHARE};
+    use crate::solver::{outside, outside_bounds, slack_bounds, slack_tol};
     let (mins, maxs) = (&pre.var_mins, &pre.var_maxs);
     let x: Vec<f64> = (0..xstar.len())
         .map(|v| {
@@ -819,7 +831,7 @@ fn keeps(pre: &Presolved, cons: &[(CsVec, ComparisonOp, f64)], xstar: &[f64]) ->
             magnitude += (a * x[v]).abs();
         }
         let (lo, hi) = slack_bounds(*op);
-        let budget = ROW_BUDGET_SHARE * row_tolerance(1e-7, magnitude);
+        let budget = slack_tol(1e-7, magnitude, coeffs.nnz());
         !outside(rhs - activity, lo, hi, budget)
     });
     in_bounds && rows_hold

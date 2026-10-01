@@ -95,7 +95,7 @@ impl VertexChange {
 /// declared only when two consecutive basis changes both lead to visited
 /// vertices (`is_bad_change`); the next iteration then chooses another row
 /// (dual) or another entering var (primal). A record is dropped once a step
-/// moves the value in its row by at least the row's tolerance: the state it
+/// moves the value in its row by more than the row's tolerance: the state it
 /// was bad in is gone.
 ///
 /// Every rebuild lifts the taboo flags, so that on fresh data a taboo change
@@ -300,7 +300,7 @@ impl CycleGuard {
         }
     }
 
-    /// Drop the records whose row a step has moved by at least its
+    /// Drop the records whose row a step has moved by more than its
     /// tolerance.
     pub(crate) fn forget_moved_rows(&mut self, moved: impl Fn(usize) -> bool) {
         self.bad_changes.retain(|c| !moved(c.row));

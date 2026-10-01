@@ -7,8 +7,12 @@
 //! * A row holds within [`crate::Tolerances::feasibility`] (default `1e-7`),
 //!   but never finer than the round-off of evaluating it, `ROUNDOFF`, a
 //!   hundred ulps of the row's magnitude: a row whose terms are `1e10`
-//!   cannot be checked below about `1e-6`.
+//!   cannot be checked below about `1e-6`. Its residual is summed in
+//!   compensated arithmetic, so the verdict does not depend on the order of
+//!   the terms.
 //! * A variable is within its bounds by the same rule.
+//! * An integer variable is within [`crate::SolveOptions::int_tol`] of an
+//!   integer.
 //! * The objective is not worse than at `x*` by more than `1e-4` of its extent
 //!   over the variable box. The tolerances let every variable move a little,
 //!   so this catches gross sub-optimality (a wrongly pruned branch, a wrong
@@ -111,15 +115,16 @@ impl Model {
     }
 }
 
-/// `Σ a_j x_j - b` and the magnitude `|b| + Σ |a_j x_j|` it was computed from.
+/// `Σ a_j x_j - b`, summed with the products exact in compensated
+/// arithmetic, and the magnitude `|b| + Σ |a_j x_j|` it was computed from.
 fn activity(row: &Row, x: &[f64]) -> (f64, f64) {
-    let mut act = 0.0;
+    let mut act = crate::solver::CDouble::from(-row.rhs);
     let mut mag = row.rhs.abs();
     for &(j, a) in &row.terms {
-        act += a * x[j];
+        act.add_product(a, x[j]);
         mag += (a * x[j]).abs();
     }
-    (act - row.rhs, mag)
+    (act.value(), mag)
 }
 
 /// How far `x` violates `row` (0 when satisfied, infinite when the activity
@@ -202,6 +207,7 @@ fn check_contract_with(
     let mut options = SolveOptions::default();
     options.presolve = presolve;
     options.time_limit = time_limit;
+    let int_tol = options.int_tol;
     let call = if presolve {
         "solve()"
     } else {
@@ -237,6 +243,13 @@ fn check_contract_with(
             x[j],
             v.lo,
             v.hi,
+            model.source()
+        );
+        let off = (x[j] - x[j].round()).abs();
+        assert!(
+            !v.integer || off <= int_tol,
+            "x{j} = {:e} is {off:e} off its integer (tolerance {int_tol:e}):\n{}",
+            x[j],
             model.source()
         );
     }

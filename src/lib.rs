@@ -36,11 +36,12 @@ let y = problem.add_integer_var(2.0, (0, 3));
 problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
 problem.add_constraint(&[(x, 2.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
 
-// The optimum is 7, at x = 1, y = 3.
+// The optimum is 7, at x = 1, y = 3. An integer variable's value is
+// reported within `int_tol` of its integer: round it for an exact one.
 let solution = problem.solve().unwrap().into_solution().unwrap();
-assert_eq!(solution.objective(), 7.0);
-assert_eq!(solution.var_value(x), 1.0);
-assert_eq!(solution.var_value(y), 3.0);
+assert!((solution.objective() - 7.0).abs() < 1e-6);
+assert!((solution.var_value(x) - 1.0).abs() < 1e-6);
+assert_eq!(solution.var_value(y).round(), 3.0);
 ```
 
 # Solving and reading the solution
@@ -67,6 +68,14 @@ When a solve call returns successfully:
 [`SolveOutcome::termination_reason`] distinguishes
 [`TerminationReason::ProvenOptimal`], [`TerminationReason::MipGap`],
 [`TerminationReason::TimeLimit`], and [`TerminationReason::NodeLimit`].
+
+[`Solution::var_value`] reports a value as the solver computed it. An integer
+or boolean variable's value lies within [`SolveOptions::int_tol`] of an
+integer, not necessarily on it: values like `0.9999999` are normal; one fixed
+at an integer lies on it. Round it where an exact integer is needed, bearing
+in mind that rounded values need not meet the constraints: under
+`x <= 1e7 * y`, a `y` of `1e-6` allows `x` up to 10, which `y` rounded to zero
+forbids.
 
 # Time limits, resuming, and editing
 

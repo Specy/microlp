@@ -292,7 +292,7 @@ mod regression_tests {
     /// user's tolerance: maximizing `y` needs `x` at its upper bound, which
     /// the solve must reach although every value of `x` lies within the
     /// user's tolerance of both bounds. Taking `x` for fixed at 0 would answer
-    /// 0, `5e-3` below the exact optimum (ARCHITECTURE §7, `structural_tol`).
+    /// 0, `5e-3` below the exact optimum (ARCHITECTURE §3).
     #[test]
     fn a_continuous_var_narrower_than_its_tolerance_reaches_the_exact_optimum() {
         let model = Model {
@@ -325,15 +325,13 @@ mod regression_tests {
     }
 
     /// `max 1e6 x + y` s.t. `y - x <= 0` with `x` in `[0, 5e-8]` and `y` in
-    /// `[0, 1]`: `x`'s whole range moves the row by no more than its reserve,
-    /// so the cap leaves `x` a tolerance as wide as that range, and the
-    /// at-bound state takes `x` for fixed at 0. The exact optimum,
-    /// `x = y = 5e-8`, is `5e-2` better, a gain that comes through the
-    /// objective, which no row shows (ARCHITECTURE §7).
+    /// `[0, 1]`: `x`'s whole range lies within its tolerance, and the exact
+    /// optimum, `x = y = 5e-8`, needs `x` at its upper bound, a gain of `5e-2`
+    /// that comes through the objective, which no row shows. A non-basic var's
+    /// state is the bound it sits at, not a tolerance test, so `x` is not
+    /// taken for fixed (ARCHITECTURE §3).
     #[test]
-    #[should_panic(expected = "is worse than the objective")]
-    fn a_continuous_var_narrower_than_its_tolerance_misses_its_objective_gain_is_a_known_limitation(
-    ) {
+    fn a_continuous_var_narrower_than_its_tolerance_reaches_its_objective_gain() {
         let model = Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![real(1e6, 0.0, 5e-8), real(1.0, 0.0, 1.0)],
@@ -913,16 +911,13 @@ mod regression_tests {
         }
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): a model whose optimum is reached
-    /// only through a basis the factorization finds singular fails loudly,
-    /// where `x*`, at `x2 = 5000`, is optimal. `x2`, the last var that
-    /// improves the objective, is blocked only by an entry some `1e-14` of its
-    /// column: the pivot on it leaves a singular basis, the repair takes `x2`
-    /// out, and the phase comes back to that basis by another route until only
-    /// changes to it are left.
+    /// A model whose exact optimum, `x*` at `x2 = 5000`, is reached only
+    /// through a basis the factorization finds singular (`x2` is blocked by an
+    /// entry some `1e-14` of its column) solves: the rows admit
+    /// `x2 = 9999.995` with `x5` `5e-8` below its bound, within its tolerance,
+    /// and the simplex ends at that vertex.
     #[test]
-    #[should_panic(expected = "leads to a singular basis")]
-    fn an_optimum_reached_only_through_a_singular_basis_is_a_known_limitation() {
+    fn a_model_whose_exact_optimum_needs_a_singular_basis_solves() {
         check(Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![
@@ -948,11 +943,16 @@ mod regression_tests {
 
     /// KNOWN LIMITATION (ARCHITECTURE §7): a model whose optimal basis the
     /// factorization finds singular fails loudly, where the origin, its only
-    /// feasible point, is optimal. The last primal step pivots on an entry
-    /// some `1e-14` of its column into that basis (a 1-norm condition of about
-    /// `4.5e14` in the scaled data); the repair takes the entering var back
-    /// out, and the change back stays taboo, since the step, a zero one, moved
-    /// no row.
+    /// exactly feasible point, is optimal. The last primal step pivots on an
+    /// entry some `1e-14` of its column into that basis (a 1-norm condition of
+    /// about `4.5e14` in the scaled data); the repair takes the entering var
+    /// back out, and the change back stays taboo, since the step, a zero one,
+    /// moved no row. The evaluation margin keeps it pinned: held to its whole
+    /// contract, `x0 - 1e-7 x4 = 0` admits `x4 = 1`, of objective `-1e9`,
+    /// which the solve then returns; the engine's tolerance, short of the
+    /// contract by the round-off of evaluating the row, excludes that point.
+    /// The model lies outside the recommended range (a row dynamism of
+    /// `1e11`).
     #[test]
     #[should_panic(expected = "leads to a singular basis")]
     fn an_optimal_basis_the_factorization_finds_singular_is_a_known_limitation() {
@@ -1131,6 +1131,47 @@ mod regression_tests {
                 ),
             ],
             xstar: vec![0.0, -115.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model"
+        );
+        assert_solves_within_contract_in_time(&model, Duration::from_secs(10));
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the node `x0 = 2` holds only with
+    /// two terms past their bounds at once, each within its tolerance: `x1`
+    /// past its upper bound and the second equality's slack past zero, a
+    /// point no single absorption reaches. The two equalities' slacks absorb
+    /// the violation in turn, each carrying another basic var out of its
+    /// tolerance for a regular pivot to move the violation back, until every
+    /// violated row is taboo: the solve fails loudly ("dual simplex cycles",
+    /// at the node and from the slack basis), presolve on and off. The rows
+    /// lie within the recommended range.
+    #[test]
+    #[should_panic(expected = "dual simplex cycles")]
+    fn a_node_feasible_only_through_two_tolerances_at_once_is_a_known_limitation() {
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(-1.0, 0, 2),
+                real(-1.0, 354647636.0, 354647637.0),
+                real(-1.0, 0.0, 0.0),
+                real(-1.0, -1.0, 0.0),
+            ],
+            rows: vec![
+                row(
+                    &[(0, -1e-7), (1, -0.001), (3, -1.75e-7)],
+                    ComparisonOp::Eq,
+                    -354647.637,
+                ),
+                row(
+                    &[(0, 1.5e-6), (1, -1.0), (3, -1e-6)],
+                    ComparisonOp::Eq,
+                    -354647637.0,
+                ),
+            ],
+            xstar: vec![0.0, 354647637.0, 0.0, 0.0],
         };
         assert!(
             xstar_is_feasible(&model),
@@ -1540,18 +1581,13 @@ mod regression_tests {
         }
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): the phases alternate over a row
-    /// only entries below the round-off floor can repair, and the solve fails
-    /// with `8 phase rounds` where the answer is the origin, the only feasible
-    /// point. The primal step that lowers `x0` passes `-1e4 x2 + 1e-3 x3 >= 0`,
-    /// whose genuine `3e-15` is below its column's round-off floor (largest
-    /// entry 4), and leaves the row `1e-7` short; the dual phase's
-    /// certificate repair moves `x5` across its range through another such
-    /// entry, which gives the step back. The fix is a degenerate pivot on the `3e-15`,
-    /// which needs absolute pivot tolerances and a refined row.
+    /// A row only entries below the round-off floor can repair: the origin is
+    /// the only exact point, and a primal step that lowers `x0` passes
+    /// `-1e4 x2 + 1e-3 x3 >= 0` through a tableau entry of `3e-15`, below its
+    /// column's floor. Within `x2`'s bound tolerance (`x2 = -1e-11`) the rows
+    /// admit `x3 = -1e-4`, a vertex where the phases agree.
     #[test]
-    #[should_panic(expected = "8 phase rounds")]
-    fn phases_alternating_over_a_row_repaired_through_round_off_is_a_known_limitation() {
+    fn a_row_only_entries_below_the_floor_repair_solves() {
         check(Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
@@ -1575,18 +1611,11 @@ mod regression_tests {
         });
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): the same class. The second row
-    /// makes `x1 = 1e-11 x0`, so `x1 >= 0` needs `x0 >= 0` and the optimum is
-    /// 0; the solve fails with `8 phase rounds`. The primal step that lowers
-    /// `x0` to -1 passes `x1`'s row through an entry below its column's
-    /// round-off floor, to a point that meets the engine's tolerances only off
-    /// every vertex (the equality at its tolerance, `x1` at its own, capped at
-    /// `5e-12` by its row's reserve); the dual phase moves `x3` back through
-    /// another such entry. The fix is the one above, or the engine's
-    /// tolerances raised to the whole contract.
+    /// The second row makes `x1 = 1e-11 x0`, so the exact rows need `x0 >= 0`
+    /// for `x1 >= 0`. Within `x1`'s bound tolerance, `x1 = -1e-11` meets both
+    /// equalities with `x0 = -1` at a vertex, where the solve ends.
     #[test]
-    #[should_panic(expected = "8 phase rounds")]
-    fn an_equality_met_only_off_every_vertex_is_a_known_limitation() {
+    fn an_equality_met_within_a_bound_tolerance_at_a_vertex_solves() {
         check(Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
@@ -1607,15 +1636,77 @@ mod regression_tests {
         });
     }
 
-    /// A vertex that misses a bound by the round-off of solving for it, beyond
-    /// the tolerance the engine holds the var to, is repaired within the
-    /// tolerance of a fixed slack. After two dual pivots every
-    /// non-basic var is an equality's fixed slack, and `x2` sits `3.3e-10`
-    /// (scaled) past its upper bound, three times its tolerance; the row's
-    /// certificate proves nothing (a gap of `-6.7e-14`), and only a slack
-    /// moved within its tolerance lands `x2`. `x* = (0, -230094, 0)`.
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the phases alternate over a row
+    /// only entries below the round-off floor can repair, and the solve fails
+    /// with `8 phase rounds` where the origin is feasible. The better point,
+    /// `x3 = -1`, `x4 = 1000`, needs the equality `1e4 x2 - 1e-7 x3 = 0` at
+    /// exactly its whole contract, which the engine's tolerance stops short
+    /// of by the round-off of evaluating the row. The primal step toward it
+    /// passes that equality through an entry below its column's round-off
+    /// floor and leaves it beyond its tolerance; the dual phase takes `x3`
+    /// back, and the step comes again. The fix is a degenerate pivot on the
+    /// tiny entry, which needs absolute pivot tolerances.
     #[test]
-    fn a_vertex_off_its_bound_by_round_off_is_repaired_within_the_slacks_tolerances() {
+    #[should_panic(expected = "8 phase rounds")]
+    fn phases_alternating_over_an_equality_a_long_step_passes_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, 0.0, 0.0),
+                real(0.0, 0.0, 0.0),
+                real(-1.0, 0.0, 1.0),
+                real(1.0, -1.0, 0.0),
+                real(1.0, 0.0, 256167.0),
+            ],
+            rows: vec![
+                row(&[(3, -1.0), (4, -0.001)], ComparisonOp::Eq, -0.0),
+                row(&[(2, -1e-5), (4, -10000.0)], ComparisonOp::Le, 0.0),
+                row(&[(2, 10000.0), (3, -1e-7)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![0.0; 5],
+        });
+    }
+
+    /// A MILP whose `x4 ∈ [-5.96e-8, 0]` is narrower than its bound
+    /// tolerance. Counted at both bounds, fixed, by a state taken from that
+    /// tolerance, `x4` never moved, and at the node `x1 ∈ [2, 3]`, which the
+    /// rows make infeasible, the phases alternated round after round. `x*` is
+    /// optimal.
+    #[test]
+    fn a_var_whose_range_is_narrower_than_its_tolerance_is_not_fixed() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(-1.0, -2, 0),
+                int(1.0, 0, 4),
+                real(-1.0, 0.0, 0.0),
+                real(-1.0, 32768.0, 32769.0),
+                real(-1.0, -5.960464477539063e-8, 0.0),
+                real(-1.0, 0.0, 0.0),
+            ],
+            rows: vec![
+                row(
+                    &[(1, -0.001), (3, 1000.0), (4, -1e-7)],
+                    ComparisonOp::Eq,
+                    32768000.0,
+                ),
+                row(&[(3, -1.0)], ComparisonOp::Le, -32768.0),
+                row(
+                    &[(0, 2.0), (1, 1.0), (3, 1.0), (4, -1.0)],
+                    ComparisonOp::Eq,
+                    32768.0,
+                ),
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 32768.0, 0.0, 0.0],
+        });
+    }
+
+    /// A vertex that misses a bound by the round-off of solving for it: every
+    /// non-basic var is an equality's fixed slack, and the rows of magnitude
+    /// `2.6e5` put `x2` `4.7e-10` past its upper bound, within its tolerance.
+    /// `x* = (0, -230094, 0)`.
+    #[test]
+    fn a_vertex_off_its_bound_by_round_off_is_within_its_vars_tolerance() {
         check(Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![
@@ -1636,16 +1727,13 @@ mod regression_tests {
         });
     }
 
-    /// A MILP node LP that no pivot can repair is repaired within the
-    /// tolerance of a fixed slack, neither pruned nor failed. The rows pin
-    /// `x5` at zero; the root vertex puts it `3.05e-12` (scaled, `5e-8` in
-    /// user units) past its upper bound, beyond the tolerance its rows'
-    /// reserve caps it at, and only the second row's unbounded slack could
-    /// pivot, through an entry of `3.2e-16`, below every pivot floor. The
-    /// certificate proves nothing, and the first row's fixed slack, moved
-    /// within its tolerance, lands `x5`. `x* = 0` but for `x4 = 500001`.
+    /// A MILP node LP whose vertex no pivot can move: the rows pin `x5` at
+    /// zero, the root vertex puts it `5e-8` past its upper bound, within its
+    /// tolerance, and only the second row's unbounded slack could pivot,
+    /// through an entry of `3.2e-16`, below every pivot floor.
+    /// `x* = 0` but for `x4 = 500001`.
     #[test]
-    fn a_node_lp_no_pivot_can_repair_is_repaired_within_a_slacks_tolerance() {
+    fn a_node_lp_vertex_no_pivot_can_move_is_within_its_vars_tolerance() {
         check(Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
@@ -1665,16 +1753,11 @@ mod regression_tests {
         });
     }
 
-    /// A vertex whose basic var misses its bound by the round-off of rows of
-    /// magnitude `7.7e7` is repaired within the tolerances of two fixed
-    /// slacks. After five dual pivots `x2` is computed `2^-24` (scaled) below
-    /// its lower bound, beyond its tolerance, where the vertex is exactly
-    /// feasible (the certificate's gap is `-3e-33`); every var of its row is
-    /// fixed or at its bound in the direction that helps, and no one slack
-    /// can absorb the move. The slacks of the last two rows, each moved
-    /// within its tolerance, land `x2`. The optimum is `x*`'s, `77137`.
+    /// A vertex whose basic vars miss their bounds by the round-off of rows
+    /// of magnitude `7.7e7` (`x0` and `x3` some `2.5e-10` below zero, `x2`
+    /// `2.5e-11`), within their tolerances. The optimum is `x*`'s, `77137`.
     #[test]
-    fn a_basic_var_off_its_bound_by_its_rows_round_off_is_repaired() {
+    fn a_basic_var_off_its_bound_by_its_rows_round_off_is_within_its_tolerance() {
         let model = Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
@@ -1705,14 +1788,12 @@ mod regression_tests {
         assert_solves_within_contract_in_time(&model, Duration::from_secs(10));
     }
 
-    /// A vertex off its bound by round-off whose only pivot is an entry below
-    /// round-off is repaired within the tolerance of a fixed slack. `x1` is
-    /// computed `3.05e-12` (scaled) past its upper bound, `6e-20` more than
-    /// the first row's slack could absorb alone; the second row's slack,
-    /// unbounded, reaches the row through `5e-16` only. The first row's slack
-    /// moved by its tolerance lands `x1` within its own.
+    /// A vertex off its bound whose only pivot is an entry below round-off:
+    /// the rows put `x1` `5e-8` past its upper bound, within its tolerance,
+    /// and the second row's slack, unbounded, reaches it through `5e-16`
+    /// only. The vertex's objective is `x*`'s.
     #[test]
-    fn a_vertex_off_its_bound_behind_a_round_off_entry_is_repaired() {
+    fn a_vertex_off_its_bound_behind_a_round_off_entry_is_within_its_tolerance() {
         let model = Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![
@@ -1732,20 +1813,12 @@ mod regression_tests {
         assert_solves_within_contract_in_time(&model, Duration::from_secs(10));
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): a vertex whose computed value
-    /// misses a bound by more than the other terms of its row's certificate
-    /// can absorb, though its exact value does not, fails loudly where `x*`
-    /// is feasible. The dual simplex ends at a vertex that computes `x0`
-    /// `3.7e-9` (scaled) past its upper bound of 0, the round-off of rows of
-    /// magnitude `4.9e6`, where the vertex is inside it (the certificate's
-    /// gap is `-1.2e-9`). `x1` and the first row's slack are at the bounds
-    /// that block them, and moved within their tolerances they carry `x0` by
-    /// `2e-9`, which with its own tolerance of `1e-9` leaves it `7e-10`
-    /// short. Values computed to the certificate's precision would accept
-    /// the vertex.
+    /// A vertex computed to the round-off of rows of magnitude `4.9e6`, next
+    /// to `x0`'s upper bound of 0, lands within the contract: `x0` and `x1`,
+    /// whose room in `-200 x0 - 10 x1 <= 6e-8` is what can absorb that
+    /// round-off, each keep their whole bound tolerance.
     #[test]
-    #[should_panic(expected = "no var can repair row")]
-    fn a_vertex_computed_past_its_bound_beyond_its_terms_tolerances_is_a_known_limitation() {
+    fn a_vertex_computed_through_large_rows_next_to_a_bound_solves() {
         let model = Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![
@@ -1772,16 +1845,14 @@ mod regression_tests {
         assert_solves_feasibly_within_contract(&model);
     }
 
-    /// A MILP node whose LP misses a bound by less than the user's tolerance
-    /// but more than the engine's is proven infeasible and pruned. The node
-    /// `x0 <= -1` puts `x2` at `1e-8`, past its bound of zero, beyond the
-    /// tolerance its first row's reserve caps it at but within the user's
-    /// `1e-7`, and nothing can move; the certificate's gap is exactly that
-    /// `1e-8`. A proof that asks more than the simplex's own test leaves the
-    /// node neither proven nor solvable. The optimum is `x0 = 1` (where
-    /// `x2 = -1e-8`).
+    /// The rows give `x2 = -1e-8 x0` and pin `x2` at zero, so the exact
+    /// optimum is `x0 = 0`; `x0 = 1` needs the second row at `1e-9`, within
+    /// its tolerance. The root LP ends at `x0 = 7e-9`, integral within
+    /// `int_tol`, and the search closes there: its objective is the root's
+    /// bound, and a point better only within the tolerances is not sought
+    /// (ARCHITECTURE §7).
     #[test]
-    fn a_node_infeasible_by_less_than_the_contract_is_pruned() {
+    fn a_root_lp_point_integral_within_int_tol_closes_the_search() {
         check(Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![int(1.0, -1, 1), real(0.0, 0.0, 0.0), real(0.0, -1.0, 0.0)],
@@ -1854,6 +1925,119 @@ mod regression_tests {
         assert_solves_within_contract_without_presolve(
             &integer_value_met_within_the_rows_tolerances(),
         );
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): `2 x0 - x1 = 0`, `x1 - x2 = 0`
+    /// and `x2 = 2 + 1.8e-7` over a binary `x0`, with `-878 x0 >= -878`:
+    /// `x0 = 1` needs `x1 = x2 = 2 + 9e-8`, the first and third rows each
+    /// `9e-8` off, within their tolerances together, and `x0 = 0` meets
+    /// nothing. Presolve rewrites the last row and drops it; the root's LP
+    /// point has `x0 = 1 + 9e-8`, within its bound's tolerance, which the row
+    /// as written rejects, and the branch fixes `x0` at 1. There the engine
+    /// holds `x0` exactly, no single row can take its offset, and the proof,
+    /// which grants the leaving `x0` its tolerance, none, and the rows none,
+    /// prunes the node: `Infeasible` where `x*` is optimal. Without presolve
+    /// the root is pruned the same way, on an equality's slack.
+    #[test]
+    #[should_panic(expected = "returned Infeasible")]
+    fn a_node_fixing_a_binary_feasible_only_within_two_rows_tolerances_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(0.0, 0, 1),
+                real(-1.0, 0.0, 100.0),
+                real(0.0, 0.0, 100.0),
+            ],
+            rows: vec![
+                row(&[(0, 2.0), (1, -1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(1, 1.0), (2, -1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(2, 1.0)], ComparisonOp::Eq, 2.00000018),
+                row(&[(0, -878.0)], ComparisonOp::Ge, -878.0),
+            ],
+            xstar: vec![1.0, 2.00000009, 2.00000009],
+        });
+    }
+
+    /// `x0 + 1e-5 x2 = 262144.00001`, with `x0` fixed at `2^18`, holds exactly
+    /// only at `x2 = 1 + 1.8e-6`, past `x2 <= 1`, since its right-hand side is
+    /// not representable, and `x*` meets it at `x2 = 1`, `1.8e-11` off, within
+    /// its tolerance. The dual phase hands that miss to the equality's slack
+    /// (absorption), a later pivot takes the slack out of the basis, and the
+    /// slack absorbs it again. Refusing the second absorption would send the
+    /// row to the proof, which grants the slack none of its tolerance: the
+    /// model would be reported `Infeasible`, presolve on and off.
+    #[test]
+    fn an_equality_whose_slack_must_absorb_twice_in_a_phase_solves() {
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(0.0, 262144, 262144),
+                real(1.0, -1.0, 0.0),
+                real(1.0, 0.0, 1.0),
+                real(-1.0, 0.0, 1.0),
+                real(-1.0, 0.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(3, -1.0)], ComparisonOp::Ge, -1.0),
+                row(&[(1, -1.0), (3, 0.01)], ComparisonOp::Eq, 0.0),
+                row(&[(0, 1.0), (2, 1e-5)], ComparisonOp::Eq, 262144.00001),
+                row(
+                    &[(1, -1e-5), (2, -2000.0), (3, 1.0)],
+                    ComparisonOp::Eq,
+                    -2000.0,
+                ),
+            ],
+            xstar: vec![262144.0, 0.0, 1.0, 0.0, 0.0],
+        };
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model"
+        );
+        assert_solves_within_contract(&model);
+        assert_solves_within_contract_without_presolve(&model);
+    }
+
+    /// The same in an LP within the recommended range (row dynamism `3.5e5`):
+    /// `-67 x0 + 0.012 x4 = -70254591.988`, with `x0` fixed at `2^20`, holds
+    /// exactly only at `x4 = 1 - 4.6e-7`, since its right-hand side is not
+    /// representable, while `-2.58 x4 <= -2.58` needs `x4 >= 1`. `x*` meets
+    /// the equality at `x4 = 1`, `5.5e-9` off, within its tolerance. The
+    /// equality's slack absorbs a move, a regular pivot takes it out of the
+    /// basis, and it absorbs again on the way to the optimum.
+    #[test]
+    fn an_lp_whose_equality_slack_must_absorb_twice_in_a_phase_solves() {
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(0.0, 1048576.0, 1048576.0),
+                real(0.0, 0.0, 1.0),
+                real(1.0, 0.0, 1.0),
+                real(-2.0, 0.0, 1.0),
+                real(0.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(0, -67.0), (4, 0.012)], ComparisonOp::Eq, -70254591.988),
+                row(&[(4, -2.58)], ComparisonOp::Le, -2.58),
+                row(
+                    &[(2, -0.00182), (3, 631.0), (4, 493.0)],
+                    ComparisonOp::Le,
+                    494.0,
+                ),
+                row(&[(1, 6.71), (2, 2.74)], ComparisonOp::Ge, 6.71),
+                row(
+                    &[(1, 275.0), (3, 0.294), (4, -0.00504)],
+                    ComparisonOp::Eq,
+                    274.99496,
+                ),
+            ],
+            xstar: vec![1048576.0, 1.0, 0.0, 0.0, 1.0],
+        };
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model"
+        );
+        assert_solves_within_contract(&model);
+        assert_solves_within_contract_without_presolve(&model);
     }
 
     /// A MILP node whose certificate carries a basic var's round-off on a huge
@@ -2509,7 +2693,8 @@ mod regression_tests {
 
     /// [`two_rooms_behind_a_search`] with `x*` as a warm-start hint, whose
     /// `x1 = 4e-8` only a model keeping `x1`'s room admits: under a budget of
-    /// no node, the root adopts the hint, with and without presolve.
+    /// no node, the root adopts the hint, with and without presolve, its
+    /// values as computed within their bound tolerance of the hint's.
     #[test]
     fn a_warm_start_hint_needing_the_rooms_of_forcing_rows_is_adopted() {
         let model = two_rooms_behind_a_search();
@@ -2531,7 +2716,12 @@ mod regression_tests {
             let solution = hinted.into_solution().unwrap_or_else(|i| {
                 panic!("the root must adopt the hint (presolve {presolve}): {i:?}")
             });
-            assert_eq!(solution.objective(), model.objective_at(&model.xstar));
+            let costs: f64 = model.vars.iter().map(|v| v.obj.abs()).sum();
+            assert!(
+                (solution.objective() - model.objective_at(&model.xstar)).abs() <= 1e-7 * costs,
+                "presolve {presolve}: objective {}",
+                solution.objective()
+            );
         }
     }
 
@@ -2590,7 +2780,8 @@ mod regression_tests {
     /// -1. `p - q + pin y >= pin` and `q - p + pin y >= pin` over
     /// `p, q ∈ [0, pq]` exclude `y = 0` together; with `pin > pq`, each alone
     /// does. Coefficient tightening rewrites the big-M row into about
-    /// `100 x + k1 w1 + k2 w2 + 500 y <= 1000 + k1 + k2`.
+    /// `100 x + k1 w1 + k2 w2 + 500 y <= 1000 + k1 + k2`. `x*` has `y` at
+    /// `y_star`.
     fn big_m_row_met_beyond_its_bound(
         m: f64,
         ks: [f64; 2],
@@ -2598,6 +2789,7 @@ mod regression_tests {
         pq: f64,
         share: f64,
         optimum: bool,
+        y_star: f64,
     ) -> Model {
         let [k1, k2] = ks;
         let bound = m + 500.0 + (k1 + k2);
@@ -2624,7 +2816,7 @@ mod regression_tests {
                 row(&[(2, 1.0), (3, -1.0), (1, pin)], ComparisonOp::Ge, pin),
                 row(&[(2, -1.0), (3, 1.0), (1, pin)], ComparisonOp::Ge, pin),
             ],
-            xstar: vec![5.0 + e / 100.0, 1.0, 0.0, 0.0, 1.0, 1.0],
+            xstar: vec![5.0 + e / 100.0, y_star, 0.0, 0.0, 1.0, 1.0],
         };
         if optimum {
             model.vars.push(int(-1.0, 0, 1));
@@ -2643,27 +2835,24 @@ mod regression_tests {
     /// `1.05e-6`, and `e` at `0.49` of it: within the engine's budget of the
     /// row as written, so the rewrite must keep the point. Its binding branch
     /// keeps the contract at the fixed terms' magnitude: at the rewritten
-    /// terms' alone both contracts are the absolute `1e-7`, and the rewritten
-    /// row, held to its budget, would reach only `5e-7`. `pq = 1e5` leaves `y`
-    /// unfixed, and `pin = 1e4` holds it within `5e-12` of 1 in the LP, where
-    /// rounding it moves the rewritten row, `500 y`, by `2.5e-9` at most.
+    /// terms' alone both contracts are the absolute `1e-7`. `pq = 1e5` leaves
+    /// `y` unfixed, and `pin = 1e4` holds it within `5e-12` of 1 in the LP.
     #[test]
     fn a_point_within_the_budget_of_a_big_m_row_with_fixed_terms_is_kept() {
         for optimum in [false, true] {
-            let model = big_m_row_met_beyond_its_bound(2.5e6, [5e7, -5e7], 1e4, 1e5, 0.49, optimum);
+            let model =
+                big_m_row_met_beyond_its_bound(2.5e6, [5e7, -5e7], 1e4, 1e5, 0.49, optimum, 1.0);
             assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
         }
     }
 
     /// [`big_m_row_met_beyond_its_bound`] at `M = 1.8e6` with fixed terms of
     /// `4.7e5` and `-4.7e6`, where the big-M row's contract at `y = 1` is the
-    /// absolute `1e-7`, and `e` at `0.484` of it: within the engine's budget,
-    /// by less than an ulp of the fixed term `4.7e6`. The rewrite keeps
-    /// nothing for the contract, so the rewritten row at `y = 1` must be no
-    /// tighter than the row as written, by a single bit; carried in `f64`
-    /// through the fixed terms' fold, the rewrite and the unfold, its bound
-    /// came out an ulp short, and presolve on answered `Infeasible`, and
-    /// `z = 0` in the optimum form.
+    /// absolute `1e-7`, and `e` at `0.484` of it: within the engine's budget.
+    /// The rewrite keeps nothing for the contract, so the rewritten row at
+    /// `y = 1` must be no tighter than the row as written, by a single bit,
+    /// which a bound carried in `f64` through the fixed terms' fold, the
+    /// rewrite and the unfold is not: an ulp of the fixed term `4.7e6`.
     #[test]
     fn a_point_within_the_budget_of_a_big_m_row_by_less_than_an_ulp_is_kept() {
         for optimum in [false, true] {
@@ -2674,8 +2863,64 @@ mod regression_tests {
                 1e5,
                 0.484,
                 optimum,
+                1.0,
             );
             assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+        }
+    }
+
+    /// Two facilities with big-M rows `x_a <= 1e8 y_a`, `x_b <= 1e8 y_b` and a
+    /// demand of 10: opening `b` (20 + 9 · 10 = 110) beats opening `a`
+    /// (100 + 2 · 10 = 120). With `int_tol = 0` the root's `y_a = 1e-7` is
+    /// fractional, and the branch `y_a = 0` fixes it. The engine holds a
+    /// fixed binary exactly at its value, so that branch moves the demand to
+    /// `b`: had it held `y_a` within its bound tolerance, `1e-7`, the big-M
+    /// row would turn that into all the demand, and a fixed var, which cannot
+    /// be branched on, counted fractional would drop the branch, `b`'s
+    /// optimum with it (the answer was 120). The point is integral, within
+    /// the contract, and not worse than 110.
+    #[test]
+    fn a_branch_that_fixes_a_big_m_binary_is_kept() {
+        let (m, demand) = (1e8, 10.0);
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(100.0, 0, 1),
+                int(20.0, 0, 1),
+                real(2.0, 0.0, m),
+                real(9.0, 0.0, m),
+            ],
+            rows: vec![
+                row(&[(2, 1.0), (3, 1.0)], ComparisonOp::Ge, demand),
+                row(&[(2, 1.0), (0, -m)], ComparisonOp::Le, 0.0),
+                row(&[(3, 1.0), (1, -m)], ComparisonOp::Le, 0.0),
+            ],
+            xstar: vec![0.0, 1.0, 0.0, demand],
+        };
+        let (problem, vars) = model.build();
+        for presolve in [true, false] {
+            let solution = problem
+                .solve_with(SolveOptions {
+                    presolve,
+                    int_tol: 0.0,
+                    ..SolveOptions::default()
+                })
+                .unwrap()
+                .into_solution()
+                .unwrap();
+            let x: Vec<f64> = vars.iter().map(|&v| solution.var_value(v)).collect();
+            assert!(
+                solution.objective() <= 110.0 + 1e-6,
+                "presolve {presolve}: objective {} at {x:?}",
+                solution.objective()
+            );
+            for (i, r) in model.rows.iter().enumerate() {
+                let violation = crate::tests::oracle::row_violation(r, &x);
+                assert!(
+                    violation <= crate::tests::oracle::row_tolerance(r, &x),
+                    "presolve {presolve}: row {i} violated by {violation:e} at {x:?}"
+                );
+            }
         }
     }
 
@@ -2766,67 +3011,217 @@ mod regression_tests {
     /// so only the two pin rows together keep `y` at one, and presolve
     /// rewrites `y`'s coefficient to about `500`.
     fn big_m_row_presolve_rewrites(optimum: bool) -> Model {
-        big_m_row_met_beyond_its_bound(5e7, [5e7, -5e7], 100.0, 1000.0, 0.8, optimum)
+        big_m_row_met_beyond_its_bound(5e7, [5e7, -5e7], 100.0, 1000.0, 0.8, optimum, 1.0)
     }
 
     /// [`big_m_row_met_beyond_its_bound`] at `M = 5e7` without fixed terms and
     /// `e` at `0.8` of the big-M row's contract. `pin = 1e4 > pq`, so each pin
     /// row alone keeps `y` at one, and presolve rounds `y`'s lower bound to 1.
     fn big_m_row_presolve_fixes(optimum: bool) -> Model {
-        big_m_row_met_beyond_its_bound(5e7, [0.0, -0.0], 1e4, 1000.0, 0.8, optimum)
+        big_m_row_met_beyond_its_bound(5e7, [0.0, -0.0], 1e4, 1000.0, 0.8, optimum, 1.0)
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): [`big_m_row_presolve_rewrites`].
-    /// With `y` at one the point needs the big-M row at `0.8` of its
-    /// contract, beyond the engine's budget, half the contract. It lies within
-    /// the engine's box only with `y` off its integer within `int_tol`, the
-    /// LP's `1 - 3e-14` under `5e7` moving the row the rest of the way, and
-    /// such a point is not guaranteed. Without presolve the search reaches it
-    /// through the LP; the rewritten coefficient takes that room away, and the
-    /// rewritten row held to its budget reaches `0.75` of the contract:
-    /// presolve on answers `Infeasible`.
+    /// [`big_m_row_presolve_rewrites`]: with `y` at one the point needs the
+    /// big-M row at `0.8` of its contract, within the engine's box, the whole
+    /// contract less the round-off of evaluating the row. The rewrite keeps
+    /// the binding branch's contract, so presolve on and off find the point.
     #[test]
-    #[should_panic(expected = "solve() returned Infeasible")]
-    fn a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_a_known_limitation() {
+    fn a_point_at_most_of_a_big_m_rows_contract_presolve_rewrites_is_kept() {
         let model = big_m_row_presolve_rewrites(false);
         assert_solves_within_contract_without_presolve(&model);
         check(model);
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): the optimum form of
-    /// [`a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_a_known_limitation`]:
-    /// presolve on answers `z = 0`, of objective 0 against `x*`'s -1.
+    /// The optimum form of
+    /// [`a_point_at_most_of_a_big_m_rows_contract_presolve_rewrites_is_kept`]:
+    /// presolve on and off find `z = 1`, of objective -1.
     #[test]
-    #[should_panic(expected = "solve(): objective 0e0 is worse than the objective -1e0")]
-    fn an_optimum_needing_the_int_tol_of_a_binary_presolve_rewrites_is_a_known_limitation() {
+    fn an_optimum_at_most_of_a_big_m_rows_contract_presolve_rewrites_is_found() {
         let model = big_m_row_presolve_rewrites(true);
         assert_solves_within_contract_without_presolve(&model);
         check(model);
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): [`big_m_row_presolve_fixes`]. With
-    /// `y` at one the point needs the big-M row at `0.8` of its contract,
-    /// beyond the engine's budget, half the contract. It lies within the
-    /// engine's box only with `y` off its integer within `int_tol`, and such a
-    /// point is not guaranteed. Without presolve the search reaches it through
-    /// the LP; `y` fixed at 1 takes that room away, and the big-M row held to
-    /// its budget reaches half the contract: presolve on answers
-    /// `Infeasible`.
+    /// [`big_m_row_presolve_fixes`]: with `y` at one the point needs the big-M
+    /// row at `0.8` of its contract, within the engine's box. Presolve fixes
+    /// `y` at 1, which keeps the point, and presolve on and off find it.
     #[test]
-    #[should_panic(expected = "solve() returned Infeasible")]
-    fn a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation() {
+    fn a_point_at_most_of_a_big_m_rows_contract_presolve_fixes_is_kept() {
         let model = big_m_row_presolve_fixes(false);
         assert_solves_within_contract_without_presolve(&model);
         check(model);
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): the optimum form of
-    /// [`a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation`]:
-    /// presolve on answers `z = 0`, of objective 0 against `x*`'s -1.
+    /// The optimum form of
+    /// [`a_point_at_most_of_a_big_m_rows_contract_presolve_fixes_is_kept`]:
+    /// presolve on and off find `z = 1`, of objective -1.
     #[test]
-    #[should_panic(expected = "solve(): objective 0e0 is worse than the objective -1e0")]
-    fn an_optimum_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation() {
+    fn an_optimum_at_most_of_a_big_m_rows_contract_presolve_fixes_is_found() {
         let model = big_m_row_presolve_fixes(true);
+        assert_solves_within_contract_without_presolve(&model);
+        check(model);
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): [`big_m_row_met_beyond_its_bound`]
+    /// with `e` at `1.03` of the big-M row's contract, `3%` beyond it with `y`
+    /// at one. The point lies within the contract only with `y` off its
+    /// integer within `int_tol`: `x*` has `y = 1 - 3e-14`, whose offset times
+    /// `M = 5e7` makes the room. Without presolve the search reaches it
+    /// through the LP (`y = 1 - 2e-14`); presolve rewrites `y`'s coefficient
+    /// to about `500`, which takes that room away, and answers `Infeasible`.
+    #[test]
+    #[should_panic(expected = "solve() returned Infeasible")]
+    fn a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_a_known_limitation() {
+        let model = big_m_row_met_beyond_its_bound(
+            5e7,
+            [5e7, -5e7],
+            100.0,
+            1000.0,
+            1.03,
+            false,
+            1.0 - 3e-14,
+        );
+        assert_solves_within_contract_without_presolve(&model);
+        check(model);
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): the model of
+    /// [`a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_a_known_limitation`]
+    /// without fixed terms and with each pin row alone keeping `y` at one:
+    /// presolve fixes `y` at 1, which takes the room away, and answers
+    /// `Infeasible`.
+    #[test]
+    #[should_panic(expected = "solve() returned Infeasible")]
+    fn a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation() {
+        let model =
+            big_m_row_met_beyond_its_bound(5e7, [0.0, -0.0], 1e4, 1000.0, 1.03, false, 1.0 - 3e-14);
+        assert_solves_within_contract_without_presolve(&model);
+        check(model);
+    }
+
+    /// A facility model whose capacity row `x2 + ... + x6 <= 2.918e9 x0`
+    /// presolve rewrites to a coefficient of about `25`. The root's LP point
+    /// has `x0` basic at `-7.8e-16`, within round-off of 0, which the row as
+    /// written turns into `2.3e-6` of violation, beyond its contract: the
+    /// guard rejects the point. The branches at `int_tol = 0` fix `x1` at 1
+    /// and then `x0` at 0, which the engine holds there exactly, where the row
+    /// holds. Without presolve the engine holds the row as written. Its
+    /// coefficient, `2.918e9` beside ones, lies far outside the recommended
+    /// range.
+    #[test]
+    fn a_binary_round_off_under_a_big_m_row_presolve_rewrites_solves() {
+        let flow = |obj: f64, hi: f64| real(obj, 0.0, hi);
+        let unbounded = f64::INFINITY;
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(17.46, 0, 1),
+                int(54.35, 0, 1),
+                flow(2.43, 4.39),
+                flow(15.54, unbounded),
+                flow(15.74, unbounded),
+                flow(16.73, unbounded),
+                flow(6.37, 5.09),
+                flow(13.59, unbounded),
+                flow(5.17, 4.3),
+                flow(3.66, 2.2),
+                flow(13.0, unbounded),
+                flow(9.46, 5.09),
+            ],
+            rows: vec![
+                row(&[(2, 1.0), (7, 1.0)], ComparisonOp::Eq, 4.39),
+                row(&[(3, 1.0), (8, 1.0)], ComparisonOp::Eq, 4.3),
+                row(&[(4, 1.0), (9, 1.0)], ComparisonOp::Eq, 2.2),
+                row(&[(5, 1.0), (10, 1.0)], ComparisonOp::Ge, 9.09),
+                row(&[(6, 1.0), (11, 1.0)], ComparisonOp::Ge, 5.09),
+                row(
+                    &[
+                        (2, 1.0),
+                        (3, 1.0),
+                        (4, 1.0),
+                        (5, 1.0),
+                        (6, 1.0),
+                        (0, -2918000000.0),
+                    ],
+                    ComparisonOp::Le,
+                    0.0,
+                ),
+                row(&[(2, 1.0), (0, -4.39)], ComparisonOp::Le, 0.0),
+                row(&[(3, 1.0), (0, -4.3)], ComparisonOp::Le, 0.0),
+                row(&[(4, 1.0), (0, -2.2)], ComparisonOp::Le, 0.0),
+                row(&[(5, 1.0), (0, -9.09)], ComparisonOp::Le, 0.0),
+                row(&[(6, 1.0), (0, -5.09)], ComparisonOp::Le, 0.0),
+                row(
+                    &[
+                        (7, 1.0),
+                        (8, 1.0),
+                        (9, 1.0),
+                        (10, 1.0),
+                        (11, 1.0),
+                        (1, -25.07),
+                    ],
+                    ComparisonOp::Le,
+                    0.0,
+                ),
+                row(&[(0, 1.0), (1, 1.0)], ComparisonOp::Le, 1.0),
+            ],
+            xstar: vec![
+                0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.39, 4.3, 2.2, 9.09, 5.09,
+            ],
+        };
+        assert_solves_within_contract_without_presolve(&model);
+        check(model);
+    }
+
+    /// The class above within the recommended range (row dynamism at most
+    /// `72.5`, column `571`). The round-off of the data of
+    /// `1.09 x0 + 0.952 x2 = 1090004.222`, with `x0` fixed at `1000003`, puts
+    /// `x2` at `1 + 5.1e-11`, which `7.5 x1 - 544 x2 = -536.5` turns into the
+    /// binary `x1 = 1 + 3.7e-9`, within its bound's tolerance. Presolve
+    /// rewrites `-878 x1 >= -878` to a coefficient of `8.8e-5` and drops it,
+    /// and the row as written turns the offset into `3.2e-6` of violation: the
+    /// guard rejects the point, and the branch that fixes `x1` at 1 holds it
+    /// there exactly, an equality's slack taking the offset within its
+    /// tolerance. Without presolve the engine holds the row as written.
+    #[test]
+    fn a_binary_round_off_under_a_row_presolve_rewrites_solves() {
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(0.0, 1000003, 1000003),
+                int(0.0, 0, 1),
+                real(0.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(0, 1.09), (2, 0.952)], ComparisonOp::Eq, 1090004.222),
+                row(&[(1, 7.5), (2, -544.0)], ComparisonOp::Eq, -536.5),
+                row(&[(1, -878.0)], ComparisonOp::Ge, -878.0),
+            ],
+            xstar: vec![1000003.0, 1.0, 1.0],
+        };
+        assert_solves_within_contract_without_presolve(&model);
+        check(model);
+    }
+
+    /// `-x0 + x3 = 0` and `-2 x0 - 10 x3 <= 7.642e-7` over a binary `x0` and
+    /// `x3 ∈ [-1, 100]`, whose every point has the objective `-x0 + x3 = 0`
+    /// (row and column dynamism at most `10`). Presolve rewrites the second
+    /// row's coefficient on `x0`, which holds as written only at an integral
+    /// `x0`, and the vertex of the rewritten rows puts `x0` at `-7.6e-8`,
+    /// past its bound within its tolerance, where the row as written misses
+    /// by `1.5e-7`: the guard rejects the point, and the branch that fixes
+    /// `x0` at 0 holds it there exactly, where the row holds.
+    #[test]
+    fn a_binary_the_lp_puts_past_its_bound_under_a_row_presolve_rewrites_solves() {
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![int(-1.0, 0, 1), real(1.0, -1.0, 100.0)],
+            rows: vec![
+                row(&[(0, -1.0), (1, 1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(0, -2.0), (1, -10.0)], ComparisonOp::Le, 7.642e-7),
+            ],
+            xstar: vec![0.0, 0.0],
+        };
         assert_solves_within_contract_without_presolve(&model);
         check(model);
     }

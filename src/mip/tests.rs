@@ -264,54 +264,86 @@ fn tolerances_default_matches_documented_values() {
 #[test]
 fn try_adopt_incumbent_respects_custom_feasibility_tolerance() {
     // Derived from the big-M fixture `tests_general::solve_big_m` (same
-    // m = 1e9 shape: `x - m*b == 10`, minimize x). Pin b to a value that
-    // is integral-within-`int_tol` (5e-7, well inside the default 1e-6)
-    // but not exactly 0; the rounded-incumbent guard then re-checks the
-    // ROUNDED point (b -> 0) against the ORIGINAL row, which is off by
-    // exactly m * 5e-7 = 500 — precisely the "big-M trap"
-    // `tolerances.feasibility` exists to catch, in absolute terms. The guard
-    // applies the tolerance the search was built with (the engine and the
-    // guard share one contract), so each tolerance gets its own search.
+    // m = 1e9 shape: `x - m*b == 10`, minimize x). The candidate is the
+    // engine's point as computed: pinned at b = 5e-7, integral within
+    // `int_tol` but not exactly 0, and x = 510, it meets the row exactly and
+    // is adopted unrounded (rounded, b = 0 would miss the row by 500). The
+    // guard applies the tolerance the search was built with (the engine and
+    // the guard share one contract): with x pinned at 510.5, the row is off
+    // by 0.5, which 1e6 accepts and the default tolerance refuses, in the
+    // engine, which holds the row. The next test has the guard refuse a row
+    // the engine does not hold.
     let m = 1.0e9;
     let mut p = Problem::new(OptimizationDirection::Minimize);
     let x = p.add_var(1.0, (0.0, f64::INFINITY));
     let b = p.add_binary_var(0.0);
     p.add_constraint(&[(x, 1.0), (b, -m)], ComparisonOp::Eq, 10.0);
 
-    let pin_and_adopt = |feasibility: f64| -> (f64, bool) {
+    let pin_and_adopt = |feasibility: f64, x_pin: f64| -> Result<Option<Vec<f64>>, Error> {
         let mut options = SolveOptions::default();
         options.tolerances.feasibility = feasibility;
         let mut solved = run(&p, options).unwrap();
         let state = &mut solved.state;
-        // Force the relaxation to a specific near-zero fractional b: pin its
-        // bounds to [5e-7, 5e-7], and x to the 10 + m*5e-7 = 510 the row
-        // then asks for (a loose tolerance would otherwise let the engine
-        // move x, and the violation under test with it), and re-solve.
         state.solver.set_var_bounds(b.idx(), 5e-7, 5e-7).unwrap();
-        state.solver.set_var_bounds(x.idx(), 510.0, 510.0).unwrap();
-        assert_eq!(
-            state.solver.reoptimize().unwrap(),
-            crate::StopReason::Finished
-        );
-        let x_value = state.solver.get_value(x.idx());
-        (x_value, try_adopt_incumbent(state).unwrap())
+        state.solver.set_var_bounds(x.idx(), x_pin, x_pin).unwrap();
+        assert_eq!(state.solver.reoptimize()?, crate::StopReason::Finished);
+        state.incumbent = None;
+        let adopted = try_adopt_incumbent(state).unwrap();
+        Ok(adopted.then(|| state.incumbent.as_ref().unwrap().values.clone()))
     };
 
-    // Default tolerance (1e-7): the rounded point (x=510, b=0) misses the
-    // original `x - m*b == 10` row by 500 — must be rejected.
-    let (x_value, adopted) = pin_and_adopt(Tolerances::default().feasibility);
-    assert_eq!(x_value, 510.0);
-    assert!(
-        !adopted,
-        "a 500-unit rounding-induced violation must be rejected at the default feasibility tolerance"
+    let default = Tolerances::default().feasibility;
+    assert_eq!(
+        pin_and_adopt(default, 510.0),
+        Ok(Some(vec![510.0, 5e-7])),
+        "the point is adopted as computed"
     );
+    assert_eq!(
+        pin_and_adopt(default, 510.5),
+        Err(Error::Infeasible),
+        "a 0.5 violation is beyond the default tolerance"
+    );
+    assert_eq!(
+        pin_and_adopt(1e6, 510.5),
+        Ok(Some(vec![510.5, 5e-7])),
+        "the same violation must be accepted once tolerances.feasibility is loosened past it"
+    );
+}
 
-    // Absurdly loosened tolerance: the same 500-unit violation is now
-    // within bounds — the guard must accept it.
-    let (x_value, adopted) = pin_and_adopt(1e6);
-    assert_eq!(x_value, 510.0);
+#[test]
+fn try_adopt_incumbent_holds_a_rewritten_row_to_the_custom_feasibility_tolerance() {
+    // Presolve rewrites `x - 1000 b <= 0` over `x ∈ [0, 10]` to about
+    // `x - 10 b <= 0`, which the engine holds, and the guard checks the row
+    // as written. Pinned at b = -5e-9, integral within `int_tol`, and x = 0,
+    // the point meets the rewritten row within 5e-8 and misses the row as
+    // written by 5e-6, which the default tolerance refuses and 1e-5 accepts.
+    let mut p = Problem::new(OptimizationDirection::Minimize);
+    let x = p.add_var(-1.0, (0.0, 10.0));
+    let b = p.add_binary_var(1.0);
+    p.add_constraint(&[(x, 1.0), (b, -1000.0)], ComparisonOp::Le, 0.0);
+
+    let pin_and_adopt = |feasibility: f64| -> bool {
+        let mut options = SolveOptions::default();
+        options.tolerances.feasibility = feasibility;
+        let mut solved = run(&p, options).unwrap();
+        let state = &mut solved.state;
+        state.solver.set_var_bounds(b.idx(), -5e-9, -5e-9).unwrap();
+        state.solver.set_var_bounds(x.idx(), 0.0, 0.0).unwrap();
+        assert_eq!(
+            state.solver.reoptimize(),
+            Ok(StopReason::Finished),
+            "the engine holds the rewritten row"
+        );
+        state.incumbent = None;
+        try_adopt_incumbent(state).unwrap()
+    };
+
     assert!(
-        adopted,
+        !pin_and_adopt(Tolerances::default().feasibility),
+        "a 5e-6 violation of the row as written is beyond the default tolerance"
+    );
+    assert!(
+        pin_and_adopt(1e-5),
         "the same violation must be accepted once tolerances.feasibility is loosened past it"
     );
 }
@@ -319,7 +351,7 @@ fn try_adopt_incumbent_respects_custom_feasibility_tolerance() {
 #[test]
 fn incumbent_feasible_row_tolerance_is_absolute_not_relative_to_rhs() {
     // `incumbent_feasible` uses the same absolute feasibility tolerance
-    // as the rounded-incumbent guard, regardless of row magnitude.
+    // as the incumbent guard, regardless of row magnitude.
     let mut p = Problem::new(OptimizationDirection::Minimize);
     let x = p.add_var(1.0, (0.0, f64::INFINITY));
     p.add_constraint(&[(x, 1.0)], ComparisonOp::Le, 1000.0);

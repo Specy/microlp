@@ -148,10 +148,11 @@ These normalizations happen at the boundary and hold everywhere inside:
   that is wrong shows as a loud error, never as a returned point that violates a row.
   Every reduction is exact: it keeps, up to round-off, every point of the model as written
   within the engine's box whose integer vars are exactly integral (each row within the
-  budget, each continuous var within its bound tolerance; dual fixing keeps an optimum), and
-  a continuous var keeps its bounds (§7). No other point is guaranteed: a point beyond the
-  box, within the contract, can be cut, and so can a point within the box only with an
-  integer var off its integer, within `int_tol`, which the search can reach without
+  budget, each var within its bound tolerance; dual fixing keeps an optimum), and a
+  continuous var keeps its bounds (§7). No other point is guaranteed: a point beyond the
+  box, within the contract by less than the round-off of evaluating a row, can be cut, and
+  so can a point within the box only with an integer var off its integer, within
+  `int_tol`, which the search can reach without
   presolve through its LP and which fixing the var, tightening its bounds or rewriting its
   coefficient takes away (§7, known limitations). So an `Infeasible` the engine or the
   search proves on the reduced model is final on every path (the solve, a resume, an edit),
@@ -213,7 +214,11 @@ State you need to know when reading it:
   `basic_var_mins`/`basic_var_maxs` their bounds (during a primal phase, the working bounds of
   `bounds.rs`).
 - `nb_vars[col]` / `nb_var_vals` / `nb_var_states{at_min, at_max}` — non-basic variables
-  sit at one of their bounds, within its tolerance (or at 0 if free).
+  sit exactly at one of their (working) bounds (or at 0 if free), and the state names that
+  bound, never a tolerance test: a var whose range is narrower than its tolerance is at one
+  bound and can move to the other. A var past a bound (it left the basis where it sat, or
+  the certificate repair moved it, within its tolerance, §7) is at that bound, and one
+  between its bounds (a partial repair move) at neither.
 - `is_primal_feasible` / `is_dual_feasible` — honest flags; every solve path is a state
   machine over them. `initial_solve` = restore primal feasibility (dual simplex /
   phase-1-style) then optimize (primal simplex).
@@ -226,12 +231,14 @@ The engine exposes a small contract surface; everything the B&B does goes throug
 
 **`set_var_bounds(var, min, max) -> Result<(), Error>`** — change a variable's bounds in
 place. Basic variable: update the row's bound mirrors, flag primal-infeasible if its value
-fell outside. Non-basic variable: clamp its value to the new range, propagate the delta into
-the basic values through the variable's column (same mechanism as `fix_var`), recompute its
-at-bound flags, and downgrade `is_dual_feasible` if the move broke the reduced-cost/bound
-pairing. Crossing bounds (`min > max`) or either bound being NaN returns
-`Err(Infeasible)` with state untouched. Infinite bounds remain valid. It does **not** run
-simplex — callers decide when to reoptimize.
+fell outside. Non-basic variable: move it to the new bound its state names (a var that was
+fixed goes to the bound at which its reduced cost is dual feasible, and one between its
+bounds stays where it is if they still hold it), propagate the delta into the basic values
+through the variable's column (same mechanism as `fix_var`), and downgrade
+`is_dual_feasible` if the move broke the reduced-cost/bound pairing. Crossing bounds
+(`min > max`) or either bound being NaN returns `Err(Infeasible)` with state untouched.
+Infinite bounds remain valid. It does **not** run simplex — callers decide when to
+reoptimize.
 
 *Why this is the branching primitive:* tightening a bound leaves every reduced cost
 untouched, so the current basis stays **dual feasible** — re-solving is a short dual-simplex
@@ -258,19 +265,21 @@ scratch, LU refactorized, feasibility flags recomputed honestly. Two contracts m
   gives a non-basic var (the lower bound if finite, else the upper, else 0). `load_basis`
   fails only on a basis of the wrong shape, a bug, and leaves the state untouched then.
 
-**`reported_values()`** — the verified point in user units, fixed vars at their value: what
-every read-out and every candidate starts from.
+**`reported_values()`** — the verified point in user units, as the engine computed it: what
+every read-out and every candidate is. Nothing is snapped: a fixed var's value is within its
+bound tolerance of its value (a fixed integer var's on it, §7), an integer var's within the
+search's `int_tol` of an integer.
 
 **`first_violated_row(values)` / `first_violated_bound(values)` / `objective_of(values)`** —
 evaluate an explicit structural-variable vector (user units) against the stored rows (sense
 recovered from slack bounds) and bounds within the **absolute** user tolerance floored at
 the round-off of the row or bound (`row_tolerance`, through `outside`), and compute its
 objective. A value or row activity that is not finite violates every bound and row. These
-are the contract check, applied by the rounded-incumbent guard (§5.4) and the pure-LP path
+are the contract check, applied by the incumbent guard (§5.4) and the pure-LP path
 (`SolveOutcome::from_lp_stop`, on every solve, edit and resume). They evaluate a row exactly
 as the engine's own verification does (`row_activity`, term for term in the same order), so
 a point the engine has verified passes them by construction, and they are independent of
-the current basis values, so a rounded candidate is judged on its own merits.
+the current basis values.
 `first_violated_row` also checks the rows presolve dropped or rewrote, as the user wrote
 them (`validation_rows`, installed from `Presolved`): the engine never pivots on them, so the
 answer is held to the whole model only here.
@@ -307,13 +316,13 @@ and direction that created it.
 | `solver` | the ONE live LP engine |
 | `root_bounds`, `applied` | original bounds + which changes are currently applied to the solver (for diffing when switching nodes) |
 | `open: Vec<Node>` | the frontier (LIFO tail = current dive; best-bound scan on jumps) |
-| `incumbent: Option<Incumbent>` | best integer solution: **rounded** values + `objective = c·x_rounded` |
+| `incumbent: Option<Incumbent>` | best integral solution: its values as computed + `objective = c·x` |
 | `node_seq`, `last_solved_id`, `diving` | warm-dive detection + node-selection mode |
 | `pseudocosts`, `stats`, `options`, `deadline`, `direction` | search intelligence and bookkeeping |
 | `base: Problem`, `fixed: BTreeMap<var, val>` | the CLEAN user problem + user-level fixes — the substrate for post-solve edits (§5.8) |
 
 `Solution` for a MILP holds `SolutionStatus`, `TerminationReason`, and this `MipState`
-boxed. User reads come from its validated incumbent's plain rounded values.
+boxed. User reads come from its validated incumbent's values, as the engine computed them.
 `InterruptedSolve` also retains the live state for resume, but exposes only its reason and
 statistics. For a pure LP, `Solution` keeps the live solver (that is what makes LP
 incremental editing cheap).
@@ -409,14 +418,20 @@ proof*). The rebuild is armed once per stall and any successful pivot re-arms it
 cannot loop; a row the proof leaves open is made taboo, and its last resorts end in a loud
 error rather than a verdict.
 
-### 5.4 Incumbents and the rounded-feasibility guard
+### 5.4 Incumbents and the feasibility guard
 
 When a node's LP solution is integral within `int_tol` (default `1e-6`), it is a *candidate*
-— not yet an incumbent. Every solver-produced candidate enters `try_adopt_incumbent`, which
-rounds integer variables and applies one validation funnel:
+— not yet an incumbent. Integral means every integer variable the search can branch on lies
+within `int_tol` of an integer; a variable whose node bounds fix it cannot be branched on,
+and the engine holds it exactly at its value (an integer variable its bounds fix has no
+bound tolerance, §7). Every solver-produced candidate enters `try_adopt_incumbent`, which
+takes the values as the engine computed them (nothing is rounded) and applies one validation
+funnel:
 
 1. `candidate_variables_feasible` rejects malformed lengths, non-finite values, invalid
-   bounds, bound violations, and domain violations.
+   bounds, violations of the model's bounds (the root's: a warm-start hint fixes a variable
+   up to `HINT_BOUNDS_SLACK` outside them, so the node's are not always within them), and
+   integer variables off their integer by more than `int_tol`.
 2. `Solver::first_violated_row` validates the vector against the rows, the ones presolve
    dropped or rewrote included, within the absolute `Tolerances::feasibility` (default
    `1e-7`) floored at each row's round-off (§7).
@@ -426,22 +441,32 @@ Post-edit warm-start filtering deliberately remains separate: `incumbent_feasibl
 the clean `Problem` plus its fix overlay in original user scale before a solver exists. Both
 paths share variable/domain validation, but their row representations are not conflated.
 
-Why this exists — the **big-M trap**: with `int_tol = 1e-6`, a relaxation value like
-`b = 0.999999995` counts as integral. But if `b` multiplies a coefficient of `1e9` somewhere,
-rounding it to `1` moves that row by `5.0` — a real violation hiding inside the integrality
-tolerance. The guard makes this impossible to adopt:
+The engine verified its own rows and bounds at these very values, with the evaluation the
+guard repeats, so a candidate can fail only on a row presolve dropped or rewrote:
 
-- Guard **passes** → adopt: store the ROUNDED values with `objective = c·x_rounded`, so what
-  the user reads is exactly self-consistent. If rounding changed any integer value, adoption
-  does **not** close the node: the relaxation bound can still be strictly better than the
-  rounded objective, so the driver branches on that below-tolerance fractionality to finish
-  the proof.
-- Guard **fails** → do not adopt; **branch on the offending below-tolerance variable**
-  (children `⌊v⌋` / `⌊v⌋+1` fix it exactly, and the dive resolves the truth).
-- If every integer variable is *exactly* integral yet the check failed, that is a
-  contradiction — the engine reported `Finished` only after verifying the same point through
-  the same evaluation, with half the contract to spare — and it is returned as an internal
-  error rather than force-accepted.
+- Guard **passes** → adopt the values with `objective = c·x`, and close the node: its
+  objective is the node's bound.
+- Guard **fails** → do not adopt; **branch on an integer variable off its integer** (at
+  `int_tol = 0`: children `⌊v⌋` / `⌊v⌋+1` fix its bounds), and the dive resolves the truth.
+  A row presolve rewrote holds as written only where its binaries are exactly integral
+  (§7), and the LP vertex itself, not only its round-off, can put a binary off its integer
+  within `int_tol`, or past its bound within its bound tolerance: `-x0 + x3 = 0` with
+  `-2 x0 - 10 x3 <= 7.642e-7` puts `x0` at `-7.6e-8` once presolve has rewritten the second
+  row. The row as written rejects that point, and the child that fixes the binary holds it
+  exactly at its value, where the row holds
+  (`a_binary_the_lp_puts_past_its_bound_under_a_row_presolve_rewrites_solves`); where the
+  child's point then needs two rows' tolerances at once, the proof prunes it (§7, known
+  limitations).
+  A candidate that fails with every integer variable exactly integral, nothing left to
+  branch on, is returned as an internal error rather than force-accepted: presolve's
+  reduction did not keep that point.
+
+The **big-M caveat**: with `int_tol = 1e-6`, a relaxation value like `y = 1e-6` counts as
+integral, and under a row `x <= 1e7 y` it lets `x` reach 10. That point meets the row as
+written at its values, so it is a valid answer within the contract, and the search may
+report it. Rounding such values, as the API docs advise where an exact integer is needed,
+can break the row; the docs warn of it, and a big-M coefficient no larger than the model
+needs keeps that room small.
 
 During zero-objective unboundedness classification, the same funnel runs first; only a valid
 integer point returns `Err(Unbounded)`. If classification is interrupted before an incumbent
@@ -449,9 +474,9 @@ exists, the public objective is evaluated from the original model coefficients a
 current working values rather than from the temporary zero objective.
 
 The tolerance is deliberately **absolute**, never scaled by row magnitude: a relative
-tolerance (`1e-7·|rhs|`) evaluates to ~100 on a 1e9-scale row and would swallow exactly the
-violations the guard exists to catch. A false *rejection* from the absolute check is benign
-(extra exact-fixing branching); a false acceptance would be a wrong answer.
+tolerance (`1e-7·|rhs|`) evaluates to ~100 on a 1e9-scale row and would accept violations
+of that size. A false *rejection* from the absolute check is benign (extra exact-fixing
+branching); a false acceptance would be a wrong answer.
 
 ### 5.5 Node selection, bound, and gap
 
@@ -622,11 +647,12 @@ if let Some(sol) = outcome.solution() {
 let outcome = outcome.resume_with(ResumeOptions::default())?;
 ```
 
-Reading values: `var_value` rounds integer variables (and asserts the stored value was
-already integral-clean — a failed assert means a solver bug, not user error);
-`var_value_raw`/`iter`/indexing return the incumbent's already-rounded values for a MILP
-with an incumbent, or the optimal live working values for a pure LP. Interrupted outcomes
-expose no answer-value accessors.
+Reading values: `var_value`/`iter`/indexing return the values as the engine computed them:
+the incumbent's for a MILP with an incumbent, the optimal live working values for a pure LP.
+An integer variable's value lies within `int_tol` of an integer, not necessarily on it, and a
+fixed one's on it (round it where an exact integer is needed, §5.4);
+`var_value_raw` is a deprecated alias of `var_value`. Interrupted outcomes expose no
+answer-value accessors.
 
 ---
 
@@ -639,10 +665,10 @@ Two homes, by audience:
 | Knob | Default | Gates |
 |---|---|---|
 | `presolve` | `true` | run the reductions of `src/presolve/` before the solve (§2); off, the engine gets the model as written |
-| `int_tol` | `1e-6` | "is this LP value integral?" — a rounded feasible point may be adopted, but branching continues until its LP point is exact. Must be finite and in `[0, 0.5)`. |
+| `int_tol` | `1e-6` | "is this LP value integral?" — an integral LP point is adopted as computed and closes its node, so integer values are reported within it (§5.4). Must be finite and in `[0, 0.5)`. |
 | `mip_gap` | `0.0` | early-stop proof quality (relative gap) |
-| `tolerances.feasibility` | `1e-7` **absolute**, at least `1e-10` | the rounded-incumbent guard and the post-edit incumbent pre-filter (§5.4 explains why absolute) |
-| `tolerances.integrality_rounding` | `1e-5` | integrality check in the edit pre-filter; `var_value`'s sanity assert pins the *default* deliberately |
+| `tolerances.feasibility` | `1e-7` **absolute**, at least `1e-10` | the engine's box, the incumbent guard and the post-edit incumbent pre-filter (§5.4 explains why absolute) |
+| `tolerances.integrality_rounding` | `1e-5` | integrality check in the edit pre-filter, and the integer `Solution::fix_var` fixes a value at |
 | `tolerances.prune_epsilon` | `1e-9` | the pruning cutoff slack |
 
 `tolerances.feasibility` reaches presolve and the engine: `Problem::solve_with` and the MIP
@@ -663,8 +689,8 @@ floored at that quantity's round-off:
 
 | Comparison | Tolerance | Constants |
 |---|---|---|
-| Is a basic slack (row) within its bounds? | `slack_tol`: the engine's share (`ROW_BUDGET_SHARE`, ½) of the contract `row_tolerance(feasibility × r, m)` in the row's scaled units, at the row's magnitude `m = |b| + Σ|a_j x_j|` at the current values (refreshed whenever the rows are checked). The other half is the reserve: for the snap of an integer or fixed var, and for evaluating the row in another order of operations. | `ROUNDOFF_FLOOR = 1e-14`, `ROW_BUDGET_SHARE = 0.5` |
-| Is a structural var within / at its bounds? | `structural_tol`: the user contract in user units, but never more than any of its rows can absorb when the value is snapped to the bound (`snap_budget`: the row's reserve over the var's scaled coefficient, minimised over its rows), floored at the round-off of the bound magnitude. One rule for every var: it keeps a big-M row within contract when its binary is rounded, and a fixed var's reported value within the rows presolve substituted it out of. The non-basic at-bound state counts a var within its tolerance of both bounds as fixed, so the cap also keeps a continuous var free to move wherever its whole range moves a row by more than that row's reserve (`a_continuous_var_narrower_than_its_tolerance_reaches_the_exact_optimum`); a gain such a var brings through the objective alone is lost (a known limitation, below). | |
+| Is a basic slack (row) within its bounds? | `slack_tol`: the contract `row_tolerance(feasibility × r, m)` in the row's scaled units, at the row's magnitude `m = |b| + Σ|a_j x_j|` at the current values (refreshed whenever the rows are checked), less the round-off of evaluating the row, `(n + 2)·2^-53·m` for `n` terms and at most half the contract: the engine's plain `f64` sum, and one more evaluation in another order (the boundary's, a user's). | `ROUNDOFF_FLOOR = 1e-14` |
+| Is a structural var within its bounds? | `structural_tol`: the user contract in user units, `feasibility / s_j` in the engine's, floored at the round-off of the bound magnitude, for every var but an integer var its bounds fix (a branch, an edit, presolve), which gets none: the engine holds it exactly at its value, pivoting it out of the basis onto that value when it is basic off it, since a row presolve rewrote holds as written only at an exactly integral binary, and the search cannot branch on a binary its node fixes (§5.4). The reported value is the engine's times `s_j`, exactly, and nothing is snapped. Whether a non-basic var is at a bound is no tolerance test but the bound it sits at (§3). | |
 | Is a reduced cost zero? | `dual_tol`: `EPS` floored at the round-off of `|c_j| + Σ|a_ij y_i|`, refreshed with the multipliers. | `EPS = 1e-10` |
 | Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it: `ENTRY_ROUNDOFF` of its column's largest entry (primal test), or of its row's largest entry over the columns not excluded that the scalings made comparable (dual test: all but those of vars fixed when the model entered the engine, which keep the user's units, so a fixed column's `1e17` cannot make a genuine `1` noise; an entry that cannot help still counts, as it shares the round-off of the row's solve). A genuine entry of at least `PIVOT_REL_TOL` of the largest genuine one among the vars that could enter and are not excluded (rows that could block, in the primal test) is preferred; a smaller one pivots only when nothing larger will do. In the primal test every genuine entry bounds the step, each basic var's Harris allowance counted from where it sits (see *Anti-degeneracy and cycling in the primal simplex*). In the dual test a boxed var the step passes is flipped instead of entering (*Bound flipping*), a row with no candidate is no verdict (next row), and the last resort takes any entry of at least `INSTABLE_PIVOT_TOL` (*Infeasibility only from a proof*). | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7`, `INSTABLE_PIVOT_TOL = 1e-10` |
 | Does a row that no var can repair prove the model infeasible? | only through its certificate, summed from the model's data, whose gap must exceed the tolerance the engine holds the row's basic var to; on an infinite bound a coefficient counts as zero only within the error of the multipliers, which the refinement bounds only where it converged (see *Infeasibility only from a proof*). | `REFINEMENT_CONVERGED = 2^-53` |
@@ -672,19 +698,26 @@ floored at that quantity's round-off:
 | Is the LU pivot column singular? | eligible part below `LU_SINGULAR_REL` of the column's largest transformed entry; the column is then replaced by the slack of a row no pivot took (the repair, §3). | `= ROUNDOFF_FLOOR` |
 
 Two rules complete the model. **Absorption:** when no var can enter a violated row's pivot
-regularly, a non-basic continuous var or slack may enter by crossing its bound (or its fixed
-value) by no more than its own tolerance, so that it is still at its bound in the engine's
-sense afterwards. This hands a round-off-level violation that a tightly held var cannot
-carry to a row or var that can; integer vars never absorb. Such a pivot is no step of the
-dual simplex, so the absorber enters on a zero dual step, its cost shifted by its whole
-reduced cost (see *Anti-degeneracy* below). The absorber chosen is the one whose shift does
-the least harm when it is given back: the ratio is its reduced cost (zero for a fixed var)
-over its entry, and among the absorbers within the Harris relaxation of the smallest ratio
-the largest entry enters (one `PIVOT_REL_TOL` below the largest absorbing entry is no
-candidate). The rule is needed because the engine's own tolerances (half the contract for a
-row, a bound tolerance capped by the rows' reserve) create primal violations that no dual
-step removes, and that the infeasibility proof, which counts every term but the leaving
-var's as exact, would take for infeasibility.
+regularly, a non-basic continuous var or slack may enter by crossing its bound (or, for a
+slack, its fixed value) by no more than the tolerance the phase holds it to once basic (a
+slack's stored one, and no more than its row's at the current values), so that it is not
+violated in turn. This hands a round-off-level violation that a tightly held var cannot
+carry to a row or var that can, such as an equality's slack; integer vars and fixed
+structural vars never absorb, as they never take the certificate repair's band moves (see
+*Infeasibility only from a proof*). Such a pivot is no step of the dual simplex, so the
+absorber enters on a zero dual step, its cost shifted by its whole reduced cost (see
+*Anti-degeneracy* below). The shift is given back when the var leaves, so the dual
+objective does not record an absorption: a var may absorb again after a pivot took it out
+(`an_lp_whose_equality_slack_must_absorb_twice_in_a_phase_solves`), and two vars can hand a
+violation back and forth, which the cycling detection ends, in an `InternalError` where no
+other change is left (known limitations below). The absorber chosen is the one whose shift
+does the least harm when it is given back: the ratio is its reduced cost (zero for a fixed
+slack) over its entry, and among the absorbers within the Harris relaxation of the smallest
+ratio the largest entry enters (one `PIVOT_REL_TOL` below the largest absorbing entry is no
+candidate). The rule is needed because the infeasibility proof counts every term but the
+leaving var's as exact: without it, a model whose every point needs another term within its
+tolerance, an equality on a `2.7e8` activity pinning a var `2.4e-7` past its bound, say, is
+proven infeasible.
 **Verified termination:** a phase reports `Finished` only after `verify_primal` and exact
 reduced costs (recomputed only when pivots have updated them incrementally since).
 `verify_primal` runs `check_rows`: every basic slack is re-derived from its row,
@@ -696,8 +729,9 @@ are refined through the factorization, then through a fresh one, then reported a
 `InternalError` (the basis cannot represent its vertex). Values within tolerance are not
 refined: the contract asks no more, and moving last bits steers the branch & bound. The
 objective is always recomputed from the values, and the verified point itself is what is
-reported (`reported_values`, fixed vars at their value), so it passes the checks at the
-boundary (§3.1) with the reserve to spare. Periodic refactorization renews the
+reported (`reported_values`, as computed), so it passes the checks at the boundary (§3.1),
+and a row evaluated in another order within the round-off its tolerance keeps. Periodic
+refactorization renews the
 factorization and, once per full basis turnover of pivots, checks the rows and recomputes
 the values if they drifted. A recompute is not a verification: on an ill-conditioned basis
 a solve through the factorization can leave a residual above a row's tolerance, so
@@ -707,17 +741,19 @@ them.
 **Presolve** (`src/presolve/`, module docs) makes its decisions with the same model, in
 user units:
 
-- a row is held to the engine's *budget*, `ROW_BUDGET_SHARE` of
-  `row_tolerance(feasibility, m)`, `m` the magnitude of the corner the decision is about
-  (never of the whole box, so a bound of `f64::MAX` cannot inflate a tolerance), counting the
-  right-hand side as written, fixed terms not substituted out;
+- a row is held to the engine's *budget*, `slack_tol(feasibility, m, n)`, the contract
+  less the round-off of evaluating the row, `m` the magnitude of the corner the decision is
+  about (never of the whole box, so a bound of `f64::MAX` cannot inflate a tolerance),
+  counting the right-hand side as written, fixed terms not substituted out, and `n` the
+  row's terms;
 - activity ranges are widened by `Σ|a_j|·bound_tol_j` before a verdict is drawn or a row
-  dropped, since a continuous var may sit outside its emitted bounds by its bound tolerance,
-  and a row is forcing when its right-hand side equals an activity bound within
-  `ROUNDOFF_FLOOR` of the sum;
-- a bound implied by a row is relaxed by the row's allowance (the budget, or for an integer
-  var the full contract), plus the round-off of the cancellation it came from, over the
-  coefficient, so it never cuts a point the engine may return;
+  dropped, since every var, an integer one too, may sit outside its emitted bounds by its
+  bound tolerance (an integer var they fix the engine holds exactly, so for it the widening
+  only keeps more), and a row is forcing when its right-hand side equals an activity bound
+  within `ROUNDOFF_FLOOR` of the sum;
+- a bound implied by a row is relaxed by the row's budget, plus the round-off of the
+  cancellation it came from, over the coefficient, so it never cuts a point the engine may
+  return;
 - a continuous var keeps its bounds as written: presolve fixes none, by a forcing row, an
   equality or dual fixing, and turns no row into bounds. Such a reduction takes from the var
   the room the model as written leaves it (the row's allowance over the coefficient, or its
@@ -726,13 +762,12 @@ user units:
   bounds, with its bound tolerance, meet it within its whole contract, less the round-off
   of evaluating it (as the boundary checks it once dropped);
 - an integer var's bound implied by a row keeps every integral value that meets the row
-  within its full contract, the other vars within their working bounds: a singleton row
-  rounds the var's implied bounds, and a forcing row, judged over the emitted bounds, fixes
-  the var only where no other integer lies within the room the row leaves it (its sliver
-  and its full contract at its magnitude, round-off part included, over the coefficient)
-  and every term of the row is resolvable above its round-off. A continuous var's working
-  bound keeps only the budget of the row that implies it, so through it the points kept are
-  those within the budget;
+  within its budget, the other vars within their working bounds: a singleton row rounds
+  the var's implied bounds, and goes only where the rounded bounds, with their bound
+  tolerance, meet it within its whole contract less round-off, and a forcing row, judged
+  over the emitted bounds, fixes the var only where no other integer lies within the room
+  the row leaves it (its sliver and its budget at its magnitude, round-off part included,
+  over the coefficient) and every term of the row is resolvable above its round-off;
 - coefficient tightening makes a big-M row's vacuous branch bound-tight, relaxed by the
   activity's round-off and the bound slack, and relaxes its binding branch (the binaries of
   the rewrites that shrink the bound at one) by the contract the rewrites take out of it:
@@ -745,14 +780,15 @@ user units:
   rewrites and back, the bound is off by their round-off, some ulps of the row's largest
   term, which the vacuous branches' relaxation covers and the binding branch's does not.
   The rest of the row adds the same magnitude to both contracts, so the rewritten row, held
-  to the engine's budget, keeps its own reserve within the row's contract, and keeps every
-  point of the row's budget whose binaries are exactly at one, up to half the round-off of
-  the magnitude of its unfixed other terms. A point within the budget only with a binary
+  to the engine's budget, admits no point beyond the row's contract, and keeps every point
+  of the row's budget whose binaries are exactly at one, up to half the round-off of the
+  magnitude of its unfixed other terms. A point within the budget only with a binary
   off its integer, within `int_tol`, is not kept: the rewritten coefficient takes away the
   room the offset gives the row;
 - a row all of whose vars are fixed is judged as the boundary will judge it once dropped: as
   written, at the fixed values, by `row_violation`, against the full contract (nothing the
-  engine does moves it);
+  engine does moves it: a var fixed on entry never enters the basis, which prices it dual
+  feasible, and neither absorbs nor takes the certificate repair's band moves);
 - infeasibility is declared only when no point the engine could accept exists, as far as
   the reductions can tell, and with no certificate, so the verdict is not final: the solve
   goes on with the model as written, where the engine decides. The engine's `Infeasible` on
@@ -832,12 +868,11 @@ below the floor, or the round-off of a computed vertex, for a row no var can rep
   term counting as exact, so the proof says that no point has that var within its
   tolerance and every other term within its bounds. Any other tolerance leaves a band where
   a row is violated for the simplex but not infeasible for the proof, and nothing can act
-  on it: the user's absolute tolerance as a floor fails loudly on nodes infeasible by less
-  than the contract (`a_node_infeasible_by_less_than_the_contract_is_pruned`), and every
-  term's contract tolerance summed on nodes whose rows disagree by less than their
-  tolerances together. The price: a model is reported infeasible when its points all need
-  more room than that, on the leaving var (beyond the engine's share of its contract) or on
-  another term (rows that agree only within their tolerances; see the known limitations).
+  on it: every term's contract tolerance summed fails loudly on nodes whose rows disagree by
+  less than their tolerances together. The price: a model is reported infeasible when its
+  points all need more room than that, on the leaving var (beyond its contract less the
+  round-off of evaluating its row) or on another term (rows that agree only within their
+  tolerances, where absorption does not reach; see the known limitations).
 - *A failed proof* makes the row taboo, recorded as a bad basis change with no entering var,
   and the phase goes on with the other rows; a rebuild lifts the taboo, and the row is tried
   again on fresh data.
@@ -851,16 +886,17 @@ below the floor, or the round-off of a computed vertex, for a row no var can rep
   to their bound in that direction, largest reach first, flipped, or the last one only
   partway (between its bounds, which a basis snapshot records as `Free` and a load puts back
   at a bound, an open issue), then, if the row is still short, past it within their
-  tolerance, as far as they still count as at it (never an integer var, which never absorbs,
-  nor a fixed structural var, which is reported at its value: its tolerance is the reserve
-  its rows keep for that snap, and a second snap in the same row would exceed the contract).
-  The flips serve a row whose only repair is a boxed var with an entry below every pivot
-  floor (the `wide_chain` fixtures of `src/tests/magnitudes.rs`), the tolerances a vertex
-  that misses a bound by the round-off of solving for it where every var that could move it
-  is at the bound that blocks it (an equality's slack, say). The moves are kept only if the
-  leaving var then lands, computed through their columns, and are tried once per row in a
-  phase. A round-off coefficient moves nothing: the ratio tests do not see its entry, and
-  the primal step would take the move back. After these, the phase fails loudly
+  tolerance, where they stay at that bound (never an integer var, where presolve's rewrite of
+  a big-M row holds exactly and past which the row as written is tighter than the rewritten
+  one by the cut coefficient times the move, nor a fixed structural var, at whose value
+  presolve checks the rows it substituted it out of). The flips serve a row whose only
+  repair is a boxed var with an entry below every pivot floor (the `wide_chain` fixtures of
+  `src/tests/magnitudes.rs`), the tolerances a row every var that could move sits at the
+  bound that blocks, short of its bound by a tolerance
+  (`the_repair_moves_vars_past_their_bounds_within_their_tolerances`). The moves are kept
+  only if the leaving var then lands, computed through their columns, and are tried once per
+  row in a phase. A round-off coefficient moves nothing: the ratio tests do not see its
+  entry, and the primal step would take the move back. After these, the phase fails loudly
   (`InternalError`: no var can repair the row, and it proves nothing).
 
 Returning `Infeasible` only on a proof also means that the branch and bound prunes a node
@@ -918,10 +954,10 @@ and objective value of the phase is the working costs'.
   vertex a phase reaches by a pivot is recorded; when two consecutive basis changes both
   lead to visited vertices, the change is recorded as bad and its row made taboo (not chosen
   to leave) until a rebuild; a bad change seen again is taboo at once; a record is dropped
-  once a pivot moves its row by the row's tolerance. A rebuild lifts the taboos but keeps
-  the records, which last the phase, since the engine refactorizes too often for a record
-  dropped at refactorization to outlive its cycle. A basis repair within the phase records
-  its change back as bad, taboo at once. The rows a step moved are forgotten after its
+  once a pivot moves its row by more than the row's tolerance. A rebuild lifts the taboos
+  but keeps the records, which last the phase, since the engine refactorizes too often for a
+  record dropped at refactorization to outlive its cycle. A basis repair within the phase
+  records its change back as bad, taboo at once. The rows a step moved are forgotten after its
   refactorization, so the record of a repair that the step's refactorization made goes too if
   the step moved its row: the phase may then take the change again, on the eta file, rather
   than run out of changes. A cycling change later in the phase is recorded as singular too,
@@ -954,20 +990,23 @@ and objective value of the phase is the working costs'.
   point satisfies. A step causes this through an entry below the column's round-off floor,
   which bounds no step.
 - *Steps*: the Harris pass counts each basic var's allowance from where it sits; the leaving
-  var goes exactly to its working bound, a fixed var to its true value. Where the leaving var
-  already sits past that target, the step is zero, not backwards, and the var leaves where
-  it sits: past a moved bound, the bound moves on to it; past its true bound, within its
-  tolerance, it is at that bound in the engine's sense. So no entering column is ever
-  refused. A step backwards would move the entering var the wrong way by the leaving var's
-  offset over the pivot element, which a small element amplifies past the entering var's
-  tolerance (`property_counterexample_where_a_step_backwards_amplified_round_off`).
+  var goes exactly to its working bound, a fixed var to its true value (an equality's slack
+  then holds its row as computed, and a fixed integer var the value a row presolve rewrote
+  relies on). Where the leaving var already sits past that target, the step is zero, not
+  backwards, and the var leaves where it sits: past a moved bound, the bound moves on to it;
+  past its true bound, within its tolerance, it stays there, at that bound (§3). So no
+  entering column is ever refused. A step backwards would move the entering var the wrong
+  way by the leaving var's offset over the pivot element, which a small element amplifies
+  past the entering var's tolerance
+  (`property_counterexample_where_a_step_backwards_amplified_round_off`).
 - *Cleanup*, however the phase ends: the working bounds become the true ones again. A
   non-basic var at a moved bound goes back to the true one, and when one did, the basic
   values are recomputed from scratch (else the values the steps left stand, for `run_phases`
-  to verify). A non-basic var off a true bound but within its tolerance at the current values
-  stays, since moving it would push its offset, divided by a tableau entry, into the basic
-  vars; one beyond it moves onto the bound. The dual phase of the next round removes what
-  violations the cleanup uncovers.
+  to verify). A non-basic var past a true bound it is at, within its tolerance at the
+  current values, stays, since moving it would push its offset, divided by a tableau entry,
+  into the basic vars, where a small entry makes it a violation the dual phase would undo
+  by taking the var off its bound again, round after round; one beyond it moves onto the
+  bound. The dual phase of the next round removes what violations the cleanup uncovers.
 - *Rounds that loop*: each round of `run_phases` after the first cuts the primal ratio
   test's allowance a hundredfold (`LOOP_HARRIS_REDUCTION`), since a step that ends at a var's
   tolerance, which the verification's recomputation finds an ulp past, would otherwise be
@@ -995,17 +1034,14 @@ Known limitations:
   an `InternalError`, and in a MIP, after the node's slack-basis retry, so does the solve:
   the certificate proves nothing, nothing checks such an entry reliably before the pivot,
   and a pivot on round-off leaves a basis the factorization finds singular;
-- a feasible model whose vertex, computed through an ill-conditioned basis, misses a bound
-  by more than the other terms of the row's certificate can absorb within their tolerances,
-  though its exact values do not miss it, ends in an `InternalError` (in a MIP, the node's
-  slack-basis retry may reach the point from another basis): the certificate proves
-  nothing, and the moves of the certificate repair do not land the computed value
-  (`a_vertex_computed_past_its_bound_beyond_its_terms_tolerances_is_a_known_limitation`);
 - a feasible model whose optimum the simplex reaches only through a basis the factorization
   finds singular, after a pivot on an entry some `1e-14` of its column, can end in an
   `InternalError` that names a singular basis: the repair takes a column out, and the phase
   can run out of changes that do not lead back to that basis (the change back stays taboo
-  when the step into that basis moved no row);
+  when the step into that basis moved no row). The pinned model lies outside the
+  recommended range, and its better point needs an equality at exactly its whole contract,
+  which the engine's tolerance stops short of by the round-off of evaluating the row
+  (`an_optimal_basis_the_factorization_finds_singular_is_a_known_limitation`);
 - the primal ratio test's round-off scale is its column's largest entry, so a genuine
   blocking entry below `ENTRY_ROUNDOFF` of a huge entry in rows that cannot block counts as
   noise and a bounded LP can come back `Unbounded`; a scale over the blocking rows alone
@@ -1016,22 +1052,20 @@ Known limitations:
   objective alone, would also end a phase that progresses for `STALL_ITERATIONS` iterations
   without improving it (an unperturbed, near-optimal start on a zero objective, a check
   that falls while a large shift holds the objective down, or one shortly after a basis
-  repair moved it back);
+  repair moved it back). Absorption makes such cycles: where a point holds only with two
+  terms past their bounds at once, each within its tolerance, which no single absorption
+  reaches, two equalities' slacks can absorb the violation in turn, each carrying another
+  basic var out of its tolerance for a regular pivot to move it back, until every violated
+  row is taboo. The pinned MILP node lies within the recommended range
+  (`a_node_feasible_only_through_two_tolerances_at_once_is_a_known_limitation`);
 - the phases can alternate over a row that only entries below the round-off floor can
   repair: the primal step passes a genuine entry below its column's floor and leaves the row
-  beyond its tolerance, the dual simplex repairs it through another such entry, and the
-  primal step comes back, until the solve fails with `InternalError` after
-  `MAX_PHASE_ROUNDS`; a degenerate pivot on the tiny entry would resolve it, which needs
-  absolute pivot tolerances;
-- the non-basic at-bound state counts a var within its tolerance of both bounds as fixed,
-  and the cap leaves a continuous var free only where its whole range moves a row by more
-  than that row's reserve, so a gain that comes through the objective alone is lost:
-  `max 1e6 x + y` s.t. `y - x <= 0` over `x ∈ [0, 5e-8]` answers 0 against `5e-2`
-  (`a_continuous_var_narrower_than_its_tolerance_misses_its_objective_gain_is_a_known_limitation`),
-  and `max 1e9 x + y` with `x` in no row and `y <= 0.5` answers `0.5` against `50.5`.
-  Presolve's redundancy drops can leave such a var in no row, uncapped, so presolve on can
-  miss a gain that presolve off finds under the dropped rows' caps. A state taken from the
-  basis, with non-basic values exactly at their bounds, would remove it;
+  beyond its tolerance, the dual simplex repairs it, and the primal step comes back, until
+  the solve fails with `InternalError` after `MAX_PHASE_ROUNDS`; a degenerate pivot on the
+  tiny entry would resolve it, which needs absolute pivot tolerances. The pinned model's
+  better point needs an equality at exactly its whole contract, which the engine's
+  tolerance stops short of by the round-off of evaluating the row
+  (`phases_alternating_over_an_equality_a_long_step_passes_is_a_known_limitation`);
 - a feasible model whose only room is a coefficient of round-off size that its rows' own
   data leave (`x + y + z + q >= 3` and `t - (1 + 2^-50) z - q >= 1e-6` over
   `x, y, t ∈ [0, 1]` need `z <= -2^50 · 1e-6`) fails loudly, and in a MIP its node is not
@@ -1040,23 +1074,28 @@ Known limitations:
   where the coefficient is a basic var's, left by a row the certificate leaves out
   (`L + j + w = 1.000001`, `-(1 + 2^-50) j - w = 0` and `j + v <= 0`, `j` and `w` free);
 - the infeasibility proof grants the leaving var its tolerance and every other term none,
-  so a model whose points all need more is reported `Infeasible`: a row missed beyond the
-  engine's share of its contract, or rows that agree only within their tolerances, as at a
-  MILP node whose equalities, taken as exact, keep `x1` at least `7e-5` from the node's
-  value 1, where a point meets every row within half its contract (the same LP with `x1`
-  fixed from the start solves);
+  so a model whose points all need more, where absorption does not reach, is reported
+  `Infeasible`: rows that agree only within their tolerances, as at a MILP node whose
+  equalities, taken as exact, keep `x1` at least `7e-5` from the node's value 1, where a
+  point meets every row within half its contract (the same LP with `x1` fixed from the
+  start solves;
+  `a_node_feasible_only_within_its_rows_tolerances_is_pruned_and_is_a_known_limitation`).
+  An integer var its bounds fix has no tolerance to grant, so the node that fixes a binary
+  is pruned where its exactly integral point needs two rows' tolerances at once:
+  `2 x0 - x1 = 0`, `x1 - x2 = 0` and `x2 = 2 + 1.8e-7` at `x0 = 1`, a node the search
+  reaches when a row presolve rewrote rejects the root's point
+  (`a_node_fixing_a_binary_feasible_only_within_two_rows_tolerances_is_a_known_limitation`);
 - a MILP point within the engine's box only with an integer var off its integer, within
   `int_tol`, under a coefficient that makes the offset count (an LP value `1 - 3e-14` under
   `5e7` moves its row by `1.6e-6`), is not guaranteed. The search reaches it without
   presolve through its LP; presolve takes it away where it fixes the var, tightens its
   bounds or rewrites its big-M coefficient, as a branch on the var does. So on a model whose
   every point needs the integrality tolerance, presolve on answers `Infeasible`, or a worse
-  optimum, where presolve off finds one. The pinned models need their big-M row at `0.8` of
-  its contract with the binary at one, beyond the budget, the half of the contract the
-  engine holds rows to while it keeps the other half in reserve
+  optimum, where presolve off finds one. The pinned models need their big-M row `3%` beyond
+  its contract with the binary at one, within it only with the binary under one within
+  `int_tol`
   (`a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_a_known_limitation`,
-  `a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation`, and their
-  optimum forms, `an_optimum_needing_...`).
+  `a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation`).
 
 The convention for such models is to pin each as a `#[should_panic]` test named
 `..._is_a_known_limitation` in `src/tests/magnitudes.rs` (beside the engine's unit tests when
@@ -1079,7 +1118,7 @@ classes above stand (a random search cannot assert its own failure); run it with
 | Node LP unbounded | impossible when the node is bounded → `InternalError` |
 | A basis the factorization finds singular (after a pivot on an entry tiny beside its column, or loaded) | repaired: the slack of a row no pivot took replaces each dependent column, and the solve goes on; within a phase the change back is taboo, unless the step whose refactorization found the basis singular moved its row (§3, §7) |
 | Basis bookkeeping found inconsistent when a singular basis is repaired (a var basic twice, or a slack's non-basic position held by another var) | panic: a bug, never repaired |
-| Exactly-integral candidate failing the guard | `InternalError` (the engine verified the same point; see §5.4) |
+| Integral candidate failing the guard with no integer variable to branch on | `InternalError`, never force-accepted. The engine verified the point on its own rows, and with nothing to branch on every integer variable is exactly integral (one its bounds fix the engine holds on its value), where a row presolve dropped or rewrote holds as written: the failure is a reduction that did not keep the point (§5.4) |
 | Verified state unreachable (`MAX_PHASE_ROUNDS` alternations, or a basis that cannot represent its vertex) | `InternalError`, never an unverified optimum |
 | A reduced cost the primal simplex would price or the dual ratio test would weigh, an entry of the dual ratio test's row or of the primal ratio test's column (or the value of a basic var it moves), or a steepest-edge weight, is not finite | `InternalError`: such a value would silently corrupt a verdict (a NaN compares false with every tolerance, so a NaN reduced cost could end a phase as optimal); a weight is checked before its floor, which would make a NaN finite |
 | A basis of the wrong shape given to `load_basis` | `InternalError` (a bug), propagated |

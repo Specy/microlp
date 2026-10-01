@@ -1715,10 +1715,11 @@ fn proof_of_a_single_row(rhs: f64, y_max: f64) -> proof::Proof {
 }
 
 /// The infeasibility proof needs a gap beyond the tolerance the engine holds
-/// the row's slack to, half the user's `1e-7`: at the slack basis the
-/// certificate is the row `x + y + s = rhs`, `s <= 0`, at most 2 over the
-/// box, so `rhs = 3` and `2 + 2e-7` are proven, but not `2 + 3e-8`, a miss
-/// the dual simplex accepts, nor any `rhs` with `y` unbounded above.
+/// the row's slack to, the user's `1e-7` less the round-off of evaluating the
+/// row: at the slack basis the certificate is the row `x + y + s = rhs`,
+/// `s <= 0`, at most 2 over the box, so `rhs = 3` and `2 + 2e-7` are proven,
+/// but not `2 + 3e-8`, a miss the dual simplex accepts, nor any `rhs` with
+/// `y` unbounded above.
 #[test]
 fn infeasibility_proof_needs_a_gap_beyond_the_tolerance() {
     init();
@@ -1728,7 +1729,7 @@ fn infeasibility_proof_needs_a_gap_beyond_the_tolerance() {
 
     let proof = proof_of_a_single_row(2.0 + 3e-8, 1.0);
     assert!(!proof.holds, "{proof:?}");
-    assert!(proof.gap > 2.9e-8 && proof.allowance > 4.9e-8, "{proof:?}");
+    assert!(proof.gap > 2.9e-8 && proof.allowance > 9.9e-8, "{proof:?}");
 
     let proof = proof_of_a_single_row(2.0 + 2e-7, 1.0);
     assert!(proof.holds, "{proof:?}");
@@ -2210,7 +2211,7 @@ fn c2_06_through_an_edit() -> Solver {
 /// `INSTABLE_PIVOT_TOL`) pivots on `y`'s entry of one, and the phase ends at
 /// `y = 1`. That pivot refused (planted as a bad basis change), the
 /// certificate repair cannot land the row (`y` has no upper bound, and the
-/// fixed `f` may move only by its rows' reserve over `1e17`), and the phase
+/// fixed `f` never leaves its value), and the phase
 /// fails loudly at once instead of retrying until its stall bound; a time
 /// limit turns running on into a failure.
 #[test]
@@ -2251,9 +2252,10 @@ fn a_row_the_proof_leaves_open_gets_the_instable_leave_once() {
     assert!(sol.lp_iterations - iterations < 20, "{}", sol.lp_iterations);
 }
 
-/// `x + y >= 2 + 8e-8` over `x, y ∈ [0, 1]` (integer if asked), at the slack
-/// basis with `x = y = 0`: the row's slack is `8e-8` past its bound beyond
-/// its tolerance of `5e-8` even with both vars at their upper bounds.
+/// `x + y >= 2 + 1.8e-7` over `x, y ∈ [0, 1]` (integer if asked), at the
+/// slack basis with `x = y = 0`: the row's slack is `1.8e-7` past its bound,
+/// beyond its tolerance of about `1e-7`, even with both vars at their upper
+/// bounds.
 fn row_short_of_its_bounds_by_a_tolerance(integer: bool) -> Solver {
     let domain = if integer {
         VarDomain::Integer
@@ -2264,7 +2266,7 @@ fn row_short_of_its_bounds_by_a_tolerance(integer: bool) -> Solver {
         &[1.0, 1.0],
         &[0.0, 0.0],
         &[1.0, 1.0],
-        &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 2.0 + 8e-8)],
+        &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 2.0 + 1.8e-7)],
         &[domain.clone(), domain],
         None,
         crate::Tolerances::default().feasibility,
@@ -2278,14 +2280,18 @@ fn row_short_of_its_bounds_by_a_tolerance(integer: bool) -> Solver {
     assert_eq!(sol.nb_var_vals, [0.0, 0.0], "fixture: x = y = 0");
     let slack = sol.num_vars;
     assert_eq!(sol.basic_vars, [slack], "fixture: the slack basis");
-    assert_eq!(sol.var_tols[slack], BoundTols::uniform(5e-8));
+    assert_eq!(
+        sol.var_tols[slack],
+        BoundTols::uniform(slack_tol(1e-7, 2.0 + 1.8e-7, 2)),
+        "fixture: the row's whole contract less its round-off"
+    );
     sol
 }
 
 /// The certificate repair moves the vars that can help to their bounds
-/// first, then past them within their tolerances, to the farthest value that
-/// still counts as at the bound: `x` and `y` flip to 1 and `x` moves on by
-/// its tolerance, `5e-8`, which lands the row's slack within its own. An
+/// first, then past them within their tolerances, to the farthest value
+/// within its tolerance of the bound: `x` and `y` flip to 1 and `x` moves on
+/// by its tolerance, `1e-7`, which lands the row's slack within its own. An
 /// integer var never leaves its bound, so with `x, y` integer the repair
 /// fails and puts them back.
 #[test]
@@ -2293,11 +2299,11 @@ fn the_repair_moves_vars_past_their_bounds_within_their_tolerances() {
     init();
     let mut sol = row_short_of_its_bounds_by_a_tolerance(false);
     let x_tol = sol.var_tols[0].hi;
-    assert_eq!(x_tol, 5e-8, "fixture: x's tolerance is its row's reserve");
+    assert_eq!(x_tol, 1e-7, "fixture: x's tolerance is its whole contract");
     assert!(sol.certificate_repair(0));
     let x = sol.nb_var_vals[0];
     assert!(
-        x > 1.0 && at_bound(x, 1.0, x_tol) && !at_bound(x.next_up(), 1.0, x_tol),
+        x > 1.0 && x - 1.0 <= x_tol && x.next_up() - 1.0 > x_tol,
         "x = {x:e}"
     );
     assert!(sol.nb_var_states[0].at_max && !sol.nb_var_states[0].at_min);
@@ -2310,12 +2316,12 @@ fn the_repair_moves_vars_past_their_bounds_within_their_tolerances() {
     assert!(!sol.basic_var_within_bounds(0));
 }
 
-/// The certificate repair keeps a fixed structural var at its value: it is
-/// reported there, so its tolerance is the reserve its rows keep for that
-/// snap, not room. `x + y >= 2 + 1.2e-7` with `x ∈ [0, 1]` and `y` fixed at
-/// 1, at the slack basis: `x` flips to 1 and moves on by its tolerance,
-/// `5e-8`, which leaves the row's slack `7e-8` past its bound, beyond its
-/// tolerance; moving `y` by its own `5e-8` would land it, so the repair
+/// The certificate repair keeps a fixed structural var at its value, at which
+/// presolve checks the rows it substituted the var out of: its tolerance is
+/// no room. `x + y >= 2 + 2.5e-7` with `x ∈ [0, 1]` and `y` fixed at 1, at the
+/// slack basis: `x` flips to 1 and moves on by its tolerance, `1e-7`, which
+/// leaves the row's slack `1.5e-7` past its bound, beyond its tolerance of
+/// about `1e-7`; moving `y` by its own `1e-7` would land it, so the repair
 /// fails instead and puts `x` back.
 #[test]
 fn the_repair_keeps_a_fixed_var_at_its_value() {
@@ -2324,7 +2330,7 @@ fn the_repair_keeps_a_fixed_var_at_its_value() {
         &[1.0, 0.0],
         &[0.0, 1.0],
         &[1.0, 1.0],
-        &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 2.0 + 1.2e-7)],
+        &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 2.0 + 2.5e-7)],
         &[VarDomain::Real, VarDomain::Real],
         None,
         crate::Tolerances::default().feasibility,
@@ -2337,7 +2343,13 @@ fn the_repair_keeps_a_fixed_var_at_its_value() {
     );
     assert_eq!(sol.nb_var_vals, [0.0, 1.0], "fixture: x = 0, y = 1");
     assert_eq!(sol.basic_vars, [sol.num_vars], "fixture: the slack basis");
-    assert_eq!(sol.var_tols[1].lo, 5e-8, "fixture: y's tolerance");
+    assert_eq!(sol.var_tols[0].hi, 1e-7, "fixture: x's tolerance");
+    assert_eq!(sol.var_tols[1].lo, 1e-7, "fixture: y's tolerance");
+    assert_eq!(
+        sol.var_tols[sol.num_vars],
+        BoundTols::uniform(slack_tol(1e-7, 2.0 + 2.5e-7 + 1.0, 2)),
+        "fixture: the row's tolerance"
+    );
     assert!(!sol.certificate_repair(0));
     assert_eq!(sol.nb_var_vals, [0.0, 1.0]);
 }
@@ -2451,9 +2463,9 @@ fn primal_phase_is_perturbed_only_far_from_optimal_and_cleans_up_exactly() {
 
 /// A leaving var past the bound it leaves at, within its tolerance, gives a
 /// zero step, not a step backwards, and leaves where it sits: the slack of
-/// `x0 + x1 <= -3.5e-8` starts at `-3.5e-8` (tolerance `5e-8`), and a step
-/// back to its bound would move `x0` to `-3.5e-8`, out of its bounds. The
-/// slack keeps its working bounds and, within its tolerance, stays there
+/// `x0 + x1 <= -3.5e-8` starts at `-3.5e-8` (tolerance about `1e-7`), and a
+/// step back to its bound would move `x0` to `-3.5e-8`, out of its bounds.
+/// The slack keeps its working bounds and, within its tolerance, stays there
 /// through the cleanup.
 #[test]
 fn a_step_that_would_run_backwards_is_zero() {
@@ -2469,7 +2481,7 @@ fn a_step_that_would_run_backwards_is_zero() {
     )
     .unwrap();
     assert_eq!(sol.basic_var_vals, [-3.5e-8]);
-    assert_eq!(sol.var_tols[2].lo, 5e-8);
+    assert_eq!(sol.var_tols[2].lo, slack_tol(1e-7, 3.5e-8, 2));
     // `try_new`'s exact test finds the start primal infeasible and sets the
     // phase-1 objective; the primal phase works on the real one, as in `run_phases`.
     sol.artificial_obj = None;
@@ -2498,9 +2510,9 @@ fn a_step_that_would_run_backwards_is_zero() {
 /// round of `run_phases` the primal ratio test allows a basic var only a
 /// hundredth of its tolerance past its bound (`LOOP_HARRIS_REDUCTION`), and a
 /// var already past it by more admits no step toward it. Here the second
-/// slack sits `2.5e-8` past its bound (tolerance `5e-8`) and scaling puts
-/// `x0`'s entries at `1` and `1.34e-8`: the negative limit
-/// `(-2.5e-8 + 5e-10) / 1.34e-8` would pivot on `1.34e-8`, below the pivot
+/// slack sits `2.5e-8` past its bound (tolerance about `1e-7`) and scaling
+/// puts `x0`'s entries at `1` and `1.34e-8`: the negative limit
+/// `(-2.5e-8 + 1e-9) / 1.34e-8` would pivot on `1.34e-8`, below the pivot
 /// floor, instead of on the first row's `1`, at its bound.
 #[test]
 fn a_var_past_its_bound_beyond_the_allowance_limits_the_step_to_zero() {
@@ -2519,7 +2531,7 @@ fn a_var_past_its_bound_beyond_the_allowance_limits_the_step_to_zero() {
     )
     .unwrap();
     assert_eq!(sol.basic_var_vals, [0.0, -2.5e-8]);
-    assert_eq!(sol.var_tols[3].lo, 5e-8);
+    assert_eq!(sol.var_tols[3].lo, slack_tol(1e-7, 2.5e-8, 2));
     // `try_new`'s exact test finds the start primal infeasible and sets the
     // phase-1 objective; the primal phase works on the real one, as in `run_phases`.
     sol.artificial_obj = None;
@@ -2600,71 +2612,75 @@ fn a_leaving_var_holds_its_working_bounds_until_the_cleanup() {
 /// A step also moves the basic vars whose entries the ratio test ignores, and
 /// one that ends beyond its tolerance has its bound shifted, so the phase
 /// goes on over bounds its point satisfies; the cleanup restores the bound
-/// and reports the violation. Here `x0` enters with a genuine `3e-15` in
-/// `-1e4 x2 + 1e-3 x3 >= 0`, below its column's round-off floor (largest
-/// entry 4), and its step of 32 takes that row's slack `9.5e-14` past its
-/// bound, twice its tolerance. (The whole solve still fails:
-/// `phases_alternating_over_a_row_repaired_through_round_off_is_a_known_limitation`.)
+/// and reports the violation. Here the step toward `x3 = -1`, `x4 = 1000`
+/// passes the equality `1e4 x2 - 1e-7 x3 = 0` through an entry below its
+/// column's round-off floor and takes its slack `3e-12` past its bound,
+/// beyond its tolerance. (The whole solve still fails:
+/// `phases_alternating_over_an_equality_a_long_step_passes_is_a_known_limitation`.)
 #[test]
 fn a_step_past_a_row_the_ratio_test_ignores_shifts_its_bound() {
     init();
     let mut sol = Solver::try_new(
-        &[0.0, 0.0, 0.0, 1.0, 1.0, -1.0],
-        &[-2.0, 0.0, 0.0, -1.0, 0.0, -1.0],
-        &[0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+        &[1.0, 0.0, 1.0, -1.0, -1.0],
+        &[0.0, 0.0, 0.0, -1.0, 0.0],
+        &[0.0, 0.0, 1.0, 0.0, 256167.0],
         &[
             (
-                to_sparse(&[1.0, 0.0, 0.0, -0.01, 0.0, 1.0]),
+                to_sparse(&[0.0, 0.0, 0.0, -1.0, -0.001]),
                 ComparisonOp::Eq,
+                -0.0,
+            ),
+            (
+                to_sparse(&[0.0, 0.0, -1e-5, 0.0, -10000.0]),
+                ComparisonOp::Le,
                 0.0,
             ),
             (
-                to_sparse(&[0.0, 0.0, -10000.0, 0.001, 0.0, 0.0]),
-                ComparisonOp::Ge,
-                0.0,
-            ),
-            (
-                to_sparse(&[-1.0, 0.0, -1e-8, 10000.0, 0.0, 0.0]),
+                to_sparse(&[0.0, 0.0, 10000.0, -1e-7, 0.0]),
                 ComparisonOp::Eq,
                 0.0,
             ),
         ],
-        &vec![VarDomain::Real; 6],
+        &vec![VarDomain::Real; 5],
         None,
         crate::Tolerances::default().feasibility,
     )
     .unwrap();
-    assert_eq!(
-        sol.restore_feasibility(false).unwrap(),
-        StopReason::Finished
-    );
-    assert!(sol.verify_primal().unwrap());
+    // As in `run_phases`: the values the first dual phase ends on violate a
+    // bound once recomputed, and a cleanup dual phase repairs them.
+    for cleanup in [false, true] {
+        assert_eq!(
+            sol.restore_feasibility(cleanup).unwrap(),
+            StopReason::Finished
+        );
+        assert_eq!(sol.verify_primal().unwrap(), cleanup);
+    }
     sol.recalc_obj_coeffs().unwrap();
     assert!(sol.calc_dual_infeasibility().0 > 0);
-    let slack = sol.num_vars + 1;
+    let slack = sol.num_vars + 2;
     let VarState::Basic(row) = sol.var_states[slack] else {
-        panic!("the slack of the second row is basic");
+        panic!("the slack of the equality is basic");
     };
 
     sol.begin_primal_phase(true);
     assert!(!sol.bounds_modified);
     assert_eq!(sol.primal_phase(1.0).unwrap(), (StopReason::Finished, true));
     assert!(sol.bounds_modified);
-    let tol = sol.var_tols[slack].hi;
+    let tol = sol.var_tols[slack].lo;
     let val = sol.basic_var_vals[row];
     assert!(
-        val > tol,
+        val < -tol,
         "the row is violated beyond its tolerance: {val:e}"
     );
     assert!(
-        sol.basic_var_maxs[row] > val + tol,
+        sol.basic_var_mins[row] < val - tol,
         "and its bound shifted past it"
     );
     assert!(sol.calc_primal_infeasibility().0 == 0);
 
     sol.end_primal_phase().unwrap();
     assert!(!sol.bounds_modified);
-    assert_eq!(sol.basic_var_maxs[row], 0.0);
+    assert_eq!(sol.basic_var_mins[row], 0.0);
     assert!(!sol.is_primal_feasible);
     assert!(sol.calc_primal_infeasibility().0 == 1);
 }
@@ -2910,9 +2926,9 @@ fn a_dual_pivot_whose_computations_differ_in_sign_is_excluded() {
 /// The cleanup of a primal phase moves a slack left off its bound beyond its
 /// tolerance at the current values onto the bound. Issue #3's model with
 /// `z ≤ 1e15`: the phase-1 dual phase starts `z` at 1e15, where the first
-/// row's tolerance is taken (2.5 scaled, the row halved), and ends with the
+/// row's tolerance is taken (4.7 scaled, the row halved), and ends with the
 /// row violated by 1.375 within it; the primal phase lets the slack leave
-/// there, where its tolerance is now `2.5e-8` scaled, so the cleanup moves it
+/// there, where its tolerance is now `5e-8` scaled, so the cleanup moves it
 /// onto its bound and reports the violation for the dual simplex.
 #[test]
 fn a_slack_left_off_its_bound_beyond_its_current_tolerance_moves_onto_it() {

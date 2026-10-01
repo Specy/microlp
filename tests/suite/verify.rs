@@ -12,7 +12,8 @@ use microlp::{ComparisonOp, Error, Solution, SolutionStatus, SolveOutcome};
 /// no more than `FEAS_ABS * (1 + |rhs|)`, which scales gracefully for the
 /// benchmark instances with rhs values in the 1e5 range.
 const FEAS_ABS: f64 = 1e-6;
-/// Integrality slack, matching `Solution::var_value`'s own rounding threshold.
+/// Integrality slack: above the default `int_tol` (1e-6), within which the
+/// solver reports an integer var's value.
 const INT_ABS: f64 = 1e-5;
 /// Slack for re-computed vs reported objective.
 const OBJ_CONSISTENCY: f64 = 1e-6;

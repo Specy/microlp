@@ -98,7 +98,7 @@ fn add_constraint_lp(cases: &mut Vec<Case>) {
                 inst.objective as f64,
             )?;
             for (j, &want) in inst.x_star.iter().enumerate() {
-                assert_close(&format!("x{}", j), sol.var_value_raw(vars[j]), want as f64)?;
+                assert_close(&format!("x{}", j), sol.var_value(vars[j]), want as f64)?;
             }
             Ok(())
         }));
@@ -232,7 +232,7 @@ fn fix_unfix_lp(cases: &mut Vec<Case>) {
             for (jj, &want) in inst.x_star.iter().enumerate() {
                 assert_close(
                     &format!("restored x{}", jj),
-                    restored.var_value_raw(vars_handle[jj]),
+                    restored.var_value(vars_handle[jj]),
                     want as f64,
                 )?;
             }
@@ -464,11 +464,7 @@ fn milp_edits(cases: &mut Vec<Case>) {
                 "fix_var(y, 1) on MILP solution",
             )?;
             // The documented contract implies an integer-feasible re-solve.
-            let vals = [
-                sol.var_value_raw(x),
-                sol.var_value_raw(y),
-                sol.var_value_raw(z),
-            ];
+            let vals = [sol.var_value(x), sol.var_value(y), sol.var_value(z)];
             for (name, v) in ["x", "y", "z"].iter().zip(vals) {
                 if (v - v.round()).abs() > 1e-5 {
                     return Err(format!("{} = {} is fractional after fix_var", name, v));
@@ -548,7 +544,7 @@ fn milp_edits(cases: &mut Vec<Case>) {
                 )?;
                 // The point itself must respect every conflict so far.
                 for &(a, b) in &conflicts {
-                    let sum = sol.var_value_raw(vars[a]) + sol.var_value_raw(vars[b]);
+                    let sum = sol.var_value(vars[a]) + sol.var_value(vars[b]);
                     if sum > 1.0 + 1e-6 {
                         return Err(format!(
                             "solution violates added conflict {:?}: sum = {}",
@@ -673,7 +669,7 @@ fn milp_edits(cases: &mut Vec<Case>) {
                 "adding y <= 5",
             )?;
             assert_close("objective with y <= 5", sol.objective(), 395.0)?;
-            let zv = sol.var_value_raw(z);
+            let zv = sol.var_value(z);
             if (zv - zv.round()).abs() > 1e-5 {
                 return Err(format!("z = {} is fractional after the edit", zv));
             }

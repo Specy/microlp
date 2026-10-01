@@ -21,7 +21,7 @@
 //!   (within its tolerance) would give a step backwards. The step is zero
 //!   instead, and the var leaves where it sits (see `choose_pivot`): past a
 //!   bound the phase moved, the bound moves on to it; past its true bound it
-//!   is at that bound in the engine's sense.
+//!   stays there, at that bound.
 //! * **Cleanup.** However the phase ends, the working bounds return to the
 //!   true ones (see `end_primal_phase`), and `run_phases` leaves the
 //!   violations this uncovers to the dual simplex.
@@ -208,10 +208,11 @@ impl Solver {
     /// A var that leaves where it sits, past the bound it leaves at (a zero
     /// step, see `choose_pivot`), moves that bound on to `val` only if the
     /// phase moved it, for the cleanup to move it back: past its true bound it
-    /// is within its tolerance, as the Harris pass allows, and so at that
-    /// bound as far as the engine is concerned. A var fixed in the model is
-    /// fixed at its value, whatever the phase did to its working bounds, when
-    /// it leaves within its tolerance of that value, and at `val` otherwise.
+    /// is within its tolerance, as the Harris pass allows, and stays there,
+    /// at that bound ([`super::NonBasicVarState::at`]). A var fixed in the
+    /// model is fixed at its value, whatever the phase did to its working
+    /// bounds, when it leaves within its tolerance of that value, and at `val`
+    /// otherwise.
     pub(super) fn hold_leaving_value(&mut self, var: usize, val: f64) {
         let (min, max) = (self.orig_var_mins[var], self.orig_var_maxs[var]);
         let (working_min, working_max) = self.working_bounds(var);
@@ -241,13 +242,13 @@ impl Solver {
     /// moved to where the var left the basis) moves back to the true bound,
     /// and when one did, the basic values are recomputed from scratch, which
     /// also clears the round-off the steps carried into them. A non-basic var
-    /// off a true bound it counts as at (one that left the basis where it sat)
+    /// past a true bound it is at (one that left the basis where it sat)
     /// stays there if it is within its tolerance at the current values (a
     /// slack's stored tolerance may be stale and far too loose), and moves
-    /// onto the bound otherwise: moving it back even then would push what it
-    /// carries past its bound into the basic vars, divided by their tableau
-    /// entries, which a small entry turns into a violation beyond their
-    /// tolerances.
+    /// onto the bound otherwise: moving it back even then would push its
+    /// offset, divided by the tableau entries, into the basic vars, which a
+    /// small entry turns into a violation beyond their tolerances, and the
+    /// dual phase would take the var off its bound again, round after round.
     pub(super) fn end_primal_phase(&mut self) -> Result<(), Error> {
         self.cycle_guard.stop();
         let mut moved = 0usize;

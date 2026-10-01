@@ -11,29 +11,29 @@ use super::{
 use crate::solver::check_deadline;
 use crate::{Error, StopReason, VarDomain};
 
-/// Validate and adopt the solver's current solution using integer-rounded
-/// values. `Ok(false)` means rounding produced an invalid candidate and the
-/// caller must branch. A valid candidate completes unboundedness classification.
+/// Validate and adopt the solver's current point, as the engine computed it:
+/// every bound and row of the model (the rows presolve dropped or rewrote
+/// included) within the contract, and every integer var within `int_tol` of
+/// an integer (one the node fixes lies on its value, where the engine holds
+/// it). The bounds are the root's: the node's are not always within them,
+/// since a warm-start hint fixes a var up to `params::HINT_BOUNDS_SLACK`
+/// outside them, and the var may sit its whole tolerance beyond that.
+/// `Ok(false)` means the point fails the check and the caller must branch. A
+/// valid candidate completes unboundedness classification.
 pub(crate) fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
-    let tolerances = &state.options.tolerances;
-    let mut values = state.solver.reported_values();
+    let values = state.solver.reported_values();
     let solver = &state.solver;
     let domains = &solver.orig_var_domains;
-    for (val, dom) in values.iter_mut().zip(domains.iter()) {
-        if matches!(dom, VarDomain::Integer | VarDomain::Boolean) {
-            *val = val.round();
-        }
-    }
-    if !candidate_variables_feasible(&values, domains, tolerances, |v| state.root_bounds[v]) {
-        debug!(
-            "integral-within-tol solution rejected: a rounded value violates its bounds or domain"
-        );
+    let (tolerances, int_tol) = (&state.options.tolerances, state.options.int_tol);
+    let root_bounds = &state.root_bounds;
+    if !candidate_variables_feasible(&values, domains, tolerances.feasibility, int_tol, |v| {
+        root_bounds[v]
+    }) {
+        debug!("integral-within-tol solution rejected: a value violates its bounds or domain");
         return Ok(false);
     }
     if let Some((row, violation)) = solver.first_violated_row(&values) {
-        debug!(
-            "integral-within-tol solution rejected: rounded values violate row {row} by {violation:e}"
-        );
+        debug!("integral-within-tol solution rejected: it violates row {row} by {violation:e}");
         return Ok(false);
     }
     let objective = solver.objective_of(&values);
@@ -61,28 +61,31 @@ enum IntegralCandidate {
     Branch(usize),
 }
 
-/// Adopt a feasible rounded candidate, but close the current subtree only when
-/// the LP point itself is exactly integral. An exactly integral point that
-/// fails the feasibility guard is an `InternalError`, not round-off: the
-/// engine reports `Finished` only after checking the very values it reports
-/// with the evaluation the guard repeats (`Solver::check_rows` and
-/// `Solver::first_violated_row` share it), with half the contract to spare.
+/// Adopt the node's LP point, integral within `int_tol`, and close the
+/// subtree: its objective is the node's bound. The engine verified its own
+/// rows and bounds at these very values, with the evaluation the guard
+/// repeats (`Solver::check_rows` and `Solver::first_violated_row` share it),
+/// so a point fails the guard only on a row presolve dropped or rewrote. Such
+/// a row holds where the integer vars are exactly integral, but an LP value
+/// within `int_tol` of an integer, or past a bound within its tolerance, can
+/// break it (a rewritten coefficient is exact only at an integral binary):
+/// the node then branches at `int_tol = 0` on an integer var off its integer,
+/// which the child that fixes it holds exactly at its value. A point that
+/// fails with every integer var exactly integral, nothing left to branch on,
+/// is an `InternalError`: presolve's reduction did not keep it.
 fn process_integral_candidate(
     state: &mut MipState,
     domains: &[VarDomain],
-    _int_tol: f64,
 ) -> Result<IntegralCandidate, Error> {
-    let adopted = try_adopt_incumbent(state)?;
-    if let Some(var) = branching::choose_branch_var(&state.solver, domains, 0.0, &state.pseudocosts)
-    {
-        return Ok(IntegralCandidate::Branch(var));
+    if try_adopt_incumbent(state)? {
+        return Ok(IntegralCandidate::Closed);
     }
-    if adopted {
-        Ok(IntegralCandidate::Closed)
-    } else {
-        Err(Error::InternalError(
-            "exactly integral solution failed feasibility validation".to_string(),
-        ))
+    match branching::choose_branch_var(&state.solver, domains, 0.0, &state.pseudocosts) {
+        Some(var) => Ok(IntegralCandidate::Branch(var)),
+        None => Err(Error::InternalError(
+            "an integral solution the search cannot branch on failed feasibility validation"
+                .to_string(),
+        )),
     }
 }
 
@@ -124,9 +127,9 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
     // noise-robust: a raw `val.floor()` of a within-tolerance-integral value
     // is catastrophic — floor(−8e-16) = −1 makes the up child
     // (max(0, lo), hi) reproduce the parent VERBATIM and the search
-    // descends forever. Reachable through the rounding-rejected re-branch
+    // descends forever. Reachable through the rejected-candidate re-branch
     // path (`choose_branch_var` at int_tol = 0) whenever LP noise puts an
-    // integer var a hair below an integer. Snap near-integral values to
+    // integer var a hair below an integer. Take near-integral values at
     // their integer first, then clamp k into [lo, hi − 1] so BOTH children
     // strictly tighten the parent's [lo, hi] whenever hi − lo ≥ 1
     // (integral bounds — guaranteed for branchable vars).
@@ -328,7 +331,7 @@ pub(crate) fn try_warm_start(
         match state.solver.reoptimize() {
             Ok(StopReason::Finished) => {
                 if branching::is_integral(&state.solver, &domains, state.options.int_tol) {
-                    // Rounded-incumbent feasibility guard: never bypass it for a hint.
+                    // The incumbent's feasibility guard: never bypass it for a hint.
                     // If it rejects the completion, drop the hint — do not branch
                     // below-tolerance vars here, that fallback is only for the main
                     // search loop.
@@ -420,19 +423,15 @@ fn initialize_root(
     };
     let int_tol = state.options.int_tol;
     if branching::is_integral(&state.solver, domains, int_tol) {
-        match process_integral_candidate(state, domains, int_tol)? {
+        match process_integral_candidate(state, domains)? {
             IntegralCandidate::Branch(var) => branch(state, &root, var),
             IntegralCandidate::Closed => {
                 return Ok(Some(TerminationReason::ProvenOptimal));
             }
         }
     } else {
-        match branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts) {
-            Some(var) => branch(state, &root, var),
-            // Fractional integer variables fixed to a non-integer value cannot
-            // produce an integer point or a useful branch.
-            None => return Err(Error::Infeasible),
-        }
+        let var = fractional_branch_var(state, domains, int_tol);
+        branch(state, &root, var);
     }
 
     Ok(None)
@@ -493,7 +492,7 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
 
     let int_tol = state.options.int_tol;
     if branching::is_integral(&state.solver, domains, int_tol) {
-        match process_integral_candidate(state, domains, int_tol)? {
+        match process_integral_candidate(state, domains)? {
             IntegralCandidate::Branch(var) => branch(state, &node, var),
             IntegralCandidate::Closed => {
                 state.last_solved_id = None;
@@ -503,14 +502,17 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
         return Ok(NodeVisit::Solved);
     }
 
-    match branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts) {
-        Some(var) => branch(state, &node, var),
-        None => {
-            state.last_solved_id = None;
-            state.diving = false;
-        }
-    }
+    let var = fractional_branch_var(state, domains, int_tol);
+    branch(state, &node, var);
     Ok(NodeVisit::Solved)
+}
+
+/// The var to branch on at a point that is not integral within `int_tol`:
+/// one exists, since `branching::is_integral` weighs only the vars the search
+/// can branch on.
+fn fractional_branch_var(state: &MipState, domains: &[VarDomain], int_tol: f64) -> usize {
+    branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts)
+        .expect("a point that is not integral has an integer var the search can branch on")
 }
 
 pub(crate) fn search_loop(state: &mut MipState) -> Result<TerminationReason, Error> {

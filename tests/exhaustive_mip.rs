@@ -9,6 +9,13 @@ fn expect_solution(outcome: SolveOutcome) -> microlp::Solution {
         .expect("an unlimited bounded feasible solve must return a solution")
 }
 
+/// The distance from an integer within which a solve reports an integer
+/// var's value (`SolveOptions::int_tol`): values are reported as computed, so
+/// an optimum's objective lies within it times the costs of the enumeration's.
+fn int_tol() -> f64 {
+    SolveOptions::default().int_tol
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Row {
     coeffs: [i32; 4],
@@ -291,6 +298,29 @@ fn mixed_oracle(case: &MixedCase) -> Option<(f64, [i32; 3], f64)> {
     best
 }
 
+/// How far the objective of `case` moves per unit its integer vars lie off
+/// their integers: their costs, and the real var's cost times the most the
+/// integer terms of a row move the real var (whose entry, an integer, is at
+/// least one where it is not zero).
+fn mixed_objective_reach(case: &MixedCase) -> f64 {
+    let n = case.n_int;
+    let costs: f64 = case.objective[..n]
+        .iter()
+        .map(|&c| f64::from(c).abs())
+        .sum();
+    let reach = case
+        .rows
+        .iter()
+        .map(|row| {
+            row.coeffs[..n]
+                .iter()
+                .map(|&a| f64::from(a).abs())
+                .sum::<f64>()
+        })
+        .fold(0.0, f64::max);
+    costs + f64::from(case.objective[n]).abs() * reach
+}
+
 fn build_mixed_problem(case: &MixedCase) -> (Problem, Vec<Variable>) {
     let mut problem = Problem::new(OptimizationDirection::Minimize);
     let mut vars: Vec<_> = (0..case.n_int)
@@ -322,14 +352,23 @@ fn assert_solution(
         SolutionStatus::Optimal,
         "seed {seed}: {case:?}"
     );
+    let costs: f64 = case.objective[..case.n]
+        .iter()
+        .map(|&c| f64::from(c).abs())
+        .sum();
     assert!(
-        (solution.objective() - expected as f64).abs() < 1e-7,
+        (solution.objective() - expected as f64).abs() < 1e-7 + int_tol() * costs,
         "seed {seed}: objective {}, expected {expected}; {case:?}",
         solution.objective()
     );
     let mut values = [0; 4];
     for (v, value) in values.iter_mut().enumerate().take(case.n) {
-        *value = solution.var_value(vars[v]).round() as i32;
+        let x = solution.var_value(vars[v]);
+        assert!(
+            (x - x.round()).abs() <= int_tol(),
+            "seed {seed}: x{v} = {x} is not integral within int_tol; {case:?}"
+        );
+        *value = x.round() as i32;
     }
     assert!(
         case.rows.iter().all(|row| row_holds(row, &values, case.n)),
@@ -349,7 +388,10 @@ fn bounded_integer_models_match_exhaustive_enumeration() {
             (Some((objective, values)), Ok(outcome)) => {
                 let solution = expect_solution(outcome);
                 assert_solution(&case, &vars, seed, objective, &solution);
-                let cold_values: Vec<_> = vars.iter().map(|&var| solution.var_value(var)).collect();
+                let cold_values: Vec<_> = vars
+                    .iter()
+                    .map(|&var| solution.var_value(var).round())
+                    .collect();
 
                 if seed % 10 == 0 {
                     let (hinted_problem, hinted_vars, options) =
@@ -378,8 +420,10 @@ fn bounded_integer_models_match_exhaustive_enumeration() {
                     }
                     let resumed = expect_solution(resumed);
                     assert_solution(&case, &vars, seed, objective, &resumed);
-                    let resumed_values: Vec<_> =
-                        vars.iter().map(|&var| resumed.var_value(var)).collect();
+                    let resumed_values: Vec<_> = vars
+                        .iter()
+                        .map(|&var| resumed.var_value(var).round())
+                        .collect();
                     assert_eq!(
                         resumed_values, cold_values,
                         "seed {seed}: resumed solve selected a different optimum; {case:?}"
@@ -410,13 +454,17 @@ fn mixed_integer_models_match_integer_enumeration_and_analytic_lp() {
                     "seed {seed}: {case:?}"
                 );
                 assert!(
-                    (solution.objective() - objective).abs() < 1e-6,
+                    (solution.objective() - objective).abs()
+                        < 1e-6 + int_tol() * mixed_objective_reach(&case),
                     "seed {seed}: objective {}, expected {objective}; {case:?}",
                     solution.objective()
                 );
                 for &var in &vars[..case.n_int] {
                     let value = solution.var_value(var);
-                    assert_eq!(value, value.round(), "seed {seed}: {case:?}");
+                    assert!(
+                        (value - value.round()).abs() <= int_tol(),
+                        "seed {seed}: {value} is not integral within int_tol; {case:?}"
+                    );
                 }
             }
             (Some(expected), other) => {
