@@ -102,6 +102,9 @@ pub(crate) struct DualStep {
     /// entering var's cost is shifted so that its own is zero, instead of a
     /// step backwards.
     pub(crate) zero_step: bool,
+    /// For an absorbing entry whose move crosses the bound it sits at, that
+    /// bound: the upper one if `true`.
+    pub(crate) crosses: Option<bool>,
 }
 
 /// Stuff related to inversion of the basis matrix

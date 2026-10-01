@@ -1698,14 +1698,19 @@ fn compensated_sums_keep_what_f64_rounds_away() {
 }
 
 /// The proof of infeasibility of the row of `x + y >= rhs` over `x ∈ [0, 1]`
-/// and `y ∈ [0, y_max]`, violated at the slack basis.
-fn proof_of_a_single_row(rhs: f64, y_max: f64) -> proof::Proof {
+/// and `y ∈ [0, y_max]` (both integer if asked), violated at the slack basis.
+fn proof_of_a_single_row(rhs: f64, y_max: f64, integer: bool) -> proof::Proof {
+    let domain = if integer {
+        VarDomain::Integer
+    } else {
+        VarDomain::Real
+    };
     let mut sol = Solver::try_new(
         &[0.0, 0.0],
         &[0.0, 0.0],
         &[1.0, y_max],
         &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, rhs)],
-        &[VarDomain::Real, VarDomain::Real],
+        &[domain.clone(), domain],
         None,
         crate::Tolerances::default().feasibility,
     )
@@ -1714,27 +1719,39 @@ fn proof_of_a_single_row(rhs: f64, y_max: f64) -> proof::Proof {
     sol.prove_infeasible(row, leaving_new_val > sol.basic_var_vals[row])
 }
 
-/// The infeasibility proof needs a gap beyond the tolerance the engine holds
-/// the row's slack to, the user's `1e-7` less the round-off of evaluating the
-/// row: at the slack basis the certificate is the row `x + y + s = rhs`,
-/// `s <= 0`, at most 2 over the box, so `rhs = 3` and `2 + 2e-7` are proven,
-/// but not `2 + 3e-8`, a miss the dual simplex accepts, nor any `rhs` with
-/// `y` unbounded above.
+/// The infeasibility proof needs a gap beyond the room the engine can give
+/// the certificate's terms: at the slack basis the certificate is the row
+/// `x + y + s = rhs`, `s <= 0`, at most 2 over the box, and the row's slack
+/// may pass its bound by its tolerance, the user's `1e-7` less the round-off
+/// of evaluating the row, while `x` and `y` may each pass their upper bound
+/// by their own `1e-7`. So `rhs = 3` and `2 + 4e-7` are proven, but neither
+/// `2 + 3e-8`, a miss the dual simplex accepts, nor `2 + 2.5e-7`, which
+/// `x = y = 1 + 1e-7` meets within the row's tolerance, nor any `rhs` with
+/// `y` unbounded above. Integer `x` and `y` get no room, as the engine keeps
+/// them on their bounds: `2 + 2.5e-7` is proven then.
 #[test]
-fn infeasibility_proof_needs_a_gap_beyond_the_tolerance() {
+fn infeasibility_proof_needs_a_gap_beyond_the_tolerances() {
     init();
-    let proof = proof_of_a_single_row(3.0, 1.0);
+    let proof = proof_of_a_single_row(3.0, 1.0, false);
     assert!(proof.holds, "{proof:?}");
     assert!((proof.gap - 1.0).abs() < 1e-15, "{proof:?}");
 
-    let proof = proof_of_a_single_row(2.0 + 3e-8, 1.0);
+    let proof = proof_of_a_single_row(2.0 + 3e-8, 1.0, false);
     assert!(!proof.holds, "{proof:?}");
-    assert!(proof.gap > 2.9e-8 && proof.allowance > 9.9e-8, "{proof:?}");
+    assert!(proof.gap > 2.9e-8, "{proof:?}");
 
-    let proof = proof_of_a_single_row(2.0 + 2e-7, 1.0);
+    let proof = proof_of_a_single_row(2.0 + 2.5e-7, 1.0, false);
+    assert!(!proof.holds, "{proof:?}");
+    assert!((proof.allowance - 3e-7).abs() < 1e-14, "{proof:?}");
+
+    let proof = proof_of_a_single_row(2.0 + 2.5e-7, 1.0, true);
+    assert!(proof.holds, "{proof:?}");
+    assert!((proof.allowance - 1e-7).abs() < 1e-14, "{proof:?}");
+
+    let proof = proof_of_a_single_row(2.0 + 4e-7, 1.0, false);
     assert!(proof.holds, "{proof:?}");
 
-    let proof = proof_of_a_single_row(3.0, f64::INFINITY);
+    let proof = proof_of_a_single_row(3.0, f64::INFINITY, false);
     assert!(!proof.holds, "{proof:?}");
     assert_eq!(proof.gap, f64::NEG_INFINITY);
 }
@@ -2289,29 +2306,41 @@ fn row_short_of_its_bounds_by_a_tolerance(integer: bool) -> Solver {
 }
 
 /// The certificate repair moves the vars that can help to their bounds
-/// first, then past them within their tolerances, to the farthest value
-/// within its tolerance of the bound: `x` and `y` flip to 1 and `x` moves on
-/// by its tolerance, `1e-7`, which lands the row's slack within its own. An
-/// integer var never leaves its bound, so with `x, y` integer the repair
-/// fails and puts them back.
+/// first, then, largest reach first, widens the bound each sits at by its
+/// tolerance and moves it there, to the farthest value within its tolerance
+/// of the model's bound: `x` and `y` flip to 1 and `x`'s upper bound in force
+/// becomes `1 + 1e-7`, which lands the row's slack within its own tolerance.
+/// The model's bound is kept for the boundary, and the next solve restores
+/// it. An integer var is never widened, so with `x, y` integer the repair
+/// does nothing.
 #[test]
 fn the_repair_moves_vars_past_their_bounds_within_their_tolerances() {
     init();
     let mut sol = row_short_of_its_bounds_by_a_tolerance(false);
     let x_tol = sol.var_tols[0].hi;
     assert_eq!(x_tol, 1e-7, "fixture: x's tolerance is its whole contract");
-    assert!(sol.certificate_repair(0));
+    assert_eq!(sol.certificate_repair(0, true), proof::Repair::Widened);
     let x = sol.nb_var_vals[0];
     assert!(
         x > 1.0 && x - 1.0 <= x_tol && x.next_up() - 1.0 > x_tol,
         "x = {x:e}"
     );
+    assert_eq!(sol.orig_var_maxs[0], x, "x's bound in force");
+    assert_eq!(sol.var_tols[0].hi, 0.0, "x's bound holds its tolerance");
+    assert_eq!(sol.get_var_bounds(0), (0.0, 1.0), "the model's bounds");
     assert!(sol.nb_var_states[0].at_max && !sol.nb_var_states[0].at_min);
     assert_eq!(sol.nb_var_vals[1], 1.0);
+    assert_eq!(sol.orig_var_maxs[1], 1.0, "y is not widened");
     assert!(sol.basic_var_within_bounds(0), "{:?}", sol.basic_var_vals);
+    sol.restore_model_bounds();
+    assert_eq!(
+        (sol.orig_var_maxs[0], sol.var_tols[0].hi, sol.nb_var_vals[0]),
+        (1.0, x_tol, 1.0),
+        "restored"
+    );
 
     let mut sol = row_short_of_its_bounds_by_a_tolerance(true);
-    assert!(!sol.certificate_repair(0));
+    assert_eq!(sol.certificate_repair(0, true), proof::Repair::Nothing);
     assert_eq!(sol.nb_var_vals, [0.0, 0.0]);
     assert!(!sol.basic_var_within_bounds(0));
 }
@@ -2319,10 +2348,10 @@ fn the_repair_moves_vars_past_their_bounds_within_their_tolerances() {
 /// The certificate repair keeps a fixed structural var at its value, at which
 /// presolve checks the rows it substituted the var out of: its tolerance is
 /// no room. `x + y >= 2 + 2.5e-7` with `x ∈ [0, 1]` and `y` fixed at 1, at the
-/// slack basis: `x` flips to 1 and moves on by its tolerance, `1e-7`, which
-/// leaves the row's slack `1.5e-7` past its bound, beyond its tolerance of
-/// about `1e-7`; moving `y` by its own `1e-7` would land it, so the repair
-/// fails instead and puts `x` back.
+/// slack basis: `x` flips to 1 and its bound is widened by its tolerance,
+/// `1e-7`, which leaves the row's slack `1.5e-7` past its bound, beyond its
+/// tolerance of about `1e-7`; `y` stays at 1, though its own `1e-7` would
+/// land the row. The proof, which grants `y` no room either, then holds.
 #[test]
 fn the_repair_keeps_a_fixed_var_at_its_value() {
     init();
@@ -2350,8 +2379,11 @@ fn the_repair_keeps_a_fixed_var_at_its_value() {
         BoundTols::uniform(slack_tol(1e-7, 2.0 + 2.5e-7 + 1.0, 2)),
         "fixture: the row's tolerance"
     );
-    assert!(!sol.certificate_repair(0));
-    assert_eq!(sol.nb_var_vals, [0.0, 1.0]);
+    assert_eq!(sol.certificate_repair(0, true), proof::Repair::Widened);
+    assert_eq!(sol.nb_var_vals[1], 1.0);
+    assert!(!sol.basic_var_within_bounds(0), "{:?}", sol.basic_var_vals);
+    let up = sol.leaving_target(0) > sol.basic_var_vals[0];
+    assert!(sol.prove_infeasible(0, up).holds);
 }
 
 /// The bound perturbation of a primal phase: every finite bound moves outward
@@ -2615,8 +2647,8 @@ fn a_leaving_var_holds_its_working_bounds_until_the_cleanup() {
 /// and reports the violation. Here the step toward `x3 = -1`, `x4 = 1000`
 /// passes the equality `1e4 x2 - 1e-7 x3 = 0` through an entry below its
 /// column's round-off floor and takes its slack `3e-12` past its bound,
-/// beyond its tolerance. (The whole solve still fails:
-/// `phases_alternating_over_an_equality_a_long_step_passes_is_a_known_limitation`.)
+/// beyond its tolerance (the whole solve:
+/// `an_equality_a_long_step_passes_below_its_floor_settles`).
 #[test]
 fn a_step_past_a_row_the_ratio_test_ignores_shifts_its_bound() {
     init();
@@ -2975,4 +3007,86 @@ fn a_slack_left_off_its_bound_beyond_its_current_tolerance_moves_onto_it() {
         "{}",
         sol.cur_obj_val
     );
+}
+
+/// Two equalities `x + y = 1` and `x + y = 1 + 1.5e-7` over `x, y ∈ [0, 2]`
+/// disagree by `1.5e-7`, within their tolerances together but beyond either
+/// alone, so no slack can absorb the miss, and the proof grants both slacks
+/// their room. The dual phase's last resort widens a slack's bound, and the
+/// solve ends within the rows' contract, the model's bounds unchanged for the
+/// boundary; the next solve restores them in the engine too.
+#[test]
+fn a_solve_widens_a_slack_bound_and_the_next_restores_it() {
+    init();
+    let mut sol = Solver::try_new(
+        &[1.0, 0.0],
+        &[0.0, 0.0],
+        &[2.0, 2.0],
+        &[
+            (to_sparse(&[1.0, 1.0]), ComparisonOp::Eq, 1.0),
+            (to_sparse(&[1.0, 1.0]), ComparisonOp::Eq, 1.0 + 1.5e-7),
+        ],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(sol.reoptimize().unwrap(), StopReason::Finished);
+    let values: Vec<f64> = (0..2).map(|v| sol.get_value(v)).collect();
+    assert_eq!(sol.first_violated_row(&values), None, "{values:?}");
+    let w = *sol
+        .widened
+        .iter()
+        .find(|w| w.var >= sol.num_vars)
+        .expect("a slack's bound is widened");
+    assert_eq!(sol.model_bounds(w.var), (0.0, 0.0), "the model's bounds");
+    assert!(sol.orig_var_mins[w.var] < 0.0 || sol.orig_var_maxs[w.var] > 0.0);
+
+    sol.restore_model_bounds();
+    assert!(sol.widened.is_empty());
+    assert_eq!(
+        (sol.orig_var_mins[w.var], sol.orig_var_maxs[w.var]),
+        (0.0, 0.0)
+    );
+}
+
+/// The slack of `x + 1e-9 z <= 1` over `x ∈ [0, 2]` and `z ∈ [0, 1e12]`, its
+/// lower bound widened by its room at the slack basis, where the row's
+/// magnitude is its right-hand side's. Moved to `1e12`, `z` raises the
+/// magnitude a thousandfold, and with it the round-off of evaluating the
+/// row, which the widened side keeps as its tolerance: the bound then moves
+/// back to the room the row leaves at those values.
+#[test]
+fn a_widened_slack_bound_follows_its_rows_room() {
+    init();
+    let mut sol = Solver::try_new(
+        &[0.0, 0.0],
+        &[0.0, 0.0],
+        &[2.0, 1e12],
+        &[(to_sparse(&[1.0, 1e-9]), ComparisonOp::Le, 1.0)],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(sol.row_scales, [1.0], "fixture: the row is not scaled");
+    let slack = sol.num_vars;
+    let room = sol.slack_room(0);
+    let edge = band_edge(0.0, room, false);
+    sol.widen(slack, false, edge);
+    assert_eq!(sol.orig_var_mins[slack], edge);
+    assert_eq!(sol.model_bounds(slack), (0.0, f64::INFINITY));
+    let margin = slack_margin(1e-7, 1.0, 2);
+    assert_eq!(sol.var_tols[slack].lo, margin, "the side keeps the margin");
+
+    let z = nb_col(&sol, 1);
+    sol.apply_flips(&[(z, sol.orig_var_maxs[1])]);
+    let refit = band_edge(0.0, sol.slack_room(0), false);
+    assert!(refit > edge, "the room shrinks: {refit:e} {edge:e}");
+    sol.refit_widened_slacks();
+    assert_eq!(sol.orig_var_mins[slack], refit);
+    let VarState::Basic(row) = sol.var_states[slack] else {
+        panic!("the slack is basic");
+    };
+    assert_eq!(sol.basic_var_mins[row], refit);
 }

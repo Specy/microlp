@@ -26,6 +26,7 @@ mod tolerances;
 
 pub(crate) use basis::*;
 pub(crate) use proof::CDouble;
+use proof::Repair;
 pub(crate) use scaling::*;
 pub(crate) use tolerances::*;
 
@@ -115,7 +116,9 @@ pub(crate) struct Solver {
     /// (`s_j c_j · x_j / s_j = c_j x_j`), so `cur_obj_val` is in user units.
     orig_obj_coeffs: Vec<f64>,
     /// Bounds in scaled units: `lo_j / s_j` and `hi_j / s_j` for a structural
-    /// var, the slack's own bounds for a slack.
+    /// var, the slack's own bounds for a slack. These are the bounds in force:
+    /// the model's, but where the dual simplex's last resort widened one for
+    /// the rest of the solve (`widened`).
     orig_var_mins: Vec<f64>,
     orig_var_maxs: Vec<f64>,
     pub(crate) orig_var_domains: Vec<VarDomain>,
@@ -143,7 +146,9 @@ pub(crate) struct Solver {
     /// var counts as within each of its bounds: [`structural_tol`] for a
     /// structural var, refreshed when its bounds change, and [`slack_tol`]
     /// for a slack, refreshed whenever the rows are checked since its
-    /// round-off depends on the values.
+    /// round-off depends on the values. A side whose bound the last resort
+    /// widened keeps none (a slack, its evaluation margin): its bound holds
+    /// the rest ([`Self::widen`]).
     var_tols: Vec<BoundTols>,
     /// Per total var, the tolerance within which its reduced cost counts as
     /// zero ([`dual_tol`]); refreshed whenever the reduced costs are
@@ -227,6 +232,16 @@ pub(crate) struct Solver {
     /// before the fix, so [`Self::unfix_var`] can restore them. A fix is a
     /// plain bound change to `[val, val]`; this is the only extra state.
     fixed_var_bounds: Vec<Option<(f64, f64)>>,
+    /// The bounds a var crossed by absorbing a move in this solve, as (var,
+    /// upper): a var crosses a bound by absorbing once per solve (see
+    /// `choose_entering_col_dual`).
+    absorbed: Vec<(usize, bool)>,
+    /// The bounds the certificate repair widened by their var's tolerance in
+    /// this solve, with the model's values ([`Self::widen`]): `orig_var_mins`
+    /// and `orig_var_maxs` hold the bounds in force. The boundary's checks
+    /// and the edits read the model's ([`Self::model_bounds`]), and every
+    /// solve starts by restoring them ([`Self::restore_model_bounds`]).
+    widened: Vec<WidenedBound>,
 
     pub(crate) cur_obj_val: f64,
 
@@ -238,6 +253,16 @@ pub(crate) struct Solver {
     /// The combined column `Σ Δx_c a_c` of the bound flips of one dual step
     /// (see [`Self::apply_flips`]).
     flip_rhs: ScatteredVec,
+}
+
+/// A bound of `var`, the upper one if `up`, that the certificate repair
+/// widened by the var's tolerance ([`Solver::widen`]), and its value in the
+/// model.
+#[derive(Clone, Copy, Debug)]
+struct WidenedBound {
+    var: usize,
+    up: bool,
+    model: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -620,6 +645,8 @@ impl Solver {
             nb_var_states,
             primal_edge_sq_norms,
             fixed_var_bounds: vec![None; num_vars],
+            absorbed: Vec::new(),
+            widened: Vec::new(),
             cur_obj_val,
             col_coeffs: SparseVec::new(),
             sq_norms_update_helper,
@@ -677,6 +704,25 @@ impl Solver {
             )
     }
 
+    /// Whether the engine keeps `var` on its bounds while it is non-basic: an
+    /// integer var, and a structural var its bounds fix.
+    #[inline]
+    fn holds_on_bounds(&self, var: usize) -> bool {
+        self.is_integer(var)
+            || (var < self.num_vars && self.orig_var_mins[var] == self.orig_var_maxs[var])
+    }
+
+    /// Whether moving the non-basic var at `col` by `step` takes it past its
+    /// bound in that direction.
+    fn crosses_bound(&self, col: usize, step: f64) -> bool {
+        let (var, val) = (self.nb_vars[col], self.nb_var_vals[col]);
+        if step > 0.0 {
+            val + step > self.orig_var_maxs[var]
+        } else {
+            val + step < self.orig_var_mins[var]
+        }
+    }
+
     /// A var's current value in the engine's scaled units.
     #[inline]
     fn internal_value(&self, var: usize) -> f64 {
@@ -713,15 +759,29 @@ impl Solver {
         self.orig_constraints.outer_view(r).unwrap().nnz() - 1
     }
 
-    /// The slack tolerance of row `r` at the current values (see
-    /// [`slack_tol`]).
-    fn current_slack_tol(&self, r: usize) -> f64 {
+    /// The tolerances of the slack of row `r` at the current values
+    /// ([`Self::slack_tols`]).
+    fn current_slack_tols(&self, r: usize) -> BoundTols {
         let (_, magnitude) = self.row_activity(r, |v| self.internal_value(v));
-        slack_tol(
-            self.feasibility * self.row_scales[r],
-            magnitude,
-            self.row_terms(r),
-        )
+        self.slack_tols(r, magnitude)
+    }
+
+    /// The tolerances of the slack of row `r` at the row's `magnitude`:
+    /// [`slack_tol`], or only the evaluation margin ([`slack_margin`]) on a
+    /// side the certificate repair widened, whose bound holds the rest
+    /// ([`Self::widen`]).
+    fn slack_tols(&self, r: usize, magnitude: f64) -> BoundTols {
+        let (tol, terms) = (self.feasibility * self.row_scales[r], self.row_terms(r));
+        let mut tols = BoundTols::uniform(slack_tol(tol, magnitude, terms));
+        for w in self.widened.iter().filter(|w| w.var == self.num_vars + r) {
+            let margin = slack_margin(tol, magnitude, terms);
+            if w.up {
+                tols.hi = margin;
+            } else {
+                tols.lo = margin;
+            }
+        }
+        tols
     }
 
     /// Re-derive every reduced-cost tolerance from the magnitudes of the
@@ -758,8 +818,7 @@ impl Solver {
             // `values` are in user units; dividing by the power-of-two `s_v`
             // is exact, so each term is the user's term times the row factor.
             let (lhs, magnitude) = self.row_activity(r, |v| values[v] / self.col_scales[v]);
-            let slack = self.num_vars + r;
-            let (smin, smax) = (self.orig_var_mins[slack], self.orig_var_maxs[slack]);
+            let (smin, smax) = self.model_bounds(self.num_vars + r);
             let implied = self.orig_rhs[r] - lhs;
             let tol = row_tolerance(self.feasibility * self.row_scales[r], magnitude);
             if outside(implied, smin, smax, tol) {
@@ -803,10 +862,25 @@ impl Solver {
             .sum()
     }
 
-    /// A var's bounds in user units.
+    /// A var's bounds in the model, in user units.
     pub(crate) fn get_var_bounds(&self, var: usize) -> (f64, f64) {
         let s = self.col_scale(var);
-        (self.orig_var_mins[var] * s, self.orig_var_maxs[var] * s)
+        let (min, max) = self.model_bounds(var);
+        (min * s, max * s)
+    }
+
+    /// A var's bounds in the model, in scaled units: the bounds in force but
+    /// where the certificate repair widened one ([`Self::widen`]).
+    fn model_bounds(&self, var: usize) -> (f64, f64) {
+        let (mut min, mut max) = (self.orig_var_mins[var], self.orig_var_maxs[var]);
+        for w in self.widened.iter().filter(|w| w.var == var) {
+            if w.up {
+                max = w.model;
+            } else {
+                min = w.model;
+            }
+        }
+        (min, max)
     }
 
     /// Change a variable's bounds (user units) in place. Records the new bounds
@@ -821,6 +895,8 @@ impl Solver {
             !self.bounds_modified,
             "a bound changed during a primal phase"
         );
+        // The new bounds are the model's, in force from here on.
+        self.widened.retain(|w| w.var != var);
         // Dividing by a power of two is exact, so the user's bound maps to
         // exactly one internal bound.
         let s = self.col_scale(var);
@@ -890,7 +966,9 @@ impl Solver {
     /// the factorization satisfy the rows and their bounds, and the reduced
     /// costs recomputed from the multipliers are dual feasible. A phase's own
     /// exit test runs on incrementally updated numbers and can end on drifted
-    /// values, so only a verified state is reported as `Finished`.
+    /// values, so only a verified state is reported as `Finished`. The solve
+    /// starts from the model's bounds, restoring any a previous solve's last
+    /// resort widened ([`Self::restore_model_bounds`]).
     ///
     /// A phase ends by restoring the costs in force ([`costs`]) or the true
     /// bounds ([`bounds`]), and the infeasibility that uncovers is left to the
@@ -904,6 +982,8 @@ impl Solver {
     /// ([`LOOP_HARRIS_REDUCTION`]), so that a step no longer ends at a
     /// tolerance the verification's recomputation finds exceeded.
     fn run_phases(&mut self) -> Result<StopReason, Error> {
+        self.restore_model_bounds();
+        self.absorbed.clear();
         let mut cleanup = false;
         for round in 0..MAX_PHASE_ROUNDS {
             let harris_scale = LOOP_HARRIS_REDUCTION.powi(round as i32);
@@ -1103,7 +1183,8 @@ impl Solver {
     /// `residuals` receives `b - Σ a_j x_j - s` per row, zero where the slack
     /// is basic: how far the basic structural values are from solving the
     /// rows whose slack is non-basic. Returns whether every residual is
-    /// within its row's tolerance.
+    /// within its slack's tolerance on the side it moves the slack (on a side
+    /// whose bound the last resort widened, the evaluation margin alone).
     fn check_rows(&mut self, residuals: &mut Vec<f64>) -> bool {
         residuals.clear();
         let mut hold = true;
@@ -1118,13 +1199,11 @@ impl Solver {
                 }
                 VarState::NonBasic(col) => implied - self.nb_var_vals[col],
             };
-            let tol = slack_tol(
-                self.feasibility * self.row_scales[r],
-                magnitude,
-                self.row_terms(r),
-            );
-            self.var_tols[slack] = BoundTols::uniform(tol);
-            // A NaN residual holds nothing.
+            let tols = self.slack_tols(r, magnitude);
+            self.var_tols[slack] = tols;
+            // A NaN residual holds nothing, and one is held to the tolerance
+            // on the side it moves the slack.
+            let tol = if residual < 0.0 { tols.lo } else { tols.hi };
             if residual.is_nan() || residual.abs() > tol {
                 hold = false;
             }
@@ -1134,8 +1213,10 @@ impl Solver {
     }
 
     /// Make the values satisfy the rows to within their tolerances and
-    /// measure primal feasibility on them. The rows are evaluated through
-    /// [`Self::check_rows`], as the boundary evaluates the reported point, so
+    /// measure primal feasibility on them. A widened slack bound first
+    /// follows its row's magnitude ([`Self::refit_widened_slacks`]). The rows
+    /// are evaluated through [`Self::check_rows`], as the boundary evaluates
+    /// the reported point, so
     /// a `Finished` state and the point handed out agree bit for bit. Values
     /// within tolerance are kept (moving last bits steers the branch &
     /// bound); drifted ones are refined through the factorization, then a
@@ -1153,6 +1234,7 @@ impl Solver {
             self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
             return Ok(self.is_primal_feasible);
         }
+        self.refit_widened_slacks();
         let mut residuals = Vec::with_capacity(self.num_constraints());
         let mut hold = self.check_rows(&mut residuals);
         if !hold {
@@ -1712,9 +1794,12 @@ impl Solver {
     /// holds on the model's data ([`Self::prove_infeasible`]); a row whose
     /// proof fails is made taboo. When only taboo rows are left on fresh data,
     /// one whose proof failed gets two last resorts: the ratio test with every
-    /// entry of at least [`INSTABLE_PIVOT_TOL`] a candidate, then, once per
-    /// row in a phase, moves of the non-basic vars the row's certificate says
-    /// can help ([`Self::certificate_repair`]).
+    /// entry of at least [`INSTABLE_PIVOT_TOL`] a candidate, then the
+    /// certificate repair ([`Self::certificate_repair`]): flips of the
+    /// non-basic vars the row's certificate says can help, once per row in a
+    /// phase, or the bounds they sit at widened by their room for the rest of
+    /// the solve, after which the cycling detection starts afresh, the LP
+    /// having changed.
     ///
     /// The phase fails loudly rather than run forever or guess: when only
     /// taboo rows are left after a rebuild and no last resort remains, and
@@ -1722,9 +1807,9 @@ impl Solver {
     /// [`STALL_ITERATIONS`] iterations. The room an unrepaired row's
     /// certificate leaves then lies where no step reaches: in an entry below
     /// [`INSTABLE_PIVOT_TOL`] of a var with no bound in its direction, in a
-    /// coefficient below the round-off of its terms, or beyond the values
-    /// computed through the basis (see the known limitations in ARCHITECTURE
-    /// §7).
+    /// coefficient below the round-off of its terms, within the round-off of
+    /// the room every term can give, or beyond the values computed through
+    /// the basis (see the known limitations in ARCHITECTURE §7).
     fn dual_phase(&mut self) -> Result<StopReason, Error> {
         let obj_str = if self.artificial_obj.is_some() {
             "artificial obj."
@@ -1812,20 +1897,26 @@ impl Solver {
                                 continue;
                             }
                             // The unstable pivot was not taken: the
-                            // certificate repair, once per row in a phase, or
-                            // nothing can repair the row.
-                            if !repaired_rows.contains(&row) && self.certificate_repair(row) {
-                                repaired_rows.push(row);
-                                refreshed_since_pivot = false;
-                                instable_tried = None;
-                                continue;
+                            // certificate repair's flips, once per row in a
+                            // phase, or its widening, or nothing can repair
+                            // the row. A widening changes the LP, so the
+                            // cycling detection starts afresh.
+                            match self.certificate_repair(row, !repaired_rows.contains(&row)) {
+                                Repair::Flipped => repaired_rows.push(row),
+                                Repair::Widened => self.start_cycle_detection(),
+                                Repair::Nothing => {
+                                    return Err(Error::InternalError(format!(
+                                        "dual simplex: no var can repair row {row} (basic var \
+                                         {}) by an accepted pivot or through a coefficient \
+                                         above round-off, and the row does not prove the model \
+                                         infeasible",
+                                        self.basic_vars[row]
+                                    )));
+                                }
                             }
-                            return Err(Error::InternalError(format!(
-                                "dual simplex: no var can repair row {row} (basic var {}) by an \
-                                 accepted pivot or through a coefficient above round-off, and \
-                                 the row does not prove the model infeasible",
-                                self.basic_vars[row]
-                            )));
+                            refreshed_since_pivot = false;
+                            instable_tried = None;
+                            continue;
                         }
                         return Err(self.stuck_error("dual"));
                     }
@@ -1983,6 +2074,9 @@ impl Solver {
                 // entering var's cost is shifted so its reduced cost is
                 // zero, and the step, zero, changes no other.
                 self.shift_entering_cost(col);
+            }
+            if let Some(up) = step.crosses {
+                self.absorbed.push((self.nb_vars[col], up));
             }
             let val = self.basic_var_vals[row];
             let entering_diff = (val - leaving_new_val) / a_col;
@@ -2685,15 +2779,15 @@ impl Solver {
 
         // Whether the non-basic var `c` could instead absorb the leaving
         // var's move by crossing the bound it sits at (or, if fixed, its
-        // value) by no more than its own tolerance. This hands a primal,
-        // round-off-level violation that a var cannot carry (an integer var, a
-        // tight bound) to one that can, such as an equality's slack: the
-        // infeasibility proof grants that other term no tolerance, so without
-        // it a model whose point needs the other term's room (an equality on a
-        // 2.7e8 activity pinning a var 2.4e-7 past its bound) could only be
-        // reported infeasible. An integer var never absorbs, as it never takes
-        // the certificate repair's band moves, and neither does a fixed
-        // structural var (see `certificate_moves`). The var moves the way its
+        // value) by no more than its own tolerance. This hands a violation
+        // that a var cannot carry (an integer var, a tight bound) to a term
+        // whose tolerance the infeasibility proof counts, such as an
+        // equality's slack, at once rather than through the last resort. An
+        // integer var never absorbs, nor does a fixed structural var (see
+        // `holds_on_bounds`), and a var crosses a bound by absorbing once per
+        // solve (`absorbed`), so that absorptions cannot hand a violation
+        // back and forth for ever: a later need for that room goes to the
+        // proof and the last resort's widening. The var moves the way its
         // bound forbids, so the pivot takes a zero dual step with the var's
         // cost shifted, rather than a step `d_q / a_q` that would run
         // backwards by any amount.
@@ -2702,21 +2796,23 @@ impl Solver {
                 return false;
             }
             let var = self.nb_vars[c];
-            let integer = self.is_integer(var);
-            let fixed = var < self.num_vars && self.orig_var_mins[var] == self.orig_var_maxs[var];
+            let step = leaving_move / coeff;
+            let up = step > 0.0;
             // The var is to stay within the tolerance the phase holds it to
             // once basic, so that it is not violated in turn: its own, for a
             // structural var the bound it crosses in the direction the pivot
             // moves it; a slack's stored one, derived at the last
             // recomputation, and no more than its row's at the current point.
             let tol = if var < self.num_vars {
-                self.var_tols[var].toward(leaving_move / coeff > 0.0)
+                self.var_tols[var].toward(up)
             } else {
                 self.var_tols[var]
-                    .lo
-                    .min(self.current_slack_tol(var - self.num_vars))
+                    .toward(up)
+                    .min(self.current_slack_tols(var - self.num_vars).toward(up))
             };
-            !integer && !fixed && (leaving_move / coeff).abs() <= tol
+            !self.holds_on_bounds(var)
+                && step.abs() <= tol
+                && !(self.crosses_bound(c, step) && self.absorbed.contains(&(var, up)))
         };
 
         // The round-off scale of the row: its largest entry over the columns
@@ -2935,6 +3031,7 @@ impl Solver {
                 flips,
                 entering: (col, coeff),
                 zero_step: ratio <= 0.0,
+                crosses: None,
             }));
         }
         if let Some((col, coeff, ratio)) = entering {
@@ -2942,6 +3039,7 @@ impl Solver {
                 flips: Vec::new(),
                 entering: (col, coeff),
                 zero_step: ratio <= 0.0,
+                crosses: None,
             }));
         }
 
@@ -2994,11 +3092,13 @@ impl Solver {
                 absorbing = Some((c, coeff));
             }
         }
-        if let Some(entering) = absorbing {
+        if let Some((c, coeff)) = absorbing {
+            let step = leaving_move / coeff;
             return Ok(DualRatioTest::Step(DualStep {
                 flips: Vec::new(),
-                entering,
+                entering: (c, coeff),
                 zero_step: true,
+                crosses: self.crosses_bound(c, step).then_some(step > 0.0),
             }));
         }
 

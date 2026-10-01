@@ -25,10 +25,16 @@
 //! * **Cleanup.** However the phase ends, the working bounds return to the
 //!   true ones (see `end_primal_phase`), and `run_phases` leaves the
 //!   violations this uncovers to the dual simplex.
+//!
+//! The true bounds are the bounds in force: the model's, but where the dual
+//! simplex's last resort widened one by its var's tolerance for the rest of
+//! the solve ([`Solver::widen`]), so that the phases can reach every point
+//! the infeasibility proof leaves open. Every solve starts from the model's
+//! ([`Solver::restore_model_bounds`]).
 
 use super::{
-    random_fraction, BoundTols, Solver, Stream, VarState, NEAR_OPTIMAL_MAX_INFEASIBILITIES,
-    NEAR_OPTIMAL_MAX_INFEASIBILITY,
+    band_edge, random_fraction, slack_margin, slack_tol, structural_tol, Solver, Stream, VarState,
+    WidenedBound, NEAR_OPTIMAL_MAX_INFEASIBILITIES, NEAR_OPTIMAL_MAX_INFEASIBILITY,
 };
 use crate::Error;
 
@@ -296,16 +302,157 @@ impl Solver {
     /// Whether the non-basic `var` at `val` is within its tolerance of its
     /// `bound` (the upper one if `up`) at the current values: a structural
     /// var's own tolerance, or a slack's derived afresh from its row
-    /// ([`Self::current_slack_tol`]) and stored.
+    /// ([`Self::current_slack_tols`]) and stored.
     fn within_current_tol(&mut self, var: usize, val: f64, bound: f64, up: bool) -> bool {
         let tol = if var < self.num_vars {
             self.var_tols[var].toward(up)
         } else {
-            let tol = self.current_slack_tol(var - self.num_vars);
-            self.var_tols[var] = BoundTols::uniform(tol);
-            tol
+            let tols = self.current_slack_tols(var - self.num_vars);
+            self.var_tols[var] = tols;
+            tols.toward(up)
         };
         (val - bound).abs() <= tol
+    }
+
+    /// How far past its bound on the side `up` the dual simplex's last resort
+    /// may widen the bound of `var` ([`Self::widen`]): none if it did
+    /// already; else the var's tolerance there, less, for a slack, its row's
+    /// evaluation margin ([`Self::slack_tols`]), which that side keeps.
+    pub(super) fn widening_room(&self, var: usize, up: bool) -> f64 {
+        if self.widened.iter().any(|w| w.var == var && w.up == up) {
+            return 0.0;
+        }
+        if var < self.num_vars {
+            return self.var_tols[var].toward(up);
+        }
+        self.slack_room(var - self.num_vars)
+    }
+
+    /// The room the slack of row `r` may be widened by at the current values:
+    /// its tolerance less its row's evaluation margin.
+    pub(super) fn slack_room(&self, r: usize) -> f64 {
+        let (_, magnitude) = self.row_activity(r, |v| self.internal_value(v));
+        let (tol, terms) = (self.feasibility * self.row_scales[r], self.row_terms(r));
+        (slack_tol(tol, magnitude, terms) - slack_margin(tol, magnitude, terms)).max(0.0)
+    }
+
+    /// Hold every widened slack bound to its row's room at the current values
+    /// ([`Self::slack_room`]): the room follows the row's magnitude, so a
+    /// bound widened at other values may lie beyond it, and moves back to it,
+    /// with the slack where it lies past it. Run before the rows are checked,
+    /// so that the evaluation margin the side keeps covers the check's
+    /// round-off.
+    pub(super) fn refit_widened_slacks(&mut self) {
+        let mut moves = Vec::new();
+        for k in 0..self.widened.len() {
+            let w = self.widened[k];
+            if w.var < self.num_vars {
+                continue;
+            }
+            let edge = band_edge(w.model, self.slack_room(w.var - self.num_vars), w.up);
+            let past = |val: f64| if w.up { val > edge } else { val < edge };
+            let bound = if w.up {
+                &mut self.orig_var_maxs[w.var]
+            } else {
+                &mut self.orig_var_mins[w.var]
+            };
+            if !past(*bound) {
+                continue;
+            }
+            *bound = edge;
+            match self.var_states[w.var] {
+                VarState::Basic(row) => {
+                    if w.up {
+                        self.basic_var_maxs[row] = edge;
+                    } else {
+                        self.basic_var_mins[row] = edge;
+                    }
+                }
+                VarState::NonBasic(col) => {
+                    if past(self.nb_var_vals[col]) {
+                        moves.push((col, edge));
+                    }
+                }
+            }
+        }
+        self.apply_flips(&moves);
+    }
+
+    /// Widen the bound of `var` on the side `up` to `edge`, which lies within
+    /// [`Self::widening_room`] of it, for the rest of the solve, recording the
+    /// model's: the side keeps no tolerance but a slack's evaluation margin.
+    /// The caller moves the var, non-basic, onto it.
+    pub(super) fn widen(&mut self, var: usize, up: bool, edge: f64) {
+        let model = if up {
+            std::mem::replace(&mut self.orig_var_maxs[var], edge)
+        } else {
+            std::mem::replace(&mut self.orig_var_mins[var], edge)
+        };
+        self.widened.push(WidenedBound { var, up, model });
+        if var < self.num_vars {
+            if up {
+                self.var_tols[var].hi = 0.0;
+            } else {
+                self.var_tols[var].lo = 0.0;
+            }
+        } else {
+            self.var_tols[var] = self.current_slack_tols(var - self.num_vars);
+        }
+    }
+
+    /// Restore the model's bounds and tolerances that the last solve widened
+    /// ([`Self::widen`]), a non-basic var outside the model's bounds moving
+    /// onto them, so that every solve starts from the model.
+    pub(super) fn restore_model_bounds(&mut self) {
+        if self.widened.is_empty() {
+            return;
+        }
+        let mut vars = Vec::new();
+        for w in std::mem::take(&mut self.widened) {
+            if w.up {
+                self.orig_var_maxs[w.var] = w.model;
+            } else {
+                self.orig_var_mins[w.var] = w.model;
+            }
+            if !vars.contains(&w.var) {
+                vars.push(w.var);
+            }
+        }
+        let mut moves = Vec::new();
+        for var in vars {
+            let (min, max) = (self.orig_var_mins[var], self.orig_var_maxs[var]);
+            self.var_tols[var] = if var < self.num_vars {
+                structural_tol(
+                    self.col_scales[var],
+                    min,
+                    max,
+                    self.feasibility,
+                    self.is_integer(var),
+                )
+            } else {
+                self.current_slack_tols(var - self.num_vars)
+            };
+            match self.var_states[var] {
+                VarState::Basic(row) => {
+                    self.basic_var_mins[row] = min;
+                    self.basic_var_maxs[row] = max;
+                }
+                VarState::NonBasic(col) => {
+                    let val = self.nb_var_vals[col];
+                    let target = val.clamp(min, max);
+                    if target == val {
+                        self.nb_var_states[col] = self.nonbasic_state(var, val);
+                    } else {
+                        moves.push((col, target));
+                    }
+                }
+            }
+        }
+        self.apply_flips(&moves);
+        for &(col, _) in &moves {
+            self.downgrade_dual_feasibility(col);
+        }
+        self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
     }
 }
 

@@ -20,20 +20,25 @@
 //! unbounded where it is infinite, with one concession for the error of the
 //! multipliers ([`Solver::proof_of`]).
 //!
-//! The certificate proves infeasibility when its gap exceeds the tolerance
-//! the engine holds the leaving var to at the bound it violates (`var_tols`),
-//! plus the round-off allowance of the compensated sums, with no tolerance on
-//! the other terms. That is the tolerance by which the dual simplex found the
-//! row violated, so a proof says that no point has that var within its
-//! tolerance and every other term within its bounds; any other tolerance
-//! would leave a band where a row is violated for the simplex yet not
-//! infeasible for the proof, and nothing that can act on it. The price: a
-//! model is reported infeasible when its points all need more room than that,
-//! on the leaving var (beyond its contract less the round-off of evaluating
-//! its row) or on another term (rows that agree only within their
-//! tolerances, which the certificate takes as exact).
+//! The certificate proves infeasibility when its gap exceeds the room the
+//! engine can give its terms, plus the round-off allowance of the compensated
+//! sums: the leaving var the tolerance by which the dual simplex found the
+//! row violated (`var_tols`: for a slack, its row's contract less the
+//! round-off of evaluating the row; for a structural var, its whole bound
+//! contract, none for an integer var its bounds fix), and every other term
+//! the room by which the last resort can widen its bound in the direction
+//! that helps ([`Solver::widening_room`]: a structural var's tolerance, a
+//! slack's less the evaluation margin the widened side keeps, none for a
+//! bound already widened or a var the engine keeps on its bounds), each up
+//! to the farthest value `f64` holds within it, times its coefficient. So a
+//! proof says that no point has its terms within the room the engine can
+//! reach, and a row the proof leaves open is the last resort's
+//! ([`Solver::certificate_repair`]), which can widen the same bounds by the
+//! same room: rows that agree only within their tolerances together are
+//! solved, not reported infeasible. The price: a model whose points all need
+//! more room than that is reported infeasible.
 
-use super::{Solver, ROUNDOFF_FLOOR};
+use super::{band_edge, Solver, ROUNDOFF_FLOOR};
 
 /// A compensated double: the unevaluated sum `hi + lo` of two `f64`, which
 /// carries about twice the precision of one. The proof accumulates products
@@ -182,8 +187,8 @@ pub(super) struct Proof {
     /// direction makes the range unbounded, and NaN when a number of the
     /// certificate is not finite, which voids it.
     pub(super) gap: f64,
-    /// The leaving var's tolerance the gap must exceed (see the module doc),
-    /// plus the allowance for the error of the compensated sums
+    /// The room of the certificate's terms the gap must exceed (see the
+    /// module doc), plus the allowance for the error of the compensated sums
     /// ([`COMPENSATED_ERROR`]).
     pub(super) allowance: f64,
 }
@@ -449,16 +454,20 @@ impl Solver {
     ///
     /// A number of the certificate that is not finite (an overflow: a huge
     /// multiplier or coefficient, or Dekker's split of one beyond about
-    /// `1.3e300`) voids it, with a NaN gap. The gap must exceed the leaving
-    /// var's tolerance at the bound it violates plus the round-off allowance
-    /// of the sums (see the module doc).
+    /// `1.3e300`) voids it, with a NaN gap. The gap must exceed the room of
+    /// every term at the bound it counts at (the leaving var's tolerance, any
+    /// other's widening room) plus the round-off allowance of the sums (see
+    /// the module doc).
     pub(super) fn proof_of(&self, refined: &RefinedRow, row: usize, leaving_up: bool) -> Proof {
         let cert = self.certificate(refined, leaving_up);
+        let leaving = self.basic_vars[row];
         let (mut magnitude, mut terms) = (cert.magnitude, cert.terms);
         // Whether every number of the certificate is finite (see above).
         let mut finite = cert.beta.value().is_finite();
         // The largest value of `p^T z` over the box.
         let mut implied_max = CDouble::default();
+        // How far past that the terms' room carries it.
+        let mut room = 0.0;
         let mut unbounded = false;
         // How many coefficients count as zero (see above), for the log.
         let mut zero_within_error = 0;
@@ -496,6 +505,13 @@ impl Solver {
             // summed from, not to what they left, is carried by the bound.
             magnitude += cert.magnitudes[var] * bound.abs();
             terms += 1;
+            if var == leaving {
+                let tol = self.var_tols[var].toward(p > 0.0);
+                room += p.abs() * (band_edge(bound, tol, p > 0.0) - bound).abs();
+            } else if !self.holds_on_bounds(var) {
+                let reach = self.widening_room(var, p > 0.0);
+                room += p.abs() * (band_edge(bound, reach, p > 0.0) - bound).abs();
+            }
         }
         let gap = if !finite {
             f64::NAN
@@ -512,11 +528,9 @@ impl Solver {
                 f64::NAN
             }
         };
-        // The leaving var's tolerance at the bound it violates (see the
-        // module doc), plus the round-off allowance of the compensated sums.
-        let leaving = self.basic_vars[row];
-        let allowance = self.var_tols[leaving].toward(!leaving_up)
-            + (terms as f64 + 1.0) * COMPENSATED_ERROR * magnitude;
+        // Every term's room (see the module doc), plus the round-off
+        // allowance of the compensated sums.
+        let allowance = room + (terms as f64 + 1.0) * COMPENSATED_ERROR * magnitude;
         let proof = Proof {
             holds: gap > allowance,
             gap,
@@ -542,26 +556,33 @@ impl Solver {
     /// The last resort of the dual simplex for a violated `row` that no var
     /// can repair, not even by a pivot on an unstable entry, and that does
     /// not prove the model infeasible (see [`Self::dual_phase`]): the
-    /// non-basic vars that can close the gap move, first to their bound in
-    /// the direction that helps (flipped, or the last one, if a flip would
-    /// carry the leaving var past its other bound, only partway, where it
-    /// stays non-basic between its bounds), then, if that is not enough,
-    /// past it within their tolerance, where they stay at that bound.
-    /// The moves are applied through the vars' columns and kept only if the
-    /// leaving var then lands within its tolerance; returns whether it did
-    /// (the moves are undone if not).
+    /// non-basic vars that can close the gap move. First they flip to their
+    /// bound in the direction that helps (the last one, if a flip would carry
+    /// the leaving var past its other bound, only partway, where it stays
+    /// non-basic between its bounds), kept, if `flips_allowed`, when that
+    /// lands the leaving var within its tolerance, computed through their
+    /// columns. Otherwise, largest reach first, the bound each sits at in
+    /// that direction is widened by its room ([`Self::widening_room`]) for
+    /// the rest of the solve ([`Self::widen`]) and the var moves onto it,
+    /// until the leaving var reaches its target or none is left; a widened
+    /// var stays at the bound it sat at, dual feasible, and the dual simplex
+    /// goes on over the bounds in force. That is the room the proof grants
+    /// every term but the leaving var ([`Self::proof_of`]), so a row it
+    /// leaves open has a widening until the room of every var that can help
+    /// it is spent, and a phase widens finitely often.
     ///
     /// The `wide_chain` fixtures of `src/tests/magnitudes.rs` need the
     /// flips: their only repair moves a var through an entry of `1.5e-15`
-    /// beside `1.95`, below every pivot floor. The tolerances are the room of
-    /// a row every var that could move sits at the bound that blocks, short
-    /// of its bound by a tolerance
+    /// beside `1.95`, below every pivot floor. The widening is the room of a
+    /// row every var that could move sits at the bound that blocks, short of
+    /// its bound by a tolerance, alone or with other rows
     /// (`the_repair_moves_vars_past_their_bounds_within_their_tolerances`).
-    /// An integer var never leaves its bound, where presolve's rewrite of a
-    /// big-M row holds exactly (past it, the row as written is tighter than
-    /// the rewritten one by the cut coefficient times the move), and a fixed
-    /// structural var never leaves its value, at which presolve checks the
-    /// rows it substituted it out of.
+    /// A var the engine keeps on its bounds ([`Self::holds_on_bounds`]) is
+    /// never widened: an integer var's bounds are where presolve's rewrite of
+    /// a big-M row holds exactly (past them, the row as written is tighter
+    /// than the rewritten one by the cut coefficient times the move), and a
+    /// fixed structural var's value is where presolve checks the rows it
+    /// substituted it out of.
     ///
     /// The moves are read off the certificate, not off the tableau row: a var
     /// takes part only where its coefficient is finite and not round-off
@@ -569,61 +590,21 @@ impl Solver {
     /// it helps and with a finite bound there, and it carries the leaving var
     /// by its coefficient times its move. That is its tableau entry times its
     /// move only where the certificate keeps every row of the var; where it
-    /// does not, the move misses, the landing check undoes it, and the row is
-    /// left to the loud error of [`Self::dual_phase`]. A round-off
-    /// coefficient, which the proof counts on a finite bound, makes no move:
-    /// the round-off floors of the ratio tests hide such an entry from the
-    /// rest of the engine, so the primal step would take the move back and
-    /// the phases would alternate until `MAX_PHASE_ROUNDS`.
-    pub(super) fn certificate_repair(&mut self, row: usize) -> bool {
+    /// does not, a flip misses and is undone, and a widening leaves the row to
+    /// the dual simplex. A round-off coefficient, which the proof counts on a
+    /// finite bound, makes
+    /// no move: the round-off floors of the ratio tests hide such an entry
+    /// from the rest of the engine, so the primal step would take the move
+    /// back and the phases would alternate until `MAX_PHASE_ROUNDS`.
+    pub(super) fn certificate_repair(&mut self, row: usize, flips_allowed: bool) -> Repair {
         let refined = self.refined_basis_inverse_row(row);
         let leaving_new_val = self.leaving_target(row);
-        let Some(moves) = self.certificate_moves(&refined, row, leaving_new_val) else {
-            return false;
-        };
-        let undo: Vec<(usize, f64)> = moves
-            .iter()
-            .map(|&(c, _)| (c, self.nb_var_vals[c]))
-            .collect();
-        self.apply_flips(&moves);
-        if !self.basic_var_within_bounds(row) {
-            self.apply_flips(&undo);
-            return false;
-        }
-        trace!(
-            "dual certificate repair: vars moved {:?}, var {} of row {row} lands at {:e}",
-            moves
-                .iter()
-                .map(|&(c, val)| (self.nb_vars[c], val))
-                .collect::<Vec<_>>(),
-            self.basic_vars[row],
-            self.basic_var_vals[row],
-        );
-        for &(c, _) in &moves {
-            // No dual step went with the move, so the var's reduced cost may
-            // have the wrong sign where it landed: its cost is shifted until
-            // it has the right one, and the cleanup gives the shift back.
-            self.shift_to_dual_feasible(c);
-        }
-        true
-    }
-
-    /// The moves of [`Self::certificate_repair`] that bring the basic var of
-    /// `row` to `leaving_new_val`, within its tolerance, read off the
-    /// certificate of the multipliers of `refined`, as (col, value); `None`
-    /// if the vars that can help cannot.
-    fn certificate_moves(
-        &self,
-        refined: &RefinedRow,
-        row: usize,
-        leaving_new_val: f64,
-    ) -> Option<Vec<(usize, f64)>> {
         let val = self.basic_var_vals[row];
         let leaving_up = leaving_new_val > val;
-        let cert = self.certificate(refined, leaving_up);
+        let cert = self.certificate(&refined, leaving_up);
         let tols = self.var_tols[self.basic_vars[row]];
         // How far the leaving var must move, the tolerance within which it
-        // counts as there, and how far past it a move may carry it (to its
+        // counts as there, and how far past it a flip may carry it (to its
         // other bound, within that bound's tolerance).
         let need = (val - leaving_new_val).abs();
         let (target_tol, room_past_target) = if leaving_up {
@@ -638,10 +619,9 @@ impl Solver {
             )
         };
         // The vars that can help, as (col, coefficient, bound it moves to,
-        // whether it sits there already, its tolerance there). A var helps
-        // by moving up where its coefficient is positive, down where it is
-        // negative.
-        let helpers: Vec<(usize, f64, f64, bool, f64)> = self
+        // whether it sits there already). A var helps by moving up where its
+        // coefficient is positive, down where it is negative.
+        let helpers: Vec<(usize, f64, f64, bool)> = self
             .nb_vars
             .iter()
             .enumerate()
@@ -650,13 +630,13 @@ impl Solver {
                 if !p.is_finite() || cert.is_round_off(var, p) {
                     return None;
                 }
-                let (state, tols) = (&self.nb_var_states[c], self.var_tols[var]);
-                let (at_bound, bound, tol) = if p > 0.0 {
-                    (state.at_max, self.orig_var_maxs[var], tols.hi)
+                let state = &self.nb_var_states[c];
+                let (at_bound, bound) = if p > 0.0 {
+                    (state.at_max, self.orig_var_maxs[var])
                 } else {
-                    (state.at_min, self.orig_var_mins[var], tols.lo)
+                    (state.at_min, self.orig_var_mins[var])
                 };
-                bound.is_finite().then_some((c, p, bound, at_bound, tol))
+                bound.is_finite().then_some((c, p, bound, at_bound))
             })
             .collect();
         let mut moves = Moves {
@@ -671,39 +651,107 @@ impl Solver {
             helpers
                 .iter()
                 .filter(|h| !h.3)
-                .map(|&(c, p, bound, _, _)| (c, p, self.nb_var_vals[c], bound))
+                .map(|&(c, p, bound, _)| (c, p, self.nb_var_vals[c], bound))
                 .collect(),
         );
-        // Then, if that is not enough, past them within their tolerances.
-        // An integer var stays on its bound, and a fixed structural var at
-        // its value (see the doc above).
-        if !moves.landed() {
-            let band = helpers
+        if moves.landed() {
+            if !flips_allowed {
+                return Repair::Nothing;
+            }
+            let undo: Vec<(usize, f64)> = moves
+                .list
                 .iter()
-                .filter(|&&(c, _, _, _, tol)| {
-                    let var = self.nb_vars[c];
-                    let fixed =
-                        var < self.num_vars && self.orig_var_mins[var] == self.orig_var_maxs[var];
-                    tol > 0.0 && !self.is_integer(var) && !fixed
-                })
-                .map(|&(c, p, bound, _, tol)| {
-                    // Every var a first move takes reaches its bound.
-                    let from = if moves.list.iter().any(|&(col, _)| col == c) {
-                        bound
-                    } else {
-                        self.nb_var_vals[c]
-                    };
-                    (c, p, from, band_edge(bound, tol, p > 0.0))
-                })
+                .map(|&(c, _)| (c, self.nb_var_vals[c]))
                 .collect();
-            moves.take(band);
+            self.apply_flips(&moves.list);
+            if !self.basic_var_within_bounds(row) {
+                self.apply_flips(&undo);
+                return Repair::Nothing;
+            }
+            self.finish_repair(row, &moves.list, 0);
+            return Repair::Flipped;
         }
-        moves.landed().then_some(moves.list)
+        // Then past them: largest reach first, each var's bound in the
+        // direction it helps widened by its room, with the var on it.
+        let mut band: Vec<(usize, usize, bool, f64, f64)> = helpers
+            .iter()
+            .filter_map(|&(c, p, bound, _)| {
+                let var = self.nb_vars[c];
+                let up = p > 0.0;
+                let room = self.widening_room(var, up);
+                if self.holds_on_bounds(var) || room <= 0.0 {
+                    return None;
+                }
+                let edge = band_edge(bound, room, up);
+                // Every var a flip took sits at its bound.
+                let from = if moves.list.iter().any(|&(col, _)| col == c) {
+                    bound
+                } else {
+                    self.nb_var_vals[c]
+                };
+                let reach = p * (edge - from);
+                (reach > 0.0 && reach.is_finite()).then_some((c, var, up, edge, reach))
+            })
+            .collect();
+        band.sort_by(|a, b| b.4.total_cmp(&a.4));
+        let mut widened = Vec::new();
+        for (c, var, up, edge, reach) in band {
+            if moves.landed() {
+                break;
+            }
+            moves.moved += reach;
+            moves.set(c, edge);
+            widened.push((var, up, edge));
+        }
+        if widened.is_empty() {
+            return Repair::Nothing;
+        }
+        for &(var, up, edge) in &widened {
+            self.widen(var, up, edge);
+        }
+        self.apply_flips(&moves.list);
+        self.finish_repair(row, &moves.list, widened.len());
+        Repair::Widened
+    }
+
+    /// Log the certificate repair's `moves` of `row` (see
+    /// [`Self::certificate_repair`]), `widened` of them onto widened bounds,
+    /// and shift the costs a flip leaves dual infeasible.
+    fn finish_repair(&mut self, row: usize, moves: &[(usize, f64)], widened: usize) {
+        trace!(
+            "dual certificate repair: vars moved {:?} ({widened} onto widened bounds), var {} of \
+             row {row} at {:e}",
+            moves
+                .iter()
+                .map(|&(c, val)| (self.nb_vars[c], val))
+                .collect::<Vec<_>>(),
+            self.basic_vars[row],
+            self.basic_var_vals[row],
+        );
+        for &(c, _) in moves {
+            // No dual step went with a flip, so the var's reduced cost may
+            // have the wrong sign where it landed: its cost is shifted until
+            // it has the right one, and the cleanup gives the shift back. A
+            // widened var stays at the bound it sat at, which needs none.
+            self.shift_to_dual_feasible(c);
+        }
     }
 }
 
-/// The moves [`Solver::certificate_moves`] collects: how far the leaving var
-/// must go (`need`), within `target_tol`, and may overshoot
+/// What [`Solver::certificate_repair`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Repair {
+    /// Its flips landed the row.
+    Flipped,
+    /// It widened at least one bound.
+    Widened,
+    /// Nothing: the flips do not land the row or are not allowed, and no
+    /// bound is left to widen.
+    Nothing,
+}
+
+/// The moves [`Solver::certificate_repair`] collects: how far the leaving var
+/// must go (`need`), within `target_tol`, and a flip may overshoot
 /// (`room_past_target`), how far the moves so far carry it, and the moves,
 /// as (col, value).
 struct Moves {
@@ -750,20 +798,15 @@ impl Moves {
                     from - step
                 }
             };
-            match self.list.iter_mut().find(|(col, _)| *col == c) {
-                Some(entry) => entry.1 = value,
-                None => self.list.push((c, value)),
-            }
+            self.set(c, value);
         }
     }
-}
 
-/// The farthest value past `bound`, above it (`up`) or below, within `tol`
-/// of it: `bound ± tol`, less the round-off of that sum.
-fn band_edge(bound: f64, tol: f64, up: bool) -> f64 {
-    let mut edge = if up { bound + tol } else { bound - tol };
-    while (edge - bound).abs() > tol {
-        edge = if up { edge.next_down() } else { edge.next_up() };
+    /// Move `col` to `value`, replacing an earlier move of it.
+    fn set(&mut self, col: usize, value: f64) {
+        match self.list.iter_mut().find(|(c, _)| *c == col) {
+            Some(entry) => entry.1 = value,
+            None => self.list.push((col, value)),
+        }
     }
-    edge
 }
