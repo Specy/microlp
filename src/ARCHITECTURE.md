@@ -151,15 +151,15 @@ These normalizations happen at the boundary and hold everywhere inside:
   budget, each var within its bound tolerance; dual fixing keeps an optimum), and a
   continuous var keeps its bounds (§7). No other point is guaranteed: a point beyond the
   box, within the contract by less than the round-off of evaluating a row, can be cut, and
-  so can a point within the box only with an integer var off its integer, within
-  `int_tol`, which the search can reach without
-  presolve through its LP and which fixing the var, tightening its bounds or rewriting its
-  coefficient can take away (§7, known limitations). So an `Infeasible` the engine or the
-  search proves on the reduced model is final on every path (the solve, a resume, an edit),
-  but for a model whose every point needs the integrality tolerance. When presolve finds the
-  model infeasible, or reduces nothing, the solve goes on with the model as written
-  (`presolve::reduced_model`, logged at debug level), so the verdict is the engine's, which
-  returns `Infeasible` only on a proof, or the search's.
+  so can a point within the box only with an integer var off its integer, within `int_tol`,
+  which the search can reach without presolve through its LP and which fixing the var,
+  tightening its bounds or rewriting its coefficient can take away (§7, known limitations).
+  So an `Infeasible` the engine or the search proves on the reduced model is final on every
+  path (the solve, a resume, an edit), but for a model whose every point needs the
+  integrality tolerance. When presolve finds the model infeasible, or reduces nothing, the
+  solve goes on with the model as written (`presolve::reduced_model`, logged at debug
+  level), so the verdict is the engine's, which returns `Infeasible` only on a proof, or the
+  search's.
 
 `prepare_row` is the single row-normalization contract used by both `Solver::try_new` and
 incremental `Solver::add_constraint`. It settles the rows whose data alone decide them
@@ -765,10 +765,15 @@ values, and the verified point itself is what is reported (`reported_values`, as
 computed), so it passes the checks at the boundary (§3.1), which sum each row in
 compensated arithmetic within the round-off its tolerance keeps. Periodic refactorization
 renews the factorization and, once per full basis turnover of pivots, checks the rows and
-recomputes the values if they drifted. A recompute is not a verification: on an
-ill-conditioned basis a solve through the factorization can leave a residual above a
-row's tolerance, so recomputed values stay unverified until the next phase exit checks
-and, if needed, refines them.
+recomputes the values if they drifted, which starts the cycling detection afresh (*Cycling*
+below). Every recompute sums `b − N x_N` in compensated arithmetic, as the refinement sums
+its residual: a plain sum keeps the round-off of a row's terms where they cancel, which that
+row's tolerance covers, but the solve carries it into the other basic vars and through them
+into rows it can miss many times over
+(`a_cancelling_row_leaves_no_round_off_in_the_recomputed_values`). A recompute is not a
+verification: on an ill-conditioned basis a solve through the factorization can leave a
+residual above a row's tolerance, so recomputed values stay unverified until the next phase
+exit checks and, if needed, refines them.
 
 **Presolve** (`src/presolve/`, module docs) makes its decisions with the same model, in
 user units:
@@ -1007,16 +1012,20 @@ and objective value of the phase is the working costs'.
   lead to visited vertices, the change is recorded as bad and its row made taboo (not chosen
   to leave) until a rebuild; a bad change seen again is taboo at once; a record is dropped
   once a pivot moves its row by more than the row's tolerance. A rebuild lifts the taboos
-  but keeps the records, which last the phase, since the engine refactorizes too often for a
-  record dropped at refactorization to outlive its cycle. A basis repair within the phase
-  records its change back as bad, taboo at once. The rows a step moved are forgotten after its
-  refactorization, so the record of a repair that the step's refactorization made goes too if
-  the step moved its row: the phase may then take the change again, on the eta file, rather
-  than run out of changes. A cycling change later in the phase is recorded as singular too,
-  since it can lead back to that basis by another route. When a rebuild leaves only taboo
-  rows violated, none of which failed an infeasibility proof (those get the last resorts), the
-  phase fails with an `InternalError`, which names a singular basis when a change left leads
-  to one.
+  but keeps the records, although it recomputes the values; they last the phase, since the
+  engine refactorizes too often for a record dropped at refactorization to outlive its cycle.
+  A refactorization that finds the values drifted and recomputes them starts the detection
+  afresh, as a widening does, forgetting every vertex and record of the phase, a repair's
+  too: the phase reached its vertex on the drifted values, so a return to one it visited need
+  not be a cycle (`a_vertex_left_on_drifted_values_can_be_returned_to`). A basis repair
+  within the phase records its change back as bad, taboo at once. The rows a step moved are
+  forgotten after its refactorization, so the record of a repair that the step's
+  refactorization made goes too if the step moved its row: the phase may then take the change
+  again, on the eta file, rather than run out of changes. A cycling change later in the phase
+  is recorded as singular too, since it can lead back to that basis by another route, unless
+  a restart forgot the repair. When a rebuild leaves only taboo rows violated, none of which
+  failed an infeasibility proof (those get the last resorts), the phase fails with an
+  `InternalError`, which names a singular basis when a change left leads to one.
 - *Stall bound*: every `STALL_ITERATIONS` (10,000) iterations of a phase, the working
   objective must have risen beyond round-off, or the phase fails with an `InternalError`, so
   a cycle the hash misses ends loudly instead of never. A basis repair moves a var to a bound
@@ -1090,9 +1099,9 @@ Known limitations:
   finds singular, after a pivot on an entry some `1e-14` of its column, can end in an
   `InternalError` that names a singular basis: the repair takes a column out, and the phase
   can run out of changes that do not lead back to that basis (the change back stays taboo
-  when the step into that basis moved no row). The models found so lie outside the
-  recommended range
-  (`a_primal_step_into_a_basis_the_factorization_finds_singular_is_a_known_limitation`);
+  when the step into that basis moved no row). The models found so, such as
+  `a_primal_step_into_a_basis_the_factorization_finds_singular_is_a_known_limitation`, lie
+  outside the recommended range;
 - the primal ratio test's round-off scale is its column's largest entry, so a genuine
   blocking entry below `ENTRY_ROUNDOFF` of a huge entry in rows that cannot block counts as
   noise and a bounded LP can come back `Unbounded`; a scale over the blocking rows alone
@@ -1115,8 +1124,9 @@ Known limitations:
 - an ill-conditioned vertex whose computed values the rows and bounds accept, but whose
   exact values miss a bound, keeps its computed values (*Verified termination*), so the
   basis can amplify their round-off into the objective and the answer, within the
-  contract, is worse than the optimum: taking the exact values instead lets the primal
-  phase, which steps in plain `f64`, come back to such a vertex until `MAX_PHASE_ROUNDS`
+  contract, is worse than the optimum: with the exact values instead, the phases do not
+  leave such a vertex for good, since a primal step or a solve through the basis computes
+  its values in plain `f64` again, until the solve fails after `MAX_PHASE_ROUNDS`
   (`a_vertex_whose_exact_values_miss_a_bound_keeps_its_computed_ones`). The pinned model lies
   inside the recommended range: a cancelling row leaves a var `5.5e-8` off its exact value,
   and a row of dynamism `7.5e5` amplifies that into a basic var, `0.964` as computed and

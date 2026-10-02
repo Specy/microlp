@@ -1239,9 +1239,13 @@ impl Solver {
     /// drifted out of the rows' tolerances. Recomputing values that satisfy
     /// every row would not improve them and, next to a bound, can move a var
     /// by a round-off amount the rows allow but its own tolerance does not.
-    /// The reduced costs are left to their incremental updates; the phase
-    /// exit recomputes them exactly. A repaired basis is a new vertex, whose
-    /// values and reduced costs are recomputed, as in a rebuild.
+    /// Values found drifted also restart the cycling detection, as a
+    /// widening does, forgetting every vertex and bad change of the phase, a
+    /// basis repair's too: the phase reached its vertex on those values, so a
+    /// return to one it visited need not be a cycle. The reduced costs are
+    /// left to their incremental updates; the phase exit recomputes them
+    /// exactly. A repaired basis is a new vertex, whose values and reduced
+    /// costs are recomputed, as in a rebuild.
     fn refactorize(&mut self) -> Result<(), Error> {
         if self.factorize() {
             self.recalc_basic_var_vals()?;
@@ -1254,6 +1258,7 @@ impl Solver {
             self.pivots_since_drift_check = 0;
             if !self.check_rows() {
                 self.recalc_basic_var_vals()?;
+                self.start_cycle_detection();
             }
         }
         Ok(())
@@ -3619,22 +3624,17 @@ impl Solver {
         Ok(())
     }
 
+    /// Recompute the basic values from the non-basic ones: a refinement
+    /// ([`Self::refine`]) from zero, so that `b - N x_N` is summed in
+    /// compensated arithmetic. A plain sum keeps the round-off of a row's
+    /// terms where they cancel (a fixed var's large term against the
+    /// right-hand side), which the row's own tolerance covers, but the solve
+    /// carries it into the other basic vars, and through them into rows whose
+    /// tolerance it can exceed many times over. Etas are applied to the dense
+    /// solve directly; a pending eta file does not require a refactorization.
     fn recalc_basic_var_vals(&mut self) -> Result<(), Error> {
-        let mut cur_vals = self.orig_rhs.clone();
-        for (i, var) in self.nb_vars.iter().enumerate() {
-            let val = self.nb_var_vals[i];
-            if val != 0.0 {
-                //guaranteed to be a valid index
-                for (r, &coeff) in self.orig_constraints_csc.outer_view(*var).unwrap().iter() {
-                    cur_vals[r] -= val * coeff;
-                }
-            }
-        }
-
-        // Etas are applied to the dense solve directly; a pending eta file
-        // does not require a full basis refactorization.
-        self.basis_solver.solve_dense_with_etas(&mut cur_vals);
-        self.basic_var_vals = cur_vals;
+        self.basic_var_vals.fill(0.0);
+        self.refine();
         // Basic slacks re-derived from their rows and the slack tolerances
         // refreshed; whether the rows hold is the caller's business.
         self.check_rows();

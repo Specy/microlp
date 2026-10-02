@@ -1187,21 +1187,41 @@ mod regression_tests {
         }
     }
 
-    /// `-19.63 x0 + x1 = -2389797937.98` with `x0` fixed at `121736438` puts
-    /// `x1` at `0.125000683`, `1.8e-7` past its bound, beyond its tolerance;
-    /// but the row's tolerance (`4.8e-5`, the round-off floor of its
-    /// magnitude) also admits `0.125000428`, which `x1 = 0.125000428` asks.
-    /// The vertex with `x1` basic in the first row, computed in plain `f64`,
-    /// cancels `2.4e9` against itself and puts `x1` at `0.1250004768`, which
-    /// the rows and bounds accept, with the second row's slack past its bound
-    /// by round-off. Refined, the vertex is rejected: the dual phase moves
-    /// `x1` to its bound, the primal phase steps back, and a recomputation in
-    /// plain `f64` accepts the vertex where the refinement does not, until
-    /// the rounds run out. A refinement that turns accepted values into
-    /// rejected ones keeps the computed values instead.
+    /// `-10 x0 + 0.01 x1 = 20971520.000000007`, with `x0` held at
+    /// `-2097152.000000001` by the first row, puts `x1` at `-1.86e-7`, past
+    /// its bound beyond its tolerance; but the row's tolerance (`4.2e-7`, the
+    /// round-off floor of its magnitude) also admits `x1 = 0`, which is `x*`.
+    /// In plain `f64`, `10 x0` rounds onto the right-hand side, so the vertex
+    /// with both vars basic computes `x1 = 0`, by a step or by a solve
+    /// through the basis (the cancellation lies inside the solve, beyond a
+    /// compensated `b - N x_N`). Refined, `x1` lies past its bound, but the
+    /// phases do not leave the vertex for good: a primal zero step or a
+    /// rebuild's solve computes `x1 = 0` again, until the rounds run out. A
+    /// refinement that turns accepted values into rejected ones keeps the
+    /// computed values instead. The rows lie inside the recommended range
+    /// (row dynamism `1e3`). In the second model, a dual step through a row
+    /// that cancels `2.4e9` against itself (`x0` fixed) computes
+    /// `x1 = 0.125000428`, within its bound, where exactly it is
+    /// `0.125000683`, `1.8e-7` past it.
     #[test]
     fn a_vertex_whose_exact_values_miss_a_bound_keeps_its_computed_ones() {
-        let model = || Model {
+        let rounded_onto_the_rhs = Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, -2097152.000000001, -2097151.000000001),
+                real(1.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(0, 1.0)], ComparisonOp::Eq, -2097152.000000001),
+                row(
+                    &[(0, -10.0), (1, 0.01)],
+                    ComparisonOp::Eq,
+                    20971520.000000007,
+                ),
+            ],
+            xstar: vec![-2097152.000000001, 0.0],
+        };
+        let cancelling = Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
                 real(-1.0, 121736438.0, 121736438.0),
@@ -1217,8 +1237,10 @@ mod regression_tests {
             ],
             xstar: vec![121736438.0, 0.125000428093828],
         };
-        check(model());
-        assert_solves_within_contract_without_presolve(&model());
+        for model in [rounded_onto_the_rhs, cancelling] {
+            assert_solves_within_contract_without_presolve(&model);
+            check(model);
+        }
     }
 
     /// KNOWN LIMITATION (ARCHITECTURE §7): an ill-conditioned vertex whose
@@ -1256,6 +1278,91 @@ mod regression_tests {
             ],
             xstar: vec![67109.0, 0.0, 1.0, 1.0],
         });
+    }
+
+    /// `1.89 x0 + 0.00683 x2 = 188999979.21` with `x0` fixed at `99999989`
+    /// cancels to the last bit, and pins `x2` within `5.5e-4` of `2.7e-6`
+    /// through the row's round-off floor `3.8e-6`, which the answer uses.
+    /// Edited at the answer's values (a var fixed at its value, or a row
+    /// bounding it there), the model solves, presolve on and off. A recompute
+    /// of the basic values summed `b - N x_N` in `f64`, which kept `1.2e-8` of
+    /// the first row's round-off; through the basis that put `x2` `1.7e-6`
+    /// off, and the fourth row's slack `3.2e-3` off its exact value where
+    /// the row allows `1e-7`: the dual simplex repaired a violation of the
+    /// wrong sign, and no var could ("no var can repair row"). In the
+    /// recommended range (dynamism at most `5.5e4`).
+    #[test]
+    fn a_cancelling_row_leaves_no_round_off_in_the_recomputed_values() {
+        let model = |fixed: Option<(usize, f64)>, bounded: Option<(usize, f64)>| {
+            let mut vars = vec![
+                real(-1.0, 99999989.0, 99999989.0),
+                real(-2.0, 0.0, 1.0),
+                real(-1.0, -2.0, 0.0),
+                real(0.0, -2.0, 0.0),
+                real(1.0, -2.0, 0.0),
+                real(0.5, -2.0, 0.0),
+            ];
+            let mut rows = vec![
+                row(&[(0, 1.89), (2, 0.00683)], ComparisonOp::Eq, 188999979.21),
+                row(&[(2, 1.44)], ComparisonOp::Le, 0.0),
+                row(
+                    &[
+                        (1, -0.0214),
+                        (2, 5.69),
+                        (3, -0.796),
+                        (4, -69.2),
+                        (5, -0.00562),
+                    ],
+                    ComparisonOp::Eq,
+                    1.5706,
+                ),
+                row(
+                    &[(2, 318.0), (3, 218.0), (4, 0.00581)],
+                    ComparisonOp::Eq,
+                    -436.0,
+                ),
+                row(
+                    &[(1, -29.8), (4, -0.0309), (5, 14.2)],
+                    ComparisonOp::Eq,
+                    -29.8,
+                ),
+            ];
+            if let Some((var, value)) = fixed {
+                (vars[var].lo, vars[var].hi) = (value, value);
+            }
+            if let Some((var, value)) = bounded {
+                rows.push(row(&[(var, 1.0)], ComparisonOp::Le, value));
+            }
+            Model {
+                direction: OptimizationDirection::Maximize,
+                vars,
+                rows,
+                xstar: vec![
+                    99999989.0,
+                    0.8964647784891895,
+                    -0.0005016330258672402,
+                    -1.999268260081533,
+                    0.0,
+                    -0.21727814091707387,
+                ],
+            }
+        };
+        let (x1, x2, x5) = (
+            0.8964647784891895,
+            -0.0005016330258672402,
+            -0.21727814091707387,
+        );
+        for (fixed, bounded) in [
+            (Some((1, x1)), None),
+            (Some((5, x5)), None),
+            (None, Some((1, x1))),
+            (None, Some((2, x2))),
+            (None, Some((5, x5))),
+        ] {
+            let model = model(fixed, bounded);
+            assert!(xstar_is_feasible(&model), "fixture: the answer's point");
+            assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+        }
     }
 
     /// `2^53 x0 + 0.75 (x1 + ... + x300) - 2^53 x301 >= 225` with `x0` and
@@ -1448,6 +1555,49 @@ mod regression_tests {
             "fixture error: x* must satisfy the model"
         );
         assert_solves_within_contract_in_time(&model, Duration::from_secs(10));
+    }
+
+    /// A vertex the dual simplex left on drifted values is no cycle when it
+    /// returns. The root LP starts `x2` at its lower bound, where the second
+    /// row's terms reach `1.4e11`; its first step flips `x2` to 0, and the
+    /// values the steps carry on keep the round-off of those terms: two
+    /// pivots later they put `x4` `9.5e-6` past its upper bound, beyond its
+    /// tolerance `4.2e-6`, where exactly it lies within, and the phase leaves
+    /// that vertex. The drift check after the next pivot recomputes the
+    /// values; the way back to the vertex followed a revisit, which made the
+    /// change back taboo for good ("dual simplex cycles"), presolve on and
+    /// off. Within the recommended range (row dynamism `6.7e5`).
+    #[test]
+    fn a_vertex_left_on_drifted_values_can_be_returned_to() {
+        let model = Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(-1.0, 0, 1),
+                real(1.0, -651624630.0, -651623443.0),
+                real(0.0, -136593742.0, 0.0),
+                real(-1.0, -1.0, 0.0),
+                real(-1.0, -422117195.0000001, -422117194.0000001),
+            ],
+            rows: vec![
+                row(
+                    &[(0, 0.01), (1, -1.0), (4, -1.0)],
+                    ComparisonOp::Eq,
+                    1073741824.0,
+                ),
+                row(
+                    &[(1, 0.0015), (2, 1000.0), (3, 0.1), (4, 2.0)],
+                    ComparisonOp::Eq,
+                    -845211824.9450003,
+                ),
+                row(&[(3, 1.0), (4, -0.01)], ComparisonOp::Ge, 4221171.940000001),
+            ],
+            xstar: vec![0.0, -651624630.0, 0.0, 0.0, -422117194.0000001],
+        };
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model"
+        );
+        assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
     }
 
     /// The node `x0 = 2` holds only with two terms past their bounds at once,
@@ -2474,7 +2624,7 @@ mod regression_tests {
     /// `x1 = -10`, at `-9.999900099`, presolve on and off.
     #[test]
     fn a_node_within_its_terms_tolerances_is_solved() {
-        let (problem, vars) = Model {
+        let model = Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
                 int(1.0, 0, 0),
@@ -2492,20 +2642,30 @@ mod regression_tests {
                 ),
                 row(&[(1, 1e-5), (3, -1.0), (4, 100.0)], ComparisonOp::Eq, 0.0),
             ],
-            xstar: vec![0.0; 6],
-        }
-        .build();
+            xstar: vec![0.0, -10.0, 0.0, -9.99e-5, 1e-9, 0.0],
+        };
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model"
+        );
+        assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+        let (problem, vars) = model.build();
         for presolve in [true, false] {
             let options = SolveOptions {
                 presolve,
                 ..SolveOptions::default()
             };
+            let int_tol = options.int_tol;
             let solution = problem
                 .solve_with(options)
                 .unwrap()
                 .into_solution()
                 .unwrap();
-            assert_eq!(solution[vars[1]], -10.0, "presolve {presolve}");
+            assert!(
+                (solution[vars[1]] + 10.0).abs() <= int_tol,
+                "presolve {presolve}: x1 = {}",
+                solution[vars[1]]
+            );
             assert!(
                 (solution.objective() + 9.999900099).abs() < 1e-9,
                 "presolve {presolve}: objective {}",
@@ -2515,40 +2675,62 @@ mod regression_tests {
     }
 
     /// A MILP node proven infeasible through an ill-conditioned basis. The
-    /// rows allow `x0 >= -0.982` (at `x2 = 0`; `x2 = -1` needs `x0 >= 1.8e7`),
-    /// so the node `x0 <= -1` misses them by `0.018` of `x0`, beyond the
-    /// `0.010` its terms' tolerances make room for. Its basis mixes
-    /// coefficients from `1e-5` to `1.6e4`, and the unrefined row of its
-    /// inverse leaves the basic `x1 ∈ [-9439526, 0]` a certificate
-    /// coefficient of `2e-14` of its terms, which at `x1`'s scaled bound of
-    /// `-1.2e9` takes `0.021` off the gap, and the proof fails; refined twice,
-    /// the row leaves `x1` none, the node is proven, and the optimum is `0`.
+    /// rows allow `x0 >= -0.898` (at `x2 = 0`, its best), so the node
+    /// `x0 <= -1` misses them by `0.10` of `x0`, beyond the `0.022` its
+    /// terms' tolerances make room for. The unrefined row of its basis
+    /// inverse leaves the basic `x1 ∈ [-1e9, 0]` a certificate coefficient of
+    /// `4.8e-14` of its terms, which at `x1`'s scaled bound of `-3.2e10`
+    /// takes `0.165` off the gap, and the proof fails; refined, the row
+    /// leaves `x1` none, the node is proven, and the optimum is `0`. The rows
+    /// lie inside the recommended range (row dynamism `6.6e5` and `2.2e5`).
+    /// The second model's rows lie outside it (`2.1e7` and `1.8e7`): they
+    /// allow `x0 >= -0.982` (at `x2 = 0`; `x2 = -1` needs `x0 >= 1.8e7`), the
+    /// node misses them by `0.018` of `x0` against `0.010` of room, and the
+    /// unrefined row leaves `x1 ∈ [-9439526, 0]` `2e-14` of its terms, which
+    /// at its scaled bound of `-1.2e9` takes `0.021` off the gap.
     #[test]
     fn an_ill_conditioned_basis_does_not_void_a_nodes_proof() {
-        assert_solves_within_contract_in_time(
-            &Model {
-                direction: OptimizationDirection::Minimize,
-                vars: vec![
-                    int(1.0, -12, 0),
-                    real(-2.0, -9439526.0, 0.0),
-                    int(2.0, -1, 0),
-                ],
-                rows: vec![
-                    row(
-                        &[(0, 0.000785), (1, -16300.0), (2, -0.232)],
-                        ComparisonOp::Le,
-                        0.288,
-                    ),
-                    row(
-                        &[(0, -9.94e-6), (1, 0.551), (2, -181.0)],
-                        ComparisonOp::Eq,
-                        0.0,
-                    ),
-                ],
-                xstar: vec![0.0; 3],
-            },
-            Duration::from_secs(60),
-        );
+        let in_range = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![int(1.0, -5, 0), real(-2.0, -1e9, 0.0), real(1.0, -1.0, 0.0)],
+            rows: vec![
+                row(
+                    &[(0, 0.00041), (1, -270.0), (2, 0.14)],
+                    ComparisonOp::Le,
+                    0.14,
+                ),
+                row(
+                    &[(0, -0.0011), (1, 1.9), (2, -240.0)],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+            ],
+            xstar: vec![0.0; 3],
+        };
+        let out_of_range = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(1.0, -12, 0),
+                real(-2.0, -9439526.0, 0.0),
+                int(2.0, -1, 0),
+            ],
+            rows: vec![
+                row(
+                    &[(0, 0.000785), (1, -16300.0), (2, -0.232)],
+                    ComparisonOp::Le,
+                    0.288,
+                ),
+                row(
+                    &[(0, -9.94e-6), (1, 0.551), (2, -181.0)],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+            ],
+            xstar: vec![0.0; 3],
+        };
+        for model in [in_range, out_of_range] {
+            assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+        }
     }
 
     /// A MILP node whose certificate no `f64` multipliers combine exactly is
