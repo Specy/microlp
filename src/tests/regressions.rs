@@ -617,9 +617,9 @@ pub(crate) mod regression_tests {
 
     /// Issue #47 in general: a reported value may sit outside the var's
     /// bounds by round-off (here `0.2999999999999998` on `[0.3, 5.3]`), and a
-    /// fix may lie within tolerance of a bound presolve tightened (`2 x = 6`
-    /// fixes `x` at 3). A value within the bound tolerance fixes the var at
-    /// that bound, on the LP and the MIP path; one beyond it is `Infeasible`.
+    /// fix may lie within tolerance of the value a row forces (`2 x = 6`). A
+    /// value within the bound tolerance fixes the var at that value, on the
+    /// LP and the MIP path; one beyond it is `Infeasible`.
     #[test]
     fn issue_47_fix_var_accepts_a_value_within_the_bound_tolerance() {
         for milp in [false, true] {
@@ -668,6 +668,92 @@ pub(crate) mod regression_tests {
             assert!(
                 (refixed.objective() - 4.0).abs() < 1e-6,
                 "presolve {presolve}"
+            );
+        }
+    }
+
+    /// Issue #47 past a bound: `3 x = 3 + 1.5e-7` with `x ≤ 1` solves at
+    /// `x = 1 + 5e-8`, within `x`'s bound tolerance, and `fix_var` at that
+    /// value fixed `x` at the bound instead, where the row misses by
+    /// `1.5e-7`. A fixed var gets no room in the proof, so the MILP path,
+    /// whose edit re-solves from the root, answered `Infeasible`; a larger
+    /// coefficient makes the miss larger.
+    #[test]
+    fn issue_47_fix_var_keeps_a_reported_value_past_a_bound() {
+        for (coeff, rhs) in [(3.0, 3.0 + 1.5e-7), (1e6, 1e6 + 0.05)] {
+            for milp in [false, true] {
+                for presolve in [true, false] {
+                    let case = format!("{coeff} x = {rhs}, milp {milp}, presolve {presolve}");
+                    let mut problem = Problem::new(OptimizationDirection::Minimize);
+                    let x = problem.add_var(-1.0, (0.0, 1.0));
+                    if milp {
+                        let z = problem.add_integer_var(1.0, (0, 3));
+                        problem.add_constraint([(z, 1.0)], ComparisonOp::Ge, 1.0);
+                    }
+                    problem.add_constraint([(x, coeff)], ComparisonOp::Eq, rhs);
+                    let solution = problem
+                        .solve_with(crate::SolveOptions {
+                            presolve,
+                            ..crate::SolveOptions::default()
+                        })
+                        .unwrap_or_else(|e| panic!("{case}: solve gave {e:?}"))
+                        .into_solution()
+                        .unwrap();
+                    let value = solution[x];
+                    assert!(
+                        value > 1.0,
+                        "{case}: fixture: x = {value:?} lies past its bound"
+                    );
+                    let refixed = solution
+                        .fix_var(x, value)
+                        .unwrap_or_else(|e| panic!("{case}: fix_var(x, {value:?}) gave {e:?}"))
+                        .into_solution()
+                        .unwrap();
+                    assert!(
+                        (refixed[x] - value).abs() < 1e-9,
+                        "{case}: after fix_var(x, {value:?}) x = {:?}",
+                        refixed[x]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The LP path of the test above, with the var to fix non-basic on a
+    /// bound the solve widened: minimizing `x + 0.5 y` subject to
+    /// `x + y >= 2 + 2.5e-7` over `[0, 1]^2` answers `y = 1 + 1e-7`, on its
+    /// widened upper bound. Clamping the fixed value to the bound moved `y`
+    /// back to `1`, where the row misses by more than the proof grants, so
+    /// `fix_var(y, y)` answered `Infeasible`.
+    #[test]
+    fn fix_var_keeps_a_value_reported_on_a_widened_bound() {
+        for presolve in [true, false] {
+            let mut problem = Problem::new(OptimizationDirection::Minimize);
+            let x = problem.add_var(1.0, (0.0, 1.0));
+            let y = problem.add_var(0.5, (0.0, 1.0));
+            problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 2.0 + 2.5e-7);
+            let solution = problem
+                .solve_with(crate::SolveOptions {
+                    presolve,
+                    ..crate::SolveOptions::default()
+                })
+                .unwrap_or_else(|e| panic!("presolve {presolve}: solve gave {e:?}"))
+                .into_solution()
+                .unwrap();
+            let value = solution[y];
+            assert!(
+                value > 1.0,
+                "presolve {presolve}: fixture: y = {value:?} lies past its bound"
+            );
+            let refixed = solution
+                .fix_var(y, value)
+                .unwrap_or_else(|e| panic!("presolve {presolve}: fix_var(y, {value:?}) gave {e:?}"))
+                .into_solution()
+                .unwrap();
+            assert!(
+                (refixed[y] - value).abs() < 1e-9,
+                "presolve {presolve}: after fix_var(y, {value:?}) y = {:?}",
+                refixed[y]
             );
         }
     }

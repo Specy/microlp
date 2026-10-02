@@ -4066,7 +4066,7 @@ mod regression_tests {
         assert_solves_within_contract_without_presolve(&binary_off_its_integer(5.0, 1e7));
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7.9): the last test in range, with
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): the previous test's model, in range, with
     /// `x >= 9e-7` and `x <= y`, from `y = 9e-7`.
     #[test]
     #[should_panic(expected = "solve() without presolve returned Infeasible")]
@@ -4077,6 +4077,63 @@ mod regression_tests {
             "fixture error: the model must lie within the recommended range"
         );
         assert_solves_within_contract_without_presolve(&model);
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9), through an edit, in range: the
+    /// solve without presolve reports `x1 = 1 + 6.6e-9` and the binary `x2` at
+    /// `-1.1e-9`, each past its bound within its tolerance. Fixed at that
+    /// value, `x1` leaves `-24.4 x1 - 144 x2 + 0.287 x3 = -24.4` short by
+    /// `1.6e-7`, which only `x2` past its bound makes up, and the edit's
+    /// search, whose proof holds an integer var within its bounds, answers
+    /// `Infeasible`.
+    #[test]
+    #[should_panic(expected = "returned Infeasible")]
+    fn a_fix_at_a_value_only_points_needing_int_tol_meet_is_a_known_limitation() {
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(0.0, 1048576, 1048576),
+                real(1.0, 0.0, 1.0),
+                int(-1.0, 0, 1),
+                real(1.0, -2.0, 0.0),
+            ],
+            rows: vec![
+                row(
+                    &[(0, 54.9), (1, -0.509)],
+                    ComparisonOp::Eq,
+                    57566821.890999995,
+                ),
+                row(&[(1, 2.52)], ComparisonOp::Le, 2.52),
+                row(
+                    &[(1, -24.4), (2, -144.0), (3, 0.287)],
+                    ComparisonOp::Eq,
+                    -24.4,
+                ),
+                row(&[(1, -241.0), (3, 70.4)], ComparisonOp::Ge, -241.0),
+            ],
+            xstar: vec![1048576.0, 1.0, 0.0, 0.0],
+        };
+        assert!(
+            within_recommended_range(&model) && xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model, which lies within the recommended range"
+        );
+        let (problem, vars) = model.build();
+        let options = SolveOptions {
+            presolve: false,
+            ..SolveOptions::default()
+        };
+        let solution = problem
+            .solve_with(options)
+            .unwrap()
+            .into_solution()
+            .unwrap();
+        let value = 1.000000006557682;
+        let edited = solution
+            .fix_var(vars[1], value)
+            .unwrap_or_else(|e| panic!("fix_var(x1, {value:?}) returned {e:?}"))
+            .into_solution()
+            .unwrap();
+        assert!((edited[vars[1]] - value).abs() < 1e-9);
     }
 
     /// A facility model whose capacity row `x2 + ... + x6 <= 2.918e9 x0`

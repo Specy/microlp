@@ -1657,16 +1657,17 @@ impl Solver {
     /// simplex like any other bound violation.
     ///
     /// `val` must lie within the var's bounds as they were before any fix, to
-    /// within the contract (a reported value may sit outside a bound by
-    /// round-off): a value outside a bound within its tolerance fixes the var
-    /// at that bound, and one beyond it returns `Err(Infeasible)`. Fixing
-    /// again replaces the previous fixed value.
+    /// within the contract, and one beyond it returns `Err(Infeasible)`. The
+    /// var is fixed at `val` itself, also past a bound: a value a solve
+    /// reported there met its rows there, and at the bound a row could miss
+    /// by the offset times its coefficient, which the proof, granting a fixed
+    /// var no room, would call infeasible. Fixing again replaces the previous
+    /// fixed value.
     pub(crate) fn fix_var(&mut self, var: usize, val: f64) -> Result<StopReason, Error> {
         let (min, max) = self.fixed_var_bounds[var].unwrap_or(self.get_var_bounds(var));
         if outside_bounds(val, min, max, self.feasibility) {
             return Err(Error::Infeasible);
         }
-        let val = val.clamp(min, max);
         self.fixed_var_bounds[var] = Some((min, max));
         self.set_var_bounds(var, val, val)?;
         self.reoptimize()

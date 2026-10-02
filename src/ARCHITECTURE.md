@@ -1100,12 +1100,15 @@ wrong answer.
   integral points of the box (§7.4), so a point within the box only with an integer var off
   its integer, under a coefficient that makes the offset count, is found only where an LP
   reaches it. Presolve takes it away where it fixes the var, tightens its bounds or rewrites
-  its coefficient, and the search where it branches on the var, whose children hold it to
-  its integers. So presolve off can answer `Infeasible`, or a worse optimum, too
+  its coefficient; the search where it branches on the var, whose children hold it to its
+  integers; and the proof where the var lies past a bound, since it holds an integer var
+  within its bounds (§7.3). So presolve off can answer `Infeasible`, or a worse optimum, too
   (`a_point_needing_the_int_tol_of_a_binary_a_branch_fixes_is_a_known_limitation`,
-  `a_point_needing_the_int_tol_of_a_binary_in_range_is_a_known_limitation`), and presolve on
+  `a_point_needing_the_int_tol_of_a_binary_in_range_is_a_known_limitation`), presolve on
   where presolve off finds one
-  (`a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation`).
+  (`a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation`), and an
+  edit that fixes a var at a value only such points have
+  (`a_fix_at_a_value_only_points_needing_int_tol_meet_is_a_known_limitation`).
 
 ---
 
