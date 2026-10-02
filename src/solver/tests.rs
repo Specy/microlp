@@ -1167,7 +1167,7 @@ fn dual_ratio_test_pivots_on_the_largest_entry_of_a_tied_group() {
     let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
     sol.calc_row_coeffs(row);
     let step = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[], false)
+        .choose_entering_col_dual(row, leaving_new_val)
         .unwrap()
         .step();
     assert!(step.flips.is_empty(), "flips {:?}", step.flips);
@@ -1203,7 +1203,7 @@ fn dual_ratio_test_steps_back_to_a_group_with_a_stable_pivot() {
     let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
     sol.calc_row_coeffs(row);
     let step = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[], false)
+        .choose_entering_col_dual(row, leaving_new_val)
         .unwrap()
         .step();
     assert!(step.flips.is_empty(), "flips {:?}", step.flips);
@@ -1216,37 +1216,193 @@ fn dual_ratio_test_steps_back_to_a_group_with_a_stable_pivot() {
     assert_eq!(sol.cur_obj_val, 16.0);
 }
 
-/// A column excluded for the row (its entry disagreed with the column
-/// computation on a fresh factorization) does not set the pivot floor.
-/// Planted: the row `x0 + 1e-6 x1 + 1e-14 x2` of `x0 + x1 + x2 >= 5`, with
-/// `x0` at its upper bound and `x1` excluded; a floor set by `x1` (`1e-13`)
-/// would leave `x2`, the only var that can repair the row, no candidate.
-#[test]
-fn excluded_column_does_not_set_the_dual_pivot_floor() {
-    init();
+/// The violated row `x0 + x1 + x2 >= 5` of `min x2 - x0`, `x0 ∈ [-1, 0]`,
+/// `x1, x2 >= 0`, from the slack basis, with the matrix entries of the three
+/// vars in the row planted as `entries` (in the row-wise and the column-wise
+/// copy alike, so that every computation of the row agrees): `x0` sits at its
+/// upper bound and cannot help, `x1` helps with a reduced cost of zero (its
+/// breakpoint comes first) and `x2` with one of one. The row is computed for
+/// the dual ratio test; returns the solver, the row and the bound its basic
+/// var leaves at.
+fn planted_dual_row(entries: [f64; 3]) -> (Solver, usize, f64) {
     let mut sol = Solver::try_new(
+        &[-1.0, 0.0, 1.0],
         &[-1.0, 0.0, 0.0],
-        &[0.0, 0.0, 0.0],
-        &[1.0, 1.0, f64::INFINITY],
+        &[0.0, f64::INFINITY, f64::INFINITY],
         &[(to_sparse(&[1.0, 1.0, 1.0]), ComparisonOp::Ge, 5.0)],
         &vec![VarDomain::Real; 3],
         None,
         crate::Tolerances::default().feasibility,
     )
     .unwrap();
+    assert_eq!(sol.col_scales, [1.0; 3], "fixture: no column scaling");
+    assert_eq!(sol.row_scales, [1.0], "fixture: no row scaling");
+    for (var, &entry) in entries.iter().enumerate() {
+        *sol.orig_constraints.get_mut(0, var).unwrap() = entry;
+        *sol.orig_constraints_csc.get_mut(0, var).unwrap() = entry;
+    }
     let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
     sol.calc_row_coeffs(row);
-    let col_of = |sol: &Solver, var: usize| sol.nb_vars.iter().position(|&v| v == var).unwrap();
-    let (c0, c1, c2) = (col_of(&sol, 0), col_of(&sol, 1), col_of(&sol, 2));
-    *sol.row_coeffs.get_mut(c0) = 1.0;
-    *sol.row_coeffs.get_mut(c1) = 1e-6;
-    *sol.row_coeffs.get_mut(c2) = 1e-14;
+    (sol, row, leaving_new_val)
+}
+
+/// An entry of the dual ratio test's row at or below the pivot tolerance is
+/// no candidate while a larger one can enter, however small the other
+/// helping entries are: planted row `[1, 5e-10, 2e-9]`, where `x1`'s entry has
+/// the first breakpoint and `x2` enters. A floor relative to the largest
+/// helping entry made `x1`'s a candidate, a pivot of `5e-10`. The tolerance is
+/// `1e-9` on a fresh factorization, larger the longer the eta file.
+#[test]
+fn a_dual_entry_at_or_below_the_pivot_tolerance_gives_way_to_a_larger_one() {
+    init();
+    let (mut sol, row, leaving_new_val) = planted_dual_row([1.0, 5e-10, 2e-9]);
+    let (col, coeff) = sol
+        .choose_entering_col_dual(row, leaving_new_val)
+        .unwrap()
+        .step()
+        .entering;
+    assert_eq!((sol.nb_vars[col], coeff), (2, 2e-9));
+    assert_eq!(
+        [0, 9, 10, 19, 20].map(dual_pivot_tolerance),
+        [1e-9, 1e-9, 3e-8, 3e-8, 1e-6]
+    );
+    assert_eq!(
+        [0, 9, 10, 19, 20].map(primal_pivot_tolerance),
+        [1e-9, 1e-9, 1e-8, 1e-8, 1e-7]
+    );
+}
+
+/// Where no entry above the pivot tolerance can enter and the row proves
+/// nothing, an entry below it enters once the refined row shows it genuine:
+/// planted row `[1, 5e-10, 0]`, where `x1`'s `5e-10` alone can repair the
+/// row (unbounded above, its coefficient voids the proof). The regular test
+/// leaves it out; the refined row, summed from the data, has it beyond the
+/// error the refinement measured. Planted as `5e-10` in the computed row over
+/// data of zero, the entry is round-off, which the refined row does not
+/// have: no candidate.
+#[test]
+fn a_dual_entry_below_the_pivot_tolerance_enters_once_the_refined_row_shows_it_genuine() {
+    init();
+    let (mut sol, row, leaving_new_val) = planted_dual_row([1.0, 5e-10, 0.0]);
+    assert!(matches!(
+        sol.choose_entering_col_dual(row, leaving_new_val),
+        Ok(DualRatioTest::NoCandidate)
+    ));
+    let leaving_up = leaving_new_val > sol.basic_var_vals[row];
+    assert!(!sol.prove_infeasible(row, leaving_up).holds);
+    let (col, coeff) = sol
+        .genuine_entry_step(row, leaving_new_val)
+        .unwrap()
+        .step()
+        .entering;
+    assert_eq!((sol.nb_vars[col], coeff), (1, 5e-10));
+
+    let (mut sol, row, leaving_new_val) = planted_dual_row([1.0, 0.0, 0.0]);
+    let x1 = nb_col(&sol, 1);
+    *sol.row_coeffs.get_mut(x1) = 5e-10;
+    assert!(matches!(
+        sol.choose_entering_col_dual(row, leaving_new_val),
+        Ok(DualRatioTest::NoCandidate)
+    ));
+    assert!(matches!(
+        sol.genuine_entry_step(row, leaving_new_val),
+        Ok(DualRatioTest::NoCandidate)
+    ));
+}
+
+/// A fixed var's entry sets no scale for the growth test: planted row
+/// `[1e10, 1, 100]` over a fixed `f` and the `y` and `z` of `x + y + z >= 5`,
+/// `min z`, where `y`'s breakpoint comes first. Measured against `f`'s
+/// `1e10`, `y`'s one would be small and left out, and `z`, whose reduced cost
+/// the step takes past zero, would enter in its place.
+#[test]
+fn a_fixed_vars_entry_sets_no_growth_scale() {
+    init();
+    let mut sol = Solver::try_new(
+        &[0.0, 0.0, 1.0],
+        &[0.0, 0.0, 0.0],
+        &[0.0, f64::INFINITY, f64::INFINITY],
+        &[(to_sparse(&[1.0, 1.0, 1.0]), ComparisonOp::Ge, 5.0)],
+        &vec![VarDomain::Real; 3],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(sol.col_scales, [1.0; 3], "fixture: no column scaling");
+    assert_eq!(sol.row_scales, [1.0], "fixture: no row scaling");
+    for (var, entry) in [1e10, 1.0, 100.0].into_iter().enumerate() {
+        *sol.orig_constraints.get_mut(0, var).unwrap() = entry;
+        *sol.orig_constraints_csc.get_mut(0, var).unwrap() = entry;
+    }
+    let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
+    sol.calc_row_coeffs(row);
+    let (col, coeff) = sol
+        .choose_entering_col_dual(row, leaving_new_val)
+        .unwrap()
+        .step()
+        .entering;
+    assert_eq!((sol.nb_vars[col], coeff), (1, 1.0));
+}
+
+/// A pivot that fails the growth test (at most `1e-9` of the row's largest
+/// entry) is not passed over before the row has been refined and its entries
+/// summed again in compensated arithmetic: planted row `[1e3, 1, 0]`, with
+/// `x1`'s entry in the computed row then planted as `1e-7`, as if the
+/// transposed solve had lost it. The refined row has it back at one, and `x1`
+/// enters on it; the refined row of the basis inverse is what the
+/// steepest-edge update reads. A floor relative to the largest helping entry
+/// took the `1e-7`.
+#[test]
+fn a_small_dual_pivot_is_refined_before_it_is_passed_over() {
+    init();
+    let (mut sol, row, leaving_new_val) = planted_dual_row([1e3, 1.0, 0.0]);
+    let x1 = nb_col(&sol, 1);
+    *sol.row_coeffs.get_mut(x1) = 1e-7;
     let step = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[c1], false)
+        .choose_entering_col_dual(row, leaving_new_val)
         .unwrap()
         .step();
     assert!(step.flips.is_empty());
-    assert_eq!(step.entering, (c2, 1e-14));
+    assert_eq!(step.entering, (x1, 1.0));
+    assert_eq!(*sol.row_coeffs.get(x1), 1.0);
+    let rho: Vec<(usize, f64)> = sol
+        .inv_basis_row_coeffs
+        .iter()
+        .map(|(r, &v)| (r, v))
+        .collect();
+    assert_eq!(rho, [(row, 1.0)]);
+}
+
+/// A pivot that still fails the growth test on the refined row is left out,
+/// and the ratio test runs again without it: planted row `[1e6, 1e-5, 1]`,
+/// whose first breakpoint is `x1`'s, `1e-11` of the row's largest entry.
+/// `x2` enters instead, its entry `1e-6` of the largest. A floor relative to
+/// the largest helping entry took `x1`'s `1e-5` beside the `1e6`. Where no
+/// other can enter, the regular test has no candidate, and the small pivot,
+/// genuine on the refined row, is the fallback's: the row `[1e6, 1e-5, 0]`.
+#[test]
+fn a_dual_pivot_small_beside_its_row_is_left_out_for_the_next() {
+    init();
+    let (mut sol, row, leaving_new_val) = planted_dual_row([1e6, 1e-5, 1.0]);
+    let step = sol
+        .choose_entering_col_dual(row, leaving_new_val)
+        .unwrap()
+        .step();
+    assert!(step.flips.is_empty());
+    let (col, coeff) = step.entering;
+    assert_eq!((sol.nb_vars[col], coeff), (2, 1.0));
+
+    let (mut sol, row, leaving_new_val) = planted_dual_row([1e6, 1e-5, 0.0]);
+    assert!(matches!(
+        sol.choose_entering_col_dual(row, leaving_new_val),
+        Ok(DualRatioTest::NoCandidate)
+    ));
+    let (col, coeff) = sol
+        .genuine_entry_step(row, leaving_new_val)
+        .unwrap()
+        .step()
+        .entering;
+    assert_eq!((sol.nb_vars[col], coeff), (1, 1e-5));
 }
 
 /// A dual pivot puts the column's element in the eta file, so the updated
@@ -1275,7 +1431,7 @@ fn dual_pivot_applies_the_column_element_to_the_eta_file() {
     let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
     sol.calc_row_coeffs(row);
     let step = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[], false)
+        .choose_entering_col_dual(row, leaving_new_val)
         .unwrap()
         .step();
     let (col, a_row) = step.entering;
@@ -1327,19 +1483,15 @@ fn dual_pivot_applies_the_column_element_to_the_eta_file() {
     assert_eq!(sol.dual_edge_sq_norms[row], rho_sq_norm / (a_col * a_col));
 }
 
-/// KNOWN LIMITATION (ARCHITECTURE §7): the primal ratio test's round-off
-/// scale is its column's largest entry, so a genuine blocking entry below its
-/// `ENTRY_ROUNDOFF` share counts as noise beside huge entries in rows that
-/// cannot block: `max x` comes back `Unbounded` instead of `x = 8`. Basis: the
-/// free `y1`, `y2` of the nearly dependent `y1 + y2 + x/8 = 0` and
+/// A genuine blocking entry of the primal ratio test's column bounds the
+/// step beside huge entries in rows that cannot block: `max x` is `x = 8`.
+/// Basis: the free `y1`, `y2` of the nearly dependent `y1 + y2 + x/8 = 0` and
 /// `y1 + (1 + 2^-43) y2 + 8x = 0` (7e13 in `x`'s column, never blocking), and
 /// the slack of `x/8 + 8z <= 1`, whose entry, 1/64, is exact (the basis is
-/// block diagonal). A scale over the blocking rows alone would pivot on
-/// round-off elsewhere; the fix needs an absolute pivot tolerance and a
-/// refined column.
+/// block diagonal). A floor relative to the column's largest entry took that
+/// entry for round-off, and the column for an unbounded ray.
 #[test]
-#[should_panic(expected = "Unbounded")]
-fn primal_ratio_test_scale_hides_a_blocking_entry_is_a_known_limitation() {
+fn a_primal_blocking_entry_small_beside_its_column_bounds_the_step() {
     init();
     let eps = 2.0f64.powi(-43);
     let mut sol = Solver::try_new(
@@ -1540,10 +1692,10 @@ fn nb_col(sol: &Solver, var: usize) -> usize {
 }
 
 /// The primal simplex's next choice, as its phase makes it: the pricing, then
-/// the ratio test for the priced column with no row excluded.
+/// the ratio test for the priced column.
 fn primal_pivot_choice(sol: &mut Solver, harris_scale: f64) -> PivotChoice {
     let col = sol.price_primal().unwrap().expect("a var can enter");
-    sol.choose_pivot(col, &[], harris_scale).unwrap()
+    sol.choose_pivot(col, harris_scale).unwrap()
 }
 
 /// A dual step never runs backwards: where the Harris pass lets the entering
@@ -1576,7 +1728,7 @@ fn dual_step_is_zero_where_the_entering_reduced_cost_has_crossed_zero() {
     let mut sol = sol;
     sol.calc_row_coeffs(row);
     let step = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[], false)
+        .choose_entering_col_dual(row, leaving_new_val)
         .unwrap()
         .step();
     assert_eq!(sol.nb_vars[step.entering.0], 1);
@@ -1918,7 +2070,7 @@ fn dual_phase_fails_loudly_when_only_taboo_changes_are_left() {
     let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
     sol.calc_row_coeffs(row);
     let (col, _) = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[], false)
+        .choose_entering_col_dual(row, leaving_new_val)
         .unwrap()
         .step()
         .entering;
@@ -1958,7 +2110,7 @@ fn dual_phase_names_a_singular_basis_when_only_its_change_is_left() {
     let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
     sol.calc_row_coeffs(row);
     let (col, _) = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[], false)
+        .choose_entering_col_dual(row, leaving_new_val)
         .unwrap()
         .step()
         .entering;
@@ -2112,6 +2264,7 @@ fn exact_row(rho: &[f64]) -> proof::RefinedRow {
     proof::RefinedRow {
         rho: multipliers(rho),
         error: Some(vec![0.0; rho.len()]),
+        second: vec![0.0; rho.len()],
     }
 }
 
@@ -2178,25 +2331,25 @@ fn the_refined_row_keeps_its_correction_to_twice_the_precision() {
 fn the_refinement_bounds_the_multipliers_error_only_where_it_converged() {
     let row = |values: &[f64]| multipliers(values);
     assert_eq!(
-        proof::multipliers_error(&row(&[1.0, -2.0]), &[3e-33, -1e-34]),
+        proof::refinement_error(&row(&[1.0, -2.0]), &[3e-33, -1e-34]),
         Some(vec![3e-33, 1e-34])
     );
     assert_eq!(
-        proof::multipliers_error(&row(&[1.0, 0.5]), &[0.0, 0.0]),
+        proof::refinement_error(&row(&[1.0, 0.5]), &[0.0, 0.0]),
         Some(vec![0.0, 0.0])
     );
     assert_eq!(
-        proof::multipliers_error(&row(&[1e20]), &[1e4]),
+        proof::refinement_error(&row(&[1e20]), &[1e4]),
         Some(vec![1e4])
     );
-    assert_eq!(proof::multipliers_error(&row(&[1.0]), &[2e-16]), None);
-    assert_eq!(proof::multipliers_error(&row(&[1e-20]), &[1e-30]), None);
+    assert_eq!(proof::refinement_error(&row(&[1.0]), &[2e-16]), None);
+    assert_eq!(proof::refinement_error(&row(&[1e-20]), &[1e-30]), None);
     assert_eq!(
-        proof::multipliers_error(&row(&[1.0, 1.0]), &[1e-33, f64::NAN]),
+        proof::refinement_error(&row(&[1.0, 1.0]), &[1e-33, f64::NAN]),
         None
     );
     assert_eq!(
-        proof::multipliers_error(&row(&[f64::INFINITY]), &[0.0]),
+        proof::refinement_error(&row(&[f64::INFINITY]), &[0.0]),
         None
     );
 }
@@ -2301,6 +2454,7 @@ fn an_error_bound_that_is_not_finite_voids_the_proof() {
     let unbounded_error = proof::RefinedRow {
         rho: multipliers(&[1.0]),
         error: Some(vec![f64::INFINITY]),
+        second: vec![f64::INFINITY],
     };
     let proof = sol.proof_of(&unbounded_error, row, false);
     assert!(!proof.holds, "{proof:?}");
@@ -2454,6 +2608,7 @@ fn a_coefficient_on_an_infinite_bound_counts_as_zero_only_within_its_error() {
         let refined = proof::RefinedRow {
             rho: vec![proof::CDouble::from(1.0), second],
             error: error.map(|e| vec![0.0, e]),
+            second: vec![0.0, error.unwrap_or(f64::INFINITY)],
         };
         sol.proof_of(&refined, row, false)
     };
@@ -2494,9 +2649,8 @@ fn a_failed_proof_makes_its_row_taboo() {
 /// A fixed var's huge coefficient in a row added through the LP edit path:
 /// `min y` s.t. `f + y >= 0`, then `f` fixed at zero and `1e17 f + y >= 1`
 /// added. The added row leaves the fixed `f` out of its equilibration, so the
-/// dual ratio test sees `[1e17, 1]` and `y`'s exact one is below the pivot
-/// floor: no candidate. A deadline in the past stops the edit's solve before
-/// its first iteration, for the tests to resume.
+/// dual ratio test sees `[1e17, 1]`. A deadline in the past stops the edit's
+/// solve before its first iteration, for the tests to resume.
 fn c2_06_through_an_edit() -> Solver {
     let mut sol = Solver::try_new(
         &[0.0, 1.0],
@@ -2520,17 +2674,14 @@ fn c2_06_through_an_edit() -> Solver {
     sol
 }
 
-/// The dual simplex's last resorts for a row that no var can repair and that
-/// does not prove infeasibility: with the row taboo and nothing else left,
-/// the instable leave (a pivot the regular floors refuse, down to
-/// `INSTABLE_PIVOT_TOL`) pivots on `y`'s entry of one, and the phase ends at
-/// `y = 1`. That pivot refused (planted as a bad basis change), the
-/// certificate repair cannot land the row (`y` has no upper bound, and the
-/// fixed `f` never leaves its value), and the phase
-/// fails loudly at once instead of retrying until its stall bound; a time
-/// limit turns running on into a failure.
+/// The growth test measures a pivot against the entries of the vars that can
+/// move: `f`, fixed by an edit, never enters, so its `1e17` leaves `y`'s exact
+/// one a regular pivot, and the phase ends at `y = 1`. That pivot refused (planted as a bad basis change), no other can
+/// repair the row, and the phase fails loudly at once, every basis change
+/// left returning to visited vertices, instead of retrying until its stall
+/// bound; a time limit turns running on into a failure.
 #[test]
-fn a_row_the_proof_leaves_open_gets_the_instable_leave_once() {
+fn a_fixed_vars_huge_entry_leaves_a_genuine_pivot_regular() {
     init();
     let mut sol = c2_06_through_an_edit();
     assert_eq!(sol.reoptimize().unwrap(), StopReason::Finished);
@@ -2541,16 +2692,12 @@ fn a_row_the_proof_leaves_open_gets_the_instable_leave_once() {
     let (row, leaving_new_val) = sol.choose_pivot_row_dual().unwrap();
     assert_eq!(row, 1, "fixture: the added row is the violated one");
     sol.calc_row_coeffs(row);
-    assert!(matches!(
-        sol.choose_entering_col_dual(row, leaving_new_val, &[], false),
-        Ok(DualRatioTest::NoCandidate)
-    ));
-    let (y_col, _) = sol
-        .choose_entering_col_dual(row, leaving_new_val, &[], true)
+    let (y_col, coeff) = sol
+        .choose_entering_col_dual(row, leaving_new_val)
         .unwrap()
         .step()
         .entering;
-    assert_eq!(sol.nb_vars[y_col], 1);
+    assert_eq!((sol.nb_vars[y_col], coeff), (1, 1.0));
     let here = sol.cycle_guard.hash_after(std::iter::empty());
     let (leaving, entering) = (sol.basic_vars[row], 1);
     assert!(!sol.cycle_guard.is_bad_change(row, leaving, entering, here));
@@ -2561,15 +2708,19 @@ fn a_row_the_proof_leaves_open_gets_the_instable_leave_once() {
     let result = sol.dual_phase();
     sol.end_dual_phase();
     assert!(
-        matches!(&result, Err(Error::InternalError(msg)) if msg.contains("no var can repair row")),
+        matches!(
+            &result,
+            Err(Error::InternalError(message))
+                if message.contains("every basis change left returns to visited vertices")
+        ),
         "{result:?}"
     );
     assert!(sol.lp_iterations - iterations < 20, "{}", sol.lp_iterations);
 }
 
 /// `x + y >= 2 + 1.8e-7` over `x, y ∈ [0, 1]` (integer if asked), at the
-/// slack basis with `x = y = 0`: the row's slack is `1.8e-7` past its bound,
-/// beyond its tolerance of about `1e-7`, even with both vars at their upper
+/// slack basis with `x = y = 1`: the row's slack is `1.8e-7` past its bound,
+/// beyond its tolerance of about `1e-7`, with both vars at their upper
 /// bounds.
 fn row_short_of_its_bounds_by_a_tolerance(integer: bool) -> Solver {
     let domain = if integer {
@@ -2578,7 +2729,7 @@ fn row_short_of_its_bounds_by_a_tolerance(integer: bool) -> Solver {
         VarDomain::Real
     };
     let sol = Solver::try_new(
-        &[1.0, 1.0],
+        &[-1.0, -1.0],
         &[0.0, 0.0],
         &[1.0, 1.0],
         &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 2.0 + 1.8e-7)],
@@ -2592,32 +2743,31 @@ fn row_short_of_its_bounds_by_a_tolerance(integer: bool) -> Solver {
         ([1.0, 1.0].as_slice(), [1.0].as_slice()),
         "fixture: no scaling"
     );
-    assert_eq!(sol.nb_var_vals, [0.0, 0.0], "fixture: x = y = 0");
+    assert_eq!(sol.nb_var_vals, [1.0, 1.0], "fixture: x = y = 1");
     let slack = sol.num_vars;
     assert_eq!(sol.basic_vars, [slack], "fixture: the slack basis");
     assert_eq!(
         sol.var_tols[slack],
-        BoundTols::uniform(slack_tol(1e-7, 2.0 + 1.8e-7, 2)),
+        BoundTols::uniform(slack_tol(1e-7, 4.0 + 1.8e-7, 2)),
         "fixture: the row's whole contract less its round-off"
     );
     sol
 }
 
-/// The certificate repair moves the vars that can help to their bounds
-/// first, then, largest reach first, widens the bound each sits at by its
-/// tolerance and moves it there, to the farthest value within its tolerance
-/// of the model's bound: `x` and `y` flip to 1 and `x`'s upper bound in force
-/// becomes `1 + 1e-7`, which lands the row's slack within its own tolerance.
-/// The model's bound is kept for the boundary, and the next solve restores
-/// it. An integer var is never widened, so with `x, y` integer the repair
-/// does nothing.
+/// The certificate repair widens, largest reach first, the bound each var
+/// that can help sits at by its tolerance and moves the var there, to the
+/// farthest value within its tolerance of the model's bound: `x`'s upper
+/// bound in force becomes `1 + 1e-7`, which lands the row's slack within its
+/// own tolerance. The model's bound is kept for the boundary, and the next
+/// solve restores it. An integer var is never widened, so with `x, y` integer
+/// the repair does nothing.
 #[test]
 fn the_repair_moves_vars_past_their_bounds_within_their_tolerances() {
     init();
     let mut sol = row_short_of_its_bounds_by_a_tolerance(false);
     let x_tol = sol.var_tols[0].hi;
     assert_eq!(x_tol, 1e-7, "fixture: x's tolerance is its whole contract");
-    assert_eq!(sol.certificate_repair(0, true), proof::Repair::Widened);
+    assert!(sol.certificate_repair(0));
     let x = sol.nb_var_vals[0];
     assert!(
         x > 1.0 && x - 1.0 <= x_tol && x.next_up() - 1.0 > x_tol,
@@ -2638,23 +2788,23 @@ fn the_repair_moves_vars_past_their_bounds_within_their_tolerances() {
     );
 
     let mut sol = row_short_of_its_bounds_by_a_tolerance(true);
-    assert_eq!(sol.certificate_repair(0, true), proof::Repair::Nothing);
-    assert_eq!(sol.nb_var_vals, [0.0, 0.0]);
+    assert!(!sol.certificate_repair(0));
+    assert_eq!(sol.nb_var_vals, [1.0, 1.0]);
     assert!(!sol.basic_var_within_bounds(0));
 }
 
 /// The certificate repair keeps a fixed structural var at its value, at which
 /// presolve checks the rows it substituted the var out of: its tolerance is
-/// no room. `x + y >= 2 + 2.5e-7` with `x ∈ [0, 1]` and `y` fixed at 1, at the
-/// slack basis: `x` flips to 1 and its bound is widened by its tolerance,
-/// `1e-7`, which leaves the row's slack `1.5e-7` past its bound, beyond its
-/// tolerance of about `1e-7`; `y` stays at 1, though its own `1e-7` would
-/// land the row. The proof, which grants `y` no room either, then holds.
+/// no room. `x + y >= 2 + 2.5e-7` with `x ∈ [0, 1]` at 1 and `y` fixed at 1,
+/// at the slack basis: `x`'s bound is widened by its tolerance, `1e-7`, which
+/// leaves the row's slack `1.5e-7` past its bound, beyond its tolerance of
+/// about `1e-7`; `y` stays at 1, though its own `1e-7` would land the row.
+/// The proof, which grants `y` no room either, then holds.
 #[test]
 fn the_repair_keeps_a_fixed_var_at_its_value() {
     init();
     let mut sol = Solver::try_new(
-        &[1.0, 0.0],
+        &[-1.0, 0.0],
         &[0.0, 1.0],
         &[1.0, 1.0],
         &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 2.0 + 2.5e-7)],
@@ -2668,16 +2818,16 @@ fn the_repair_keeps_a_fixed_var_at_its_value() {
         ([1.0, 1.0].as_slice(), [1.0].as_slice()),
         "fixture: no scaling"
     );
-    assert_eq!(sol.nb_var_vals, [0.0, 1.0], "fixture: x = 0, y = 1");
+    assert_eq!(sol.nb_var_vals, [1.0, 1.0], "fixture: x = 1, y = 1");
     assert_eq!(sol.basic_vars, [sol.num_vars], "fixture: the slack basis");
     assert_eq!(sol.var_tols[0].hi, 1e-7, "fixture: x's tolerance");
     assert_eq!(sol.var_tols[1].lo, 1e-7, "fixture: y's tolerance");
     assert_eq!(
         sol.var_tols[sol.num_vars],
-        BoundTols::uniform(slack_tol(1e-7, 2.0 + 2.5e-7 + 1.0, 2)),
+        BoundTols::uniform(slack_tol(1e-7, 2.0 + 2.5e-7 + 2.0, 2)),
         "fixture: the row's tolerance"
     );
-    assert_eq!(sol.certificate_repair(0, true), proof::Repair::Widened);
+    assert!(sol.certificate_repair(0));
     assert_eq!(sol.nb_var_vals[1], 1.0);
     assert!(!sol.basic_var_within_bounds(0), "{:?}", sol.basic_var_vals);
     let up = sol.leaving_target(0) > sol.basic_var_vals[0];
@@ -2943,9 +3093,9 @@ fn a_leaving_var_holds_its_working_bounds_until_the_cleanup() {
 /// one that ends beyond its tolerance has its bound shifted, so the phase
 /// goes on over bounds its point satisfies; the cleanup restores the bound
 /// and reports the violation. Here the step toward `x3 = -1`, `x4 = 1000`
-/// passes the equality `1e4 x2 - 1e-7 x3 = 0` through an entry below its
-/// column's round-off floor and takes its slack `3e-12` past its bound,
-/// beyond its tolerance. Planted: the vertex at the origin with `x3`, `x4`
+/// passes the equality `1e4 x2 - 1e-7 x3 = 0` through an entry at or below
+/// the pivot tolerance and takes its slack `3e-12` past its bound, beyond its
+/// tolerance. Planted: the vertex at the origin with `x3`, `x4`
 /// and the equality's slack basic, from which the primal phase takes that
 /// step, the slack halfway to its tolerance, as round-off can leave it, since
 /// the step alone takes it to the edge (the model of
@@ -3072,69 +3222,12 @@ fn primal_phase_fails_loudly_when_only_taboo_changes_are_left() {
     );
 }
 
-/// A row the primal phase excludes as round-off is excluded only for the
-/// column it was judged in. Planted: `x0`'s entry in the first row is `1e-9`
-/// in the column data and `2e-9` in the row data, so the computations
-/// disagree as round-off's do and the row is excluded for `x0`; `x0`'s pivot
-/// on the second row is planted as bad, so `x1` is priced next with no pivot
-/// between. The first row is `x1`'s only blocking row: hidden, it would make
-/// `x1`'s ray look unbounded.
-#[test]
-fn rows_excluded_as_round_off_for_one_column_block_another() {
-    init();
-    let mut sol = Solver::try_new(
-        &[-2.0, -1.0],
-        &[0.0, 0.0],
-        &[f64::INFINITY, f64::INFINITY],
-        &[
-            (to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 1e-6),
-            (to_sparse(&[1.0, -1.0]), ComparisonOp::Le, 1e4),
-        ],
-        &[VarDomain::Real, VarDomain::Real],
-        None,
-        crate::Tolerances::default().feasibility,
-    )
-    .unwrap();
-    assert_eq!(sol.col_scales, [1.0, 1.0], "fixture: no column scaling");
-    assert_eq!(sol.row_scales, [1.0, 1.0], "fixture: no row scaling");
-    *sol.orig_constraints_csc.get_mut(0, 0).unwrap() = 1e-9;
-    *sol.orig_constraints.get_mut(0, 0).unwrap() = 2e-9;
-    sol.begin_primal_phase(true);
-    let x0 = sol.price_primal().unwrap().unwrap();
-    assert_eq!(sol.nb_vars[x0], 0, "fixture: x0 is priced first");
-    assert!(
-        matches!(
-            sol.choose_pivot(x0, &[], 1.0).unwrap(),
-            PivotChoice::Inconsistent { row: 0 }
-        ),
-        "fixture: x0's entry in the first row is found round-off"
-    );
-    let PivotChoice::Pivot(info) = sol.choose_pivot(x0, &[0], 1.0).unwrap() else {
-        panic!("x0 enters");
-    };
-    assert_eq!(
-        info.elem.as_ref().unwrap().row,
-        1,
-        "fixture: with the first row excluded, x0 pivots on the second"
-    );
-    // `x0` in for the second row's slack (var 3) is planted as bad, as two
-    // consecutive revisits record it, and left not taboo, as a rebuild leaves it.
-    let here = sol.cycle_guard.hash_after(std::iter::empty());
-    assert!(!sol.cycle_guard.is_bad_change(1, 3, 0, here));
-    sol.cycle_guard.record_pivot();
-    assert!(sol.cycle_guard.is_bad_change(1, 3, 0, here));
-    sol.cycle_guard.clear_taboo();
-    assert!(!sol.cycle_guard.is_taboo_entering(0));
-    assert_eq!(sol.primal_phase(1.0).unwrap(), (StopReason::Finished, true));
-    assert!(matches!(sol.var_states[0], VarState::Basic(_)));
-    assert!(matches!(sol.var_states[1], VarState::Basic(_)));
-}
-
-/// On a fresh factorization, a pivot element whose row and column
-/// computations disagree beyond round-off, and that is not tiny beside its
-/// column, is taken with the column's element; a basis it leaves singular
-/// would be repaired. Planted: `x`'s entry in `x <= 4` is `0.5` in the
-/// column data and `1` in the row data, and the primal phase pivots on it.
+/// A pivot element whose row and column computations disagree renews the
+/// factorization at a raised threshold first; on a fresh one at the highest
+/// threshold it is taken with the column's element, and a basis it leaves
+/// singular would be repaired. Planted: `x`'s entry in `x <= 4` is `0.5` in
+/// the column data and `1` in the row data, and the primal phase pivots on
+/// it.
 #[test]
 fn a_primal_pivot_whose_computations_disagree_on_fresh_factors_is_taken() {
     init();
@@ -3153,7 +3246,14 @@ fn a_primal_pivot_whose_computations_disagree_on_fresh_factors_is_taken() {
     *sol.orig_constraints_csc.get_mut(0, 0).unwrap() = 0.5;
     sol.begin_primal_phase(true);
     let x = sol.price_primal().unwrap().unwrap();
-    let PivotChoice::Pivot(info) = sol.choose_pivot(x, &[], 1.0).unwrap() else {
+    assert!(matches!(
+        sol.choose_pivot(x, 1.0).unwrap(),
+        PivotChoice::Inconsistent { row: 0 }
+    ));
+    sol.raise_lu_threshold();
+    sol.rebuild_primal().unwrap();
+    assert_eq!(sol.lu_threshold, LU_STABLE_THRESHOLD);
+    let PivotChoice::Pivot(info) = sol.choose_pivot(x, 1.0).unwrap() else {
         panic!("x enters");
     };
     assert_eq!(info.elem.as_ref().unwrap().coeff, 0.5);
@@ -3164,7 +3264,8 @@ fn a_primal_pivot_whose_computations_disagree_on_fresh_factors_is_taken() {
 
 /// The dual simplex's counterpart: `x`'s entry in `x >= 1` is `0.5` in the
 /// column data and `1` in the row data, and the violated row is repaired by
-/// a pivot on it, with the column's element.
+/// a pivot on it, with the column's element, once the factorization is
+/// renewed at the highest threshold.
 #[test]
 fn a_dual_pivot_whose_computations_disagree_on_fresh_factors_is_taken() {
     init();
@@ -3186,71 +3287,44 @@ fn a_dual_pivot_whose_computations_disagree_on_fresh_factors_is_taken() {
     sol.end_dual_phase();
     assert_eq!(result.unwrap(), StopReason::Finished);
     assert!(matches!(sol.var_states[0], VarState::Basic(_)));
+    assert_eq!(sol.lu_threshold, LU_STABLE_THRESHOLD);
 }
 
-/// On a fresh factorization, the dual ratio test excludes as round-off an
-/// entry whose column computation is zero, instead of dividing the step by
-/// it. In `x + y >= 1` with `min x + 2 y`, `x` (the smaller ratio) has its
-/// entry planted as `1` in the row data and `0` in the column data: `x` is
-/// excluded, and `y` repairs the row.
+/// On a fresh factorization at the highest threshold, a dual pivot whose
+/// column computation is zero, or of the other sign than its row
+/// computation, cannot drive the step: the solve fails loudly instead of
+/// dividing by it, or moving the entering var the wrong way past its bound.
+/// In `x + y >= 1` with `min x + 2 y`, `x` (the smaller ratio) has its entry
+/// planted as `1` in the row data and `0`, or `-0.5`, in the column data.
 #[test]
-fn a_dual_pivot_whose_column_element_is_zero_is_excluded() {
+fn a_dual_pivot_the_column_computes_as_zero_or_of_the_other_sign_fails_loudly() {
     init();
-    let mut sol = Solver::try_new(
-        &[1.0, 2.0],
-        &[0.0, 0.0],
-        &[f64::INFINITY, f64::INFINITY],
-        &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 1.0)],
-        &[VarDomain::Real, VarDomain::Real],
-        None,
-        crate::Tolerances::default().feasibility,
-    )
-    .unwrap();
-    assert_eq!(sol.col_scales, [1.0, 1.0], "fixture: no column scaling");
-    assert_eq!(sol.row_scales, [1.0], "fixture: no row scaling");
-    *sol.orig_constraints_csc.get_mut(0, 0).unwrap() = 0.0;
-    sol.begin_dual_phase(true).unwrap();
-    let result = sol.dual_phase();
-    sol.end_dual_phase();
-    assert_eq!(result, Ok(StopReason::Finished));
-    assert!(matches!(sol.var_states[0], VarState::NonBasic(_)));
-    assert!(matches!(sol.var_states[1], VarState::Basic(_)));
-    assert!(float_eq(sol.get_value(1), 1.0));
-}
-
-/// On a fresh factorization, the dual ratio test also excludes an entry whose
-/// row and column computations have opposite signs: the step would take the
-/// entering var past its bound. In `x >= 1` with `min x`, `x`'s entry is
-/// planted as `1` in the row data and `-0.5` in the column data. `x`, the
-/// row's only candidate, is excluded, so the row's slack stays basic and the
-/// phase ends loudly on the row, where the step with `-0.5` would move `x` to
-/// `-2`.
-#[test]
-fn a_dual_pivot_whose_computations_differ_in_sign_is_excluded() {
-    init();
-    let mut sol = Solver::try_new(
-        &[1.0],
-        &[0.0],
-        &[f64::INFINITY],
-        &[(to_sparse(&[1.0]), ComparisonOp::Ge, 1.0)],
-        &[VarDomain::Real],
-        None,
-        crate::Tolerances::default().feasibility,
-    )
-    .unwrap();
-    assert_eq!(sol.col_scales, [1.0], "fixture: no column scaling");
-    assert_eq!(sol.row_scales, [1.0], "fixture: no row scaling");
-    *sol.orig_constraints_csc.get_mut(0, 0).unwrap() = -0.5;
-    sol.begin_dual_phase(true).unwrap();
-    let result = sol.dual_phase();
-    sol.end_dual_phase();
-    assert!(
-        matches!(&result, Err(Error::InternalError(msg))
-            if msg.contains("no var can repair row 0")),
-        "{result:?}"
-    );
-    assert!(matches!(sol.var_states[0], VarState::NonBasic(_)));
-    assert_eq!(sol.get_value(0), 0.0);
+    for planted in [0.0, -0.5] {
+        let mut sol = Solver::try_new(
+            &[1.0, 2.0],
+            &[0.0, 0.0],
+            &[f64::INFINITY, f64::INFINITY],
+            &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 1.0)],
+            &[VarDomain::Real, VarDomain::Real],
+            None,
+            crate::Tolerances::default().feasibility,
+        )
+        .unwrap();
+        assert_eq!(sol.col_scales, [1.0, 1.0], "fixture: no column scaling");
+        assert_eq!(sol.row_scales, [1.0], "fixture: no row scaling");
+        *sol.orig_constraints_csc.get_mut(0, 0).unwrap() = planted;
+        sol.begin_dual_phase(true).unwrap();
+        let result = sol.dual_phase();
+        sol.end_dual_phase();
+        assert!(
+            matches!(&result, Err(Error::InternalError(msg))
+                if msg.contains("through the column of a fresh factorization")),
+            "planted {planted}: {result:?}"
+        );
+        assert_eq!(sol.lu_threshold, LU_STABLE_THRESHOLD);
+        assert!(matches!(sol.var_states[0], VarState::NonBasic(_)));
+        assert_eq!(sol.get_value(0), 0.0);
+    }
 }
 
 /// The cleanup of a primal phase moves a slack left off its bound beyond its

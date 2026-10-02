@@ -265,11 +265,11 @@ mod tests_feasibility {
         });
     }
 
-    /// An entry too small to pivot on still bounds the primal step: x2's
-    /// entry, 1e-7 of the column's largest, falls an ulp under the relative
-    /// pivot floor, and leaving its row out of the step bound walked the
-    /// fixed x2 to 25 times its tolerance, after which the phases alternated
-    /// until `InternalError`.
+    /// An entry small beside its column still bounds the primal step: x2's
+    /// entry, 1e-7 of the column's largest, fell an ulp under a pivot floor
+    /// relative to that largest, and leaving its row out of the step bound
+    /// walked the fixed x2 to 25 times its tolerance, after which the phases
+    /// alternated until `InternalError`.
     #[test]
     fn property_counterexample_with_a_blocking_entry_below_the_pivot_floor() {
         use crate::tests::oracle::{assert_solves_within_contract, Model, Row, Var};

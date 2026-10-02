@@ -138,30 +138,32 @@ impl From<f64> for CDouble {
 /// terms' magnitude (`Dot2`, Ogita–Rump–Oishi 2005), so this is a bound up to
 /// 64 terms and an allowance for the typical error beyond. It matters only
 /// where the terms are some `1e22` times the tolerance.
-const COMPENSATED_ERROR: f64 = 16.0 * 4.930_380_657_631_324e-32; // 16 · 2^-104
+pub(super) const COMPENSATED_ERROR: f64 = 16.0 * 4.930_380_657_631_324e-32; // 16 · 2^-104
 
 /// The test of a converged refinement: a correction of at most `2^-53` of the
 /// solution in the max norm. Only a refinement whose second correction passes
-/// it bounds the error of the multipliers ([`multipliers_error`]): a solve
-/// that leaves more is too inaccurate to measure its own error, and a bound
-/// it gave could make a coefficient of the model's own count as zero.
+/// it bounds the error of its solution ([`refinement_error`]): a solve that
+/// leaves more is too inaccurate to measure its own error, and a bound it gave
+/// could make a coefficient or an entry of the model's own count as zero.
 const REFINEMENT_CONVERGED: f64 = f64::EPSILON / 2.0;
 
-/// The bound on the error of each multiplier of the refined row `rho`: the
-/// magnitude of its entry of the refinement's `second` correction
-/// ([`Solver::refine_basis_inverse_row`]), where the refinement converged
-/// ([`REFINEMENT_CONVERGED`]); `None` where it did not, or where the row or
-/// the correction is not finite. Each multiplier gets its own correction, not
-/// the largest of all, which carried through the entries of a var whose rows
-/// have multipliers far below the rest would let its coefficient count as
-/// zero far above the error those multipliers carry. A multiplier whose error
-/// exceeds its correction only has too small a bound, which can fail a proof
-/// but never make one.
-pub(super) fn multipliers_error(rho: &[CDouble], second: &[f64]) -> Option<Vec<f64>> {
-    let rho_norm = finite_max_norm(rho.iter().map(|r| r.value()))?;
+/// The bound on the error of each entry of a solution refined twice, `x`:
+/// the magnitude of its entry of the refinement's `second` correction, where
+/// the refinement converged ([`REFINEMENT_CONVERGED`]); `None` where it did
+/// not, or where the solution or the correction is not finite. The solutions
+/// are the row of the basis inverse the proof reads, whose entries are the
+/// multipliers ([`Solver::refine_basis_inverse_row`]), and a pivot column of
+/// the primal ratio test (`Solver::refine_pivot_col`). Each entry gets its own
+/// correction, not the largest of all, which carried through the entries of a
+/// var whose rows have multipliers far below the rest would let its
+/// coefficient count as zero far above the error those multipliers carry. An
+/// entry whose error exceeds its correction only has too small a bound, which
+/// can fail a proof, or bound a step that an exact zero would not, but never
+/// make a proof or an unbounded ray.
+pub(super) fn refinement_error(x: &[CDouble], second: &[f64]) -> Option<Vec<f64>> {
+    let x_norm = finite_max_norm(x.iter().map(|r| r.value()))?;
     let second_norm = finite_max_norm(second.iter().copied())?;
-    (second_norm <= REFINEMENT_CONVERGED * rho_norm)
-        .then(|| second.iter().map(|c| c.abs()).collect())
+    (second_norm <= REFINEMENT_CONVERGED * x_norm).then(|| second.iter().map(|c| c.abs()).collect())
 }
 
 /// The largest magnitude of `values`; `None` if one is not finite.
@@ -200,10 +202,15 @@ pub(super) struct RefinedRow {
     /// Per row, its multiplier, compensated.
     pub(super) rho: Vec<CDouble>,
     /// Per row, a bound on the error of its multiplier
-    /// ([`multipliers_error`]); `None` where the refinement did not converge,
+    /// ([`refinement_error`]); `None` where the refinement did not converge,
     /// and then a coefficient counts as zero only within the round-off of the
     /// certificate's own sums ([`Solver::proof_of`]).
     pub(super) error: Option<Vec<f64>>,
+    /// Per row, the second correction, taken off its multiplier; empty where
+    /// a correction is not finite. Carried through a column's entries, it is
+    /// how far the second step moved that column's coefficient, against which
+    /// the dual ratio test weighs the coefficient (`Solver::refine_pivot_row`).
+    pub(super) second: Vec<f64>,
 }
 
 /// The certificate the row of the basis inverse suggests for a violated
@@ -261,14 +268,21 @@ impl Solver {
     /// The row of the basis inverse for `row`, `rho = B^-T e_row`, solved for
     /// on the current factorization by the same transposed solve as
     /// [`Self::calc_row_coeffs`] (so the row the ratio test read, not
-    /// whatever row `inv_basis_row_coeffs` holds), and refined
-    /// ([`Self::refine_basis_inverse_row`]).
-    pub(super) fn refined_basis_inverse_row(&mut self, row: usize) -> RefinedRow {
+    /// whatever row `inv_basis_row_coeffs` holds): dense, and compensated for
+    /// a refinement's corrections to go into.
+    fn basis_inverse_row(&mut self, row: usize) -> Vec<CDouble> {
         let mut rho = vec![CDouble::default(); self.num_constraints()];
         let solved = self.basis_solver.solve_transp(std::iter::once((row, &1.0)));
         for (r, &value) in solved.iter() {
             rho[r] = CDouble::from(value);
         }
+        rho
+    }
+
+    /// The row of the basis inverse for `row` ([`Self::basis_inverse_row`]),
+    /// refined ([`Self::refine_basis_inverse_row`]).
+    pub(super) fn refined_basis_inverse_row(&mut self, row: usize) -> RefinedRow {
+        let rho = self.basis_inverse_row(row);
         self.refine_basis_inverse_row(row, rho)
     }
 
@@ -289,7 +303,7 @@ impl Solver {
     ///
     /// The second correction is the error the first step left, measured: once
     /// it is taken off, each multiplier is taken to be within it
-    /// ([`multipliers_error`]), where the refinement converged
+    /// ([`refinement_error`]), where the refinement converged
     /// ([`REFINEMENT_CONVERGED`]); [`Self::proof_of`] says what that bound
     /// decides. A single step would leave residuals the second removes, and
     /// no measure of its own error
@@ -300,20 +314,25 @@ impl Solver {
         row: usize,
         mut rho: Vec<CDouble>,
     ) -> RefinedRow {
+        let broken = |rho| RefinedRow {
+            rho,
+            error: None,
+            second: Vec::new(),
+        };
         let Some(first) = self.basis_inverse_row_correction(row, &rho) else {
-            return RefinedRow { rho, error: None };
+            return broken(rho);
         };
         for (r, correction) in rho.iter_mut().zip(&first) {
             r.add(-correction);
         }
         let Some(second) = self.basis_inverse_row_correction(row, &rho) else {
-            return RefinedRow { rho, error: None };
+            return broken(rho);
         };
         for (r, correction) in rho.iter_mut().zip(&second) {
             r.add(-correction);
         }
-        let error = multipliers_error(&rho, &second);
-        RefinedRow { rho, error }
+        let error = refinement_error(&rho, &second);
+        RefinedRow { rho, error, second }
     }
 
     /// The correction of one step of [`Self::refine_basis_inverse_row`]:
@@ -554,34 +573,30 @@ impl Solver {
     }
 
     /// The last resort of the dual simplex for a violated `row` that no var
-    /// can repair, not even by a pivot on an unstable entry, and that does
-    /// not prove the model infeasible (see [`Self::dual_phase`]): the
-    /// non-basic vars that can close the gap move. First they flip to their
-    /// bound in the direction that helps (the last one, if a flip would carry
-    /// the leaving var past its other bound, only partway, where it stays
-    /// non-basic between its bounds), kept, if `flips_allowed`, when that
-    /// lands the leaving var within its tolerance, computed through their
-    /// columns. Otherwise, largest reach first, the bound each sits at in
-    /// that direction is widened by its room ([`Self::widening_room`]) for
-    /// the rest of the solve ([`Self::widen`]) and the var moves onto it,
-    /// until the leaving var reaches its target or none is left; a widened
-    /// var stays at the bound it sat at, dual feasible, and the dual simplex
-    /// goes on over the bounds in force. That is the room the proof grants
-    /// every term but the leaving var ([`Self::proof_of`]), so a row it
-    /// leaves open has a widening until the room of every var that can help
-    /// it is spent, and a phase widens finitely often.
+    /// can repair and that does not prove the model infeasible (see
+    /// [`Self::dual_phase`]): the non-basic vars that can close the gap and
+    /// sit at their bound in the direction that helps move past it. Largest
+    /// reach first, the bound each sits at is widened by its room
+    /// ([`Self::widening_room`]) for the rest of the solve ([`Self::widen`])
+    /// and the var moves onto it, until the leaving var reaches its target or
+    /// none is left; a widened var stays at the bound it sat at, dual
+    /// feasible, and the dual simplex goes on over the bounds in force. That
+    /// is the room the proof grants every term but the leaving var
+    /// ([`Self::proof_of`]), so a row it leaves open has a widening until the
+    /// room of every var that can help it is spent, and a phase widens
+    /// finitely often. Returns whether it widened a bound.
     ///
-    /// The `wide_chain` fixtures of `src/tests/magnitudes.rs` need the
-    /// flips: their only repair moves a var through an entry of `1.5e-15`
-    /// beside `1.95`, below every pivot floor. The widening is the room of a
-    /// row every var that could move sits at the bound that blocks, short of
-    /// its bound by a tolerance, alone or with other rows
-    /// (`the_repair_moves_vars_past_their_bounds_within_their_tolerances`).
-    /// A var the engine keeps on its bounds ([`Self::holds_on_bounds`]) is
-    /// never widened: an integer var's bounds are where presolve's rewrite of
-    /// a big-M row holds exactly (past them, the row as written is tighter
-    /// than the rewritten one by the cut coefficient times the move), and a
-    /// fixed structural var's value is where presolve checks the rows it
+    /// The widening is the room of a row every var that could move sits at
+    /// the bound that blocks, short of its bound by a tolerance, alone or with
+    /// other rows (`the_repair_moves_vars_past_their_bounds_within_their_tolerances`).
+    /// A var that could move toward its other bound is the dual ratio test's,
+    /// down to the smallest genuine entry of a refined row
+    /// ([`Self::genuine_entry_step`]), the last resort before this. A var the
+    /// engine keeps on its bounds ([`Self::holds_on_bounds`]) is never
+    /// widened: an integer var's bounds are where presolve's rewrite of a
+    /// big-M row holds exactly (past them, the row as written is tighter than
+    /// the rewritten one by the cut coefficient times the move), and a fixed
+    /// structural var's value is where presolve checks the rows it
     /// substituted it out of.
     ///
     /// The moves are read off the certificate, not off the tableau row: a var
@@ -590,137 +605,65 @@ impl Solver {
     /// it helps and with a finite bound there, and it carries the leaving var
     /// by its coefficient times its move. That is its tableau entry times its
     /// move only where the certificate keeps every row of the var; where it
-    /// does not, a flip misses and is undone, and a widening leaves the row to
-    /// the dual simplex. A round-off coefficient, which the proof counts on a
-    /// finite bound, makes no move: the round-off floors of the ratio tests
-    /// hide such an entry from the rest of the engine, so the primal step
-    /// would take the move back and the phases would alternate until
-    /// `MAX_PHASE_ROUNDS`.
-    pub(super) fn certificate_repair(&mut self, row: usize, flips_allowed: bool) -> Repair {
+    /// does not, a widening leaves the row to the dual simplex.
+    pub(super) fn certificate_repair(&mut self, row: usize) -> bool {
         let refined = self.refined_basis_inverse_row(row);
         let leaving_new_val = self.leaving_target(row);
         let val = self.basic_var_vals[row];
         let leaving_up = leaving_new_val > val;
         let cert = self.certificate(&refined, leaving_up);
         let tols = self.var_tols[self.basic_vars[row]];
-        // How far the leaving var must move, the tolerance within which it
-        // counts as there, and how far past it a flip may carry it (to its
-        // other bound, within that bound's tolerance).
+        // How far the leaving var must move, and the tolerance within which it
+        // counts as there.
         let need = (val - leaving_new_val).abs();
-        let (target_tol, room_past_target) = if leaving_up {
-            (
-                tols.lo,
-                self.basic_var_maxs[row] - leaving_new_val + tols.hi,
-            )
-        } else {
-            (
-                tols.hi,
-                leaving_new_val - self.basic_var_mins[row] + tols.lo,
-            )
-        };
-        // The vars that can help, as (col, coefficient, bound it moves to,
-        // whether it sits there already). A var helps by moving up where its
-        // coefficient is positive, down where it is negative.
-        let helpers: Vec<(usize, f64, f64, bool)> = self
+        let target_tol = if leaving_up { tols.lo } else { tols.hi };
+        // The vars that can help past the bound they sit at, as (col, var,
+        // up, the widened bound, how far its move carries the leaving var). A
+        // var helps by moving up where its coefficient is positive, down where
+        // it is negative.
+        let mut band: Vec<(usize, usize, bool, f64, f64)> = self
             .nb_vars
             .iter()
             .enumerate()
             .filter_map(|(c, &var)| {
                 let p = cert.coeff(var);
-                if !p.is_finite() || cert.is_round_off(var, p) {
+                if !p.is_finite() || cert.is_round_off(var, p) || self.holds_on_bounds(var) {
                     return None;
                 }
+                let up = p > 0.0;
                 let state = &self.nb_var_states[c];
-                let (at_bound, bound) = if p > 0.0 {
+                let (at_bound, bound) = if up {
                     (state.at_max, self.orig_var_maxs[var])
                 } else {
                     (state.at_min, self.orig_var_mins[var])
                 };
-                bound.is_finite().then_some((c, p, bound, at_bound))
-            })
-            .collect();
-        let mut moves = Moves {
-            need,
-            target_tol,
-            room_past_target,
-            moved: 0.0,
-            list: Vec::new(),
-        };
-        // First to the bounds.
-        moves.take(
-            helpers
-                .iter()
-                .filter(|h| !h.3)
-                .map(|&(c, p, bound, _)| (c, p, self.nb_var_vals[c], bound))
-                .collect(),
-        );
-        if moves.landed() {
-            if !flips_allowed {
-                return Repair::Nothing;
-            }
-            let undo: Vec<(usize, f64)> = moves
-                .list
-                .iter()
-                .map(|&(c, _)| (c, self.nb_var_vals[c]))
-                .collect();
-            self.apply_flips(&moves.list);
-            if !self.basic_var_within_bounds(row) {
-                self.apply_flips(&undo);
-                return Repair::Nothing;
-            }
-            self.finish_repair(row, &moves.list, 0);
-            return Repair::Flipped;
-        }
-        // Then past them: largest reach first, each var's bound in the
-        // direction it helps widened by its room, with the var on it.
-        let mut band: Vec<(usize, usize, bool, f64, f64)> = helpers
-            .iter()
-            .filter_map(|&(c, p, bound, _)| {
-                let var = self.nb_vars[c];
-                let up = p > 0.0;
                 let room = self.widening_room(var, up);
-                if self.holds_on_bounds(var) || room <= 0.0 {
+                if !at_bound || !bound.is_finite() || room <= 0.0 {
                     return None;
                 }
                 let edge = band_edge(bound, room, up);
-                // Every var a flip took sits at its bound.
-                let from = if moves.list.iter().any(|&(col, _)| col == c) {
-                    bound
-                } else {
-                    self.nb_var_vals[c]
-                };
-                let reach = p * (edge - from);
+                let reach = p * (edge - self.nb_var_vals[c]);
                 (reach > 0.0 && reach.is_finite()).then_some((c, var, up, edge, reach))
             })
             .collect();
         band.sort_by(|a, b| b.4.total_cmp(&a.4));
-        let mut widened = Vec::new();
+        let mut moved = 0.0;
+        let mut moves = Vec::new();
         for (c, var, up, edge, reach) in band {
-            if moves.landed() {
+            if need - moved <= target_tol {
                 break;
             }
-            moves.moved += reach;
-            moves.set(c, edge);
-            widened.push((var, up, edge));
-        }
-        if widened.is_empty() {
-            return Repair::Nothing;
-        }
-        for &(var, up, edge) in &widened {
+            moved += reach;
             self.widen(var, up, edge);
+            moves.push((c, edge));
         }
-        self.apply_flips(&moves.list);
-        self.finish_repair(row, &moves.list, widened.len());
-        Repair::Widened
-    }
-
-    /// Log the certificate repair's `moves` of `row` (see
-    /// [`Self::certificate_repair`]), `widened` of them onto widened bounds,
-    /// and shift the costs a flip leaves dual infeasible.
-    fn finish_repair(&mut self, row: usize, moves: &[(usize, f64)], widened: usize) {
+        if moves.is_empty() {
+            return false;
+        }
+        self.apply_flips(&moves);
         trace!(
-            "dual certificate repair: vars moved {:?} ({widened} onto widened bounds), var {} of \
-             row {row} at {:e}",
+            "dual certificate repair: vars moved onto widened bounds {:?}, var {} of row {row} at \
+             {:e}",
             moves
                 .iter()
                 .map(|&(c, val)| (self.nb_vars[c], val))
@@ -728,85 +671,6 @@ impl Solver {
             self.basic_vars[row],
             self.basic_var_vals[row],
         );
-        for &(c, _) in moves {
-            // No dual step went with a flip, so the var's reduced cost may
-            // have the wrong sign where it landed: its cost is shifted until
-            // it has the right one, and the cleanup gives the shift back. A
-            // widened var stays at the bound it sat at, which needs none.
-            self.shift_to_dual_feasible(c);
-        }
-    }
-}
-
-/// What [`Solver::certificate_repair`] did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Repair {
-    /// Its flips landed the row.
-    Flipped,
-    /// It widened at least one bound.
-    Widened,
-    /// Nothing: the flips do not land the row or are not allowed, and no
-    /// bound is left to widen.
-    Nothing,
-}
-
-/// The moves [`Solver::certificate_repair`] collects: how far the leaving var
-/// must go (`need`), within `target_tol`, and a flip may overshoot
-/// (`room_past_target`), how far the moves so far carry it, and the moves,
-/// as (col, value).
-struct Moves {
-    need: f64,
-    target_tol: f64,
-    room_past_target: f64,
-    moved: f64,
-    list: Vec<(usize, f64)>,
-}
-
-impl Moves {
-    /// Whether the moves so far bring the leaving var within its tolerance
-    /// of its target.
-    fn landed(&self) -> bool {
-        self.need - self.moved <= self.target_tol
-    }
-
-    /// Take the `candidates` (col, coefficient, from, to), largest reach
-    /// first, each all the way or, where that would carry the leaving var
-    /// past its other bound, the last one just far enough, until the leaving
-    /// var lands. A later move of a col replaces its earlier one.
-    fn take(&mut self, candidates: Vec<(usize, f64, f64, f64)>) {
-        let mut candidates: Vec<(usize, f64, f64, f64, f64)> = candidates
-            .into_iter()
-            .filter(|&(_, p, from, to)| (to - from) * p > 0.0)
-            .map(|(c, p, from, to)| (c, p, from, to, p.abs() * (to - from).abs()))
-            .filter(|&(.., reach)| reach.is_finite())
-            .collect();
-        candidates.sort_by(|a, b| b.4.total_cmp(&a.4));
-        for (c, p, from, to, reach) in candidates {
-            if self.landed() {
-                break;
-            }
-            let rest = self.need - self.moved;
-            let value = if reach <= rest + self.room_past_target {
-                self.moved += reach;
-                to
-            } else {
-                let step = rest / p.abs();
-                self.moved = self.need;
-                if to > from {
-                    from + step
-                } else {
-                    from - step
-                }
-            };
-            self.set(c, value);
-        }
-    }
-
-    /// Move `col` to `value`, replacing an earlier move of it.
-    fn set(&mut self, col: usize, value: f64) {
-        match self.list.iter_mut().find(|(c, _)| *c == col) {
-            Some(entry) => entry.1 = value,
-            None => self.list.push((col, value)),
-        }
+        true
     }
 }

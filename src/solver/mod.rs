@@ -26,7 +26,7 @@ mod tolerances;
 
 pub(crate) use basis::*;
 pub(crate) use proof::CDouble;
-use proof::Repair;
+use proof::{refinement_error, COMPENSATED_ERROR};
 pub(crate) use scaling::*;
 pub(crate) use tolerances::*;
 
@@ -135,11 +135,10 @@ pub(crate) struct Solver {
     /// units `x'_j = x_j / s_j`; every value or bound that crosses the
     /// `Solver` boundary is converted, so callers only see user units.
     col_scales: Vec<f64>,
-    /// Per structural var, whether both scalings left its column out (the var
-    /// was fixed on entry), so that it keeps the user's units. The dual ratio
-    /// test leaves such entries (a fixed `1e17` stays `1e17`) out of its
-    /// round-off scale.
-    unscaled_cols: Vec<bool>,
+    /// The threshold of the factorizations ([`LU_STABILITY_THRESHOLD`]),
+    /// raised for the rest of the solver's life once the two computations of
+    /// a pivot element disagree ([`Self::raise_lu_threshold`]).
+    lu_threshold: f64,
     /// The user's absolute feasibility tolerance
     /// ([`crate::Tolerances::feasibility`]), in user units.
     feasibility: f64,
@@ -279,8 +278,8 @@ enum VarState {
 }
 
 /// Where a non-basic var sits: at its lower bound, its upper bound, both (a
-/// fixed var), or neither (a free var at zero, or one the certificate repair
-/// moved partway).
+/// fixed var), or neither (a free var at zero, or one a bound change left
+/// between its bounds).
 #[derive(Clone, Debug)]
 struct NonBasicVarState {
     at_min: bool,
@@ -292,11 +291,11 @@ impl NonBasicVarState {
     /// bound when its value is that bound, and at both when they are equal.
     /// A move puts a non-basic var exactly on a bound, but a var can sit past
     /// one, within its tolerance: one that left the basis where it sat
-    /// (`hold_leaving_value`), which the primal cleanup leaves there, or one
-    /// the certificate repair moved (see `proof.rs`). It is at that bound,
-    /// and one strictly between its bounds (a partial repair move) is at
-    /// neither. No tolerance is involved, so a var whose range is narrower
-    /// than its tolerance is at one bound and can move to the other.
+    /// (`hold_leaving_value`), which the primal cleanup leaves there. It is at
+    /// that bound, and one strictly between its bounds (where a bound change
+    /// left it) is at neither. No tolerance is involved, so a var whose range
+    /// is narrower than its tolerance is at one bound and can move to the
+    /// other.
     fn at(val: f64, min: f64, max: f64) -> Self {
         let fixed = min == max;
         Self {
@@ -399,7 +398,6 @@ impl Solver {
         // Everything below works in scaled units: x'_j = x_j / s_j. A var
         // fixed here is left out of both scalings.
         let col_scales = column_scales(obj_coeffs, var_mins, var_maxs, constraints);
-        let unscaled_cols: Vec<bool> = (0..num_vars).map(|v| var_mins[v] == var_maxs[v]).collect();
         let mut orig_obj_coeffs: Vec<f64> = obj_coeffs
             .iter()
             .zip(&col_scales)
@@ -416,7 +414,7 @@ impl Solver {
             .map(|(&b, &s)| b / s)
             .collect();
         // Rows in scaled units.
-        let is_fixed = |var: usize| unscaled_cols[var];
+        let is_fixed = |var: usize| var_mins[var] == var_maxs[var];
         let mut prepared_rows = Vec::with_capacity(constraints.len());
         for (coeffs, cmp_op, rhs) in constraints {
             let coeffs = scale_columns(coeffs.clone(), &col_scales);
@@ -620,7 +618,7 @@ impl Solver {
             orig_rhs,
             row_scales,
             col_scales,
-            unscaled_cols,
+            lu_threshold: LU_STABILITY_THRESHOLD,
             feasibility,
             range: CoefficientRange::default(),
             var_tols,
@@ -1149,7 +1147,7 @@ impl Solver {
     /// positions makes the basis singular too): a repair would hide the bug
     /// and leave the var both basic and non-basic.
     fn factorize(&mut self) -> bool {
-        self.factorize_at(LU_STABILITY_THRESHOLD)
+        self.factorize_at(self.lu_threshold)
     }
 
     /// [`Self::factorize`] at the pivot `threshold` of the factorization.
@@ -1323,7 +1321,8 @@ impl Solver {
     /// follows its row's magnitude ([`Self::refit_widened_slacks`]). Then a
     /// ladder until the rows hold: the values as they are, then recomputed
     /// through a fresh factorization, then through one at
-    /// [`LU_STABLE_THRESHOLD`], each checked and refined once
+    /// [`LU_STABLE_THRESHOLD`] where the threshold in force is lower, each
+    /// checked and refined once
     /// ([`Self::rows_hold`]): a residual the rows accept, left in any basic
     /// var, can be amplified into the objective. Recomputes the objective
     /// from the values and sets `is_primal_feasible`. A fresh factorization
@@ -1343,7 +1342,13 @@ impl Solver {
         }
         self.refit_widened_slacks();
         let mut hold = self.rows_hold();
-        for threshold in [LU_STABILITY_THRESHOLD, LU_STABLE_THRESHOLD] {
+        let ladder = [self.lu_threshold, LU_STABLE_THRESHOLD];
+        let rungs = if self.lu_threshold < LU_STABLE_THRESHOLD {
+            &ladder[..]
+        } else {
+            &ladder[..1]
+        };
+        for &threshold in rungs {
             if hold {
                 break;
             }
@@ -1454,20 +1459,35 @@ impl Solver {
     }
 
     /// Whether the pivot element computed through the row and through the
-    /// column agree: to [`PIVOT_AGREEMENT_TOL`] relative to the element, or
-    /// to the round-off of the computations that produced it, `scale` being
-    /// the largest entry of the tableau row and column involved (a genuine
-    /// entry far below its neighbours carries an absolute error of that order
-    /// and can never agree relatively). Round-off agreement vouches only for
-    /// an element above the level at which the factorization calls a basis
-    /// singular ([`LU_SINGULAR_REL`] of the scale); below it, an element
-    /// agrees with anything of its own size, so only relative agreement tells
-    /// a genuine element from noise.
-    fn pivots_agree(a_row: f64, a_col: f64, scale: f64) -> bool {
-        let diff = (a_row - a_col).abs();
-        let element = a_row.abs().min(a_col.abs());
-        diff <= PIVOT_AGREEMENT_TOL * a_row.abs().max(a_col.abs())
-            || (diff <= ENTRY_ROUNDOFF * scale && element > LU_SINGULAR_REL * scale)
+    /// column agree, to [`PIVOT_AGREEMENT_TOL`] relative to the larger, signs
+    /// included. Every pivot exceeds the absolute pivot tolerance of its ratio
+    /// test ([`dual_pivot_tolerance`], [`primal_pivot_tolerance`]), far above
+    /// the round-off of computing it, so no element needs an allowance for
+    /// that round-off.
+    fn pivots_agree(a_row: f64, a_col: f64) -> bool {
+        (a_row - a_col).abs() <= PIVOT_AGREEMENT_TOL * a_row.abs().max(a_col.abs())
+    }
+
+    /// Whether a fresh factorization can still settle a pivot element whose
+    /// two computations disagree: the current one has updates on it, or its
+    /// threshold can rise ([`Self::raise_lu_threshold`]). At the highest
+    /// threshold, fresh, the element is what the arithmetic gives.
+    fn can_renew_factorization(&self) -> bool {
+        !self.factorization_is_fresh() || self.lu_threshold < LU_STABLE_THRESHOLD
+    }
+
+    /// Raise the threshold of the factorizations fivefold, up to
+    /// [`LU_STABLE_THRESHOLD`], after the two computations of a pivot element
+    /// disagreed, unless ten or more updates sit on the factorization, which
+    /// are then the likelier cause. The caller renews the factorization.
+    fn raise_lu_threshold(&mut self) {
+        if self.basis_solver.eta_matrices.len() < 10 && self.lu_threshold < LU_STABLE_THRESHOLD {
+            self.lu_threshold = (self.lu_threshold * 5.0).min(LU_STABLE_THRESHOLD);
+            debug!(
+                "the factorization's threshold rises to {}",
+                self.lu_threshold
+            );
+        }
     }
 
     /// The entry of the current pivot column at `row`.
@@ -1712,21 +1732,14 @@ impl Solver {
     /// runs the ratio test ([`Self::choose_pivot`]) and, unless the basis
     /// change is bad ([`CycleGuard`]), applies it, then shifts the working
     /// bound of every basic var the step left outside its bounds beyond its
-    /// tolerance ([`Self::correct_primal`]).
+    /// tolerance ([`Self::correct_primal`]). Where the two computations of the
+    /// pivot element disagree, the factorization is renewed, at a raised
+    /// threshold ([`Self::raise_lu_threshold`]), and the iteration redone.
     ///
     /// The phase fails loudly rather than run forever: when, after a rebuild,
     /// the only vars left to enter are taboo, and when the objective has not
     /// fallen beyond round-off in [`STALL_ITERATIONS`] iterations.
     fn primal_phase(&mut self, harris_scale: f64) -> Result<(StopReason, bool), Error> {
-        // Rows whose entry in the entering column `excluded_col` proved to be
-        // round-off (see `PivotChoice::Inconsistent`). The verdict is on one
-        // entry of one column in the current basis: they are dropped when
-        // another column is priced (for it they could hide a genuine blocking
-        // entry, which the step would pass, or turn a bounded ray into an
-        // unbounded one) and after any pivot, and kept through a rebuild,
-        // which factorizes the same basis again.
-        let mut excluded_rows: Vec<usize> = Vec::new();
-        let mut excluded_col: Option<usize> = None;
         let mut pivoted = false;
         // Whether the data are fresh from a rebuild with no step since: only
         // then do taboo vars alone left to enter mean the phase is stuck.
@@ -1789,11 +1802,7 @@ impl Solver {
                 );
                 break;
             };
-            if excluded_col != Some(col) {
-                excluded_rows.clear();
-                excluded_col = Some(col);
-            }
-            match self.choose_pivot(col, &excluded_rows, harris_scale)? {
+            match self.choose_pivot(col, harris_scale)? {
                 PivotChoice::Pivot(pivot_info) => {
                     if let Some(elem) = &pivot_info.elem {
                         let next = self.cycle_guard.hash_after(
@@ -1839,16 +1848,14 @@ impl Solver {
                     self.correct_primal();
                     pivoted = true;
                     refreshed_since_step = false;
-                    excluded_col = None;
                 }
                 PivotChoice::Inconsistent { row } => {
-                    if !self.factorization_is_fresh() {
-                        debug!("optimize iter {iter}: pivot row/column disagreement; rebuilding");
-                        self.rebuild_primal()?;
-                    } else {
-                        debug!("optimize iter {iter}: entry at row {row} is round-off; excluded");
-                        excluded_rows.push(row);
-                    }
+                    debug!(
+                        "optimize iter {iter}: pivot row/column disagreement at row {row}; \
+                         rebuilding"
+                    );
+                    self.raise_lu_threshold();
+                    self.rebuild_primal()?;
                 }
             }
         }
@@ -1928,22 +1935,28 @@ impl Solver {
     /// fresh data ([`DualRatioTest::NoCandidate`]) has a certificate that
     /// holds on the model's data ([`Self::prove_infeasible`]); a row whose
     /// proof fails is made taboo. When only taboo rows are left on fresh data,
-    /// one whose proof failed gets two last resorts: the ratio test with every
-    /// entry of at least [`INSTABLE_PIVOT_TOL`] a candidate, then the
-    /// certificate repair ([`Self::certificate_repair`]): flips of the
-    /// non-basic vars the row's certificate says can help, once per row in a
-    /// phase, or the bounds they sit at widened by their room for the rest of
-    /// the solve, after which the cycling detection starts afresh, the LP
-    /// having changed.
+    /// one whose proof failed gets the last resorts: a pivot on a genuine
+    /// entry below the pivot tolerance ([`Self::genuine_entry_step`]), then
+    /// the certificate repair ([`Self::certificate_repair`]): the bounds the
+    /// non-basic vars the row's certificate says can help sit at, widened by
+    /// their room for the rest of the solve, after which the cycling detection
+    /// starts afresh, the LP having changed.
+    ///
+    /// Where the two computations of the pivot element disagree, the
+    /// factorization is renewed, at a raised threshold
+    /// ([`Self::raise_lu_threshold`]), and the iteration redone; on a fresh
+    /// factorization at the highest threshold the column's element is taken
+    /// if it is a pivot itself, of the row's sign and above the pivot
+    /// tolerance, and the solve fails loudly otherwise.
     ///
     /// The phase fails loudly rather than run forever or guess: when only
     /// taboo rows are left after a rebuild and no last resort remains, and
     /// when the dual objective has not risen beyond round-off in
     /// [`STALL_ITERATIONS`] iterations. The room an unrepaired row's
-    /// certificate leaves then lies where no step reaches: in an entry below
-    /// [`INSTABLE_PIVOT_TOL`] of a var with no bound in its direction, in a
-    /// coefficient below the round-off of its terms, within the round-off of
-    /// the room every term can give, or beyond the values computed through
+    /// certificate leaves then lies where no step reaches: in an entry at or
+    /// below the pivot tolerance of a var with no bound in its direction, in
+    /// a coefficient below the round-off of its terms, within the round-off
+    /// of the room every term can give, or beyond the values computed through
     /// the basis (see the known limitations in ARCHITECTURE §7).
     fn dual_phase(&mut self) -> Result<StopReason, Error> {
         let obj_str = if self.artificial_obj.is_some() {
@@ -1954,25 +1967,17 @@ impl Solver {
 
         // Whether the data are fresh from a rebuild, with no pivot since: a
         // row's verdict, or the loud error when only taboo rows are left, is
-        // drawn on fresh data only.
+        // drawn on fresh data only. Only the unproven row with the best score
+        // gets the last resort: if it fails on it, the phase fails without
+        // trying another (a loud error where there might have been an answer,
+        // never a wrong answer).
         let mut refreshed_since_pivot = false;
-        // Non-basic columns whose entry in the current leaving row proved to
-        // be round-off (see the agreement check below), for that row only.
-        let mut excluded_cols: Vec<usize> = Vec::new();
-        let mut excluded_row: Option<usize> = None;
-        // The row the unstable-pivot last resort takes next, and the row it
-        // was tried on since the data were last refreshed, which gets the
-        // certificate repair instead if it is left again. Only the unproven row
-        // with the best score gets the last resorts: if they fail on it, the
-        // phase fails without trying another (a loud error where there might
-        // have been an answer, never a wrong answer).
-        let mut instable_row: Option<usize> = None;
-        let mut instable_tried: Option<usize> = None;
-        // The rows the certificate repair has repaired in this phase: a row
-        // that needs it again fails the phase (see above).
-        let mut repaired_rows: Vec<usize> = Vec::new();
         // The dual objective at the last stall check.
         let mut stall_reference = self.cur_obj_val;
+        // The unproven row the next iteration gives the genuine entries of its
+        // refined row, and the last row given them since the last rebuild.
+        let mut last_resort_row: Option<usize> = None;
+        let mut last_resort_tried: Option<usize> = None;
 
         for iter in 0.. {
             self.lp_iterations += 1;
@@ -2008,7 +2013,7 @@ impl Solver {
                 stall_reference = obj;
             }
 
-            let (row, leaving_new_val, instable) = if let Some(row) = instable_row.take() {
+            let (row, leaving_new_val, last_resort) = if let Some(row) = last_resort_row.take() {
                 (row, self.leaving_target(row), true)
             } else if let Some((row, leaving_new_val)) = self.choose_pivot_row_dual() {
                 (row, leaving_new_val, false)
@@ -2022,35 +2027,31 @@ impl Solver {
                     // gets the last resorts, and otherwise the phase is stuck.
                     if refreshed_since_pivot {
                         if let Some(row) = self.unproven_row() {
-                            if instable_tried != Some(row) {
+                            // First a genuine entry below the pivot tolerance,
+                            // once per rebuild ([`Self::genuine_entry_step`]).
+                            if last_resort_tried != Some(row) {
                                 debug!(
                                     "restore feasibility iter {iter}: only taboo rows are left; \
-                                     instable leave on unproven row {row}"
+                                     the genuine entries of unproven row {row}"
                                 );
-                                instable_tried = Some(row);
-                                instable_row = Some(row);
+                                last_resort_tried = Some(row);
+                                last_resort_row = Some(row);
                                 continue;
                             }
-                            // The unstable pivot was not taken: the
-                            // certificate repair's flips, once per row in a
-                            // phase, or its widening, or nothing can repair
-                            // the row. A widening changes the LP, so the
-                            // cycling detection starts afresh.
-                            match self.certificate_repair(row, !repaired_rows.contains(&row)) {
-                                Repair::Flipped => repaired_rows.push(row),
-                                Repair::Widened => self.start_cycle_detection(),
-                                Repair::Nothing => {
-                                    return Err(Error::InternalError(format!(
-                                        "dual simplex: no var can repair row {row} (basic var \
-                                         {}) by an accepted pivot or through a coefficient \
-                                         above round-off, and the row does not prove the model \
-                                         infeasible",
-                                        self.basic_vars[row]
-                                    )));
-                                }
+                            // Then the certificate repair's widening, or
+                            // nothing can repair the row. A widening changes
+                            // the LP, so the cycling detection starts afresh.
+                            if !self.certificate_repair(row) {
+                                return Err(Error::InternalError(format!(
+                                    "dual simplex: no var can repair row {row} (basic var {}) by \
+                                     a pivot or through a coefficient above round-off, and the \
+                                     row does not prove the model infeasible",
+                                    self.basic_vars[row]
+                                )));
                             }
+                            self.start_cycle_detection();
                             refreshed_since_pivot = false;
-                            instable_tried = None;
+                            last_resort_tried = None;
                             continue;
                         }
                         return Err(self.stuck_error("dual"));
@@ -2060,7 +2061,7 @@ impl Solver {
                     );
                     self.rebuild_dual()?;
                     refreshed_since_pivot = true;
-                    instable_tried = None;
+                    last_resort_tried = None;
                     continue;
                 }
                 debug!(
@@ -2071,22 +2072,24 @@ impl Solver {
                 );
                 break;
             };
-            self.calc_row_coeffs(row);
-            if excluded_row != Some(row) {
-                excluded_cols.clear();
-                excluded_row = Some(row);
-            }
-            let test =
-                self.choose_entering_col_dual(row, leaving_new_val, &excluded_cols, instable);
+            let test = if last_resort {
+                self.genuine_entry_step(row, leaving_new_val)
+            } else {
+                self.calc_row_coeffs(row);
+                self.choose_entering_col_dual(row, leaving_new_val)
+            };
             let step = match test {
                 Ok(DualRatioTest::Step(step)) => step,
+                // The certificate repair is next for a row no genuine entry
+                // repairs either.
+                Ok(DualRatioTest::NoCandidate) if last_resort => continue,
                 Ok(DualRatioTest::DualInfeasible) => {
                     // A candidate's reduced cost lies beyond its tolerance
                     // on its infeasible side (drift of the incremental
-                    // updates, or an earlier step its entry, below the pivot
-                    // floor, did not bound: see `rebuild_dual`): recompute
-                    // and correct. The correction leaves every reduced cost
-                    // feasible, so this cannot follow a rebuild.
+                    // updates, or an earlier step its entry, at or below the
+                    // pivot tolerance, did not bound: see `rebuild_dual`):
+                    // recompute and correct. The correction leaves every
+                    // reduced cost feasible, so this cannot follow a rebuild.
                     if refreshed_since_pivot {
                         return Err(Error::InternalError(
                             "dual simplex: a reduced cost is dual infeasible right after its \
@@ -2100,12 +2103,6 @@ impl Solver {
                     );
                     self.rebuild_dual()?;
                     refreshed_since_pivot = true;
-                    instable_tried = None;
-                    continue;
-                }
-                Ok(DualRatioTest::NoCandidate) if instable => {
-                    // Not even an unstable pivot: the row is left once more,
-                    // for the certificate repair (see above).
                     continue;
                 }
                 Ok(DualRatioTest::NoCandidate) if !refreshed_since_pivot => {
@@ -2120,7 +2117,6 @@ impl Solver {
                     );
                     self.rebuild_dual()?;
                     refreshed_since_pivot = true;
-                    instable_tried = None;
                     continue;
                 }
                 Ok(DualRatioTest::NoCandidate) => {
@@ -2150,41 +2146,42 @@ impl Solver {
                 // The row is taboo now; the next iteration takes another.
                 continue;
             }
-            self.calc_col_coeffs(col);
             // The pivot element is known through the row (transposed solve)
-            // and the column (forward solve); a disagreement means one is
-            // round-off. With pivots stacked on the factorization, rebuild and
-            // redo the iteration. On a fresh one, an entry that either
-            // computation finds tiny, or that they give opposite signs, is
-            // round-off, and its column is excluded for this row: the row
-            // chose it, and the step divides by the column's element. Any
-            // other is taken, with the column's element below; a basis it
-            // leaves singular is repaired at the next factorization.
+            // and the column (forward solve), a refined row's against the
+            // refined column: like with like. Where they disagree, the
+            // factorization is renewed, at a raised threshold, and the
+            // iteration redone. On a fresh factorization at the highest
+            // threshold the column's element is what the arithmetic gives: it
+            // divides the step, so it must have the row's sign and, unless
+            // both were refined, exceed the pivot tolerance, or the solve
+            // fails loudly. A basis the pivot leaves singular is repaired at
+            // the next factorization.
+            self.calc_col_coeffs(col);
+            if step.refined {
+                self.refine_pivot_col(col)?;
+            }
             let a_col = self.col_coeff_at(row);
-            let scale = self
-                .row_coeffs
-                .iter()
-                .chain(self.col_coeffs.iter())
-                .map(|(_, coeff)| coeff.abs())
-                .fold(0.0, f64::max);
-            if !Self::pivots_agree(a_row, a_col, scale) {
-                if !self.factorization_is_fresh() {
+            if !Self::pivots_agree(a_row, a_col) {
+                if self.can_renew_factorization() {
                     debug!(
                         "restore feasibility iter {iter}: pivot row/column disagreement \
                          ({a_row:e} vs {a_col:e}); rebuilding"
                     );
+                    self.raise_lu_threshold();
                     self.rebuild_dual()?;
-                    instable_tried = None;
                     continue;
                 }
-                let floor = PIVOT_REL_TOL * scale;
-                if a_row.abs() < floor || a_col.abs() < floor || (a_row > 0.0) != (a_col > 0.0) {
-                    debug!(
-                        "restore feasibility iter {iter}: entry of column {col} in row {row} is \
-                         round-off ({a_row:e} vs {a_col:e}); excluded"
-                    );
-                    excluded_cols.push(col);
-                    continue;
+                let pivot_tol = dual_pivot_tolerance(self.basis_solver.eta_matrices.len());
+                if a_col == 0.0
+                    || (a_row > 0.0) != (a_col > 0.0)
+                    || (!step.refined && a_col.abs() <= pivot_tol)
+                {
+                    return Err(Error::InternalError(format!(
+                        "dual simplex: the pivot element of var {} in row {row} is {a_row:e} \
+                         through the row and {a_col:e} through the column of a fresh \
+                         factorization",
+                        self.nb_vars[col]
+                    )));
                 }
                 debug!(
                     "restore feasibility iter {iter}: pivot row/column disagreement \
@@ -2243,8 +2240,6 @@ impl Solver {
             self.forget_moved_rows(entering_diff);
             // Any successful pivot is progress: re-arm the valve.
             refreshed_since_pivot = false;
-            instable_tried = None;
-            excluded_row = None;
         }
 
         // Provisional: `run_phases` confirms it on recomputed values.
@@ -2259,10 +2254,10 @@ impl Solver {
     /// [`CycleGuard`]).
     ///
     /// The correction shifts every infeasible cost, a boxed var's too: the
-    /// ratio test leaves entries below [`PIVOT_REL_TOL`] of the row's largest
-    /// out of the step bound, so a step can leave such a var far dual
-    /// infeasible, and moving it to its other bound would return the phase to
-    /// a vertex it left (`wide_lp_1897_solves_within_the_contract` in
+    /// ratio test leaves an entry at or below the pivot tolerance out of the
+    /// step's bound, so a step can leave its var far dual infeasible, and
+    /// moving it to its other bound would return the phase to a vertex it left
+    /// (as on the model of `wide_lp_1897_solves_within_the_contract` in
     /// `src/tests/magnitudes.rs`). A shift keeps the vertex, and the cleanup
     /// gives it back.
     fn rebuild_dual(&mut self) -> Result<(), Error> {
@@ -2483,6 +2478,78 @@ impl Solver {
         }
     }
 
+    /// The pivot row of `row` refined, for a pivot the growth test finds
+    /// small, a row no pivot above the tolerance repairs (see
+    /// [`Self::choose_entering_col_dual`]), or a pivot read off a refined
+    /// column (see [`Self::choose_pivot`]): the row of the basis inverse the
+    /// infeasibility proof reads, refined twice in doubled precision
+    /// ([`Self::refined_basis_inverse_row`]), and the entries of the
+    /// non-basic columns summed from it in compensated arithmetic, their
+    /// products exact. The refined row replaces `row_coeffs` and, rounded,
+    /// `inv_basis_row_coeffs`, so that the ratio test, the pivot's
+    /// reduced-cost update and the steepest-edge updates all use it.
+    ///
+    /// Returns, per non-basic column, whether its entry is genuine: the
+    /// refinement has settled it, its second step moving it by less than its
+    /// size, beyond the round-off of the compensated sum. The second
+    /// correction carried through the column's entries is that move, with the
+    /// cancellation the multipliers themselves have in that column: through
+    /// an ill-conditioned basis the multipliers' corrections are large, but
+    /// along the column's own direction they cancel as the multipliers do. An
+    /// entry that is zero but for the error of computing it moves by its own
+    /// size and is not genuine, however it came out; one the data leave,
+    /// however small and however inexactly the plain row computed it, is. A
+    /// refinement that is not finite settles nothing.
+    fn refine_pivot_row(&mut self, row: usize) -> Vec<bool> {
+        let refined = self.refined_basis_inverse_row(row);
+        let num_cols = self.nb_vars.len();
+        let mut entries = vec![CDouble::default(); num_cols];
+        // Per column, how far the second step moved its entry, and the
+        // magnitude and count of the terms the entry is summed from.
+        let mut moves = vec![CDouble::default(); num_cols];
+        let mut magnitudes = vec![0.0; num_cols];
+        let mut terms = vec![0u32; num_cols];
+        for (r, &y) in refined.rho.iter().enumerate() {
+            let y_value = y.value();
+            let second = refined.second.get(r).copied().unwrap_or(0.0);
+            if y_value == 0.0 && second == 0.0 {
+                continue;
+            }
+            //guaranteed to be a valid index
+            for (v, &val) in self.orig_constraints.outer_view(r).unwrap().iter() {
+                if let VarState::NonBasic(idx) = self.var_states[v] {
+                    entries[idx].add_scaled(y, val);
+                    moves[idx].add_product(second, val);
+                    magnitudes[idx] += (y_value * val).abs();
+                    terms[idx] += 1;
+                }
+            }
+        }
+        let settled = !refined.second.is_empty();
+        let genuine = (0..num_cols)
+            .map(|idx| {
+                let sum_error = (f64::from(terms[idx]) + 1.0) * COMPENSATED_ERROR * magnitudes[idx];
+                settled && entries[idx].value().abs() > moves[idx].value().abs() + sum_error
+            })
+            .collect();
+        self.row_coeffs.clear_and_resize(self.nb_vars.len());
+        for (idx, entry) in entries.iter().enumerate() {
+            let value = entry.value();
+            if value != 0.0 {
+                *self.row_coeffs.get_mut(idx) = value;
+            }
+        }
+        let mut rho = ScatteredVec::empty(self.num_constraints());
+        for (r, y) in refined.rho.iter().enumerate() {
+            let value = y.value();
+            if value != 0.0 {
+                *rho.get_mut(r) = value;
+            }
+        }
+        rho.to_sparse_vec(&mut self.inv_basis_row_coeffs);
+        genuine
+    }
+
     /// The primal simplex's pricing: the non-basic column of the dual
     /// infeasible var, not taboo ([`CycleGuard`]), with the best steepest-edge
     /// score (the largest reduced cost when the weights are off); `None` when
@@ -2537,16 +2604,9 @@ impl Solver {
     /// The primal simplex's ratio test for the entering column `entering_c`,
     /// on the phase's working bounds (see [`bounds`]): the basic var that
     /// leaves for it, or a flip of the entering var to its other bound.
-    /// `excluded_rows` are rows whose entry in this column proved round-off
-    /// (see `PivotChoice::Inconsistent`) and are not candidates;
     /// `harris_scale` scales the tolerance by which the test lets a basic var
     /// pass its bound (see `run_phases`).
-    fn choose_pivot(
-        &mut self,
-        entering_c: usize,
-        excluded_rows: &[usize],
-        harris_scale: f64,
-    ) -> Result<PivotChoice, Error> {
+    fn choose_pivot(&mut self, entering_c: usize, harris_scale: f64) -> Result<PivotChoice, Error> {
         let entering_cur_val = self.nb_var_vals[entering_c];
         // If true, entering variable will increase (because the objective function must decrease).
         let entering_diff_sign = self.nb_var_obj_coeffs[entering_c] < 0.0;
@@ -2574,135 +2634,52 @@ impl Solver {
             }
         }
 
-        // leaving_diff = -entering_diff * coeff: whether the basic var of a
-        // row with this entry moves towards its max as the entering var moves.
-        let moves_up = |coeff: f64| {
-            (entering_diff_sign && coeff < 0.0) || (!entering_diff_sign && coeff > 0.0)
-        };
-        // How far the basic var of row `r` is from the (working) bound it
-        // moves towards: negative when it already sits past that bound
-        // (within its tolerance), infinite when that bound is.
-        let signed_room = |r: usize, coeff: f64| -> f64 {
-            let val = self.basic_var_vals[r];
-            if moves_up(coeff) {
-                self.basic_var_maxs[r] - val
-            } else {
-                val - self.basic_var_mins[r]
-            }
-        };
-
-        // Harris rule. See e.g.
-        // Gill, P. E., Murray, W., Saunders, M. A., & Wright, M. H. (1989).
-        // A practical anti-cycling procedure for linearly constrained optimization.
-        // Mathematical Programming, 45(1-3), 437-474.
-        //
-        // https://link.springer.com/content/pdf/10.1007/BF01589114.pdf
-
-        // An entry within the round-off of computing the column (relative to
-        // its largest entry, see ENTRY_ROUNDOFF) is noise: it neither blocks
-        // the step nor is a pivot, and its basic var's bound is shifted after
-        // the step where the var ends outside it beyond its tolerance
-        // (`correct_primal`). Every other entry blocks the step, but one below
-        // PIVOT_REL_TOL of the largest entry among the rows that can block at
-        // all (a row with no finite bound in the way says nothing about the
-        // scale) is the pivot only when no larger entry can take the step.
-        let col_max_all = self
-            .col_coeffs
-            .iter()
-            .map(|(_, coeff)| coeff.abs())
-            .fold(0.0, f64::max);
-        let col_max = self
-            .col_coeffs
-            .iter()
-            .filter(|&(r, &coeff)| !excluded_rows.contains(&r) && signed_room(r, coeff).is_finite())
-            .map(|(_, coeff)| coeff.abs())
-            .fold(0.0, f64::max);
-        let noise_floor = ENTRY_ROUNDOFF * col_max_all;
-        let pivot_floor = noise_floor.max(PIVOT_REL_TOL * col_max);
-
-        // First, the largest step after which no basic var has left its
-        // working bound by more than its tolerance (Harris's relaxed bounds),
-        // counted from where the var sits, so one already past its bound has
-        // only the rest of its tolerance left. The first round of `run_phases`
-        // allows the whole tolerance the phase exit verifies with (a var the
-        // recomputation then finds an ulp past is a violation for the dual
-        // simplex), each later round a hundredth as much. The allowance is
-        // not cut by the round-off of recomputing the var: on rows above about
-        // 5e6 in magnitude, that would leave none.
-        //
-        // The limit is never below zero: a var past its bound by more than the
-        // allowance (possible after the first round) admits no step toward it.
-        // A negative limit would let only the rows of vars past their bounds
-        // qualify, passing over a row at its bound with an entry of one for a
-        // tiny entry below the pivot floor
-        // (`a_var_past_its_bound_beyond_the_allowance_limits_the_step_to_zero`).
-        let mut max_step = (entering_other_val - entering_cur_val).abs();
-        for (r, &coeff) in self.col_coeffs.iter() {
-            let coeff_abs = coeff.abs();
-            if coeff_abs < noise_floor || excluded_rows.contains(&r) {
-                continue;
-            }
-
-            let tol = harris_scale * self.var_tols[self.basic_vars[r]].toward(moves_up(coeff));
-            let cur_step = (signed_room(r, coeff) + tol) / coeff_abs;
-            if cur_step < max_step {
-                max_step = cur_step;
-            }
-        }
-        let max_step = max_step.max(0.0);
-
-        // Second, among the rows whose own step (to the bound itself; below
-        // zero for a var past its bound) is within that limit, the one with
-        // the largest entry leaves: a numerically more stable basis at the
-        // price of a tolerance-level infeasibility of the others. Entries
-        // above the pivot floor are preferred; the row that set the limit
-        // always qualifies, so a blocked step always finds a pivot.
-        let mut leaving_r = None;
-        let mut leaving_new_val = 0.0;
-        let mut pivot_coeff_abs = f64::NEG_INFINITY;
-        let mut pivot_coeff = 0.0;
-        for floor in [pivot_floor, noise_floor] {
-            for (r, &coeff) in self.col_coeffs.iter() {
-                let coeff_abs = coeff.abs();
-                if coeff_abs < floor || excluded_rows.contains(&r) {
-                    continue;
-                }
-
-                let cur_step = signed_room(r, coeff) / coeff_abs;
-                if cur_step.is_finite() && cur_step <= max_step && coeff_abs > pivot_coeff_abs {
-                    leaving_r = Some(r);
-                    leaving_new_val = if moves_up(coeff) {
-                        self.basic_var_maxs[r]
-                    } else {
-                        self.basic_var_mins[r]
-                    };
-                    pivot_coeff = coeff;
-                    pivot_coeff_abs = coeff_abs;
-                }
-            }
-            if leaving_r.is_some() {
-                break;
-            }
+        // An entry at or below the pivot tolerance (absolute, larger the
+        // longer the eta file the column was computed through, see
+        // `primal_pivot_tolerance`) neither bounds the step nor is a pivot,
+        // and its basic var's bound is shifted after the step where the var
+        // ends outside it beyond its tolerance (`correct_primal`). Every other
+        // entry bounds the step and can be the pivot. A step that nothing
+        // above the tolerance bounds, toward an infinite bound, would leave
+        // such a var past its bound by an unbounded amount, which no shift
+        // makes good: the column is refined twice, and every entry beyond the
+        // error the refinement measured for it bounds the step, however small
+        // ([`Self::refine_pivot_col`]). So the column is an unbounded ray only
+        // where every blocking entry is zero within its measured error, as a
+        // row proves infeasibility only within its multipliers' measured
+        // error ([`Self::proof_of`]).
+        let pivot_tol = primal_pivot_tolerance(self.basis_solver.eta_matrices.len());
+        let max_step = (entering_other_val - entering_cur_val).abs();
+        let mut choice =
+            self.primal_harris(entering_diff_sign, max_step, harris_scale, |_, coeff| {
+                coeff.abs() > pivot_tol
+            });
+        let refined = choice.is_none() && entering_other_val.is_infinite();
+        if refined {
+            let errors = self.refine_pivot_col(entering_c)?;
+            choice = self.primal_harris(entering_diff_sign, max_step, harris_scale, |r, coeff| {
+                coeff.abs() > errors.as_ref().map_or(0.0, |errors| errors[r])
+            });
         }
 
-        if let Some(row) = leaving_r {
+        if let Some((row, mut leaving_new_val, pivot_coeff)) = choice {
             self.calc_row_coeffs(row);
+            if refined {
+                // A pivot read off the refined column is checked against the
+                // refined row: like with like.
+                self.refine_pivot_row(row);
+            }
 
             // The pivot-element cross-check of the dual phase (see
-            // `dual_phase`): the column gave `pivot_coeff`, the row must agree.
-            // On fresh factors only the column's element is tested: it chose
-            // the row and sets the step, size and direction, while the row's
-            // feeds the reduced costs, which the phase exit recomputes, and the
-            // edge weights, which are floored and checked.
-            let row_max_all = self
-                .row_coeffs
-                .iter()
-                .map(|(_, coeff)| coeff.abs())
-                .fold(0.0, f64::max);
+            // `dual_phase`): the column gave `pivot_coeff`, the row must agree,
+            // or the factorization is renewed (`PivotChoice::Inconsistent`). On a
+            // fresh one at the highest threshold the column's element is taken:
+            // it chose the row and sets the step, size and direction, while the
+            // row's feeds the reduced costs, which the phase exit recomputes,
+            // and the edge weights, which are floored and checked.
             let a_row = *self.row_coeffs.get(entering_c);
-            if !Self::pivots_agree(a_row, pivot_coeff, col_max_all.max(row_max_all)) {
-                if !self.factorization_is_fresh() || pivot_coeff.abs() < PIVOT_REL_TOL * col_max_all
-                {
+            if !Self::pivots_agree(a_row, pivot_coeff) {
+                if self.can_renew_factorization() {
                     return Ok(PivotChoice::Inconsistent { row });
                 }
                 debug!(
@@ -2765,6 +2742,183 @@ impl Solver {
         }
     }
 
+    /// The two passes of the primal ratio test (Harris's rule) over the
+    /// entries of `col_coeffs` that `takes_part` admits, for an entering var
+    /// that moves up (`entering_up`) or down by at most `max_step` before it
+    /// reaches its other bound: the row that leaves, the bound its basic var
+    /// leaves at, and the column's element there; `None` when no admitted
+    /// entry bounds the step. `harris_scale` scales the tolerance the test
+    /// lets a basic var pass its bound by (see `run_phases`).
+    ///
+    /// Harris rule. See e.g.
+    /// Gill, P. E., Murray, W., Saunders, M. A., & Wright, M. H. (1989).
+    /// A practical anti-cycling procedure for linearly constrained
+    /// optimization. Mathematical Programming, 45(1-3), 437-474.
+    /// <https://link.springer.com/content/pdf/10.1007/BF01589114.pdf>
+    fn primal_harris(
+        &self,
+        entering_up: bool,
+        max_step: f64,
+        harris_scale: f64,
+        takes_part: impl Fn(usize, f64) -> bool,
+    ) -> Option<(usize, f64, f64)> {
+        // leaving_diff = -entering_diff * coeff: whether the basic var of a
+        // row with this entry moves towards its max as the entering var moves.
+        let moves_up = |coeff: f64| (entering_up && coeff < 0.0) || (!entering_up && coeff > 0.0);
+        // How far the basic var of row `r` is from the (working) bound it
+        // moves towards: negative when it already sits past that bound
+        // (within its tolerance), infinite when that bound is.
+        let signed_room = |r: usize, coeff: f64| -> f64 {
+            let val = self.basic_var_vals[r];
+            if moves_up(coeff) {
+                self.basic_var_maxs[r] - val
+            } else {
+                val - self.basic_var_mins[r]
+            }
+        };
+
+        // First, the largest step after which no basic var has left its
+        // working bound by more than its tolerance (Harris's relaxed bounds),
+        // counted from where the var sits, so one already past its bound has
+        // only the rest of its tolerance left. The first round of `run_phases`
+        // allows the whole tolerance the phase exit verifies with (a var the
+        // recomputation then finds an ulp past is a violation for the dual
+        // simplex), each later round a hundredth as much. The allowance is
+        // not cut by the round-off of recomputing the var: on rows above about
+        // 5e6 in magnitude, that would leave none.
+        //
+        // The limit is never below zero: a var past its bound by more than the
+        // allowance (possible after the first round) admits no step toward it.
+        // A negative limit would let only the rows of vars past their bounds
+        // qualify, passing over a row at its bound with an entry of one for a
+        // tiny entry
+        // (`a_var_past_its_bound_beyond_the_allowance_limits_the_step_to_zero`).
+        let mut max_step = max_step;
+        for (r, &coeff) in self.col_coeffs.iter() {
+            if !takes_part(r, coeff) {
+                continue;
+            }
+            let tol = harris_scale * self.var_tols[self.basic_vars[r]].toward(moves_up(coeff));
+            let cur_step = (signed_room(r, coeff) + tol) / coeff.abs();
+            if cur_step < max_step {
+                max_step = cur_step;
+            }
+        }
+        let max_step = max_step.max(0.0);
+
+        // Second, among the rows whose own step (to the bound itself; below
+        // zero for a var past its bound) is within that limit, the one with
+        // the largest entry leaves: a numerically more stable basis at the
+        // price of a tolerance-level infeasibility of the others. The row that
+        // set the limit always qualifies, so a blocked step always finds a
+        // pivot.
+        let mut choice: Option<(usize, f64, f64)> = None;
+        for (r, &coeff) in self.col_coeffs.iter() {
+            if !takes_part(r, coeff) {
+                continue;
+            }
+            let cur_step = signed_room(r, coeff) / coeff.abs();
+            if cur_step.is_finite()
+                && cur_step <= max_step
+                && choice.is_none_or(|(_, _, best)| coeff.abs() > best.abs())
+            {
+                let bound = if moves_up(coeff) {
+                    self.basic_var_maxs[r]
+                } else {
+                    self.basic_var_mins[r]
+                };
+                choice = Some((r, bound, coeff));
+            }
+        }
+        choice
+    }
+
+    /// The pivot column of `entering_c` refined twice, for a primal step that
+    /// nothing above the pivot tolerance bounds, toward an infinite bound
+    /// (see [`Self::choose_pivot`]), or a pivot read off a refined row (see
+    /// [`Self::dual_phase`]), the way the proof refines its row of the basis
+    /// inverse ([`Self::refine_basis_inverse_row`]): each step solves for the
+    /// residual `a_q - B alpha`, summed in compensated arithmetic over the
+    /// basic columns, and adds the solution to the column, kept in doubled
+    /// precision. The refined column replaces `col_coeffs`.
+    ///
+    /// Returns the bound on each entry's error, its second correction, where
+    /// the refinement converged ([`refinement_error`]), and `None` where it
+    /// did not, when no entry can be told from zero but an exact zero. A
+    /// number of the refinement that is not finite is an `InternalError`: a
+    /// breakdown, which the ratio test would otherwise take for an unbounded
+    /// ray.
+    fn refine_pivot_col(&mut self, entering_c: usize) -> Result<Option<Vec<f64>>, Error> {
+        let num_rows = self.num_constraints();
+        let var = self.nb_vars[entering_c];
+        let mut alpha = vec![CDouble::default(); num_rows];
+        for (r, &coeff) in self.col_coeffs.iter() {
+            alpha[r] = CDouble::from(coeff);
+        }
+        let mut second = Vec::new();
+        for _ in 0..2 {
+            let correction = self.pivot_col_correction(var, &alpha).ok_or_else(|| {
+                Error::InternalError(format!(
+                    "primal simplex: the refinement of the column of var {var} is not finite"
+                ))
+            })?;
+            for (a, &c) in alpha.iter_mut().zip(&correction) {
+                a.add(c);
+            }
+            second = correction;
+        }
+        let mut refined = ScatteredVec::empty(num_rows);
+        for (r, a) in alpha.iter().enumerate() {
+            let value = a.value();
+            if !value.is_finite() {
+                return Err(Error::InternalError(format!(
+                    "primal simplex: the refinement of the column of var {var} is not finite"
+                )));
+            }
+            if value != 0.0 {
+                *refined.get_mut(r) = value;
+            }
+        }
+        refined.to_sparse_vec(&mut self.col_coeffs);
+        Ok(refinement_error(&alpha, &second))
+    }
+
+    /// The correction of one step of [`Self::refine_pivot_col`] for the
+    /// column of `var`: `B^-1 (a_q - B alpha)`, the residual summed in
+    /// compensated arithmetic over the basic columns and scaled for the
+    /// solve, exactly, by the power of two that puts its largest entry in
+    /// `[1, 2)`; zero where the residual is, and `None` where it is not
+    /// finite.
+    fn pivot_col_correction(&mut self, var: usize, alpha: &[CDouble]) -> Option<Vec<f64>> {
+        let num_rows = self.num_constraints();
+        let mut residual = vec![CDouble::default(); num_rows];
+        //guaranteed to be a valid index
+        for (r, &a) in self.orig_constraints_csc.outer_view(var).unwrap().iter() {
+            residual[r].add(a);
+        }
+        for (k, &basic) in self.basic_vars.iter().enumerate() {
+            if alpha[k].value() == 0.0 {
+                continue;
+            }
+            //guaranteed to be a valid index
+            for (r, &a) in self.orig_constraints_csc.outer_view(basic).unwrap().iter() {
+                residual[r].add_scaled(alpha[k], -a);
+            }
+        }
+        let mut correction: Vec<f64> = residual.iter().map(|r| r.value()).collect();
+        let norm = correction.iter().fold(0.0f64, |m, c| m.max(c.abs()));
+        if !norm.is_finite() {
+            return None;
+        }
+        if norm > 0.0 {
+            let scale = 2f64.powi(-(norm.log2().floor() as i32));
+            correction.iter_mut().for_each(|c| *c *= scale);
+            self.basis_solver.solve_dense_with_etas(&mut correction);
+            correction.iter_mut().for_each(|c| *c /= scale);
+        }
+        Some(correction)
+    }
+
     /// The row to leave the basis: the violated row with the best dual
     /// steepest-edge score, not counting a row whose basis change is taboo,
     /// and the bound its basic var leaves at.
@@ -2776,7 +2930,7 @@ impl Solver {
 
     /// The violated row with the best dual steepest-edge score among those
     /// that no var can repair and that do not prove infeasibility (see
-    /// [`CycleGuard::add_failed_proof`]): the row the last resorts of
+    /// [`CycleGuard::add_failed_proof`]): the row the last resort of
     /// [`Self::dual_phase`] take.
     fn unproven_row(&self) -> Option<usize> {
         self.best_violated_row(|r| self.cycle_guard.is_unproven(r))
@@ -2853,7 +3007,117 @@ impl Solver {
         }
     }
 
-    /// The dual ratio test for the leaving `row`, with bound flipping.
+    /// The dual ratio test for the leaving `row` ([`Self::dual_ratio_pass`]
+    /// over `row_coeffs`, as [`Self::calc_row_coeffs`] computed them), with
+    /// the growth test of its chosen pivot: at most [`PIVOT_GROWTH_TOL`] of
+    /// the row's largest entry, a pivot is small, however far above the pivot
+    /// tolerance it lies, and may be made of the round-off that every entry of
+    /// the row shares. The first time, the row is refined
+    /// ([`Self::refine_pivot_row`]) and the pass runs again on it: a genuine
+    /// pivot comes out as it was, a round-off one changes or drops out. After
+    /// that, a small pivot is left out of the row, and the pass runs again
+    /// without it, until a pivot passes or none is left
+    /// ([`DualRatioTest::NoCandidate`]: the row is the proof's to decide, and
+    /// a row the proof leaves open gets [`Self::genuine_entry_step`]).
+    ///
+    /// The row's largest entry is taken once, from the row as first computed,
+    /// rounded up to a power of two, over the slacks and the structural vars
+    /// whose bounds do not fix them: a var its bounds fix never enters, and
+    /// its entry says nothing of the scale of the others (a var fixed on entry
+    /// keeps the user's units, which the scalings leave alone, so a fixed
+    /// `1e17` can sit beside a genuine `1`).
+    fn choose_entering_col_dual(
+        &mut self,
+        row: usize,
+        leaving_new_val: f64,
+    ) -> Result<DualRatioTest, Error> {
+        let row_max = self
+            .row_coeffs
+            .iter()
+            .filter(|&(c, _)| {
+                let var = self.nb_vars[c];
+                var >= self.num_vars || self.orig_var_mins[var] != self.orig_var_maxs[var]
+            })
+            .map(|(_, coeff)| coeff.abs())
+            .fold(0.0, f64::max);
+        // The power of two that takes the largest entry into `(0.5, 1]`.
+        let growth_scale = if row_max > 0.0 && row_max.is_finite() {
+            2f64.powi(-(row_max.log2().ceil() as i32))
+        } else {
+            1.0
+        };
+        let pivot_tol = dual_pivot_tolerance(self.basis_solver.eta_matrices.len());
+        let mut left_out = vec![false; self.nb_vars.len()];
+        let mut refined = false;
+        loop {
+            let mut test = self.dual_ratio_pass(row, leaving_new_val, |c, coeff| {
+                coeff.abs() > pivot_tol && !left_out[c]
+            })?;
+            let (col, a_row) = match &mut test {
+                DualRatioTest::Step(step) => {
+                    step.refined = refined;
+                    step.entering
+                }
+                DualRatioTest::NoCandidate | DualRatioTest::DualInfeasible => return Ok(test),
+            };
+            if (a_row * growth_scale).abs() > PIVOT_GROWTH_TOL {
+                return Ok(test);
+            }
+            if refined {
+                debug!(
+                    "dual ratio test for row {row}: pivot {a_row:e} of var {} is small beside \
+                     the row's largest entry {row_max:e} on the refined row; left out",
+                    self.nb_vars[col]
+                );
+                left_out[col] = true;
+            } else {
+                debug!(
+                    "dual ratio test for row {row}: pivot {a_row:e} of var {} is small beside \
+                     the row's largest entry {row_max:e}; refining the row",
+                    self.nb_vars[col]
+                );
+                self.refine_pivot_row(row);
+                refined = true;
+            }
+        }
+    }
+
+    /// The first last resort of the dual simplex, for an unproven `row` when
+    /// only taboo rows are left on fresh data (see [`Self::dual_phase`]): the
+    /// dual ratio test over the genuine entries of the refined row
+    /// ([`Self::refine_pivot_row`]), whatever their size. A genuine entry
+    /// below the pivot tolerance, or small beside its row, can be the only one
+    /// that repairs the row, as in a row the model's ratios carry through a
+    /// chain of others or two nearly parallel rows leave, and only how far the
+    /// refinement moves it tells it from round-off, which no size can. These
+    /// are the entries the proof cannot count as zero, so a row it leaves open
+    /// has one. Every regular pivot and every proof of the other rows comes
+    /// first: the step through a tiny entry is huge and the basis it leads to
+    /// ill-conditioned, as when a boxed var whose genuine but tiny entry
+    /// cannot carry a row the proof closes enters far past its other bound, or
+    /// a basis of nearly parallel rows keeps the next proof's refinement from
+    /// converging.
+    fn genuine_entry_step(
+        &mut self,
+        row: usize,
+        leaving_new_val: f64,
+    ) -> Result<DualRatioTest, Error> {
+        let genuine = self.refine_pivot_row(row);
+        debug!(
+            "dual ratio test for row {row}: no pivot above the tolerance and no proof; the {} \
+             genuine entries of the refined row take part",
+            genuine.iter().filter(|&&g| g).count()
+        );
+        let mut test = self.dual_ratio_pass(row, leaving_new_val, |c, _| genuine[c])?;
+        if let DualRatioTest::Step(step) = &mut test {
+            step.refined = true;
+        }
+        Ok(test)
+    }
+
+    /// One pass of the dual ratio test for the leaving `row`, with bound
+    /// flipping, over the entries of `row_coeffs` that `takes_part` admits
+    /// (see [`Self::choose_entering_col_dual`]).
     ///
     /// The leaving var must move to `leaving_new_val`. A non-basic var whose
     /// entry in the row can carry that move does so by entering the basis (a
@@ -2872,20 +3136,16 @@ impl Solver {
     /// dual step; when none can, the test returns
     /// [`DualRatioTest::NoCandidate`] and draws no conclusion: infeasibility
     /// is decided on the model's data ([`Self::prove_infeasible`]), not on
-    /// this computed row, whose entries below round-off count here as zero. A
-    /// non-finite entry or reduced cost among those weighed is an
+    /// this computed row. A var whose entry does not take part neither bounds
+    /// the dual step nor pivots, and a reduced cost the step leaves dual
+    /// infeasible is corrected at the next rebuild ([`Self::rebuild_dual`]).
+    /// A non-finite entry or reduced cost among those weighed is an
     /// `InternalError` ([`Self::finite_reduced_cost`]).
-    ///
-    /// `instable`, the last resort of [`Self::dual_phase`], makes every entry
-    /// of at least [`INSTABLE_PIVOT_TOL`] a candidate instead of the relative
-    /// floors. `excluded` lists the columns whose entry in this row proved
-    /// round-off; they are not candidates.
-    fn choose_entering_col_dual(
+    fn dual_ratio_pass(
         &self,
         row: usize,
         leaving_new_val: f64,
-        excluded: &[usize],
-        instable: bool,
+        takes_part: impl Fn(usize, f64) -> bool,
     ) -> Result<DualRatioTest, Error> {
         // True if the new obj. coeff. must be nonnegative in a dual-feasible configuration.
         let leaving_diff_sign = leaving_new_val > self.basic_var_vals[row];
@@ -2950,32 +3210,18 @@ impl Solver {
                 && !(self.crosses_bound(c, step) && self.absorbed.contains(&(var, up)))
         };
 
-        // The round-off scale of the row: its largest entry over the columns
-        // not excluded, leaving out those of vars fixed on entry, which keep
-        // the user's units. The round-off of the transposed solve `rho_r` is
-        // spread over its components in proportion to the largest, so even
-        // the entry of a var that cannot help this row measures it; a fixed
-        // column's `1e17` measures only its own data, and would make a genuine
-        // entry of one "noise". An entry below `ENTRY_ROUNDOFF` of the scale
-        // is noise, never a pivot.
-        //
         // An entry that is not a finite number is a breakdown, not data: it
-        // compares false with every floor below, so its var would drop out of
-        // the test silently, and the row could prove infeasibility without
-        // it. It is a loud error instead.
-        let mut scale = 0.0f64;
+        // compares false with the pivot tolerance below, so its var would drop
+        // out of the test silently, and the row could prove infeasibility
+        // without it. It is a loud error instead.
         for (c, &coeff) in self.row_coeffs.iter() {
-            let var = self.nb_vars[c];
             if !coeff.is_finite() {
                 return Err(Error::InternalError(format!(
-                    "dual simplex: entry of var {var} in row {row} is not finite: {coeff}"
+                    "dual simplex: entry of var {} in row {row} is not finite: {coeff}",
+                    self.nb_vars[c]
                 )));
             }
-            if !excluded.contains(&c) && !(var < self.num_vars && self.unscaled_cols[var]) {
-                scale = scale.max(coeff.abs());
-            }
         }
-        let noise_floor = ENTRY_ROUNDOFF * scale;
 
         // The leaving var's distance from its bound, and the tolerance within
         // which it counts as there.
@@ -3020,28 +3266,11 @@ impl Solver {
                 capacity: coeff.abs() * (bound - self.nb_var_vals[c]).abs(),
             }
         };
-        // The pivot floor: an entry below PIVOT_REL_TOL of the largest entry
-        // among the vars that can enter and are not excluded is not a
-        // candidate while a larger one can take the step. Every candidate is
-        // above the noise floor; the last resort (`instable`) takes every
-        // entry of at least INSTABLE_PIVOT_TOL instead.
-        let mut row_max = 0.0f64;
-        for (c, &coeff) in self.row_coeffs.iter() {
-            if direction_ok(coeff, &self.nb_var_states[c]) && !excluded.contains(&c) {
-                row_max = row_max.max(coeff.abs());
-            }
-        }
-        let pivot_floor = if instable {
-            INSTABLE_PIVOT_TOL
-        } else {
-            noise_floor.max(PIVOT_REL_TOL * row_max)
-        };
+        // The entries that take part (see the doc above).
+        let in_row = |c: usize, coeff: f64| coeff != 0.0 && takes_part(c, coeff);
         // The vars that could enter regularly (the two-pass's candidates).
-        let candidate = |c: usize, coeff: f64| {
-            coeff.abs() >= pivot_floor
-                && direction_ok(coeff, &self.nb_var_states[c])
-                && !excluded.contains(&c)
-        };
+        let candidate =
+            |c: usize, coeff: f64| in_row(c, coeff) && direction_ok(coeff, &self.nb_var_states[c]);
 
         // The Harris bound on the step: the smallest relaxed ratio. Below
         // zero, a candidate's reduced cost is beyond its tolerance on its
@@ -3167,6 +3396,7 @@ impl Solver {
                 entering: (col, coeff),
                 zero_step: ratio <= 0.0,
                 crosses: None,
+                refined: false,
             }));
         }
         if let Some((col, coeff, ratio)) = entering {
@@ -3175,6 +3405,7 @@ impl Solver {
                 entering: (col, coeff),
                 zero_step: ratio <= 0.0,
                 crosses: None,
+                refined: false,
             }));
         }
 
@@ -3185,10 +3416,9 @@ impl Solver {
         // var, for which any reduced cost is feasible) over the entry, so that
         // the shift doing the least harm wins: among the absorbers within the
         // Harris relaxation of the smallest ratio, the one with the largest
-        // entry enters, and an entry below `PIVOT_REL_TOL` of the largest
-        // absorbing entry is no candidate. (By the largest entry alone, a
-        // solve can stop above the optimum: `wide_lp_558_reaches_the_optimum`
-        // in `src/tests/magnitudes.rs`.)
+        // entry enters, held to the growth test as any pivot is. (By the
+        // largest entry alone, a solve can stop above the optimum:
+        // `wide_lp_558_reaches_the_optimum` in `src/tests/magnitudes.rs`.)
         let absorber_ratio = |c: usize, coeff: f64, tol: f64| -> f64 {
             let state = &self.nb_var_states[c];
             let d = if state.at_min && state.at_max {
@@ -3198,16 +3428,7 @@ impl Solver {
             };
             (d + tol) / coeff.abs()
         };
-        let mut absorbing_max = 0.0f64;
-        for (c, &coeff) in self.row_coeffs.iter() {
-            if !excluded.contains(&c) && absorbs(c, coeff) {
-                absorbing_max = absorbing_max.max(coeff.abs());
-            }
-        }
-        let absorbing_floor = noise_floor.max(PIVOT_REL_TOL * absorbing_max);
-        let absorber = |c: usize, coeff: f64| {
-            coeff.abs() >= absorbing_floor && !excluded.contains(&c) && absorbs(c, coeff)
-        };
+        let absorber = |c: usize, coeff: f64| in_row(c, coeff) && absorbs(c, coeff);
         let mut max_step = f64::INFINITY;
         for (c, &coeff) in self.row_coeffs.iter() {
             if absorber(c, coeff) {
@@ -3234,6 +3455,7 @@ impl Solver {
                 entering: (c, coeff),
                 zero_step: true,
                 crosses: self.crosses_bound(c, step).then_some(step > 0.0),
+                refined: false,
             }));
         }
 
@@ -3242,12 +3464,11 @@ impl Solver {
         if log::log_enabled!(log::Level::Debug) {
             debug!(
                 "no entering column for row {row} (basic var {} = {:e}, bounds [{:e}, {:e}], \
-                 leaving to {leaving_new_val:e}, pivot floor {pivot_floor:e}{}); row entries:",
+                 leaving to {leaving_new_val:e}); row entries:",
                 self.basic_vars[row],
                 self.basic_var_vals[row],
                 self.basic_var_mins[row],
                 self.basic_var_maxs[row],
-                if instable { ", instable" } else { "" },
             );
             for (c, &coeff) in self.row_coeffs.iter() {
                 let state = &self.nb_var_states[c];
@@ -3286,11 +3507,10 @@ impl Solver {
 
     /// Move each non-basic column in `flips` to the value given with it (its
     /// other bound, its perturbed bound when a primal phase starts, or, for a
-    /// var the certificate repair moves, a value between its bounds or past
-    /// one within its tolerance), the basis staying as it is, and carry the
-    /// moves into the basic values, `x_B -= B^-1 Σ Δx_c a_c`, through one
-    /// solve with the combined column. The objective moves by the reduced
-    /// costs, as in a pivot.
+    /// var the certificate repair moves, the bound it widened), the basis
+    /// staying as it is, and carry the moves into the basic values,
+    /// `x_B -= B^-1 Σ Δx_c a_c`, through one solve with the combined column.
+    /// The objective moves by the reduced costs, as in a pivot.
     fn apply_flips(&mut self, flips: &[(usize, f64)]) {
         if flips.is_empty() {
             return;

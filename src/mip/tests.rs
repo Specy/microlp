@@ -462,56 +462,125 @@ fn warm_start_restores_bounds_before_unbounded_verdict() {
     assert_eq!(state.solver.get_var_bounds(x.idx()), (0.0, 10.0));
 }
 
-/// `min -x - y - t - z - w` s.t. `x + y + z + q + 3w >= 3` and
-/// `t - (1 + 2^-50) z - q >= 1e-6` over `x, y, t ∈ [0, 1]`, `z ∈ [-2e9, 1]`,
-/// `q ∈ [-1e10, 1e10]` and a binary `w`: the optimum is `-5`, at `w = 1`. With
-/// `w = 0` the LP is the one of
-/// `a_round_off_coefficient_on_a_far_bound_is_no_proof_and_is_a_known_limitation`
-/// in `src/tests/magnitudes.rs`, on which the engine fails loudly.
-fn round_off_room_unless_w_is_one() -> (Problem, Variable) {
-    let mut p = Problem::new(OptimizationDirection::Minimize);
-    let x = p.add_var(-1.0, (0.0, 1.0));
-    let y = p.add_var(-1.0, (0.0, 1.0));
-    let t = p.add_var(-1.0, (0.0, 1.0));
-    let z = p.add_var(-1.0, (-2e9, 1.0));
-    let q = p.add_var(0.0, (-1e10, 1e10));
-    let w = p.add_binary_var(-1.0);
-    p.add_constraint(
-        [(x, 1.0), (y, 1.0), (z, 1.0), (q, 1.0), (w, 3.0)],
-        ComparisonOp::Ge,
-        3.0,
+/// A switchable network like issue 48's (8 buses, 10 lines, at most one
+/// off; optimum `29.4617904`, with line 9 off) whose LP with the switch of
+/// line 8 open, `on[8] = 0`, is infeasible: with at most one line off, every
+/// other switch is then closed, and that network cannot carry its demand.
+fn network_with_line_8_off_infeasible() -> (Problem, Variable) {
+    let lines = [
+        (1, 0, 0.132, 0.724),
+        (2, 0, 206.0, 0.763),
+        (3, 2, 51.900000000000006, 0.993),
+        (4, 2, 1.71, 1.1400000000000001),
+        (5, 3, 0.0407, 0.801),
+        (6, 4, 7.0600000000000005, 1.12),
+        (7, 3, 0.0335, 0.721),
+        (4, 5, 939.0, 0.974),
+        (4, 6, 1.76, 1.04),
+        (3, 6, 6.33, 0.404),
+    ];
+    let demand = [
+        0.905,
+        0.742,
+        0.659,
+        0.294,
+        0.343,
+        0.528,
+        0.913,
+        0.8130000000000001,
+    ];
+    let gen_max = [
+        0.263,
+        1.32,
+        1.26,
+        1.1400000000000001,
+        0.335,
+        0.581,
+        0.212,
+        1.28,
+    ];
+    let gen_cost = [9.67, 4.16, 3.48, 8.0, 9.61, 3.25, 9.97, 6.21];
+    let problem = crate::tests::regressions::regression_tests::switchable_dc_network(
+        &lines, &demand, &gen_max, &gen_cost, 1,
     );
-    p.add_constraint(
-        [(t, 1.0), (z, -(1.0 + 2f64.powi(-50))), (q, -1.0)],
-        ComparisonOp::Ge,
-        1e-6,
-    );
-    (p, w)
+    // The vars: 8 bus angles, 8 generators, 10 flows, then the 10 switches.
+    (problem, Variable(8 + 8 + 10 + 8))
+}
+
+/// The warm-start completion of [`network_with_line_8_off_infeasible`] with
+/// line 8 off, the root LP re-solved with `on[8] = 0`, is proven infeasible,
+/// with presolve on and off (on: the root LP of the presolved model). Along
+/// the way the only repair of a row is a slack unbounded in its direction,
+/// through an entry of `1.2e-15` that the plain row computes as `7.1e-15`,
+/// and that coefficient leaves the row's certificate unbounded: the last
+/// resort pivots on it, genuine on the refined row, and a later row proves
+/// the LP infeasible. Taken for round-off because the plain row was off, the
+/// entry left no pivot and no proof, and the solve ended in "no var can
+/// repair row".
+#[test]
+fn a_network_completion_with_a_line_off_is_proven_infeasible() {
+    let (problem, on_8) = network_with_line_8_off_infeasible();
+    for presolve in [true, false] {
+        let hinted = SolveOptions {
+            presolve,
+            warm_start: Some(vec![(on_8, 0.0)]),
+            ..SolveOptions::default()
+        };
+        let mut state = build_state(&problem, hinted.clone()).unwrap();
+        assert_eq!(state.solver.initial_solve().unwrap(), StopReason::Finished);
+        state.solver.set_var_bounds(on_8.idx(), 0.0, 0.0).unwrap();
+        assert_eq!(
+            state.solver.reoptimize(),
+            Err(Error::Infeasible),
+            "presolve {presolve}"
+        );
+
+        let solution = problem.solve_with(hinted).unwrap().into_solution().unwrap();
+        assert!((solution.objective() - 29.4617904).abs() < 1e-6);
+    }
+}
+
+/// `min x - y - 100 z` s.t. `x + (1 + 2^-48) y <= -2 + 20 z` and
+/// `x + y >= -1 - 20 z`, `x >= 0`, `y` in `[-10, 10]`, `z` binary: the
+/// optimum is `-110` at `(0, 10, 1)`, the root LP's, and with `z = 0` the LP
+/// is the pinned model of
+/// `a_proof_of_infeasibility_through_a_singular_basis_is_a_known_limitation`
+/// in `src/tests/magnitudes.rs`, whose solve fails loudly. Returns the
+/// problem and `z`.
+fn milp_whose_lp_with_z_off_fails() -> (Problem, Variable) {
+    let mut problem = Problem::new(OptimizationDirection::Minimize);
+    let x = problem.add_var(1.0, (0.0, f64::INFINITY));
+    let y = problem.add_var(-1.0, (-10.0, 10.0));
+    let z = problem.add_binary_var(-100.0);
+    let slanted = 1.0 + 2f64.powi(-48);
+    problem.add_constraint([(x, 1.0), (y, slanted), (z, -20.0)], ComparisonOp::Le, -2.0);
+    problem.add_constraint([(x, 1.0), (y, 1.0), (z, 20.0)], ComparisonOp::Ge, -1.0);
+    (problem, z)
 }
 
 /// A hint whose LP completion fails with an engine error is dropped, as an
 /// infeasible one is: the solve returns what it returns without the hint.
 #[test]
 fn warm_start_drops_a_hint_whose_completion_fails() {
-    let (problem, w) = round_off_room_unless_w_is_one();
+    let (problem, z) = milp_whose_lp_with_z_off_fails();
     for presolve in [true, false] {
         let options = SolveOptions {
             presolve,
             ..SolveOptions::default()
         };
         let hinted = SolveOptions {
-            warm_start: Some(vec![(w, 0.0)]),
+            warm_start: Some(vec![(z, 0.0)]),
             ..options.clone()
         };
 
-        // The completion, the root LP re-solved with `w = 0`, fails loudly.
+        // The completion, the root LP re-solved with `z = 0`, fails loudly.
         let mut state = build_state(&problem, hinted.clone()).unwrap();
         assert_eq!(state.solver.initial_solve().unwrap(), StopReason::Finished);
-        state.solver.set_var_bounds(w.idx(), 0.0, 0.0).unwrap();
-        assert!(matches!(
-            state.solver.reoptimize(),
-            Err(Error::InternalError(_))
-        ));
+        state.solver.set_var_bounds(z.idx(), 0.0, 0.0).unwrap();
+        assert!(
+            matches!(state.solver.reoptimize(), Err(Error::InternalError(_))),
+            "fixture: the completion fails loudly (presolve {presolve})"
+        );
 
         let without = problem.solve_with(options).unwrap();
         let with = match problem.solve_with(hinted) {
@@ -519,7 +588,7 @@ fn warm_start_drops_a_hint_whose_completion_fails() {
             Err(err) => panic!("the hinted solve returned {err:?} (presolve {presolve})"),
         };
         let (with, without) = (with.solution().unwrap(), without.solution().unwrap());
-        assert!((without.objective() + 5.0).abs() < 1e-6);
+        assert!((without.objective() + 110.0).abs() < 1e-6);
         assert_eq!(with.status(), SolutionStatus::Optimal);
         assert_eq!(with.objective(), without.objective());
         assert_eq!(
