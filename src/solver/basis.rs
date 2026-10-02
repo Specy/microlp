@@ -19,12 +19,11 @@ pub(crate) enum PivotChoice {
     /// Apply this pivot.
     Pivot(PivotInfo),
     /// The pivot element at `row` computed through the row and through the
-    /// column disagree (see [`super::PIVOT_AGREEMENT_TOL`]). With pivots
-    /// stacked on the factorization it must be rebuilt before choosing again;
-    /// on a fresh one the entry is tiny beside its column, noise, and the row
-    /// is excluded for the column. A larger entry that disagrees on a fresh
-    /// factorization is taken with the column's element: a basis it leaves
-    /// singular is repaired at the next factorization.
+    /// column disagree (see [`super::PIVOT_AGREEMENT_TOL`]), and a fresh
+    /// factorization, at a raised threshold, can still settle it: the
+    /// factorization is renewed before choosing again. On a fresh one at the
+    /// highest threshold the pivot is taken with the column's element; a
+    /// basis it leaves singular is repaired at the next factorization.
     Inconsistent { row: usize },
 }
 
@@ -104,6 +103,11 @@ pub(crate) struct DualStep {
     /// For an absorbing entry whose move crosses the bound it sits at, that
     /// bound: the upper one if `true`.
     pub(crate) crosses: Option<bool>,
+    /// Whether the entry was read off the refined row: a pivot the growth test
+    /// refined its row for, or the last resort's genuine entry, which enters
+    /// whatever its size (see `Solver::genuine_entry_step`). The pivot's
+    /// column is then refined too before the two are compared.
+    pub(crate) refined: bool,
 }
 
 /// Stuff related to inversion of the basis matrix

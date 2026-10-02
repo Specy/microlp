@@ -89,11 +89,12 @@ const NO_SCALING_RANGE: f64 = 8.0;
 ///
 /// The factors are not bounded but for keeping the exponent within ±1000,
 /// inside the range of `f64`: the engine takes any finite coefficient, and
-/// its dual ratio test counts an entry more than `ENTRY_ROUNDOFF` below the
-/// largest of its row as round-off, so a row that bounded factors leave wider
-/// than that loses its genuine entries. With the factors bounded to `2^±20`,
-/// `min -g + y` s.t. `1e30 g + y >= 2e30`, `g ∈ [0, 1]`, `y >= 0` (a test in
-/// `src/tests/magnitudes.rs`) would come back `Infeasible`.
+/// its ratio tests take an entry at or below an absolute pivot tolerance, or
+/// small beside the largest of its row, only as a last resort, where a
+/// refinement shows it genuine, so a row that bounded factors leave wide
+/// loses the stable pivots on its genuine entries. With the factors bounded to `2^±20`, `min -g + y` s.t.
+/// `1e30 g + y >= 2e30`, `g ∈ [0, 1]`, `y >= 0` (a test in
+/// `src/tests/magnitudes.rs`) would leave `y`'s entry at `1.1e-18` beside one.
 ///
 /// A column is left at one when scaling it would leave the finite range of
 /// `f64` for any of its coefficients, its bounds or its objective coefficient.

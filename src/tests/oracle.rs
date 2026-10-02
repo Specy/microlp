@@ -200,6 +200,30 @@ pub(crate) fn assert_no_wrong_answer(model: &Model) {
     check_contract_with(model, false, true, None, true);
 }
 
+/// A model outside the recommended coefficient range whose solve, with
+/// presolve on and off, fails loudly with an `InternalError` naming the
+/// constraint or variable `outside` (such as `"constraint 1 spans"`): within
+/// the contract out of range, where an answer would have to meet it. A
+/// change that makes the solve answer shows up as a failure here, the signal
+/// to make the test an ordinary solve test again.
+pub(crate) fn assert_out_of_range_fails_loudly(model: &Model, outside: &str) {
+    for presolve in [true, false] {
+        let (problem, _) = model.build();
+        let options = SolveOptions {
+            presolve,
+            ..SolveOptions::default()
+        };
+        match problem.solve_with(options) {
+            Err(Error::InternalError(message))
+                if message.contains(OUTSIDE_THE_RANGE) && message.contains(outside) => {}
+            other => panic!(
+                "presolve {presolve}: expected a loud error naming {outside:?}, got {other:?}:\n{}",
+                model.source()
+            ),
+        }
+    }
+}
+
 /// [`assert_solves_within_contract`] without the comparison with the
 /// objective at `x*`, for models whose tolerances leave the objective real
 /// freedom (a tiny coefficient lets a var move far within its row's

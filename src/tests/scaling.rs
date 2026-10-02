@@ -227,12 +227,6 @@ mod tests_scaling {
         check_with_objective(&model.0);
     }
 
-    // KNOWN LIMITATIONS (`ARCHITECTURE.md` §7): the wide MILP regime reaches
-    // models the engine gets wrong (the classes listed there), so some draws
-    // fail. Ignored rather than `#[should_panic]` because most runs pass. Run
-    // it with `cargo test --lib -- --ignored`; pin a model it finds in
-    // `magnitudes.rs` by the convention described there.
-    #[ignore = "known limitations: wide coefficients (ARCHITECTURE §7)"]
     #[hegel::test(settings())]
     fn a_feasible_bounded_milp_with_wide_coefficients_solves(tc: hegel::TestCase) {
         let model = tc.draw(milp_wide());

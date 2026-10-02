@@ -8,7 +8,7 @@ mod tsp;
 
 mod resume;
 
-mod regressions;
+pub(crate) mod regressions;
 
 mod mip_api;
 

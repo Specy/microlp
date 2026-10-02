@@ -1,7 +1,7 @@
 //! Regression tests, each reproducing a bug and guarding against its return.
 
 #[cfg(test)]
-mod regression_tests {
+pub(crate) mod regression_tests {
     use crate::{ComparisonOp, OptimizationDirection, Problem};
 
     /// <https://github.com/Specy/microlp/issues/3>: a huge but *finite* variable
@@ -712,7 +712,7 @@ mod regression_tests {
     /// for the reference bus 0) while the line is on; per bus, generation
     /// (within `gen_max`, at `gen_cost`) less `demand` equals the flow out
     /// less the flow in; at most `max_off` lines off.
-    fn switchable_dc_network(
+    pub(crate) fn switchable_dc_network(
         lines: &[(usize, usize, f64, f64)],
         demand: &[f64],
         gen_max: &[f64],

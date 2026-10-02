@@ -33,14 +33,6 @@ pub const EPS: f64 = 1e-10;
 /// the same allowance the crate's own contract tests grant a row.
 pub(crate) const ROUNDOFF_FLOOR: f64 = 1e-14;
 
-/// Round-off of a single tableau entry computed through the factorization,
-/// relative to the largest entry of its row or column: about ten ulps of
-/// `f64`. An entry below this fraction of its neighbours is indistinguishable
-/// from the round-off of computing it, and two computations of the same entry
-/// (through the row and through the column) agree to about this much. Tighter
-/// than [`ROUNDOFF_FLOOR`], which allows for a sum over a row's many terms.
-pub(crate) const ENTRY_ROUNDOFF: f64 = 1e-15;
-
 /// A column of the basis whose largest eligible pivot, in the LU
 /// factorization, is below this fraction of the column's largest transformed
 /// entry is treated as singular: the eligible part is then within the
@@ -49,45 +41,65 @@ pub(crate) const ENTRY_ROUNDOFF: f64 = 1e-15;
 /// on the units the column is written in; an ill-conditioned but non-singular
 /// basis is judged by the verification of the values it produces, not by its
 /// pivots.
-///
-/// A pivot element of the ratio tests within this fraction of the scale of
-/// its row and column must have its two computations agree relatively, not
-/// just within their round-off (see `Solver::pivots_agree`), since at this
-/// size a round-off entry agrees with anything of its own size.
 pub(crate) const LU_SINGULAR_REL: f64 = ROUNDOFF_FLOOR;
 
-/// Relative pivot tolerance of both ratio tests: an entry of the pivot row
-/// (dual simplex) or pivot column (primal simplex) is a preferred pivot only
-/// if its magnitude is at least this fraction of the largest entry scanned.
-/// A pivot seven orders of magnitude below its neighbours amplifies the
-/// round-off of the update by the same factor, so it is taken only when no
-/// larger entry will do: the largest entry of a dual row is always a
-/// candidate, and in the primal test a smaller entry still bounds the step
-/// (its basic var is held to its tolerance like any other) and is the pivot
-/// when it is what blocks the step. So this never turns a feasible model
-/// infeasible or a bounded one unbounded, and never lets a step leave a
-/// basic var outside its tolerance.
-pub(crate) const PIVOT_REL_TOL: f64 = 1e-7;
+/// The pivot tolerance of the dual ratio test after `updates` basis changes
+/// on the current factorization (the eta file's length), in the engine's
+/// scaled units: an entry of the pivot row bounds the dual step and can
+/// enter only if its magnitude exceeds this. The row is computed through the
+/// factorization and every update since, each adding its round-off to what a
+/// small entry can be made of, so the older the factorization, the larger
+/// an entry must be to be trusted. Absolute, since rows and columns are
+/// scaled to entries near one: on a model within the recommended coefficient
+/// range a genuine entry is far above it, while what a relative floor could
+/// not tell from round-off, an entry small beside the rest of its row, the
+/// growth test on the chosen pivot catches ([`PIVOT_GROWTH_TOL`]).
+pub(crate) fn dual_pivot_tolerance(updates: usize) -> f64 {
+    if updates < 10 {
+        1e-9
+    } else if updates < 20 {
+        3e-8
+    } else {
+        1e-6
+    }
+}
 
-/// The smallest pivot element the dual simplex takes as its last resort, in
-/// the engine's scaled units, where rows and columns are equilibrated to
-/// entries near one. The regular floors ([`ENTRY_ROUNDOFF`],
-/// [`PIVOT_REL_TOL`]) are relative to the row's largest entry, so a huge
-/// entry elsewhere in the row (a fixed var's `1e17` beside a genuine `1`) can
-/// make every entry that could repair it "round-off". When such a row does
-/// not prove the model infeasible and no other row is left (see
-/// `Solver::dual_phase`), the dual simplex pivots on an entry the regular
-/// test refused if the entry is at least this; below it an entry is
-/// indistinguishable from the round-off of a solve through a basis of any
-/// condition, so no pivot is taken on it at all.
-pub(crate) const INSTABLE_PIVOT_TOL: f64 = 1e-10;
+/// The pivot tolerance of the primal ratio test after `updates` basis
+/// changes on the current factorization, in the engine's scaled units, for
+/// the reasons of [`dual_pivot_tolerance`]: an entry of the pivot column
+/// bounds the step and can be the pivot only if its magnitude exceeds this.
+/// The step passes the row of a smaller entry, and a basic var it leaves
+/// outside its bounds beyond its tolerance has its working bound shifted
+/// (`Solver::correct_primal`).
+pub(crate) fn primal_pivot_tolerance(updates: usize) -> f64 {
+    if updates < 10 {
+        1e-9
+    } else if updates < 20 {
+        1e-8
+    } else {
+        1e-7
+    }
+}
+
+/// The growth test of the dual ratio test's chosen pivot: a pivot whose
+/// magnitude is at most this fraction of the pivot row's largest entry over
+/// the vars whose bounds do not fix them (that entry rounded up to a power of
+/// two) is small, however far above the pivot tolerance it lies. Every entry
+/// of the row carries the round-off of the one solve it comes from, of the
+/// order of the largest, so the pivot may be made of it, and dividing by it
+/// grows the basis inverse and the reduced costs a billionfold. The row is
+/// refined and its entries summed again in compensated arithmetic before such
+/// a pivot is passed over (`Solver::choose_entering_col_dual`), and it enters
+/// only as the dual simplex's last resort, genuine on the refined row
+/// (`Solver::genuine_entry_step`).
+pub(crate) const PIVOT_GROWTH_TOL: f64 = 1e-9;
 
 /// Relative disagreement between the pivot element computed through the
 /// pivot row (`row_coeffs[col]`) and through the pivot column
-/// (`col_coeffs[row]`) above which the element is in doubt (see
+/// (`col_coeffs[row]`) above which the factorization is in doubt (see
 /// `PivotChoice::Inconsistent`): the two are the same number in exact
 /// arithmetic and agree to about `1e-12` at a legitimate pivot, while a pivot
-/// on round-off noise disagrees by tens of percent.
+/// computed through an inaccurate factorization disagrees by far more.
 pub(crate) const PIVOT_AGREEMENT_TOL: f64 = 1e-7;
 
 /// Upper bound on the number of primal/dual phase alternations
@@ -390,14 +402,17 @@ pub(crate) const DEADLINE_CHECK_INTERVAL: u64 = 1000;
 /// Gilbert-Peierls sparse LU (see `lu_factorize`'s doc reference) — it
 /// balances numerical stability (higher would refuse more marginal pivots,
 /// at the cost of extra fill-in) against sparsity (lower risks amplifying
-/// rounding error through a poorly-conditioned pivot).
+/// rounding error through a poorly-conditioned pivot). A solver starts with
+/// it and raises it once the two computations of a pivot element disagree
+/// (see `Solver::raise_lu_threshold`).
 pub(crate) const LU_STABILITY_THRESHOLD: f64 = 0.1;
 
-/// The threshold of the factorization the verification falls back on when
-/// the values recomputed through a fresh one at [`LU_STABILITY_THRESHOLD`]
-/// still miss the rows (see `Solver::verify_primal`): a pivot at least half
-/// its column's largest entry bounds the growth of the factors, which is
-/// what a solve through them errs by.
+/// The highest threshold of the factorization: the one a pivot disagreement
+/// raises the solver's to, and the one the verification falls back on when
+/// the values recomputed through a fresh factorization at the solver's still
+/// miss the rows (see `Solver::verify_primal`). A pivot at least half its
+/// column's largest entry bounds the growth of the factors, which is what a
+/// solve through them errs by.
 pub(crate) const LU_STABLE_THRESHOLD: f64 = 0.5;
 
 pub(crate) fn float_eq(a: f64, b: f64) -> bool {
