@@ -107,8 +107,8 @@ impl Solution {
     /// fixed at an integer (by its bounds, the search or an edit) lies on it.
     /// Use `.round()` where an exact integer is needed, bearing in mind that
     /// the rounded values need not meet the constraints: under
-    /// `x <= 1e9 * y`, rounding a `y` of `1e-9` to zero moves the constraint
-    /// by `1`.
+    /// `x <= 1e7 * y`, a `y` of `1e-6` allows `x` up to 10, which `y` rounded
+    /// to zero forbids.
     ///
     /// # Panics
     ///
@@ -194,9 +194,9 @@ impl Solution {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Infeasible`] if the new constraint makes the problem
-    /// infeasible. A malformed expression or a failure while solving is
-    /// returned as [`Error::InternalError`].
+    /// Returns [`Error::Infeasible`] when the solver proves the edited problem
+    /// infeasible (see [`Error::Infeasible`]). A malformed expression or a
+    /// failure while solving is returned as [`Error::InternalError`].
     pub fn add_constraint(
         self,
         expr: impl Into<LinearExpr>,
@@ -261,12 +261,12 @@ impl Solution {
     /// # Errors
     ///
     /// Returns [`Error::Infeasible`] if `val` is not finite, is outside the
-    /// variable's original bounds, is incompatible with its integer or boolean
-    /// domain, or leaves the edited problem without a feasible assignment.
-    /// A `min <= -2^52` or `max >= 2^52` counts as infinite here too (see
-    /// [`Problem::add_var`](crate::Problem::add_var)), and the bound and domain
-    /// checks allow the solve's tolerances, so any value this solution reports
-    /// is accepted (for an integer variable, with
+    /// variable's original bounds or is incompatible with its integer or
+    /// boolean domain, and when the solver proves the edited problem infeasible
+    /// (see [`Error::Infeasible`]). A `min <= -2^52` or `max >= 2^52` counts as
+    /// infinite here too (see [`Problem::add_var`](crate::Problem::add_var)),
+    /// and the bound and domain checks allow the solve's tolerances, so any
+    /// value this solution reports is accepted (for an integer variable, with
     /// [`SolveOptions::int_tol`] at most
     /// [`Tolerances::integrality_rounding`](crate::Tolerances::integrality_rounding),
     /// as by default; one fixed at an integer lies on it): a value up to

@@ -1,6 +1,7 @@
 //! Tests for the public solve API, grouped by topic. Each group drives the
-//! crate as a user would, through [`Problem`], [`SolveOutcome`] and
-//! [`Solution`], to pin the behaviour the API promises.
+//! crate as a user would, through [`Problem`](crate::Problem),
+//! [`SolveOutcome`](crate::SolveOutcome) and [`Solution`](crate::Solution),
+//! to pin the behaviour the API promises.
 
 #[cfg(test)]
 mod common;

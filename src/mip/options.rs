@@ -8,7 +8,8 @@ use core::time::Duration;
 /// Whether a usable solution is proven optimal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SolutionStatus {
-    /// The solver completed the optimality proof.
+    /// The solver completed the optimality proof ([`Tolerances::feasibility`]
+    /// says what that means on an ill-conditioned problem).
     Optimal,
     /// A valid incumbent is available, but exact optimality was not proven.
     Feasible,
@@ -67,26 +68,23 @@ pub struct SolveOptions {
     /// (dropping redundant rows and, for integer variables, tightening bounds,
     /// fixing variables and tightening big-M coefficients). It never removes
     /// variables or changes a continuous variable's bounds, and it keeps, up
-    /// to round-off, every point with each integer variable exactly integral
-    /// that meets each constraint within [`Tolerances::feasibility`] less the
-    /// round-off of evaluating it (the tolerance the simplex holds it to) and
-    /// each bound within its tolerance, or, for a variable it fixes because of
-    /// the objective, at least one optimum. The problem you observe through
-    /// [`crate::Solution`] is the one you wrote: answers are checked against
-    /// it. A point beyond that tolerance can be cut, and so can a point within
-    /// it only with an integer variable off its integer, within `int_tol`:
-    /// without presolve the MIP search can reach one through a
-    /// variable that presolve would fix or rewrite. So on a problem whose
-    /// every point needs that, presolve on can answer `Infeasible`, or a worse
-    /// objective, where presolve off finds a point. If presolve finds the
-    /// problem infeasible, the problem is solved without it. Disable it only to
-    /// compare raw solver behavior or to rule it out when investigating a
-    /// numerical issue. Default `true`.
+    /// to round-off, every point whose integer variables are exactly integral
+    /// that meets each constraint within the tolerance the simplex holds it to
+    /// (see [`Tolerances::feasibility`]) and each bound within its tolerance,
+    /// or, where it fixes a variable because of the objective, an optimum.
+    /// Solutions are always checked against the problem as you wrote it. A
+    /// point that needs `int_tol`, an integer variable off its integer under a
+    /// coefficient that makes the offset count, can be cut, by presolve or by a
+    /// branch on that variable: on a problem whose every point needs that, the
+    /// solve can answer `Infeasible`, or a worse objective, with presolve on or
+    /// off, and with presolve on where presolve off finds a point. If presolve
+    /// finds the problem infeasible, the problem is solved without it. Disable
+    /// it only to compare raw solver behavior or to rule it out when
+    /// investigating a numerical issue. Default `true`.
     pub presolve: bool,
-    /// Edit the tolerances used by the solver, most callers
-    /// should leave this at [`Tolerances::default`]; override an individual
-    /// field only once you understand the correctness/permissiveness
-    /// trade-off documented on it.
+    /// The tolerances of the solve. Most callers should leave this at
+    /// [`Tolerances::default`]; override an individual field only once you
+    /// understand the correctness/permissiveness trade-off documented on it.
     pub tolerances: Tolerances,
 }
 
@@ -180,23 +178,34 @@ const MIN_FEASIBILITY_TOLERANCE: f64 = 1e-10;
 
 /// Numeric tolerances for a solve (see [`SolveOptions::tolerances`]).
 ///
-/// This options override the solver's tolerances when solving the problem.
-/// Only edit those if you are sure of the impact of changing those values.
+/// The defaults suit most problems; change one only once you understand the
+/// trade-off documented on it.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct Tolerances {
-    /// The absolute feasibility tolerance of a solution: each variable may lie
-    /// outside its bounds, and each row outside its feasible range, by at most
-    /// this, or by the round-off of evaluating the bound or row in `f64` if
-    /// that is larger. The simplex holds every bound to it (an integer
-    /// variable its bounds fix to its value exactly) and every row to it less
-    /// the round-off of evaluating the row, and it is checked on a candidate,
-    /// as computed, before it becomes the incumbent, on a pure-LP solution
-    /// before it is returned, and on a previous incumbent to decide whether it
-    /// survives a [`crate::Solution`] edit. Being absolute, it lets a variable
-    /// with a large coefficient move its rows far: a `y` `1e-7` above its
-    /// upper bound `u` lets `x <= 1e8 * y` hold at `x = 1e8 * u + 10`.
-    /// Must be finite and at least `1e-10`. Default `1e-7`.
+    /// The absolute feasibility tolerance, the contract every solution meets:
+    /// each variable lies within its bounds, and each constraint within its
+    /// range, by at most this, or by the round-off of evaluating the bound or
+    /// the constraint in `f64` where that is larger. It is checked against the
+    /// problem as written on every solution before it is returned, on a
+    /// candidate before it becomes the incumbent, and on a previous incumbent
+    /// before it survives a [`crate::Solution`] edit.
+    ///
+    /// The simplex holds each bound to all of it (an integer variable its
+    /// bounds fix to its value exactly) and each constraint to it less the
+    /// round-off of evaluating the constraint, so a solution it finds passes
+    /// the check. [`Error::Infeasible`] means it proved that no point lies
+    /// within that, integer and fixed variables within their bounds: a
+    /// problem feasible only through the round-off of a constraint is
+    /// reported infeasible, as can be one feasible only by using
+    /// [`SolveOptions::int_tol`] (see [`SolveOptions::presolve`]).
+    /// [`SolutionStatus::Optimal`] means optimal at the vertices the simplex
+    /// ends at, not over every point within the tolerance: being absolute, it
+    /// lets a variable with a large coefficient move its constraints far, and
+    /// the objective with them (a `y` `1e-7` above its upper bound `u` lets
+    /// `x <= 1e8 * y` hold at `x = 1e8 * u + 10`), which coefficients within
+    /// the recommended range of the crate documentation keep small. Must be
+    /// finite and at least `1e-10`. Default `1e-7`.
     pub feasibility: f64,
     /// Distance from the nearest integer within which an integer/boolean
     /// variable's value is still treated as exactly that integer: by the

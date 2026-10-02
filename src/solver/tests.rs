@@ -2357,7 +2357,7 @@ fn the_refinement_bounds_the_multipliers_error_only_where_it_converged() {
 /// A non-basic var's certificate coefficient counts however far below its
 /// terms it cancelled, at a finite bound and as an unbounded range on an
 /// infinite one: it is the model's own, and counted as zero it proves
-/// feasible models infeasible (the round-off coefficient known limitations in
+/// feasible models infeasible (the round-off coefficient models of
 /// `src/tests/magnitudes.rs`). Planted: `rho = (1, 1)` leaves `z` the
 /// coefficient `-2^-50` beside terms of two and the rest out of reach by
 /// `1.5`; with `z >= -2^51` the certificate reaches `5`, beyond `beta = 4.5`,
@@ -2676,10 +2676,11 @@ fn c2_06_through_an_edit() -> Solver {
 
 /// The growth test measures a pivot against the entries of the vars that can
 /// move: `f`, fixed by an edit, never enters, so its `1e17` leaves `y`'s exact
-/// one a regular pivot, and the phase ends at `y = 1`. That pivot refused (planted as a bad basis change), no other can
-/// repair the row, and the phase fails loudly at once, every basis change
-/// left returning to visited vertices, instead of retrying until its stall
-/// bound; a time limit turns running on into a failure.
+/// one a regular pivot, and the phase ends at `y = 1`. That pivot refused
+/// (planted as a bad basis change), no other can repair the row, and the
+/// phase fails loudly at once, every basis change left returning to visited
+/// vertices, instead of retrying until its stall bound; a time limit turns
+/// running on into a failure.
 #[test]
 fn a_fixed_vars_huge_entry_leaves_a_genuine_pivot_regular() {
     init();
@@ -3384,7 +3385,7 @@ fn a_slack_left_off_its_bound_beyond_its_current_tolerance_moves_onto_it() {
 /// Two equalities `x + y = 1` and `x + y = 1 + 1.5e-7` over `x, y ∈ [0, 2]`
 /// disagree by `1.5e-7`, within their tolerances together but beyond either
 /// alone, so no slack can absorb the miss, and the proof grants both slacks
-/// their room. The dual phase's last resort widens a slack's bound, and the
+/// their room. The dual phase's widening moves a slack's bound, and the
 /// solve ends within the rows' contract, the model's bounds unchanged for the
 /// boundary; the next solve restores them in the engine too.
 #[test]

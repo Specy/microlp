@@ -26,14 +26,14 @@
 //! row violated (`var_tols`: for a slack, its row's contract less the
 //! round-off of evaluating the row; for a structural var, its whole bound
 //! contract, none for an integer var its bounds fix), and every other term
-//! the room by which the last resort can widen its bound in the direction
+//! the room by which the widening can move its bound in the direction
 //! that helps ([`Solver::widening_room`]: a structural var's tolerance, a
 //! slack's less the evaluation margin the widened side keeps, none for a
 //! bound already widened or a var the engine keeps on its bounds), each up
 //! to the farthest value `f64` holds within it, times its coefficient. So a
 //! proof says that no point has its terms within the room the engine can
-//! reach, and a row the proof leaves open is the last resort's
-//! ([`Solver::certificate_repair`]), which can widen the same bounds by the
+//! reach, and a row the proof leaves open is the last resorts', the last of
+//! which ([`Solver::certificate_repair`]) can widen the same bounds by the
 //! same room: rows that agree only within their tolerances together are
 //! solved, not reported infeasible. The price: a model whose points all need
 //! more room than that is reported infeasible.
@@ -572,8 +572,8 @@ impl Solver {
         proof
     }
 
-    /// The last resort of the dual simplex for a violated `row` that no var
-    /// can repair and that does not prove the model infeasible (see
+    /// The last of the dual simplex's last resorts for a violated `row` that
+    /// no var can repair and that does not prove the model infeasible (see
     /// [`Self::dual_phase`]): the non-basic vars that can close the gap and
     /// sit at their bound in the direction that helps move past it. Largest
     /// reach first, the bound each sits at is widened by its room

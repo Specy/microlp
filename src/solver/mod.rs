@@ -118,8 +118,8 @@ pub(crate) struct Solver {
     orig_obj_coeffs: Vec<f64>,
     /// Bounds in scaled units: `lo_j / s_j` and `hi_j / s_j` for a structural
     /// var, the slack's own bounds for a slack. These are the bounds in force:
-    /// the model's, but where the dual simplex's last resort widened one for
-    /// the rest of the solve (`widened`).
+    /// the model's, but where the dual simplex widened one for the rest of the
+    /// solve (`widened`).
     orig_var_mins: Vec<f64>,
     orig_var_maxs: Vec<f64>,
     pub(crate) orig_var_domains: Vec<VarDomain>,
@@ -151,7 +151,7 @@ pub(crate) struct Solver {
     /// var counts as within each of its bounds: [`structural_tol`] for a
     /// structural var, refreshed when its bounds change, and [`slack_tol`]
     /// for a slack, refreshed whenever the rows are checked since its
-    /// round-off depends on the values. A side whose bound the last resort
+    /// round-off depends on the values. A side whose bound the dual simplex
     /// widened keeps none (a slack, its evaluation margin): its bound holds
     /// the rest ([`Self::widen`]).
     var_tols: Vec<BoundTols>,
@@ -1016,8 +1016,8 @@ impl Solver {
     /// costs recomputed from the multipliers are dual feasible. A phase's own
     /// exit test runs on incrementally updated numbers and can end on drifted
     /// values, so only a verified state is reported as `Finished`. The solve
-    /// starts from the model's bounds, restoring any a previous solve's last
-    /// resort widened ([`Self::restore_model_bounds`]).
+    /// starts from the model's bounds, restoring the ones a previous solve
+    /// widened ([`Self::restore_model_bounds`]).
     ///
     /// A phase ends by restoring the costs in force ([`costs`]) or the true
     /// bounds ([`bounds`]), and the infeasibility that uncovers is left to the
@@ -1278,8 +1278,7 @@ impl Solver {
     /// these values. Returns whether the residual `b - Σ a_j x_j - s` of every
     /// row whose slack is non-basic (how far the basic structural values are
     /// from solving it) lies within the slack's tolerance on the side it moves
-    /// the slack (on a side whose bound the last resort widened, the
-    /// evaluation margin alone).
+    /// the slack (on a widened side, the evaluation margin alone).
     fn check_rows(&mut self) -> bool {
         let mut hold = true;
         for r in 0..self.num_constraints() {
@@ -1953,11 +1952,11 @@ impl Solver {
     /// taboo rows are left after a rebuild and no last resort remains, and
     /// when the dual objective has not risen beyond round-off in
     /// [`STALL_ITERATIONS`] iterations. The room an unrepaired row's
-    /// certificate leaves then lies where no step reaches: in an entry at or
-    /// below the pivot tolerance of a var with no bound in its direction, in
-    /// a coefficient below the round-off of its terms, within the round-off
-    /// of the room every term can give, or beyond the values computed through
-    /// the basis (see the known limitations in ARCHITECTURE §7).
+    /// certificate leaves then lies where no step reaches: in an entry the
+    /// refinement cannot settle of a var with no bound in its direction, in a
+    /// coefficient below the round-off of its terms, within the round-off of
+    /// the room every term can give, or beyond the values computed through the
+    /// basis (see the known limitations in ARCHITECTURE §7.9).
     fn dual_phase(&mut self) -> Result<StopReason, Error> {
         let obj_str = if self.artificial_obj.is_some() {
             "artificial obj."
@@ -1968,7 +1967,7 @@ impl Solver {
         // Whether the data are fresh from a rebuild, with no pivot since: a
         // row's verdict, or the loud error when only taboo rows are left, is
         // drawn on fresh data only. Only the unproven row with the best score
-        // gets the last resort: if it fails on it, the phase fails without
+        // gets the last resorts: if they fail on it, the phase fails without
         // trying another (a loud error where there might have been an answer,
         // never a wrong answer).
         let mut refreshed_since_pivot = false;
@@ -2930,7 +2929,7 @@ impl Solver {
 
     /// The violated row with the best dual steepest-edge score among those
     /// that no var can repair and that do not prove infeasibility (see
-    /// [`CycleGuard::add_failed_proof`]): the row the last resort of
+    /// [`CycleGuard::add_failed_proof`]): the row the last resorts of
     /// [`Self::dual_phase`] take.
     fn unproven_row(&self) -> Option<usize> {
         self.best_violated_row(|r| self.cycle_guard.is_unproven(r))
@@ -3172,20 +3171,19 @@ impl Solver {
             }
         };
 
-        // Whether the non-basic var `c` could instead absorb the leaving
-        // var's move by crossing the bound it sits at (or, if fixed, its
-        // value) by no more than its own tolerance. This hands a violation
-        // that a var cannot carry (an integer var, a tight bound) to a term
-        // whose tolerance the infeasibility proof counts, such as an
-        // equality's slack, at once rather than through the last resort. An
-        // integer var never absorbs, nor does a fixed structural var (see
+        // Whether the non-basic var `c` could instead absorb the leaving var's
+        // move by crossing the bound it sits at (or, if fixed, its value) by
+        // no more than its own tolerance. This hands a violation that a var
+        // cannot carry (an integer var, a tight bound) to a term whose
+        // tolerance the infeasibility proof counts, such as an equality's
+        // slack, at once rather than through the widening. An integer var
+        // never absorbs, nor does a fixed structural var (see
         // `holds_on_bounds`), and a var crosses a bound by absorbing once per
-        // solve (`absorbed`), so that absorptions cannot hand a violation
-        // back and forth for ever: a later need for that room goes to the
-        // proof and the last resort's widening. The var moves the way its
-        // bound forbids, so the pivot takes a zero dual step with the var's
-        // cost shifted, rather than a step `d_q / a_q` that would run
-        // backwards by any amount.
+        // solve (`absorbed`), so that absorptions cannot hand a violation back
+        // and forth for ever: a later need for that room goes to the proof and
+        // the widening. The var moves the way its bound forbids, so the pivot
+        // takes a zero dual step with the var's cost shifted, rather than a
+        // step `d_q / a_q` that would run backwards by any amount.
         let absorbs = |c: usize, coeff: f64| -> bool {
             if coeff == 0.0 {
                 return false;

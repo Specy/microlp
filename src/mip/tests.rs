@@ -512,11 +512,11 @@ fn network_with_line_8_off_infeasible() -> (Problem, Variable) {
 /// with presolve on and off (on: the root LP of the presolved model). Along
 /// the way the only repair of a row is a slack unbounded in its direction,
 /// through an entry of `1.2e-15` that the plain row computes as `7.1e-15`,
-/// and that coefficient leaves the row's certificate unbounded: the last
-/// resort pivots on it, genuine on the refined row, and a later row proves
-/// the LP infeasible. Taken for round-off because the plain row was off, the
-/// entry left no pivot and no proof, and the solve ended in "no var can
-/// repair row".
+/// and that coefficient leaves the row's certificate unbounded: the first
+/// last resort pivots on it, genuine on the refined row, and a later row
+/// proves the LP infeasible. Taken for round-off because the plain row was
+/// off, the entry left no pivot and no proof, and the solve ended in "no var
+/// can repair row".
 #[test]
 fn a_network_completion_with_a_line_off_is_proven_infeasible() {
     let (problem, on_8) = network_with_line_8_off_infeasible();

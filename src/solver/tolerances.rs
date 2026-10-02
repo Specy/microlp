@@ -1,7 +1,7 @@
 //! The engine's tolerance model: the one contract every layer holds a point
 //! to, and the few constants that describe what the arithmetic can resolve.
 //!
-//! The contract (ARCHITECTURE §7): a value may leave its range by the user's
+//! The contract (ARCHITECTURE §7.1): a value may leave its range by the user's
 //! absolute `feasibility` tolerance, or by the round-off of the quantities it
 //! was computed from if that is larger. [`row_tolerance`] is that rule,
 //! [`bound_tolerance`] its instance for a var's bound, and [`outside`] the
@@ -12,7 +12,7 @@
 //! point it reports passes the boundary's evaluation (the MIP candidate
 //! guard, the pure-LP check), which sums each row in compensated arithmetic
 //! ([`implied_slack`]) and so does not depend on the engine's order. Where
-//! the dual simplex's last resort widens a bound by its var's tolerance, the
+//! the dual simplex's widening moves a bound by its var's tolerance, the
 //! bound holds that tolerance ([`band_edge`]) and the side keeps none, or for
 //! a slack only the evaluation margin ([`slack_margin`]). Everything else
 //! here is a property of `f64` and of the factorization, not of the contract.
@@ -45,15 +45,16 @@ pub(crate) const LU_SINGULAR_REL: f64 = ROUNDOFF_FLOOR;
 
 /// The pivot tolerance of the dual ratio test after `updates` basis changes
 /// on the current factorization (the eta file's length), in the engine's
-/// scaled units: an entry of the pivot row bounds the dual step and can
-/// enter only if its magnitude exceeds this. The row is computed through the
-/// factorization and every update since, each adding its round-off to what a
-/// small entry can be made of, so the older the factorization, the larger
-/// an entry must be to be trusted. Absolute, since rows and columns are
-/// scaled to entries near one: on a model within the recommended coefficient
-/// range a genuine entry is far above it, while what a relative floor could
-/// not tell from round-off, an entry small beside the rest of its row, the
-/// growth test on the chosen pivot catches ([`PIVOT_GROWTH_TOL`]).
+/// scaled units: an entry of the pivot row bounds the dual step and is a
+/// candidate only if its magnitude exceeds this. The row is computed through
+/// the factorization and every update since, each adding its round-off to
+/// what a small entry can be made of, so the older the factorization, the
+/// larger an entry must be to be trusted. Absolute, since rows and columns are
+/// scaled to entries near one; what a relative floor could not tell from
+/// round-off, an entry small beside the rest of its row, the growth test on
+/// the chosen pivot catches ([`PIVOT_GROWTH_TOL`]). A genuine entry below it
+/// enters only as a last resort, once a refinement shows it genuine
+/// (`Solver::genuine_entry_step`).
 pub(crate) fn dual_pivot_tolerance(updates: usize) -> f64 {
     if updates < 10 {
         1e-9
@@ -70,7 +71,9 @@ pub(crate) fn dual_pivot_tolerance(updates: usize) -> f64 {
 /// bounds the step and can be the pivot only if its magnitude exceeds this.
 /// The step passes the row of a smaller entry, and a basic var it leaves
 /// outside its bounds beyond its tolerance has its working bound shifted
-/// (`Solver::correct_primal`).
+/// (`Solver::correct_primal`). A step nothing above it bounds, toward an
+/// infinite bound, refines its column, whose entries beyond their measured
+/// error bound it (`Solver::refine_pivot_col`).
 pub(crate) fn primal_pivot_tolerance(updates: usize) -> f64 {
     if updates < 10 {
         1e-9
@@ -90,8 +93,8 @@ pub(crate) fn primal_pivot_tolerance(updates: usize) -> f64 {
 /// grows the basis inverse and the reduced costs a billionfold. The row is
 /// refined and its entries summed again in compensated arithmetic before such
 /// a pivot is passed over (`Solver::choose_entering_col_dual`), and it enters
-/// only as the dual simplex's last resort, genuine on the refined row
-/// (`Solver::genuine_entry_step`).
+/// only as the first of the dual simplex's last resorts, genuine on the
+/// refined row (`Solver::genuine_entry_step`).
 pub(crate) const PIVOT_GROWTH_TOL: f64 = 1e-9;
 
 /// Relative disagreement between the pivot element computed through the

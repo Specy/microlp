@@ -9,15 +9,16 @@
 //! A model the engine gets wrong and that cannot be fixed at once is pinned
 //! here as a KNOWN LIMITATION with `#[should_panic]`, which records today's
 //! answer: a fix then shows up as a FAILING test, and deleting the attribute
-//! (the body already asserts the right answer) makes it an ordinary
-//! regression test. See §7 of `ARCHITECTURE.md`.
+//! (the body already asserts the right answer) makes it an ordinary regression
+//! test. See §7.9 of `ARCHITECTURE.md`.
 
 #[cfg(test)]
 mod regression_tests {
     use crate::tests::oracle::{
         assert_out_of_range_fails_loudly, assert_solves_feasibly_within_contract,
         assert_solves_within_contract, assert_solves_within_contract_in_time,
-        assert_solves_within_contract_without_presolve, xstar_is_feasible, Model, Row, Var,
+        assert_solves_within_contract_without_presolve, within_recommended_range,
+        xstar_is_feasible, Model, Row, Var,
     };
     use crate::{ComparisonOp, Error, OptimizationDirection, SolveOptions, TerminationReason};
     use std::time::Duration;
@@ -1093,9 +1094,9 @@ mod regression_tests {
     /// first but for `y`'s last digits and asks it for `0.995`. The first
     /// row's only repair is `y`, through an entry of `1.785e-13` that its
     /// certificate leaves on `y`'s infinite bound, so it proves nothing: the
-    /// last resort pivots on it, genuine on the refined row, and the row of
-    /// `x`, `1.7e12` past its bound there, proves the model infeasible, with
-    /// presolve on and off. Computed as `1.7852e-13` and refined to
+    /// first last resort pivots on it, genuine on the refined row, and the row
+    /// of `x`, `1.7e12` past its bound there, proves the model infeasible,
+    /// with presolve on and off. Computed as `1.7852e-13` and refined to
     /// `1.7849e-13`, the entry did not agree to seven digits, was taken for
     /// round-off, and the solve failed loudly ("no var can repair row").
     #[test]
@@ -1154,17 +1155,17 @@ mod regression_tests {
         }
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): `min x - y` s.t.
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): `min x - y` s.t.
     /// `x + (1 + 2^-48) y <= -2` and `x + y >= -1`, `x >= 0`, `y` in
     /// `[-10, 10]`, within the recommended range, is infeasible: the rows need
-    /// `2^-48 y <= -1`. The second row proves nothing (`x`'s genuine
-    /// `3.6e-15` on its infinite bound), and its last resort repairs it
-    /// through `x`, the only var that can; the basis that enters `x`, with
-    /// `y` basic, is one the factorization finds singular. The first row,
-    /// `y`'s, `2.8e14` past its bound there, gets no verdict: the fresh
-    /// factorization before it takes `x` out, the widening of the second row's
-    /// slack cannot close its gap, and the solve fails loudly where it should
-    /// answer `Infeasible`.
+    /// `2^-48 y <= -1`. The second row proves nothing (`x`'s genuine `3.6e-15`
+    /// on its infinite bound), and its first last resort repairs it through
+    /// `x`, the only var that can; the basis that enters `x`, with `y` basic,
+    /// is one the factorization finds singular. The first row, `y`'s, `2.8e14`
+    /// past its bound there, gets no verdict: the fresh factorization before
+    /// it takes `x` out, the widening of the second row's slack cannot close
+    /// its gap, and the solve fails loudly where it should answer
+    /// `Infeasible`.
     #[test]
     #[should_panic(expected = "no var can repair row")]
     fn a_proof_of_infeasibility_through_a_singular_basis_is_a_known_limitation() {
@@ -1175,6 +1176,47 @@ mod regression_tests {
             let slanted = 1.0 + 2f64.powi(-48);
             problem.add_constraint([(x, 1.0), (y, slanted)], ComparisonOp::Le, -2.0);
             problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Ge, -1.0);
+            match problem.solve_with(SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            }) {
+                Err(Error::Infeasible) => {}
+                other => panic!("presolve {presolve}: {other:?}"),
+            }
+        }
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): three rows within the recommended
+    /// range, the third `9` times the second less `2.8` times the first but
+    /// for `x2`'s coefficient (`1.8e-9` off) and its right-hand side, are
+    /// infeasible: on the line the two equalities leave, the second row misses
+    /// by `0.111` wherever `x0` lies within its bounds. The second row's
+    /// certificate proves nothing alone (`x2`'s genuine `1e-10` on its
+    /// infinite bound); its first last resort pivots on that entry, which puts
+    /// `x0` at `-2.7e10`, and the refinement of `x0`'s row of the basis
+    /// inverse, through the nearly dependent rows, does not converge, so that
+    /// row's proof, which needs `x0`'s bound, fails too. The widening cannot
+    /// close such a gap, and the solve fails loudly where it should answer
+    /// `Infeasible`.
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn an_infeasible_lp_of_nearly_dependent_rows_is_a_known_limitation() {
+        for presolve in [true, false] {
+            let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+            let x0 = problem.add_var(-0.3, (-10.0, 10.0));
+            let x1 = problem.add_var(-2.2, (f64::NEG_INFINITY, f64::INFINITY));
+            let x2 = problem.add_var(-0.6, (0.0, f64::INFINITY));
+            problem.add_constraint([(x0, 0.31), (x1, 0.81), (x2, 6.17)], ComparisonOp::Eq, 0.42);
+            problem.add_constraint(
+                [(x0, -0.77), (x1, -3.35), (x2, -0.36)],
+                ComparisonOp::Ge,
+                2.4,
+            );
+            problem.add_constraint(
+                [(x0, -7.798), (x1, -32.418), (x2, -20.516000001846947)],
+                ComparisonOp::Eq,
+                19.424,
+            );
             match problem.solve_with(SolveOptions {
                 presolve,
                 ..SolveOptions::default()
@@ -1514,19 +1556,18 @@ mod regression_tests {
         }
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): an ill-conditioned vertex whose
-    /// computed values the rows and bounds accept, but whose exact values
-    /// miss a bound, keeps its computed values, and the basis amplifies
-    /// their round-off into the objective.
-    /// `53.3 x0 + 0.0016 x2 = 3576909.7016` with `x0` fixed at `67109` puts
-    /// `x2` at `1 - 7.9e-9`, which the plain sum computes as `1 + 4.7e-8`,
-    /// within its tolerance; the active
-    /// `-0.0194 x1 - 824 x2 - 0.0011 x3 >= -824.0011` amplifies the
-    /// difference `7.5e5` times, so the vertex with `x3` basic in it has
-    /// `x3 = 0.964` as computed and `1.0059`, past its bound, exactly. The
-    /// answer is the computed vertex's, `-1.4288`, where the optimum is
-    /// `-1.5` at `x*`, with `x3` on its bound. The rows lie inside the
-    /// recommended range (row dynamism `7.5e5`).
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): an ill-conditioned vertex whose
+    /// computed values the rows and bounds accept, but whose exact values miss
+    /// a bound, keeps its computed values, and the basis amplifies their
+    /// round-off into the objective. `53.3 x0 + 0.0016 x2 = 3576909.7016` with
+    /// `x0` fixed at `67109` puts `x2` at `1 - 7.9e-9`, which the plain sum
+    /// computes as `1 + 4.7e-8`, within its tolerance; the active
+    /// `-0.0194 x1 - 824 x2 - 0.0011 x3 >= -824.0011` amplifies the difference
+    /// `7.5e5` times, so the vertex with `x3` basic in it has `x3 = 0.964` as
+    /// computed and `1.0059`, past its bound, exactly. The answer is the
+    /// computed vertex's, `-1.4288`, where the optimum is `-1.5` at `x*`, with
+    /// `x3` on its bound. The rows lie inside the recommended range (row
+    /// dynamism `7.5e5`).
     #[test]
     #[should_panic(expected = "is worse than the objective")]
     fn a_vertex_whose_exact_values_miss_a_bound_is_kept_as_computed_and_is_a_known_limitation() {
@@ -1877,8 +1918,8 @@ mod regression_tests {
     /// equality's slack absorbs the violation; the other, which crossed its
     /// bound once in the solve, does not absorb it back, so the slacks cannot
     /// hand it back and forth until every row is taboo. The proof grants both
-    /// slacks their room and proves nothing, and the last resort widens the
-    /// other slack's bound: the node solves, presolve on and off. The rows lie
+    /// slacks their room and proves nothing, and the widening moves the other
+    /// slack's bound: the node solves, presolve on and off. The rows lie
     /// within the recommended range.
     #[test]
     fn a_node_feasible_only_through_two_tolerances_at_once_is_solved() {
@@ -2065,16 +2106,15 @@ mod regression_tests {
 
     /// A model of the differential fuzz outside the recommended range
     /// (constraint 1 spans `7.9e10`, variable 6 `1.3e12`) solves within the
-    /// contract, with presolve on and off; the answer is the objective at
-    /// `x*`. Its only way to the optimum pivots on entries some `2.2e-10` of
-    /// their scaled rows and columns, below every pivot tolerance: each primal
-    /// phase leaves a row violated that such an entry alone repairs, and the
-    /// dual simplex's last resort takes it, genuine on the refined row, three
+    /// contract, with presolve on and off; the answer is the objective at `x*`.
+    /// Its only way to the optimum pivots on entries some `2.2e-10` of their
+    /// scaled rows and columns, below every pivot tolerance: each primal phase
+    /// leaves a row violated that such an entry alone repairs, and the dual
+    /// simplex's first last resort takes it, genuine on the refined row, three
     /// phase rounds in all. Earlier, a step that flipped a boxed var through
-    /// such an entry left it dual infeasible, and a rebuild that moved it
-    /// back, rather than shifting its cost (`rebuild_dual`), returned the dual
-    /// phase to a vertex it had left, round a loop the cycling detection
-    /// ended.
+    /// such an entry left it dual infeasible, and a rebuild that moved it back,
+    /// rather than shifting its cost (`rebuild_dual`), returned the dual phase
+    /// to a vertex it had left, round a loop the cycling detection ended.
     #[test]
     fn wide_lp_1897_solves_within_the_contract() {
         let model = Model {
@@ -2407,9 +2447,9 @@ mod regression_tests {
     /// phase only `x2` can repair `x1`'s row, through that entry: the proof
     /// proves nothing, and the certificate repair flipped `x2` back, for the
     /// step to come again, until the solve failed with `8 phase rounds`. The
-    /// entry is genuine on the refined row, and the dual simplex's last resort
-    /// pivots on it. The rows lie outside the recommended range (row dynamism
-    /// `1e12`).
+    /// entry is genuine on the refined row, and the dual simplex's first last
+    /// resort pivots on it. The rows lie outside the recommended range (row
+    /// dynamism `1e12`).
     #[test]
     fn phases_over_a_var_a_bound_flip_passes_settle() {
         check(Model {
@@ -2611,7 +2651,7 @@ mod regression_tests {
     /// its tolerance. The root LP ends at `x0 = 7e-9`, integral within
     /// `int_tol`, and the search closes there: its objective is the root's
     /// bound, and a point better only within the tolerances is not sought
-    /// (ARCHITECTURE §7).
+    /// (ARCHITECTURE §7.1).
     #[test]
     fn a_root_lp_point_integral_within_int_tol_closes_the_search() {
         check(Model {
@@ -2666,12 +2706,12 @@ mod regression_tests {
         model
     }
 
-    /// The node `x1 = 1` holds only within its rows' tolerances: in the
-    /// node's basis `x1` is basic, and the three equalities that hold it,
-    /// taken as exact, keep it at least `7e-5` from 1. The proof grants every
-    /// term of their certificate its room, so it proves nothing, the last
-    /// resort widens the bounds of the slacks that close the gap, and the
-    /// search reaches `x*`'s optimum.
+    /// The node `x1 = 1` holds only within its rows' tolerances: in the node's
+    /// basis `x1` is basic, and the three equalities that hold it, taken as
+    /// exact, keep it at least `7e-5` from 1. The proof grants every term of
+    /// their certificate its room, so it proves nothing, the widening moves
+    /// the bounds of the slacks that close the gap, and the search reaches
+    /// `x*`'s optimum.
     #[test]
     fn a_node_feasible_only_within_its_rows_tolerances_is_solved() {
         check(integer_value_met_within_the_rows_tolerances());
@@ -2687,10 +2727,10 @@ mod regression_tests {
 
     /// An edit holds a var to its model bounds after a solve widened one.
     /// `x + y >= 2 + 2.5e-7` over `x, y ∈ [0, 1]` needs room past both upper
-    /// bounds: the last resort widens `y`'s to `1 + 1e-7`, and the answer
-    /// puts `y` there. Fixed at `0.5`, either var leaves the other at most
-    /// `1 + 1e-7`, so each edit is `Infeasible`; a fix that kept the
-    /// widening of `y`'s bound would solve at `y = 1 + 1e-7`.
+    /// bounds: the widening moves `y`'s to `1 + 1e-7`, and the answer puts `y`
+    /// there. Fixed at `0.5`, either var leaves the other at most `1 + 1e-7`,
+    /// so each edit is `Infeasible`; a fix that kept the widening of `y`'s
+    /// bound would solve at `y = 1 + 1e-7`.
     #[test]
     fn a_var_fixed_after_its_bound_was_widened_keeps_its_model_bounds() {
         for presolve in [true, false] {
@@ -2724,15 +2764,15 @@ mod regression_tests {
 
     /// `2 x0 - x1 = 0`, `x1 - x2 = 0` and `x2 = 2 + 1.8e-7` over a binary
     /// `x0`, with `-878 x0 >= -878`: `x0 = 1` needs `x1 = x2 = 2 + 9e-8`, the
-    /// first and third rows each `9e-8` off, within their tolerances
-    /// together, and `x0 = 0` meets nothing. Presolve rewrites the last row
-    /// and drops it; the root's LP point has `x0 = 1 + 9e-8`, within its
-    /// bound's tolerance, which the row as written rejects, and the branch
-    /// fixes `x0` at 1, where the engine holds it exactly. No single row can
-    /// take its offset, so no vertex of the node's bounds meets the rows; the
-    /// proof grants both equalities their room and proves nothing, and the
-    /// last resort widens both slacks' bounds, where the node's LP finds the
-    /// point. Without presolve the root needs the same, on its equalities.
+    /// first and third rows each `9e-8` off, within their tolerances together,
+    /// and `x0 = 0` meets nothing. Presolve rewrites the last row and drops
+    /// it; the root's LP point has `x0 = 1 + 9e-8`, within its bound's
+    /// tolerance, which the row as written rejects, and the branch fixes `x0`
+    /// at 1, where the engine holds it exactly. No single row can take its
+    /// offset, so no vertex of the node's bounds meets the rows; the proof
+    /// grants both equalities their room and proves nothing, and the widening
+    /// moves both slacks' bounds, where the node's LP finds the point. Without
+    /// presolve the root needs the same, on its equalities.
     #[test]
     fn a_node_fixing_a_binary_feasible_only_within_two_rows_tolerances_is_solved() {
         assert_solves_within_contract_in_time(
@@ -2755,11 +2795,11 @@ mod regression_tests {
         );
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): a node whose only point lies
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): a node whose only point lies
     /// within the round-off of its row's room fails loudly.
     /// `-1125 x0 - 1.125e-7 x1 = -5876999.999999887` with `x0` fixed at `5224`
-    /// holds `x1 = -1` and, `1e-11` inside the engine's room of the row
-    /// (its contract less the round-off margin), `x1 = -2`. The LP's vertex,
+    /// holds `x1 = -1` and, `1e-11` inside the engine's room of the row (its
+    /// contract less the round-off margin), `x1 = -2`. The LP's vertex,
     /// `x1 = -1.0017`, branches, and the node `x1 = -2` fixes both vars: the
     /// plain sum of the row puts it `3.8e-10` beyond that room, no var can
     /// move, and the proof, summed exactly, proves nothing. The row lies
@@ -2786,7 +2826,7 @@ mod regression_tests {
     /// (absorption), and a later pivot takes the slack out of the basis. When
     /// the miss comes back, the slack, which crossed its bound once in the
     /// solve, does not absorb it again: the proof grants it its room and
-    /// proves nothing, and the last resort widens its bound.
+    /// proves nothing, and the widening moves its bound.
     #[test]
     fn an_equality_whose_slack_must_absorb_twice_in_a_phase_solves() {
         let model = Model {
@@ -2825,7 +2865,7 @@ mod regression_tests {
     /// the equality at `x4 = 1`, `5.5e-9` off, within its tolerance. The
     /// equality's slack absorbs a move and a regular pivot takes it out of the
     /// basis; the move it needs again goes to the proof, which grants the
-    /// slack its room, and the last resort widens its bound.
+    /// slack its room, and the widening moves its bound.
     #[test]
     fn an_lp_whose_equality_slack_must_absorb_twice_in_a_phase_solves() {
         let model = Model {
@@ -3075,8 +3115,8 @@ mod regression_tests {
     /// the pivot tolerance. The certificate's `-2^-50` for `z`, counted at
     /// `z >= -2e9`, leaves `7.8e-7` of room (counted as zero, it would prove
     /// the model infeasible): no proof. On the refined row, summed in
-    /// compensated arithmetic, the entry is genuine, and the last resort's
-    /// pivot on it solves the model.
+    /// compensated arithmetic, the entry is genuine, and the first last
+    /// resort's pivot on it solves the model.
     #[test]
     fn a_room_through_a_round_off_coefficient_on_a_far_bound_is_reached() {
         check(room_through_a_round_off_coefficient(false, -2e9));
@@ -3143,8 +3183,8 @@ mod regression_tests {
     /// an entry of `2^-50` beside ones. The certificate leaves that row out
     /// (its multiplier needs the slack's infinite side), so the free basic `j`
     /// keeps its exact `-2^-50`, which makes the range unbounded: no proof.
-    /// The entry is genuine on the refined row, and the last resort's pivot on
-    /// it solves the model.
+    /// The entry is genuine on the refined row, and the first last resort's
+    /// pivot on it solves the model.
     #[test]
     fn a_room_through_a_basic_vars_round_off_coefficient_is_reached() {
         check(room_through_a_basic_vars_coefficient(false));
@@ -3961,7 +4001,7 @@ mod regression_tests {
     /// `y = 1 - 3e-14`, whose offset times `M = 5e7` makes the room. Without
     /// presolve the search reaches it through the LP (`y = 1 - 2e-14`).
     /// Presolve rewrites `y`'s coefficient to about `500`; the root's LP then
-    /// needs the rows' tolerances, which the proof grants and the last resort
+    /// needs the rows' tolerances, which the proof grants and the widening
     /// reaches: one pin row's widened slack lets `y` end `5e-10` under one,
     /// within `int_tol`, where the rewritten row holds and the row as written
     /// has room to spare.
@@ -3980,11 +4020,11 @@ mod regression_tests {
         check(model);
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): the model of
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): the model of
     /// [`a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_found`]
     /// without fixed terms and with each pin row alone keeping `y` at one:
-    /// presolve fixes `y` at 1, where the engine holds it exactly, which
-    /// takes the room away, and answers `Infeasible`.
+    /// presolve fixes `y` at 1, where the engine holds it exactly, which takes
+    /// the room away, and answers `Infeasible`.
     #[test]
     #[should_panic(expected = "solve() returned Infeasible")]
     fn a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation() {
@@ -3992,6 +4032,51 @@ mod regression_tests {
             big_m_row_met_beyond_its_bound(5e7, [0.0, -0.0], 1e4, 1000.0, 1.03, false, 1.0 - 3e-14);
         assert_solves_within_contract_without_presolve(&model);
         check(model);
+    }
+
+    /// `max y` s.t. `x >= x_min`, `x <= coeff y`, `y <= 0.5`, `y` binary:
+    /// the rows hold together only with `y` off its integer, from
+    /// `y = x_min / coeff`, which is within `int_tol` of 0.
+    fn binary_off_its_integer(x_min: f64, coeff: f64) -> Model {
+        let model = Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![real(0.0, 0.0, f64::INFINITY), int(1.0, 0, 1)],
+            rows: vec![
+                row(&[(0, 1.0)], ComparisonOp::Ge, x_min),
+                row(&[(0, 1.0), (1, -coeff)], ComparisonOp::Le, 0.0),
+                row(&[(1, 1.0)], ComparisonOp::Le, 0.5),
+            ],
+            xstar: vec![x_min, x_min / coeff],
+        };
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model it was built around"
+        );
+        model
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): [`binary_off_its_integer`] with
+    /// `x >= 5` and `x <= 1e7 y`, from `y = 5e-7`. The root's LP puts `y` at
+    /// `0.5`, and the branch fixes it at 0 and at 1, where the engine holds it
+    /// exactly: both children are infeasible, and the search answers
+    /// `Infeasible` without presolve too.
+    #[test]
+    #[should_panic(expected = "solve() without presolve returned Infeasible")]
+    fn a_point_needing_the_int_tol_of_a_binary_a_branch_fixes_is_a_known_limitation() {
+        assert_solves_within_contract_without_presolve(&binary_off_its_integer(5.0, 1e7));
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): the last test in range, with
+    /// `x >= 9e-7` and `x <= y`, from `y = 9e-7`.
+    #[test]
+    #[should_panic(expected = "solve() without presolve returned Infeasible")]
+    fn a_point_needing_the_int_tol_of_a_binary_in_range_is_a_known_limitation() {
+        let model = binary_off_its_integer(9e-7, 1.0);
+        assert!(
+            within_recommended_range(&model),
+            "fixture error: the model must lie within the recommended range"
+        );
+        assert_solves_within_contract_without_presolve(&model);
     }
 
     /// A facility model whose capacity row `x2 + ... + x6 <= 2.918e9 x0`

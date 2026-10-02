@@ -245,8 +245,8 @@ impl SolveOutcome {
     /// # Errors
     ///
     /// Returns [`Error::InvalidOptions`] when a supplied value is non-finite or
-    /// outside its accepted range. Errors encountered while continuing the
-    /// solve are returned unchanged.
+    /// outside its accepted range, and otherwise the errors of
+    /// [`SolveOutcome::resume`].
     pub fn resume_with(self, options: ResumeOptions) -> Result<Self, Error> {
         options.validate()?;
         if self.is_optimal() {

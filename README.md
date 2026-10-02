@@ -28,8 +28,9 @@ The sections below show how to use microlp directly.
 * Handles problems with hundreds of thousands of variables and constraints.
 
 Integer and boolean variables are handled with branch & bound. The library is
-already quite powerful and fast, but it may still cycle or lose precision on
-some hard problems. Please report bugs and contribute code!
+already quite powerful and fast, but on some hard or ill-conditioned problems a
+solve can still fail with `Error::InternalError` rather than answer. Please
+report bugs and contribute code!
 
 ## Basic usage
 
@@ -99,23 +100,43 @@ problem.add_constraint(lhs, ComparisonOp::Eq, 0.0);
 
 ## Solving and reading the solution
 
-`solve()` tries to find the optimal solution, it returns `Error::Infeasible` when the constraints contradict each other and `Error::Unbounded` when the objective can grow forever. Invalid numeric options return `Error::InvalidOptions`, a NaN or infinite objective coefficient returns `Error::InvalidOperation`, and unrecoverable numerical failures return `Error::InternalError`.
+`solve()` tries to find the optimal solution. Every solution meets each
+constraint and each variable bound within an absolute tolerance (`1e-7` by
+default, `Tolerances::feasibility`, or the round-off of evaluating it in `f64`
+where that is larger), checked against the problem as you wrote it. Otherwise
+the solve returns an error:
+
+* `Error::Infeasible`: the solver proved, from the problem's data, that no
+  assignment meets the constraints and bounds within that tolerance with
+  every integer variable, and every variable whose bounds are equal, exactly
+  within its bounds (see `Tolerances::feasibility`).
+* `Error::Unbounded`: the objective can improve forever.
+* `Error::InternalError`: a numerical failure the solver could not recover
+  from. It returns this rather than an answer it could not verify.
+* `Error::InvalidOptions` for an invalid numeric option, and
+  `Error::InvalidOperation` for a NaN or infinite objective coefficient.
+
+An optimal solution is optimal at the point the solver ends at, within the
+tolerance, not over every point the tolerance admits: on an ill-conditioned
+problem, where a small coefficient sits beside a large one, the tolerance can
+move the objective far from the exact optimum.
 
 Keep the coefficients of each constraint, and those of each variable across
 the constraints, within six orders of magnitude: the largest magnitude at most
 `1e6` times the smallest. Nothing outside that range is refused or changed,
-and every answer is still checked against the model as you wrote it, but a
+and every solution is still checked against the model as you wrote it, but a
 solve can then fail with `Error::InternalError`, whose message names the
 constraint (in the order added) and the variable (its index) whose
-coefficients span the most. Changing the units of a variable or of a
-constraint usually brings a model back into range.
+coefficients span the most, those of them outside the range. Changing the
+units of a variable or of a constraint usually brings a model back into
+range. Within the range, please report an `Error::InternalError` as a bug.
 
 When a solver decides to produce a solution it might be for different reasons:
 
 * `SolveOutcome::Solution` contains a validated assignment. Its status is
-  `SolutionStatus::Optimal` when exact optimality was proved, or
-  `SolutionStatus::Feasible` when a valid incumbent is available without an
-  exact proof, for example if a time or node limit has been reached.
+  `SolutionStatus::Optimal` when optimality was proved, with no MIP gap, or
+  `SolutionStatus::Feasible` when a valid incumbent is available without that
+  proof, for example if a time or node limit has been reached.
 * `SolveOutcome::Interrupted` means a time or node limit fired before a usable
   incumbent existed. It exposes the termination reason and statistics, but no
   objective or variable-value accessors as they are not available. This case is
@@ -226,6 +247,15 @@ let outcome = problem.solve_with(options)?;
   absolute, for every variable bound and constraint.
   Values must be finite and non-negative, the feasibility tolerance at least
   `1e-10`, and the two integrality tolerances below `0.5`.
+* `presolve` (on by default): simplify the problem before the search. It never
+  removes a variable or changes a real variable's bounds, and it keeps, up to
+  round-off, every solution whose integer variables are exactly integral;
+  every solution is still checked against the problem as you wrote it. A
+  solution that exists only by using `int_tol` (an integer variable just off
+  its integer under a big-M coefficient) can be lost, by presolve or by a
+  branch on that variable, so such a problem can be answered `Infeasible`
+  with presolve on or off, and with presolve on where presolve off finds a
+  solution.
 
 ## Changing a solved problem
 

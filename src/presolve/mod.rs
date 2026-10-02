@@ -19,16 +19,15 @@
 //! No other point is guaranteed. A point beyond the box, within the
 //! contract by less than the round-off of evaluating a row, can be cut: a
 //! working bound keeps only the budget of the row that implies it, and what
-//! is deduced from that bound inherits it. So can a point within the box only
-//! with an integer var off
-//! its integer, within `int_tol`, under a coefficient that makes the offset
-//! count: an LP value `1 - 3e-14` under `5e7` moves its row by `1.6e-6`.
-//! Without presolve the MILP search can reach such a point through its LP;
-//! fixing the var, tightening its bounds or shrinking its coefficient takes
-//! that path away, as a branch on the var does. So where every point of a
-//! model needs the integrality tolerance, presolve on can answer
-//! `Infeasible`, or a worse optimum, where presolve off finds one
-//! (ARCHITECTURE §7, known limitations).
+//! is deduced from that bound inherits it. So can a point within the box
+//! only with an integer var off its integer, within `int_tol`, under a
+//! coefficient that makes the offset count: an LP value `1 - 3e-14` under
+//! `5e7` moves its row by `1.6e-6`. Without presolve the MILP search can
+//! reach such a point through its LP; fixing the var, tightening its bounds
+//! or shrinking its coefficient takes that path away, as a branch on the
+//! var does. So where every point of a model needs the integrality
+//! tolerance, presolve on can answer `Infeasible`, or a worse optimum,
+//! where presolve off finds one (ARCHITECTURE §7.9).
 //!
 //! The variable set never changes: a var presolve "removes" gets `lo == hi`
 //! bounds, which the simplex prices out, and its value is substituted out of
@@ -49,8 +48,8 @@
 //! # Tolerances
 //!
 //! Every decision is made in user units against the engine's contract
-//! (ARCHITECTURE §7, [`row_tolerance`]), so that presolve on and off agree on
-//! what is feasible:
+//! (ARCHITECTURE §7.4, [`row_tolerance`]), so that presolve on and off
+//! agree on what is feasible:
 //!
 //! * The engine holds a row of magnitude `m` (`|b| + Σ|a_j x_j|`, `b` the
 //!   right-hand side as written, [`Row::rhs_mag`](model::Row::rhs_mag)) and
@@ -99,6 +98,8 @@
 //!   point within the box with its integer vars exactly integral wherever the
 //!   model as written has one.
 //!
+//! [`row_tolerance`]: crate::solver::row_tolerance
+//! [`ROUNDOFF_FLOOR`]: crate::solver::ROUNDOFF_FLOOR
 //! [`row_violation`]: crate::solver::row_violation
 //! [`slack_tol`]: crate::solver::slack_tol
 //!
