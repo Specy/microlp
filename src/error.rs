@@ -18,6 +18,10 @@ pub enum Error {
     InvalidOperation(String),
     /// The solve could not continue because of an unexpected numerical or
     /// structural failure.
+    ///
+    /// When the model lies outside the recommended coefficient range (see the
+    /// crate documentation), the message names the constraint and the
+    /// variable whose coefficients span the most.
     InternalError(String),
 }
 impl From<StructureError> for Error {

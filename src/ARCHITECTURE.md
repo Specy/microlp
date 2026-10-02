@@ -65,6 +65,7 @@ Three principles shape everything:
 | `src/problem.rs` | `Problem`, `VarDomain`, and the solve entry points. Owns solve/edit timing and the pure-LP model-to-engine seam in `Problem::solve_with` (presolve, then `Solver::try_new`). |
 | `src/solution.rs`, `src/outcome.rs` | `Solution` (a validated assignment, its read-out and its post-solve edits) and `SolveOutcome` / `InterruptedSolve` (what a call returns and how it is resumed). |
 | `src/expr.rs`, `src/error.rs` | The model vocabulary (`OptimizationDirection`, `Variable`, `LinearExpr`, `ComparisonOp`) and the `Error` type. |
+| `src/range.rs` | The recommended coefficient range: the spread of each row and column as written, which the loud errors of a solve, a resume or an edit name (§7). |
 | `src/presolve/` | Presolve's exact reductions: redundant-row elimination, and in MIP mode integer bound rounding and tightening, integer fixings (forcing and singleton rows, dual fixing) with substitution, and binary coefficient tightening; a continuous variable keeps its bounds. All on the original variable indices, so there is no postsolve (§2, §7). `mod.rs` holds the contract and the entry point, `work.rs` the reduction passes, `model.rs` the data, `params.rs` the constants. |
 | `src/solver/` | The simplex engine. `mod.rs` is `Solver` itself (bounded-variable primal/dual simplex, basis management, and the small contract surface the MIP layer uses); `tolerances.rs` the tolerance model; `scaling.rs` the scaled representation and the starting vertex; `basis.rs` the basis inverse and the pivot descriptions; `costs.rs` the dual simplex's working costs and `bounds.rs` the primal simplex's working bounds; `cycling.rs` the cycling and stall detection of both; `proof.rs` the infeasibility proof and its last resorts (§3, §7). |
 | `src/lu/`, `src/sparse/`, `src/ordering/` | LU factorization with eta-file updates, sparse containers, and the column ordering of the factorization (`order_simple`: the sparsest columns first, from the bucket queue in `ordering/cols_queue.rs`). |
@@ -687,6 +688,18 @@ Two homes, by audience:
 (see below) and presolve decides against it, so what presolve assumes, what the engine
 reports and what the guard accepts are the same contract.
 
+**The recommended coefficient range** (`src/range.rs`): within every row and every column of
+the model as written, the largest nonzero coefficient magnitude at most `1e6` times the
+smallest (`RECOMMENDED_DYNAMISM`, the six-orders advice). The engine's power-of-two scaling
+can only narrow such a spread. Nothing outside the range is refused, dropped or changed, and
+every answer is checked against the model as written, in range or not. The range draws the
+line of the solver's commitment: inside it a loud error is a bug, while outside it the spread
+of the data can leave the simplex no pivot it can trust, and the error says so. Each public
+call that solves (a solve, a resume, an edit) passes its `InternalError` through
+`CoefficientRange::annotate`, which names the constraint (in the order added, edits
+included) and the variable of the widest spread where they lie outside the range. The
+pinned models of the known limitations below are classed by it too.
+
 **Internal — `src/mip/params.rs` and `src/solver/` consts (each documented at its
 definition):** `SCORE_EPS`, `PSEUDOCOST_INIT_EPS`, `BRANCH_FRAC_GUARD` (all `1e-6`),
 `GAP_DENOM_GUARD` (`1e-10`), `HINT_BOUNDS_SLACK` (`1e-9`), `DEADLINE_CHECK_INTERVAL`
@@ -1166,9 +1179,11 @@ The convention for such models is to pin each as a `#[should_panic]` test named
 `..._is_a_known_limitation` in `src/tests/magnitudes.rs` (beside the engine's unit tests when
 the model needs a constructed basis): it passes while the limitation stands and **fails as
 soon as a change fixes it**, which is the signal to drop the attribute and keep the model as
-an ordinary regression test. The wide-coefficient MILP property stays `#[ignore]`d while the
-classes above stand (a random search cannot assert its own failure); run it with
-`cargo test --lib -- --ignored`.
+an ordinary regression test. The wide-coefficient properties split at the recommended
+coefficient range: a draw within it must solve, and a draw outside it must give no wrong
+answer, a loud error that names the range being within the contract there. The wide MILP
+property stays `#[ignore]`d while the classes above stand (a random search cannot assert its
+own failure); run it with `cargo test --lib -- --ignored`.
 
 ---
 
@@ -1185,6 +1200,7 @@ classes above stand (a random search cannot assert its own failure); run it with
 | Basis bookkeeping found inconsistent when a singular basis is repaired (a var basic twice, or a slack's non-basic position held by another var) | panic: a bug, never repaired |
 | Integral candidate failing the guard with no integer variable to branch on | `InternalError`, never force-accepted. The engine verified the point on its own rows, and with nothing to branch on every integer variable is exactly integral (one its bounds fix the engine holds on its value), where a row presolve dropped or rewrote holds as written: the failure is a reduction that did not keep the point (§5.4) |
 | Verified state unreachable (`MAX_PHASE_ROUNDS` alternations, or a vertex whose values miss its rows through every factorization of the verification's ladder, again after the solve starts over from the slack basis) | `InternalError`, never an unverified optimum |
+| Any `InternalError` of a model outside the recommended coefficient range | its message names the constraint and the variable whose coefficients span the most (§7) |
 | A finished LP's answer misses a row presolve dropped or rewrote | the engine takes the row over and resumes from its basis (§3.1); a miss of an engine row or a bound after that is an `InternalError`: the engine holds both to the contract less the round-off of its own evaluation |
 | A reduced cost the primal simplex would price or the dual ratio test would weigh, an entry of the dual ratio test's row or of the primal ratio test's column (or the value of a basic var it moves), or a steepest-edge weight, is not finite | `InternalError`: such a value would silently corrupt a verdict (a NaN compares false with every tolerance, so a NaN reduced cost could end a phase as optimal); a weight is checked before its floor, which would make a NaN finite |
 | A basis of the wrong shape given to `load_basis` | `InternalError` (a bug), propagated |

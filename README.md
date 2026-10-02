@@ -101,6 +101,15 @@ problem.add_constraint(lhs, ComparisonOp::Eq, 0.0);
 
 `solve()` tries to find the optimal solution, it returns `Error::Infeasible` when the constraints contradict each other and `Error::Unbounded` when the objective can grow forever. Invalid numeric options return `Error::InvalidOptions`, a NaN or infinite objective coefficient returns `Error::InvalidOperation`, and unrecoverable numerical failures return `Error::InternalError`.
 
+Keep the coefficients of each constraint, and those of each variable across
+the constraints, within six orders of magnitude: the largest magnitude at most
+`1e6` times the smallest. Nothing outside that range is refused or changed,
+and every answer is still checked against the model as you wrote it, but a
+solve can then fail with `Error::InternalError`, whose message names the
+constraint (in the order added) and the variable (its index) whose
+coefficients span the most. Changing the units of a variable or of a
+constraint usually brings a model back into range.
+
 When a solver decides to produce a solution it might be for different reasons:
 
 * `SolveOutcome::Solution` contains a validated assignment. Its status is

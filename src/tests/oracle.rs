@@ -18,9 +18,15 @@
 //!   so this catches gross sub-optimality (a wrongly pruned branch, a wrong
 //!   vertex), not tolerance-level differences.
 //! * The reported objective is the objective of the reported values.
+//!
+//! A model outside the recommended coefficient range (`crate::range`) may
+//! instead fail loudly, with an `InternalError` that names a constraint or a
+//! variable outside it, but never with a wrong answer
+//! ([`assert_no_wrong_answer`]).
 
+use crate::range::CoefficientRange;
 use crate::{
-    ComparisonOp, OptimizationDirection, Problem, SolutionStatus, SolveOptions, Tolerances,
+    ComparisonOp, Error, OptimizationDirection, Problem, SolutionStatus, SolveOptions, Tolerances,
     Variable,
 };
 use std::time::Duration;
@@ -164,10 +170,34 @@ pub(crate) fn xstar_is_feasible(model: &Model) -> bool {
         .all(|row| row_violation(row, &model.xstar) <= row_tolerance(row, &model.xstar))
 }
 
+/// Whether `model` lies within the recommended coefficient range: the
+/// nonzero coefficient magnitudes of every row, and of every column, within
+/// six orders of each other.
+pub(crate) fn within_recommended_range(model: &Model) -> bool {
+    let (problem, _) = model.build();
+    CoefficientRange::of(&problem.constraints).is_within()
+}
+
+/// The part of a loud error's message that says the model lies outside the
+/// recommended coefficient range (see `CoefficientRange::annotate`).
+const OUTSIDE_THE_RANGE: &str = "outside the recommended coefficient range";
+
 /// Solve `model` with the default options and check the answer against the
 /// contract above. Panics with the model's source on any failure.
 pub(crate) fn assert_solves_within_contract(model: &Model) {
     check_contract(model, true);
+}
+
+/// [`assert_solves_feasibly_within_contract`] for a model outside the
+/// recommended coefficient range: an `InternalError` that says so is no
+/// failure, any other error is (the model is feasible and bounded), and an
+/// answer is held to the contract.
+pub(crate) fn assert_no_wrong_answer(model: &Model) {
+    assert!(
+        !within_recommended_range(model),
+        "fixture error: the model lies within the recommended range"
+    );
+    check_contract_with(model, false, true, None, true);
 }
 
 /// [`assert_solves_within_contract`] without the comparison with the
@@ -181,7 +211,7 @@ pub(crate) fn assert_solves_feasibly_within_contract(model: &Model) {
 /// [`assert_solves_within_contract`] with presolve off: the LP engine on the
 /// model as written.
 pub(crate) fn assert_solves_within_contract_without_presolve(model: &Model) {
-    check_contract_with(model, true, false, None);
+    check_contract_with(model, true, false, None, false);
 }
 
 /// [`assert_solves_within_contract`] with presolve on and off, each solve
@@ -189,19 +219,22 @@ pub(crate) fn assert_solves_within_contract_without_presolve(model: &Model) {
 /// of hanging it: reaching the limit is the failure.
 pub(crate) fn assert_solves_within_contract_in_time(model: &Model, time_limit: Duration) {
     for presolve in [true, false] {
-        check_contract_with(model, true, presolve, Some(time_limit));
+        check_contract_with(model, true, presolve, Some(time_limit), false);
     }
 }
 
 fn check_contract(model: &Model, compare_objective: bool) {
-    check_contract_with(model, compare_objective, true, None);
+    check_contract_with(model, compare_objective, true, None, false);
 }
 
+/// The check of the module doc; `loud_allowed` accepts an `InternalError`
+/// that says the model lies outside the recommended coefficient range.
 fn check_contract_with(
     model: &Model,
     compare_objective: bool,
     presolve: bool,
     time_limit: Option<Duration>,
+    loud_allowed: bool,
 ) {
     let (problem, vars) = model.build();
     let mut options = SolveOptions::default();
@@ -215,6 +248,11 @@ fn check_contract_with(
     };
     let outcome = match problem.solve_with(options) {
         Ok(outcome) => outcome,
+        Err(Error::InternalError(message))
+            if loud_allowed && message.contains(OUTSIDE_THE_RANGE) =>
+        {
+            return;
+        }
         Err(err) => panic!(
             "{call} returned {err:?} on a feasible, bounded model:\n{}",
             model.source()
