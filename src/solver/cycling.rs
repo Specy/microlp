@@ -100,16 +100,22 @@ impl VertexChange {
 ///
 /// Every rebuild lifts the taboo flags, so that on fresh data a taboo change
 /// can be tried again, and the phase fails loudly when fresh data leave
-/// nothing but taboo changes. The records survive rebuilds and
-/// refactorizations: the eta file outgrows the factors every few pivots on a
-/// small basis, and a record dropped that often would never outlive the
-/// cycle it records.
+/// nothing but taboo changes. The records survive rebuilds, although a
+/// rebuild recomputes the values, and refactorizations: the eta file
+/// outgrows the factors every few pivots on a small basis, and a record
+/// dropped that often would never outlive the cycle it records. A
+/// refactorization that finds the values drifted off the rows starts the
+/// detection afresh, as a widening does, forgetting every vertex and record
+/// of the phase: the phase reached its vertex on those values, so a return
+/// to one it visited need not be a cycle (`Solver::refactorize`).
 ///
 /// A basis repair within a phase records the change back as bad
 /// ([`Self::add_singular_change`]), and a cycling change later in the phase
 /// is recorded as singular too, since it can lead back to the singular basis
 /// by another route: the loud end then names that cause
-/// ([`Self::any_taboo_singular`]).
+/// ([`Self::any_taboo_singular`]). A restart forgets the repair with the
+/// rest: a cycling change after it is recorded as singular only if the
+/// phase repairs its basis again.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CycleGuard {
     /// Whether a phase is running: only then is the vertex tracked.

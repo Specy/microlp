@@ -27,7 +27,7 @@ pub(crate) struct Presolved {
     /// The input rows that `constraints` does not carry as written (dropped,
     /// or rewritten for integer points), unchanged. The engine checks the
     /// answer against them too (`Solver::set_validation_rows`), so a wrong
-    /// reduction shows at the boundary.
+    /// reduction shows at the boundary, where an LP takes the row over.
     pub validation_rows: Vec<(CsVec, ComparisonOp, f64)>,
     /// Whether this differs from the model as written: an integer bound
     /// tightened or rounded, or a row dropped or rewritten. A model presolve

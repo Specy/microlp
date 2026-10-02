@@ -157,8 +157,9 @@ pub(crate) struct Solver {
     /// The user's rows, in user units, that presolve dropped (implied by the
     /// bounds it emitted) or rewrote (valid for integer points only). No pivot
     /// sees them; the boundary checks the answer against them
-    /// ([`Self::first_violated_row`]) and reports a violation as a presolve
-    /// bug instead of returning the point.
+    /// ([`Self::first_violated_row`]): an LP takes over a row its answer
+    /// misses ([`Self::hold_validation_rows`]), and the MIP guard rejects such
+    /// a candidate.
     validation_rows: Vec<(CsVec, ComparisonOp, f64)>,
 
     enable_primal_steepest_edge: bool,
@@ -307,6 +308,18 @@ impl NonBasicVarState {
     fn is_dual_feasible(&self, d: f64, tol: f64) -> bool {
         self.dual_infeasibility(d) < tol
     }
+}
+
+/// What [`Solver::verify_primal`] finds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// The rows hold at the values: whether every basic var is within its
+    /// bounds. `false` too when a fresh factorization repaired the basis,
+    /// which leaves another vertex, unverified.
+    Checked { feasible: bool },
+    /// The values miss the rows through every factorization tried: the basis
+    /// cannot represent its vertex.
+    Unrepresentable,
 }
 
 /// Status of one variable in a simplex basis snapshot.
@@ -734,9 +747,9 @@ impl Solver {
 
     /// The activity `Σ a_rj x_j` of row `r` over the structural vars at the
     /// scaled values `x`, and the magnitude `|b_r| + Σ|a_rj x_j|` it was
-    /// computed from. The engine's basic slacks ([`Self::check_rows`]) and the
-    /// boundary checks of the reported point both evaluate rows through it,
-    /// term for term in the same order, so they all see the same bits.
+    /// computed from, summed in plain `f64`: the engine's evaluation of a row
+    /// where its round-off fits the margin the row's tolerance leaves out for
+    /// it ([`Self::check_rows`], [`slack_tol`]).
     fn row_activity(&self, r: usize, x: impl Fn(usize) -> f64) -> (f64, f64) {
         //guaranteed to be a valid index
         let row = self.orig_constraints.outer_view(r).unwrap();
@@ -804,22 +817,29 @@ impl Solver {
     /// units. A row's sense is encoded by its slack's bounds (`lhs + s = rhs`
     /// with `s` in `[smin, smax]`), which branching never touches.
     ///
-    /// This is the evaluation the engine verified ([`Self::check_rows`]): the
-    /// activity through [`Self::row_activity`], then [`outside`] against the
-    /// slack's bounds within [`row_tolerance`] of the user's absolute
-    /// tolerance in the row's scaled units (exactly the check on the user's
-    /// row, the row factor being a power of two). The tolerance is not
+    /// The slack the row implies, summed in compensated arithmetic
+    /// ([`implied_slack`]), is held by [`outside`] to the slack's bounds within
+    /// [`row_tolerance`] of the user's absolute tolerance in the row's scaled
+    /// units (exactly the check on the user's row, the row factor being a
+    /// power of two). The engine holds the row to that contract less the
+    /// round-off of its own evaluation ([`slack_tol`]), so a point it
+    /// verified passes, whatever the order of either sum. The tolerance is not
     /// relative to the coefficients, so that a violation of `5.0` on a
     /// `1e9`-scale big-M row counts; only its round-off floor is relative, to
     /// the row's activity. The rows presolve dropped or rewrote
     /// ([`Self::validation_rows`]) are then checked as the user wrote them.
     pub(crate) fn first_violated_row(&self, values: &[f64]) -> Option<(usize, f64)> {
         for r in 0..self.num_constraints() {
+            //guaranteed to be a valid index
+            let row = self.orig_constraints.outer_view(r).unwrap();
             // `values` are in user units; dividing by the power-of-two `s_v`
             // is exact, so each term is the user's term times the row factor.
-            let (lhs, magnitude) = self.row_activity(r, |v| values[v] / self.col_scales[v]);
+            let terms = row
+                .iter()
+                .filter(|&(v, _)| v < self.num_vars)
+                .map(|(v, &coeff)| (coeff, values[v] / self.col_scales[v]));
+            let (implied, magnitude) = implied_slack(self.orig_rhs[r], terms);
             let (smin, smax) = self.model_bounds(self.num_vars + r);
-            let implied = self.orig_rhs[r] - lhs;
             let tol = row_tolerance(self.feasibility * self.row_scales[r], magnitude);
             if outside(implied, smin, smax, tol) {
                 return Some((r, excursion(implied, smin, smax) / self.row_scales[r]));
@@ -840,6 +860,30 @@ impl Solver {
     /// [`Self::validation_rows`]): those presolve dropped or rewrote.
     pub(crate) fn set_validation_rows(&mut self, rows: Vec<(CsVec, ComparisonOp, f64)>) {
         self.validation_rows = rows;
+    }
+
+    /// Hold a finished LP's answer to the rows presolve dropped or rewrote
+    /// ([`Self::validation_rows`]): a row the reported point misses beyond the
+    /// contract left presolve's reduction short of the model as written, so
+    /// the engine takes the row over ([`Self::add_constraint`]) and the solve
+    /// resumes from the current basis. Each row is taken over once, so this
+    /// ends, and an `Infeasible` re-solve holds for the model as written,
+    /// which has the row too.
+    pub(crate) fn hold_validation_rows(&mut self) -> Result<StopReason, Error> {
+        loop {
+            let values = self.reported_values();
+            let missed = self.validation_rows.iter().position(|(coeffs, op, rhs)| {
+                row_violation(coeffs, *op, *rhs, |v| values[v], self.feasibility).is_some()
+            });
+            let Some(k) = missed else {
+                return Ok(StopReason::Finished);
+            };
+            debug!("the answer misses validation row {k}; the engine takes it over");
+            let (coeffs, op, rhs) = self.validation_rows.remove(k);
+            if self.add_constraint(coeffs, op, rhs)? == StopReason::Limit {
+                return Ok(StopReason::Limit);
+            }
+        }
     }
 
     /// The first structural var whose value (user units) violates its bounds
@@ -981,15 +1025,41 @@ impl Solver {
     /// cuts the primal ratio test's tolerance a hundredfold
     /// ([`LOOP_HARRIS_REDUCTION`]), so that a step no longer ends at a
     /// tolerance the verification's recomputation finds exceeded.
+    ///
+    /// When no factorization represents the vertex
+    /// ([`Verdict::Unrepresentable`]), the solve starts over once from the
+    /// slack basis, the last rung of the verification's ladder; a second time
+    /// is an `InternalError`.
     fn run_phases(&mut self) -> Result<StopReason, Error> {
         self.restore_model_bounds();
         self.absorbed.clear();
+        if let Some(stop) = self.phase_rounds()? {
+            return Ok(stop);
+        }
+        debug!(
+            "verify: no factorization represents the vertex; solving again from the slack basis"
+        );
+        self.restore_model_bounds();
+        self.absorbed.clear();
+        self.artificial_obj = None;
+        let basis = self.slack_basis();
+        self.load_basis(&basis)?;
+        self.phase_rounds()?.ok_or_else(|| {
+            Error::InternalError(
+                "basis too ill-conditioned: recomputed values do not satisfy the rows".to_string(),
+            )
+        })
+    }
+
+    /// The rounds of [`Self::run_phases`], or `None` when the verification
+    /// finds that no factorization represents the vertex.
+    fn phase_rounds(&mut self) -> Result<Option<StopReason>, Error> {
         let mut cleanup = false;
         for round in 0..MAX_PHASE_ROUNDS {
             let harris_scale = LOOP_HARRIS_REDUCTION.powi(round as i32);
             if !self.is_primal_feasible {
                 if self.restore_feasibility(cleanup)? == StopReason::Limit {
-                    return Ok(StopReason::Limit);
+                    return Ok(Some(StopReason::Limit));
                 }
                 cleanup = cleanup || self.artificial_obj.is_none();
             }
@@ -1001,12 +1071,16 @@ impl Solver {
                 let stop = self.optimize(cleanup, harris_scale)?.0;
                 cleanup = true;
                 if stop == StopReason::Limit {
-                    return Ok(StopReason::Limit);
+                    return Ok(Some(StopReason::Limit));
                 }
             }
-            if !self.verify_primal()? {
-                debug!("phase round {round}: recomputed values violate a bound; continuing");
-                continue;
+            match self.verify_primal()? {
+                Verdict::Checked { feasible: true } => {}
+                Verdict::Checked { feasible: false } => {
+                    debug!("phase round {round}: recomputed values violate a bound; continuing");
+                    continue;
+                }
+                Verdict::Unrepresentable => return Ok(None),
             }
             // Dual verification: exact reduced costs. If they still show an
             // infeasibility, let the primal simplex act on them; no pivot at
@@ -1017,16 +1091,22 @@ impl Solver {
             }
             if self.calc_dual_infeasibility().0 == 0 {
                 self.is_dual_feasible = true;
-                return Ok(StopReason::Finished);
+                return Ok(Some(StopReason::Finished));
             }
             debug!("phase round {round}: recomputed reduced costs are dual infeasible; continuing");
             let (stop, pivoted) = self.optimize(cleanup, harris_scale)?;
             cleanup = true;
             if stop == StopReason::Limit {
-                return Ok(StopReason::Limit);
+                return Ok(Some(StopReason::Limit));
             }
-            if !pivoted && self.verify_primal()? {
-                return Ok(StopReason::Finished);
+            if !pivoted {
+                match self.verify_primal()? {
+                    Verdict::Checked { feasible: true } => {
+                        return Ok(Some(StopReason::Finished));
+                    }
+                    Verdict::Checked { feasible: false } => {}
+                    Verdict::Unrepresentable => return Ok(None),
+                }
             }
         }
         Err(Error::InternalError(format!(
@@ -1062,9 +1142,14 @@ impl Solver {
     /// positions makes the basis singular too): a repair would hide the bug
     /// and leave the var both basic and non-basic.
     fn factorize(&mut self) -> bool {
-        let replaced = self
-            .basis_solver
-            .reset(&self.orig_constraints_csc, &self.basic_vars);
+        self.factorize_at(LU_STABILITY_THRESHOLD)
+    }
+
+    /// [`Self::factorize`] at the pivot `threshold` of the factorization.
+    fn factorize_at(&mut self, threshold: f64) -> bool {
+        let replaced =
+            self.basis_solver
+                .reset(&self.orig_constraints_csc, &self.basic_vars, threshold);
         if replaced.is_empty() {
             return false;
         }
@@ -1154,9 +1239,13 @@ impl Solver {
     /// drifted out of the rows' tolerances. Recomputing values that satisfy
     /// every row would not improve them and, next to a bound, can move a var
     /// by a round-off amount the rows allow but its own tolerance does not.
-    /// The reduced costs are left to their incremental updates; the phase
-    /// exit recomputes them exactly. A repaired basis is a new vertex, whose
-    /// values and reduced costs are recomputed, as in a rebuild.
+    /// Values found drifted also restart the cycling detection, as a
+    /// widening does, forgetting every vertex and bad change of the phase, a
+    /// basis repair's too: the phase reached its vertex on those values, so a
+    /// return to one it visited need not be a cycle. The reduced costs are
+    /// left to their incremental updates; the phase exit recomputes them
+    /// exactly. A repaired basis is a new vertex, whose values and reduced
+    /// costs are recomputed, as in a rebuild.
     fn refactorize(&mut self) -> Result<(), Error> {
         if self.factorize() {
             self.recalc_basic_var_vals()?;
@@ -1167,9 +1256,9 @@ impl Solver {
         // basis (one pivot per row). The phase exit always checks.
         if self.pivots_since_drift_check >= self.num_constraints().max(1) {
             self.pivots_since_drift_check = 0;
-            let mut residuals = Vec::with_capacity(self.num_constraints());
-            if !self.check_rows(&mut residuals) {
+            if !self.check_rows() {
                 self.recalc_basic_var_vals()?;
+                self.start_cycle_detection();
             }
         }
         Ok(())
@@ -1177,20 +1266,31 @@ impl Solver {
 
     /// Bring the rows and the values into agreement and measure what is left.
     /// Every basic slack is re-derived from its row, `s = b - Σ a_j x_j`,
-    /// through [`Self::row_activity`], so a row's violation lives in its
-    /// slack, where the dual simplex sees it and the boundary checks find the
-    /// same bits; the slack tolerances are refreshed at these values.
-    /// `residuals` receives `b - Σ a_j x_j - s` per row, zero where the slack
-    /// is basic: how far the basic structural values are from solving the
-    /// rows whose slack is non-basic. Returns whether every residual is
-    /// within its slack's tolerance on the side it moves the slack (on a side
-    /// whose bound the last resort widened, the evaluation margin alone).
-    fn check_rows(&mut self, residuals: &mut Vec<f64>) -> bool {
-        residuals.clear();
+    /// through [`Self::row_activity`], or in compensated arithmetic where a
+    /// plain sum's round-off would not fit the row's evaluation margin
+    /// ([`plain_sum_resolves`]), so a row's violation lives in its slack,
+    /// where the dual simplex sees it; the slack tolerances are refreshed at
+    /// these values. Returns whether the residual `b - Σ a_j x_j - s` of every
+    /// row whose slack is non-basic (how far the basic structural values are
+    /// from solving it) lies within the slack's tolerance on the side it moves
+    /// the slack (on a side whose bound the last resort widened, the
+    /// evaluation margin alone).
+    fn check_rows(&mut self) -> bool {
         let mut hold = true;
         for r in 0..self.num_constraints() {
             let (lhs, magnitude) = self.row_activity(r, |v| self.internal_value(v));
-            let implied = self.orig_rhs[r] - lhs;
+            let tol = self.feasibility * self.row_scales[r];
+            let implied = if plain_sum_resolves(tol, magnitude, self.row_terms(r)) {
+                self.orig_rhs[r] - lhs
+            } else {
+                //guaranteed to be a valid index
+                let row = self.orig_constraints.outer_view(r).unwrap();
+                let terms = row
+                    .iter()
+                    .filter(|&(v, _)| v < self.num_vars)
+                    .map(|(v, &coeff)| (coeff, self.internal_value(v)));
+                implied_slack(self.orig_rhs[r], terms).0
+            };
             let slack = self.num_vars + r;
             let residual = match self.var_states[slack] {
                 VarState::Basic(row) => {
@@ -1207,90 +1307,118 @@ impl Solver {
             if residual.is_nan() || residual.abs() > tol {
                 hold = false;
             }
-            residuals.push(residual);
         }
         hold
     }
 
     /// Make the values satisfy the rows to within their tolerances and
     /// measure primal feasibility on them. A widened slack bound first
-    /// follows its row's magnitude ([`Self::refit_widened_slacks`]). The rows
-    /// are evaluated through [`Self::check_rows`], as the boundary evaluates
-    /// the reported point, so
-    /// a `Finished` state and the point handed out agree bit for bit. Values
-    /// within tolerance are kept (moving last bits steers the branch &
-    /// bound); drifted ones are refined through the factorization, then a
-    /// fresh one, and a residual that survives both is an `InternalError` (the
-    /// basis cannot represent its own vertex). Recomputes the objective from
-    /// the values; returns whether they are within their bounds, and sets
-    /// `is_primal_feasible` to match. A fresh factorization that repairs the
-    /// basis leaves another vertex, with its values, reduced costs and
-    /// feasibility flags recomputed: that is no verification, and the answer
-    /// is `false`.
-    fn verify_primal(&mut self) -> Result<bool, Error> {
+    /// follows its row's magnitude ([`Self::refit_widened_slacks`]). Then a
+    /// ladder until the rows hold: the values as they are, then recomputed
+    /// through a fresh factorization, then through one at
+    /// [`LU_STABLE_THRESHOLD`], each checked and refined once
+    /// ([`Self::rows_hold`]): a residual the rows accept, left in any basic
+    /// var, can be amplified into the objective. Recomputes the objective
+    /// from the values and sets `is_primal_feasible`. A fresh factorization
+    /// that repairs the basis leaves another vertex, with its values, reduced
+    /// costs and feasibility flags recomputed: no verification. Values that
+    /// miss the rows on every rung are [`Verdict::Unrepresentable`]: the
+    /// basis cannot represent its vertex, and [`Self::run_phases`] solves
+    /// again from the slack basis.
+    fn verify_primal(&mut self) -> Result<Verdict, Error> {
         if !self.values_dirty {
             // Verified values that nothing has touched since; only the
             // bounds may have changed.
             self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
-            return Ok(self.is_primal_feasible);
+            return Ok(Verdict::Checked {
+                feasible: self.is_primal_feasible,
+            });
         }
         self.refit_widened_slacks();
-        let mut residuals = Vec::with_capacity(self.num_constraints());
-        let mut hold = self.check_rows(&mut residuals);
-        if !hold {
-            hold = self.refine(&mut residuals);
-        }
-        if !hold {
-            debug!("verify: residual persists through the factorization; refactorizing");
-            if self.factorize() {
+        let mut hold = self.rows_hold();
+        for threshold in [LU_STABILITY_THRESHOLD, LU_STABLE_THRESHOLD] {
+            if hold {
+                break;
+            }
+            debug!("verify: the rows miss; recomputing through a factorization at {threshold}");
+            if self.factorize_at(threshold) {
                 self.recalc_basic_var_vals()?;
                 self.recalc_obj_coeffs()?;
                 self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
                 self.is_dual_feasible = self.calc_dual_infeasibility().0 == 0;
-                return Ok(false);
+                return Ok(Verdict::Checked { feasible: false });
             }
             self.recalc_basic_var_vals()?;
-            hold = self.check_rows(&mut residuals) || self.refine(&mut residuals);
-            if !hold {
-                return Err(Error::InternalError(
-                    "basis too ill-conditioned: recomputed values do not satisfy the rows"
-                        .to_string(),
-                ));
-            }
+            hold = self.rows_hold();
+        }
+        if !hold {
+            return Ok(Verdict::Unrepresentable);
         }
         self.values_dirty = false;
         self.cur_obj_val = self.exact_obj_val();
         self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
-        Ok(self.is_primal_feasible)
+        Ok(Verdict::Checked {
+            feasible: self.is_primal_feasible,
+        })
     }
 
-    /// Iterative refinement of the basic values from the current `residuals`
-    /// (see [`Self::verify_primal`]): solve `B delta = residual` and correct,
-    /// up to [`REFINEMENT_STEPS`] times or until the rows hold. The correction
-    /// stays accurate even through a poor eta file, since a solve's round-off
-    /// scales with its right-hand side and the residual is tiny. Returns
-    /// whether the rows hold afterwards.
-    fn refine(&mut self, residuals: &mut Vec<f64>) -> bool {
-        for step in 0..REFINEMENT_STEPS {
-            self.basis_solver.solve_dense_with_etas(residuals);
-            for (val, delta) in self.basic_var_vals.iter_mut().zip(residuals.iter()) {
-                *val += delta;
+    /// Whether the rows hold at the values ([`Self::check_rows`]) after one
+    /// refinement ([`Self::refine`]). Values the rows hold are refined too: a
+    /// residual they accept, which a plain sum may not even see, can sit in
+    /// any basic var, inside its bounds or past one, and the basis or another
+    /// row can amplify it into the objective. Such a refinement is undone
+    /// where it turns values the rows and bounds accept into ones they do
+    /// not, as the exact values of an ill-conditioned vertex can be: those
+    /// keep their computed values.
+    fn rows_hold(&mut self) -> bool {
+        if self.check_rows() {
+            let computed = self.basic_var_vals.clone();
+            let accepted = self.calc_primal_infeasibility().0 == 0;
+            self.refine();
+            let kept = self.check_rows() && (!accepted || self.calc_primal_infeasibility().0 == 0);
+            debug!("verify: refined values the rows hold (kept: {kept})");
+            if !kept {
+                self.basic_var_vals = computed;
+                self.check_rows();
             }
-            let hold = self.check_rows(residuals);
-            debug!(
-                "verify: refinement step {} ({})",
-                step + 1,
-                if hold {
-                    "rows hold"
-                } else {
-                    "rows still violated"
-                }
-            );
-            if hold {
-                return true;
-            }
+            return true;
         }
-        false
+        self.refine();
+        let hold = self.check_rows();
+        debug!(
+            "verify: refined ({})",
+            if hold { "rows hold" } else { "rows still miss" }
+        );
+        hold
+    }
+
+    /// One step of iterative refinement of the basic values: the residual
+    /// `b - Σ a_j x_j - s` of every row whose slack is non-basic, summed in
+    /// compensated arithmetic ([`implied_slack`]) so that it is the values'
+    /// own to about an ulp however large the row's terms, then
+    /// `B delta = residual` and `x_B += delta`. The correction stays accurate
+    /// even through a poor eta file, since a solve's round-off scales with its
+    /// right-hand side. A row whose slack is basic has none here: it moves
+    /// only its slack, which [`Self::check_rows`] re-derives from the row.
+    fn refine(&mut self) {
+        let mut residuals: Vec<f64> = (0..self.num_constraints())
+            .map(|r| {
+                if let VarState::Basic(_) = self.var_states[self.num_vars + r] {
+                    return 0.0;
+                }
+                //guaranteed to be a valid index
+                let row = self.orig_constraints.outer_view(r).unwrap();
+                // The slack's entry, a one, is among the row's terms.
+                let terms = row
+                    .iter()
+                    .map(|(v, &coeff)| (coeff, self.internal_value(v)));
+                implied_slack(self.orig_rhs[r], terms).0
+            })
+            .collect();
+        self.basis_solver.solve_dense_with_etas(&mut residuals);
+        for (val, delta) in self.basic_var_vals.iter_mut().zip(&residuals) {
+            *val += delta;
+        }
     }
 
     /// The objective of the current values under the costs the simplex works
@@ -3496,26 +3624,20 @@ impl Solver {
         Ok(())
     }
 
+    /// Recompute the basic values from the non-basic ones: a refinement
+    /// ([`Self::refine`]) from zero, so that `b - N x_N` is summed in
+    /// compensated arithmetic. A plain sum keeps the round-off of a row's
+    /// terms where they cancel (a fixed var's large term against the
+    /// right-hand side), which the row's own tolerance covers, but the solve
+    /// carries it into the other basic vars, and through them into rows whose
+    /// tolerance it can exceed many times over. Etas are applied to the dense
+    /// solve directly; a pending eta file does not require a refactorization.
     fn recalc_basic_var_vals(&mut self) -> Result<(), Error> {
-        let mut cur_vals = self.orig_rhs.clone();
-        for (i, var) in self.nb_vars.iter().enumerate() {
-            let val = self.nb_var_vals[i];
-            if val != 0.0 {
-                //guaranteed to be a valid index
-                for (r, &coeff) in self.orig_constraints_csc.outer_view(*var).unwrap().iter() {
-                    cur_vals[r] -= val * coeff;
-                }
-            }
-        }
-
-        // Etas are applied to the dense solve directly; a pending eta file
-        // does not require a full basis refactorization.
-        self.basis_solver.solve_dense_with_etas(&mut cur_vals);
-        self.basic_var_vals = cur_vals;
+        self.basic_var_vals.fill(0.0);
+        self.refine();
         // Basic slacks re-derived from their rows and the slack tolerances
-        // refreshed; the residuals themselves are the caller's business.
-        let mut residuals = Vec::with_capacity(self.num_constraints());
-        self.check_rows(&mut residuals);
+        // refreshed; whether the rows hold is the caller's business.
+        self.check_rows();
         // Recomputed is not verified: on an ill-conditioned basis a solve
         // through the factorization leaves a residual above the rows'
         // tolerances, which only `verify_primal`'s refinement removes. So

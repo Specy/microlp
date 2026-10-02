@@ -592,10 +592,10 @@ impl Solver {
     /// move only where the certificate keeps every row of the var; where it
     /// does not, a flip misses and is undone, and a widening leaves the row to
     /// the dual simplex. A round-off coefficient, which the proof counts on a
-    /// finite bound, makes
-    /// no move: the round-off floors of the ratio tests hide such an entry
-    /// from the rest of the engine, so the primal step would take the move
-    /// back and the phases would alternate until `MAX_PHASE_ROUNDS`.
+    /// finite bound, makes no move: the round-off floors of the ratio tests
+    /// hide such an entry from the rest of the engine, so the primal step
+    /// would take the move back and the phases would alternate until
+    /// `MAX_PHASE_ROUNDS`.
     pub(super) fn certificate_repair(&mut self, row: usize, flips_allowed: bool) -> Repair {
         let refined = self.refined_basis_inverse_row(row);
         let leaving_new_val = self.leaving_target(row);

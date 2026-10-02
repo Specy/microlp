@@ -11,7 +11,6 @@ use crate::{
     CsVec,
 };
 
-use super::tolerances::LU_STABILITY_THRESHOLD;
 use super::CsMat;
 
 /// Outcome of the primal ratio test for one entering column.
@@ -184,14 +183,15 @@ impl BasisSolver {
         }
     }
 
-    /// Factorize the basis `basic_vars` afresh, with no etas. Returns the
-    /// `(position, row)` pairs of a singular basis's dependent columns, whose
-    /// places the factors give to the unit columns of those rows
-    /// ([`lu_factorize`]): the caller makes the basis match.
+    /// Factorize the basis `basic_vars` afresh, with no etas, at the pivot
+    /// `threshold` of [`lu_factorize`]. Returns the `(position, row)` pairs of
+    /// a singular basis's dependent columns, whose places the factors give to
+    /// the unit columns of those rows: the caller makes the basis match.
     pub(crate) fn reset(
         &mut self,
         orig_constraints_csc: &CsMat,
         basic_vars: &[usize],
+        threshold: f64,
     ) -> Vec<(usize, usize)> {
         self.scratch.clear_sparse(basic_vars.len());
         self.eta_matrices.clear_and_resize(basic_vars.len());
@@ -205,7 +205,7 @@ impl BasisSolver {
                     .unwrap()
                     .into_raw_storage()
             },
-            LU_STABILITY_THRESHOLD,
+            threshold,
             &mut self.scratch,
         );
         self.lu_factors = lu_factors;

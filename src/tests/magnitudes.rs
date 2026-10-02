@@ -447,7 +447,8 @@ mod regression_tests {
     /// engine's own feasibility guard as an `InternalError`. The recompute of
     /// the periodic refactorization can leave the basic values missing row 2
     /// by four times its tolerance, so it is no verification: `verify_primal`
-    /// must still refine them.
+    /// must still refine them, with residuals summed in compensated
+    /// arithmetic, and through a fresh factorization if that is not enough.
     #[test]
     fn exactly_integral_optimum_at_1e8_is_verified_before_it_is_reported() {
         check(Model {
@@ -519,11 +520,12 @@ mod regression_tests {
 
     /// An integer var with a coefficient of 1e-8 in an equality may leave the
     /// row's solution by up to the row's tolerance over that coefficient, ten
-    /// units here. Presolve's integer rounding must leave the guard the
-    /// round-off of its own evaluation: a point exactly at the contract
-    /// evaluates a few ulps over it, and an exactly integral candidate is
-    /// rejected (`InternalError`). The tolerance leaves the objective real
-    /// freedom, so only feasibility is checked.
+    /// units here. The engine holds the row short of its contract by the
+    /// round-off of its own evaluation, which the guard's compensated sum
+    /// leaves it, so the candidate passes, and presolve's integer rounding
+    /// must keep that margin: an exactly integral candidate the guard rejects
+    /// is an `InternalError`. The tolerance leaves the objective real freedom,
+    /// so only feasibility is checked.
     #[test]
     fn integer_var_with_a_tiny_coefficient_keeps_the_guards_margin() {
         let check_feasible = |model: Model| {
@@ -941,21 +943,18 @@ mod regression_tests {
         });
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7): a model whose optimal basis the
-    /// factorization finds singular fails loudly, where the origin, its only
-    /// exactly feasible point, is optimal. The last primal step pivots on an
-    /// entry some `1e-14` of its column into that basis (a 1-norm condition of
-    /// about `4.5e14` in the scaled data); the repair takes the entering var
-    /// back out, and the change back stays taboo, since the step, a zero one,
-    /// moved no row. The evaluation margin keeps it pinned: held to its whole
-    /// contract, `x0 - 1e-7 x4 = 0` admits `x4 = 1`, of objective `-1e9`,
-    /// which the solve then returns; the engine's tolerance, short of the
-    /// contract by the round-off of evaluating the row, excludes that point.
-    /// The model lies outside the recommended range (a row dynamism of
-    /// `1e11`).
+    /// The origin, the only exactly feasible point, is optimal. The first
+    /// dual phase ends at `x4 = 1`, `x3 = 1e9`, where `x0 - 1e-7 x4 = 0`
+    /// misses its tolerance, and the cleanup dual phase takes `x4` back to
+    /// `0`. Unrefined, `x3` kept the round-off of its computation, which that
+    /// step left past its bound beyond its tolerance; the repair of its row
+    /// led to a primal step on an entry some `1e-14` of its column into a
+    /// basis the factorization finds singular (a 1-norm condition of about
+    /// `4.5e14` in the scaled data), whose change back stayed taboo: a loud
+    /// failure. Refined, the step leaves `x3` at `0`. The model lies outside
+    /// the recommended range (a row dynamism of `1e11`).
     #[test]
-    #[should_panic(expected = "leads to a singular basis")]
-    fn an_optimal_basis_the_factorization_finds_singular_is_a_known_limitation() {
+    fn an_optimal_basis_the_factorization_finds_singular_is_avoided() {
         check(Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
@@ -973,6 +972,425 @@ mod regression_tests {
             ],
             xstar: vec![0.0; 5],
         });
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): a primal step into a basis the
+    /// factorization finds singular fails loudly where the origin, the only
+    /// exactly feasible point, is optimal. The primal phase takes the slack
+    /// of `-100 x2 - 1e-7 x3 <= 0` into the basis on a zero step and an
+    /// element of `-5e-15`; the factorization finds the basis singular, the
+    /// repair takes `x2` out, and the change back stays taboo, the step
+    /// having moved no row: no basis change is left. The rows lie outside the
+    /// recommended range (row dynamism `1e9`).
+    #[test]
+    #[should_panic(expected = "singular basis")]
+    fn a_primal_step_into_a_basis_the_factorization_finds_singular_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(0.0, 0, 0),
+                real(1.0, -1.0, 0.0),
+                real(1.0, 0.0, 100000011.0),
+                real(0.0, -1.0, 0.0),
+                real(-1.0, 0.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(1, 0.0001), (3, 1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(2, -100.0), (3, -1e-7)], ComparisonOp::Le, 0.0),
+                row(&[(1, 1.0), (2, 1e-8)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![0.0; 5],
+        });
+    }
+
+    /// `-13.1 x0 + 0.0112 x1 = -3434086.4` with `x0` fixed at `262144` puts
+    /// `x1` exactly at its bound `0`, but the plain sum that first computes
+    /// the row cancels `3.4e6` against itself and leaves an ulp of it: `x1`
+    /// sits `1.2e-8` past its bound, within its tolerance, and the plain
+    /// residual cannot see that. The equality
+    /// `357 x1 - 2.21 x2 + 0.00417 x3 + 9.98 x4 = -19.96` amplifies it into
+    /// `x3 = -1e-3`, an objective `1e-3` worse than the optimum, `0` at `x*`.
+    /// The verification refines the values with residuals summed in
+    /// compensated arithmetic, which see the ulp: the optimum, as an LP and
+    /// as a MILP.
+    #[test]
+    fn round_off_putting_a_var_past_its_bound_is_refined_away() {
+        for milp in [false, true] {
+            let var = |obj: f64, lo: i32, hi: i32| {
+                if milp {
+                    int(obj, lo, hi)
+                } else {
+                    real(obj, lo as f64, hi as f64)
+                }
+            };
+            let model = || Model {
+                direction: OptimizationDirection::Minimize,
+                vars: vec![
+                    var(0.0, 262144, 262144),
+                    real(1.0, -2.0, 0.0),
+                    real(-2.0, 0.0, 1.0),
+                    real(-1.0, -2.0, 0.0),
+                    var(0.5, -2, 0),
+                    real(1.0, 0.0, 1.0),
+                ],
+                rows: vec![
+                    row(&[(0, -13.1), (1, 0.0112)], ComparisonOp::Eq, -3434086.4),
+                    row(
+                        &[(2, -2.07), (4, 0.00218), (5, 0.00173)],
+                        ComparisonOp::Eq,
+                        -0.0026300000000000004,
+                    ),
+                    row(&[(5, -96.9)], ComparisonOp::Ge, -97.9),
+                    row(
+                        &[(1, 357.0), (2, -2.21), (3, 0.00417), (4, 9.98)],
+                        ComparisonOp::Eq,
+                        -19.96,
+                    ),
+                ],
+                xstar: vec![262144.0, 0.0, 0.0, 0.0, -2.0, 1.0],
+            };
+            check(model());
+            assert_exact_optimum(&model(), 0.0);
+        }
+    }
+
+    /// Solves `model` with presolve on and off, and asserts each objective
+    /// within `1e-12` of `optimum`, the exact optimum of the model as written.
+    fn assert_exact_optimum(model: &Model, optimum: f64) {
+        let (problem, _) = model.build();
+        for presolve in [true, false] {
+            let options = SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            };
+            let solution = problem
+                .solve_with(options)
+                .unwrap()
+                .into_solution()
+                .unwrap();
+            let objective = solution.objective();
+            assert!(
+                (objective - optimum).abs() <= 1e-12,
+                "presolve {presolve}: objective {objective:e}, optimum {optimum:e}:\n{}",
+                model.source()
+            );
+        }
+    }
+
+    /// `-432 x0 - 0.00552 x3 = -432001296` with `x0` fixed at `1000003` puts
+    /// `x3` exactly at `0`, inside its bounds `[-2, 0]`, but the dual step
+    /// that takes `x3` into the basis reads the row's slack from a plain sum
+    /// that cancels `4.3e8` against itself, and leaves `x3` at `-5e-6`: no
+    /// var lies past its bound, and the plain residual, `2.8e-8`, is below
+    /// half an ulp of the row's terms. The equality `0.015 x1 + 150 x3 = 0`
+    /// amplifies it into `x1 = 0.05`, an objective `0.025` worse than the
+    /// optimum, `-2` at `x*`. Values the rows hold are refined too: the
+    /// optimum, as an LP and as a MILP.
+    #[test]
+    fn round_off_inside_a_vars_bounds_is_refined_away() {
+        for milp in [false, true] {
+            let model = || Model {
+                direction: OptimizationDirection::Minimize,
+                vars: vec![
+                    if milp {
+                        int(0.0, 1000003, 1000003)
+                    } else {
+                        real(0.0, 1000003.0, 1000003.0)
+                    },
+                    real(0.5, 0.0, 1.0),
+                    real(-2.0, -2.0, 0.0),
+                    real(0.0, -2.0, 0.0),
+                    real(1.0, -2.0, 0.0),
+                ],
+                rows: vec![
+                    row(
+                        &[(0, -432.0), (3, -0.00552)],
+                        ComparisonOp::Eq,
+                        -432001296.0,
+                    ),
+                    row(
+                        &[(1, 0.0435), (2, 13.0), (3, 0.00164), (4, -234.0)],
+                        ComparisonOp::Ge,
+                        466.0,
+                    ),
+                    row(&[(1, 0.015), (3, 150.0)], ComparisonOp::Eq, 0.0),
+                ],
+                xstar: vec![1000003.0, 0.0, 0.0, 0.0, -2.0],
+            };
+            check(model());
+            assert_exact_optimum(&model(), -2.0);
+        }
+    }
+
+    /// `522 x0 + 0.0019 x1 = 522001566` with `x0` fixed at `1000003` puts
+    /// `x1` exactly at `0`. The dual phase ends with that row's slack basic,
+    /// absorbing `x1 = -2.4e-8` (the row moves by `4.7e-11`, within its
+    /// tolerance), and the primal phase's last pivot takes `x2` into the
+    /// basis on a zero step and the slack out onto its value. The values
+    /// stay, `x2 = 1`, while the new basis amplifies the row's residual by
+    /// `2e10`: its vertex has `x2 = 0`, the optimum `0` at `x*`. Unrefined,
+    /// the answer is the values' point, within the contract and `1.0002`
+    /// worse; refined, the vertex's: as an LP and as a MILP.
+    #[test]
+    fn a_residual_the_rows_accept_is_refined_out_of_the_values() {
+        for milp in [false, true] {
+            let var = |obj: f64, lo: i32, hi: i32| {
+                if milp {
+                    int(obj, lo, hi)
+                } else {
+                    real(obj, lo as f64, hi as f64)
+                }
+            };
+            let model = || Model {
+                direction: OptimizationDirection::Maximize,
+                vars: vec![
+                    var(0.0, 1000003, 1000003),
+                    real(-2.0, -2.0, 0.0),
+                    real(-1.0, 0.0, 1.0),
+                    var(0.0, 0, 1),
+                    real(0.0, 0.0, 1.0),
+                    real(-1.0, 0.0, 1.0),
+                ],
+                rows: vec![
+                    row(&[(0, 522.0), (1, 0.0019)], ComparisonOp::Eq, 522001566.0),
+                    row(
+                        &[(1, 539.0), (2, 0.0143), (3, -0.00233), (4, -6.86)],
+                        ComparisonOp::Eq,
+                        -0.00233,
+                    ),
+                    row(
+                        &[(1, 0.00567), (3, -0.00524), (4, 0.00175), (5, 0.111)],
+                        ComparisonOp::Ge,
+                        -1.00524,
+                    ),
+                    row(
+                        &[
+                            (1, 0.00858),
+                            (2, -0.0355),
+                            (3, 114.0),
+                            (4, -0.402),
+                            (5, 160.0),
+                        ],
+                        ComparisonOp::Eq,
+                        114.0,
+                    ),
+                    row(
+                        &[(1, -69.6), (3, -2.78), (5, -0.0075)],
+                        ComparisonOp::Eq,
+                        -2.78,
+                    ),
+                ],
+                xstar: vec![1000003.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            };
+            check(model());
+            assert_exact_optimum(&model(), 0.0);
+        }
+    }
+
+    /// `-10 x0 + 0.01 x1 = 20971520.000000007`, with `x0` held at
+    /// `-2097152.000000001` by the first row, puts `x1` at `-1.86e-7`, past
+    /// its bound beyond its tolerance; but the row's tolerance (`4.2e-7`, the
+    /// round-off floor of its magnitude) also admits `x1 = 0`, which is `x*`.
+    /// In plain `f64`, `10 x0` rounds onto the right-hand side, so the vertex
+    /// with both vars basic computes `x1 = 0`, by a step or by a solve
+    /// through the basis (the cancellation lies inside the solve, beyond a
+    /// compensated `b - N x_N`). Refined, `x1` lies past its bound, but the
+    /// phases do not leave the vertex for good: a primal zero step or a
+    /// rebuild's solve computes `x1 = 0` again, until the rounds run out. A
+    /// refinement that turns accepted values into rejected ones keeps the
+    /// computed values instead. The rows lie inside the recommended range
+    /// (row dynamism `1e3`). In the second model, a dual step through a row
+    /// that cancels `2.4e9` against itself (`x0` fixed) computes
+    /// `x1 = 0.125000428`, within its bound, where exactly it is
+    /// `0.125000683`, `1.8e-7` past it.
+    #[test]
+    fn a_vertex_whose_exact_values_miss_a_bound_keeps_its_computed_ones() {
+        let rounded_onto_the_rhs = Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                real(-1.0, -2097152.000000001, -2097151.000000001),
+                real(1.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(0, 1.0)], ComparisonOp::Eq, -2097152.000000001),
+                row(
+                    &[(0, -10.0), (1, 0.01)],
+                    ComparisonOp::Eq,
+                    20971520.000000007,
+                ),
+            ],
+            xstar: vec![-2097152.000000001, 0.0],
+        };
+        let cancelling = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(-1.0, 121736438.0, 121736438.0),
+                real(1.0, -0.8749995719061721, 0.12500050027266646),
+            ],
+            rows: vec![
+                row(
+                    &[(0, -19.630917228768432), (1, 1.0)],
+                    ComparisonOp::Eq,
+                    -2389797937.9780993,
+                ),
+                row(&[(1, 1.0)], ComparisonOp::Eq, 0.125000428093828),
+            ],
+            xstar: vec![121736438.0, 0.125000428093828],
+        };
+        for model in [rounded_onto_the_rhs, cancelling] {
+            assert_solves_within_contract_without_presolve(&model);
+            check(model);
+        }
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): an ill-conditioned vertex whose
+    /// computed values the rows and bounds accept, but whose exact values
+    /// miss a bound, keeps its computed values, and the basis amplifies
+    /// their round-off into the objective.
+    /// `53.3 x0 + 0.0016 x2 = 3576909.7016` with `x0` fixed at `67109` puts
+    /// `x2` at `1 - 7.9e-9`, which the plain sum computes as `1 + 4.7e-8`,
+    /// within its tolerance; the active
+    /// `-0.0194 x1 - 824 x2 - 0.0011 x3 >= -824.0011` amplifies the
+    /// difference `7.5e5` times, so the vertex with `x3` basic in it has
+    /// `x3 = 0.964` as computed and `1.0059`, past its bound, exactly. The
+    /// answer is the computed vertex's, `-1.4288`, where the optimum is
+    /// `-1.5` at `x*`, with `x3` on its bound. The rows lie inside the
+    /// recommended range (row dynamism `7.5e5`).
+    #[test]
+    #[should_panic(expected = "is worse than the objective")]
+    fn a_vertex_whose_exact_values_miss_a_bound_is_kept_as_computed_and_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(0.0, 67109.0, 67109.0),
+                real(-2.0, 0.0, 1.0),
+                real(0.5, 0.0, 1.0),
+                real(-2.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(0, 53.3), (2, 0.0016)], ComparisonOp::Eq, 3576909.7016),
+                row(
+                    &[(1, -0.0194), (2, -824.0), (3, -0.0011)],
+                    ComparisonOp::Ge,
+                    -824.0011,
+                ),
+                row(&[(1, 0.0155)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![67109.0, 0.0, 1.0, 1.0],
+        });
+    }
+
+    /// `1.89 x0 + 0.00683 x2 = 188999979.21` with `x0` fixed at `99999989`
+    /// cancels to the last bit, and pins `x2` within `5.5e-4` of `2.7e-6`
+    /// through the row's round-off floor `3.8e-6`, which the answer uses.
+    /// Edited at the answer's values (a var fixed at its value, or a row
+    /// bounding it there), the model solves, presolve on and off. A recompute
+    /// of the basic values summed `b - N x_N` in `f64`, which kept `1.2e-8` of
+    /// the first row's round-off; through the basis that put `x2` `1.7e-6`
+    /// off, and the fourth row's slack `3.2e-3` off its exact value where
+    /// the row allows `1e-7`: the dual simplex repaired a violation of the
+    /// wrong sign, and no var could ("no var can repair row"). In the
+    /// recommended range (dynamism at most `5.5e4`).
+    #[test]
+    fn a_cancelling_row_leaves_no_round_off_in_the_recomputed_values() {
+        let model = |fixed: Option<(usize, f64)>, bounded: Option<(usize, f64)>| {
+            let mut vars = vec![
+                real(-1.0, 99999989.0, 99999989.0),
+                real(-2.0, 0.0, 1.0),
+                real(-1.0, -2.0, 0.0),
+                real(0.0, -2.0, 0.0),
+                real(1.0, -2.0, 0.0),
+                real(0.5, -2.0, 0.0),
+            ];
+            let mut rows = vec![
+                row(&[(0, 1.89), (2, 0.00683)], ComparisonOp::Eq, 188999979.21),
+                row(&[(2, 1.44)], ComparisonOp::Le, 0.0),
+                row(
+                    &[
+                        (1, -0.0214),
+                        (2, 5.69),
+                        (3, -0.796),
+                        (4, -69.2),
+                        (5, -0.00562),
+                    ],
+                    ComparisonOp::Eq,
+                    1.5706,
+                ),
+                row(
+                    &[(2, 318.0), (3, 218.0), (4, 0.00581)],
+                    ComparisonOp::Eq,
+                    -436.0,
+                ),
+                row(
+                    &[(1, -29.8), (4, -0.0309), (5, 14.2)],
+                    ComparisonOp::Eq,
+                    -29.8,
+                ),
+            ];
+            if let Some((var, value)) = fixed {
+                (vars[var].lo, vars[var].hi) = (value, value);
+            }
+            if let Some((var, value)) = bounded {
+                rows.push(row(&[(var, 1.0)], ComparisonOp::Le, value));
+            }
+            Model {
+                direction: OptimizationDirection::Maximize,
+                vars,
+                rows,
+                xstar: vec![
+                    99999989.0,
+                    0.8964647784891895,
+                    -0.0005016330258672402,
+                    -1.999268260081533,
+                    0.0,
+                    -0.21727814091707387,
+                ],
+            }
+        };
+        let (x1, x2, x5) = (
+            0.8964647784891895,
+            -0.0005016330258672402,
+            -0.21727814091707387,
+        );
+        for (fixed, bounded) in [
+            (Some((1, x1)), None),
+            (Some((5, x5)), None),
+            (None, Some((1, x1))),
+            (None, Some((2, x2))),
+            (None, Some((5, x5))),
+        ] {
+            let model = model(fixed, bounded);
+            assert!(xstar_is_feasible(&model), "fixture: the answer's point");
+            assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+        }
+    }
+
+    /// `2^53 x0 + 0.75 (x1 + ... + x300) - 2^53 x301 >= 225` with `x0` and
+    /// `x301` fixed at `1` forces every other var to its upper bound `1`. A
+    /// plain sum of the row in its own order drops each `0.75` against `2^53`
+    /// and finds the optimum `225` short, beyond its contract of `180`: a
+    /// sum of 302 terms errs by more than the round-off floor of its
+    /// magnitude. The engine sums such a row in compensated arithmetic, as the
+    /// boundary sums every row, and the solve reaches the optimum.
+    #[test]
+    fn a_row_whose_plain_sum_drops_its_small_terms_is_held_exactly() {
+        let n = 300;
+        let model = || {
+            let mut vars = vec![real(0.0, 1.0, 1.0)];
+            vars.extend((0..n).map(|_| real(1.0, 0.0, 1.0)));
+            vars.push(real(0.0, 1.0, 1.0));
+            let mut terms = vec![(0, 2f64.powi(53))];
+            terms.extend((1..=n).map(|k| (k, 0.75)));
+            terms.push((n + 1, -(2f64.powi(53))));
+            Model {
+                direction: OptimizationDirection::Minimize,
+                vars,
+                rows: vec![row(&terms, ComparisonOp::Ge, 225.0)],
+                xstar: vec![1.0; n + 2],
+            }
+        };
+        check(model());
+        assert_solves_within_contract_without_presolve(&model());
     }
 
     /// The primal step that lowers x3 is bounded by `-2 x3 <= -1` and, through
@@ -1137,6 +1555,49 @@ mod regression_tests {
             "fixture error: x* must satisfy the model"
         );
         assert_solves_within_contract_in_time(&model, Duration::from_secs(10));
+    }
+
+    /// A vertex the dual simplex left on drifted values is no cycle when it
+    /// returns. The root LP starts `x2` at its lower bound, where the second
+    /// row's terms reach `1.4e11`; its first step flips `x2` to 0, and the
+    /// values the steps carry on keep the round-off of those terms: two
+    /// pivots later they put `x4` `9.5e-6` past its upper bound, beyond its
+    /// tolerance `4.2e-6`, where exactly it lies within, and the phase leaves
+    /// that vertex. The drift check after the next pivot recomputes the
+    /// values; the way back to the vertex followed a revisit, which made the
+    /// change back taboo for good ("dual simplex cycles"), presolve on and
+    /// off. Within the recommended range (row dynamism `6.7e5`).
+    #[test]
+    fn a_vertex_left_on_drifted_values_can_be_returned_to() {
+        let model = Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(-1.0, 0, 1),
+                real(1.0, -651624630.0, -651623443.0),
+                real(0.0, -136593742.0, 0.0),
+                real(-1.0, -1.0, 0.0),
+                real(-1.0, -422117195.0000001, -422117194.0000001),
+            ],
+            rows: vec![
+                row(
+                    &[(0, 0.01), (1, -1.0), (4, -1.0)],
+                    ComparisonOp::Eq,
+                    1073741824.0,
+                ),
+                row(
+                    &[(1, 0.0015), (2, 1000.0), (3, 0.1), (4, 2.0)],
+                    ComparisonOp::Eq,
+                    -845211824.9450003,
+                ),
+                row(&[(3, 1.0), (4, -0.01)], ComparisonOp::Ge, 4221171.940000001),
+            ],
+            xstar: vec![0.0, -651624630.0, 0.0, 0.0, -422117194.0000001],
+        };
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model"
+        );
+        assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
     }
 
     /// The node `x0 = 2` holds only with two terms past their bounds at once,
@@ -1637,12 +2098,13 @@ mod regression_tests {
 
     /// The primal step toward the better point, `x3 = -1`, `x4 = 1000`,
     /// passes the equality `1e4 x2 - 1e-7 x3 = 0` through an entry below its
-    /// column's round-off floor and leaves it beyond its tolerance. The dual
-    /// phase takes `x3` back through an absorption by the equality's slack,
-    /// and the step comes again. A var crosses a bound by absorbing once per
-    /// solve, so the second time `x2` absorbs instead, after which the step
-    /// leaves the equality within its tolerance: the solve ends at `999`, the
-    /// equality exact with `x2` `1e-11` past its bound.
+    /// column's round-off floor and leaves it beyond its tolerance
+    /// (`a_step_past_a_row_the_ratio_test_ignores_shifts_its_bound`), and the
+    /// phases can alternate over it. The first dual phase ends at that point;
+    /// refined, its values miss the equality, and the cleanup dual phase takes
+    /// `x3` back to the origin with no round-off left for a slack to absorb,
+    /// which would bring the step back: the solve ends at the exact optimum,
+    /// `0`.
     #[test]
     fn an_equality_a_long_step_passes_below_its_floor_settles() {
         check(Model {
@@ -1952,6 +2414,43 @@ mod regression_tests {
         );
     }
 
+    /// An edit holds a var to its model bounds after a solve widened one.
+    /// `x + y >= 2 + 2.5e-7` over `x, y ∈ [0, 1]` needs room past both upper
+    /// bounds: the last resort widens `y`'s to `1 + 1e-7`, and the answer
+    /// puts `y` there. Fixed at `0.5`, either var leaves the other at most
+    /// `1 + 1e-7`, so each edit is `Infeasible`; a fix that kept the
+    /// widening of `y`'s bound would solve at `y = 1 + 1e-7`.
+    #[test]
+    fn a_var_fixed_after_its_bound_was_widened_keeps_its_model_bounds() {
+        for presolve in [true, false] {
+            let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+            let x = problem.add_var(1.0, (0.0, 1.0));
+            let y = problem.add_var(0.5, (0.0, 1.0));
+            problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 2.0 + 2.5e-7);
+            let options = SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            };
+            let solution = problem
+                .solve_with(options)
+                .unwrap()
+                .into_solution()
+                .unwrap();
+            assert!(
+                solution[y] > 1.0,
+                "presolve {presolve}: fixture: y = {} lies on its widened bound",
+                solution[y]
+            );
+            for var in [x, y] {
+                assert_eq!(
+                    solution.clone().fix_var(var, 0.5).map(|_| ()),
+                    Err(Error::Infeasible),
+                    "presolve {presolve}: fixing {var:?} at 0.5"
+                );
+            }
+        }
+    }
+
     /// `2 x0 - x1 = 0`, `x1 - x2 = 0` and `x2 = 2 + 1.8e-7` over a binary
     /// `x0`, with `-878 x0 >= -878`: `x0 = 1` needs `x1 = x2 = 2 + 9e-8`, the
     /// first and third rows each `9e-8` off, within their tolerances
@@ -1983,6 +2482,30 @@ mod regression_tests {
             },
             Duration::from_secs(60),
         );
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7): a node whose only point lies
+    /// within the round-off of its row's room fails loudly.
+    /// `-1125 x0 - 1.125e-7 x1 = -5876999.999999887` with `x0` fixed at `5224`
+    /// holds `x1 = -1` and, `1e-11` inside the engine's room of the row
+    /// (its contract less the round-off margin), `x1 = -2`. The LP's vertex,
+    /// `x1 = -1.0017`, branches, and the node `x1 = -2` fixes both vars: the
+    /// plain sum of the row puts it `3.8e-10` beyond that room, no var can
+    /// move, and the proof, summed exactly, proves nothing. The row lies
+    /// outside the recommended range (row dynamism `1e10`).
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn a_node_point_within_the_round_off_of_its_rows_room_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![int(0.0, 5224, 5224), int(1.0, -2, -1)],
+            rows: vec![row(
+                &[(0, -1125.0), (1, -1.125e-7)],
+                ComparisonOp::Eq,
+                -5876999.999999887,
+            )],
+            xstar: vec![5224.0, -1.0],
+        });
     }
 
     /// `x0 + 1e-5 x2 = 262144.00001`, with `x0` fixed at `2^18`, holds exactly
@@ -2095,16 +2618,13 @@ mod regression_tests {
         });
     }
 
-    /// A MILP node proven infeasible through an ill-conditioned basis. At the
-    /// node `x1 <= -10` (of `x1 ∈ [-11, 0]`), whose rows allow `x1 >= -9.99`
-    /// only, the basis mixes coefficients from `1e-5` to `1e4`. The unrefined
-    /// row of its inverse leaves the basic `x3 ∈ [-2848554, 0]` a certificate
-    /// coefficient of `8.4e-16`, `1.8e-14` of its terms, which times `x3`'s
-    /// scaled bound of `3.6e8` is exactly the gap of `3.05e-7`; refined twice,
-    /// the row leaves `x3` none, and the node is proven.
+    /// A MILP node within its terms' tolerances is solved, not pruned. The
+    /// rows allow `x1 >= -9.99` at `x4 = 0`, and the node `x1 <= -10` holds
+    /// with `x4` `1e-9` past its bound, within its tolerance: the optimum is
+    /// `x1 = -10`, at `-9.999900099`, presolve on and off.
     #[test]
-    fn an_ill_conditioned_basis_does_not_void_a_nodes_proof() {
-        check(Model {
+    fn a_node_within_its_terms_tolerances_is_solved() {
+        let model = Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
                 int(1.0, 0, 0),
@@ -2122,8 +2642,95 @@ mod regression_tests {
                 ),
                 row(&[(1, 1e-5), (3, -1.0), (4, 100.0)], ComparisonOp::Eq, 0.0),
             ],
-            xstar: vec![0.0; 6],
-        });
+            xstar: vec![0.0, -10.0, 0.0, -9.99e-5, 1e-9, 0.0],
+        };
+        assert!(
+            xstar_is_feasible(&model),
+            "fixture error: x* must satisfy the model"
+        );
+        assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+        let (problem, vars) = model.build();
+        for presolve in [true, false] {
+            let options = SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            };
+            let int_tol = options.int_tol;
+            let solution = problem
+                .solve_with(options)
+                .unwrap()
+                .into_solution()
+                .unwrap();
+            assert!(
+                (solution[vars[1]] + 10.0).abs() <= int_tol,
+                "presolve {presolve}: x1 = {}",
+                solution[vars[1]]
+            );
+            assert!(
+                (solution.objective() + 9.999900099).abs() < 1e-9,
+                "presolve {presolve}: objective {}",
+                solution.objective()
+            );
+        }
+    }
+
+    /// A MILP node proven infeasible through an ill-conditioned basis. The
+    /// rows allow `x0 >= -0.898` (at `x2 = 0`, its best), so the node
+    /// `x0 <= -1` misses them by `0.10` of `x0`, beyond the `0.022` its
+    /// terms' tolerances make room for. The unrefined row of its basis
+    /// inverse leaves the basic `x1 ∈ [-1e9, 0]` a certificate coefficient of
+    /// `4.8e-14` of its terms, which at `x1`'s scaled bound of `-3.2e10`
+    /// takes `0.165` off the gap, and the proof fails; refined, the row
+    /// leaves `x1` none, the node is proven, and the optimum is `0`. The rows
+    /// lie inside the recommended range (row dynamism `6.6e5` and `2.2e5`).
+    /// The second model's rows lie outside it (`2.1e7` and `1.8e7`): they
+    /// allow `x0 >= -0.982` (at `x2 = 0`; `x2 = -1` needs `x0 >= 1.8e7`), the
+    /// node misses them by `0.018` of `x0` against `0.010` of room, and the
+    /// unrefined row leaves `x1 ∈ [-9439526, 0]` `2e-14` of its terms, which
+    /// at its scaled bound of `-1.2e9` takes `0.021` off the gap.
+    #[test]
+    fn an_ill_conditioned_basis_does_not_void_a_nodes_proof() {
+        let in_range = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![int(1.0, -5, 0), real(-2.0, -1e9, 0.0), real(1.0, -1.0, 0.0)],
+            rows: vec![
+                row(
+                    &[(0, 0.00041), (1, -270.0), (2, 0.14)],
+                    ComparisonOp::Le,
+                    0.14,
+                ),
+                row(
+                    &[(0, -0.0011), (1, 1.9), (2, -240.0)],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+            ],
+            xstar: vec![0.0; 3],
+        };
+        let out_of_range = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                int(1.0, -12, 0),
+                real(-2.0, -9439526.0, 0.0),
+                int(2.0, -1, 0),
+            ],
+            rows: vec![
+                row(
+                    &[(0, 0.000785), (1, -16300.0), (2, -0.232)],
+                    ComparisonOp::Le,
+                    0.288,
+                ),
+                row(
+                    &[(0, -9.94e-6), (1, 0.551), (2, -181.0)],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+            ],
+            xstar: vec![0.0; 3],
+        };
+        for model in [in_range, out_of_range] {
+            assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+        }
     }
 
     /// A MILP node whose certificate no `f64` multipliers combine exactly is

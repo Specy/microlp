@@ -10,12 +10,14 @@
 //! to its whole contract, an integer var its bounds fix to its value exactly
 //! ([`structural_tol`]), and reports the values as it computed them, so the
 //! point it reports passes the boundary's evaluation (the MIP candidate
-//! guard, the pure-LP validation) and one in another order. Where the dual
-//! simplex's last resort widens a bound by its var's tolerance, the bound
-//! holds that tolerance ([`band_edge`]) and the side keeps none, or for a
-//! slack only the evaluation margin ([`slack_margin`]). Everything else here
-//! is a property of `f64` and of the factorization, not of the contract.
+//! guard, the pure-LP check), which sums each row in compensated arithmetic
+//! ([`implied_slack`]) and so does not depend on the engine's order. Where
+//! the dual simplex's last resort widens a bound by its var's tolerance, the
+//! bound holds that tolerance ([`band_edge`]) and the side keeps none, or for
+//! a slack only the evaluation margin ([`slack_margin`]). Everything else
+//! here is a property of `f64` and of the factorization, not of the contract.
 
+use super::CDouble;
 use crate::{ComparisonOp, CsVec};
 
 /// The absolute part of the reduced-cost tolerance ([`dual_tol`]) and of
@@ -25,8 +27,10 @@ pub const EPS: f64 = 1e-10;
 
 /// Relative round-off allowance: about a hundred ulps of `f64`. A quantity
 /// computed from terms of magnitude `m` cannot be trusted below
-/// `ROUNDOFF_FLOOR * m`, so no tolerance on it is ever tighter than that.
-/// This is the same allowance the crate's own contract tests grant a row.
+/// `ROUNDOFF_FLOOR * m`, so no tolerance on it is tighter than that, but the
+/// bound tolerance of an integer var its bounds fix, which is zero: the
+/// engine holds that var exactly at its value ([`structural_tol`]). This is
+/// the same allowance the crate's own contract tests grant a row.
 pub(crate) const ROUNDOFF_FLOOR: f64 = 1e-14;
 
 /// Round-off of a single tableau entry computed through the factorization,
@@ -85,10 +89,6 @@ pub(crate) const INSTABLE_PIVOT_TOL: f64 = 1e-10;
 /// arithmetic and agree to about `1e-12` at a legitimate pivot, while a pivot
 /// on round-off noise disagrees by tens of percent.
 pub(crate) const PIVOT_AGREEMENT_TOL: f64 = 1e-7;
-
-/// Iterative refinement steps [`super::Solver::verify_primal`] may apply to
-/// the basic values before giving up on the current factorization.
-pub(crate) const REFINEMENT_STEPS: usize = 3;
 
 /// Upper bound on the number of primal/dual phase alternations
 /// [`super::Solver::run_phases`] performs before giving up loudly. A phase ends on
@@ -200,7 +200,8 @@ pub(crate) fn slack_bounds(op: ComparisonOp) -> (f64, f64) {
 /// `m = |rhs| + Σ|a_j x_j|`); `None` if it holds. This is the check of a row
 /// as the user wrote it, for rows the engine does not hold itself (see
 /// `Solver::first_violated_row`), and presolve's verdict on a row whose vars
-/// it fixed, so that the two are the same evaluation.
+/// it fixed, so that the two are the same evaluation: in compensated
+/// arithmetic ([`implied_slack`]), whatever the order of the terms.
 pub(crate) fn row_violation(
     coeffs: &CsVec,
     op: ComparisonOp,
@@ -208,17 +209,35 @@ pub(crate) fn row_violation(
     value: impl Fn(usize) -> f64,
     feasibility: f64,
 ) -> Option<f64> {
-    let mut lhs = 0.0;
-    let mut magnitude = rhs.abs();
-    for (v, &coeff) in coeffs.iter() {
-        let term = coeff * value(v);
-        lhs += term;
-        magnitude += term.abs();
-    }
+    let (implied, magnitude) =
+        implied_slack(rhs, coeffs.iter().map(|(v, &coeff)| (coeff, value(v))));
     let (smin, smax) = slack_bounds(op);
-    let implied = rhs - lhs;
     outside(implied, smin, smax, row_tolerance(feasibility, magnitude))
         .then(|| excursion(implied, smin, smax))
+}
+
+/// `2^996`: a factor below it never overflows Dekker's split in
+/// [`CDouble::add_product`], which multiplies it by `2^27 + 1`.
+const SPLIT_LIMIT: f64 = 6.696928794914171e299;
+
+/// The slack `rhs - Σ a_j x_j` a row implies over its `terms` `(a_j, x_j)`,
+/// with the magnitude `|rhs| + Σ|a_j x_j|` it was computed from: the products
+/// exact and summed in compensated arithmetic ([`CDouble`]), so that the
+/// result is the exact one to about an ulp of itself, whatever the order of
+/// the terms (the low parts add some `n^2 2^-106` of the magnitude). A product
+/// with a factor beyond [`SPLIT_LIMIT`] is rounded instead, as in a plain sum.
+pub(crate) fn implied_slack(rhs: f64, terms: impl Iterator<Item = (f64, f64)>) -> (f64, f64) {
+    let mut implied = CDouble::from(rhs);
+    let mut magnitude = rhs.abs();
+    for (coeff, value) in terms {
+        if coeff.abs() < SPLIT_LIMIT && value.abs() < SPLIT_LIMIT {
+            implied.add_product(-coeff, value);
+        } else {
+            implied.add(-coeff * value);
+        }
+        magnitude += (coeff * value).abs();
+    }
+    (implied.value(), magnitude)
 }
 
 /// What a row says before any point is looked at: `Some(false)` when no
@@ -277,13 +296,14 @@ const UNIT_ROUNDOFF: f64 = f64::EPSILON / 2.0;
 /// [`row_tolerance`] of the absolute `tol` at the row's `magnitude`
 /// (`|b| + Σ|a_j x_j|` at the current values), less the round-off of
 /// evaluating it, `(terms + 2) 2^-53 magnitude` for a row of `terms`
-/// nonzeros: the plain `f64` sum the engine evaluates the row with, and one
-/// more evaluation in another order, the boundary's or a user's. The margin
-/// is at most half the contract. The engine passes the user's tolerance times
-/// the row's factor, a power of two, so this is exactly the tolerance on the
-/// unscaled row; presolve passes the user's. The engine refreshes a slack's
-/// tolerance whenever it checks the rows, since the round-off follows the
-/// values.
+/// nonzeros: the plain `f64` sum the engine evaluates the row with, and the
+/// boundary's compensated one ([`implied_slack`]). The margin is at most half
+/// the contract; where that caps it, the engine sums the row in compensated
+/// arithmetic too ([`plain_sum_resolves`]). The engine passes the user's
+/// tolerance times the row's factor, a power of two, so this is exactly the
+/// tolerance on the unscaled row; presolve passes the user's. The engine
+/// refreshes a slack's tolerance whenever it checks the rows, since the
+/// round-off follows the values.
 pub(crate) fn slack_tol(tol: f64, magnitude: f64, terms: usize) -> f64 {
     row_tolerance(tol, magnitude) - slack_margin(tol, magnitude, terms)
 }
@@ -291,6 +311,14 @@ pub(crate) fn slack_tol(tol: f64, magnitude: f64, terms: usize) -> f64 {
 /// The evaluation margin [`slack_tol`] takes off a row's contract.
 pub(crate) fn slack_margin(tol: f64, magnitude: f64, terms: usize) -> f64 {
     ((terms as f64 + 2.0) * UNIT_ROUNDOFF * magnitude).min(0.5 * row_tolerance(tol, magnitude))
+}
+
+/// Whether the round-off of the engine's plain `f64` sum of a row fits the
+/// evaluation margin [`slack_margin`] leaves it, which is at most half the
+/// contract. A row of more than 43 terms at its round-off floor does not,
+/// and the engine sums it in compensated arithmetic ([`implied_slack`]).
+pub(crate) fn plain_sum_resolves(tol: f64, magnitude: f64, terms: usize) -> bool {
+    (terms as f64 + 2.0) * UNIT_ROUNDOFF * magnitude <= 0.5 * row_tolerance(tol, magnitude)
 }
 
 /// Tolerances within which a structural var (column factor `scale`, scaled
@@ -364,6 +392,13 @@ pub(crate) const DEADLINE_CHECK_INTERVAL: u64 = 1000;
 /// at the cost of extra fill-in) against sparsity (lower risks amplifying
 /// rounding error through a poorly-conditioned pivot).
 pub(crate) const LU_STABILITY_THRESHOLD: f64 = 0.1;
+
+/// The threshold of the factorization the verification falls back on when
+/// the values recomputed through a fresh one at [`LU_STABILITY_THRESHOLD`]
+/// still miss the rows (see `Solver::verify_primal`): a pivot at least half
+/// its column's largest entry bounds the growth of the factors, which is
+/// what a solve through them errs by.
+pub(crate) const LU_STABLE_THRESHOLD: f64 = 0.5;
 
 pub(crate) fn float_eq(a: f64, b: f64) -> bool {
     (a - b).abs() < EPS
