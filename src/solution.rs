@@ -1,6 +1,7 @@
 //! [`Solution`]: a validated assignment, everything that can be read off it,
 //! and the post-solve edits that continue from it.
 
+use crate::range::CoefficientRange;
 use crate::solver::Solver;
 use crate::{
     mip, timed_lp_call, ComparisonOp, CsVec, Error, LinearExpr, OptimizationDirection,
@@ -12,6 +13,17 @@ use crate::{
 pub(crate) enum SolveState {
     Lp(Box<Solver>),
     Mip(Box<mip::MipState>),
+}
+
+impl SolveState {
+    /// The spread of the rows of the problem as edited so far, which a loud
+    /// error of the next call names ([`CoefficientRange`]).
+    pub(crate) fn coefficient_range(&self) -> CoefficientRange {
+        match self {
+            Self::Lp(solver) => solver.range.clone(),
+            Self::Mip(state) => CoefficientRange::of(&state.base.constraints),
+        }
+    }
 }
 
 /// A validated feasible assignment returned by a solve-like call.
@@ -191,6 +203,24 @@ impl Solution {
         cmp_op: ComparisonOp,
         rhs: f64,
     ) -> Result<SolveOutcome, Error> {
+        let expr = expr.into();
+        let coefficients = CsVec::new_from_unsorted(self.num_vars, expr.vars, expr.coeffs)
+            .map_err(|error| Error::InternalError(error.2.to_string()))?;
+        let mut range = self.state.coefficient_range();
+        range.add_row(&coefficients);
+        self.add_row(coefficients, cmp_op, rhs, range.clone())
+            .map_err(|error| range.annotate(error))
+    }
+
+    /// [`Solution::add_constraint`] of the row `coefficients cmp_op rhs`;
+    /// `range` is the edited problem's.
+    fn add_row(
+        self,
+        coefficients: CsVec,
+        cmp_op: ComparisonOp,
+        rhs: f64,
+        range: CoefficientRange,
+    ) -> Result<SolveOutcome, Error> {
         let last_options = self.last_options.clone();
         let Self {
             direction,
@@ -200,22 +230,14 @@ impl Solution {
         } = self;
         match state {
             SolveState::Lp(mut solver) => {
-                let expr = expr.into();
+                solver.range = range;
                 let time_limit = solver.operation_time_limit;
                 let stop = timed_lp_call(&mut solver, time_limit, move |solver| {
-                    solver.add_constraint(
-                        CsVec::new_from_unsorted(num_vars, expr.vars, expr.coeffs)
-                            .map_err(|error| Error::InternalError(error.2.to_string()))?,
-                        cmp_op,
-                        rhs,
-                    )
+                    solver.add_constraint(coefficients, cmp_op, rhs)
                 })?;
                 SolveOutcome::from_lp_stop(direction, num_vars, stop, solver, last_options)
             }
             SolveState::Mip(mut state) => {
-                let expr = expr.into();
-                let coefficients = CsVec::new_from_unsorted(num_vars, expr.vars, expr.coeffs)
-                    .map_err(|error| Error::InternalError(error.2.to_string()))?;
                 state.base.constraints.push((coefficients, cmp_op, rhs));
                 let run = mip::reedit_and_resolve(state)?;
                 Ok(SolveOutcome::from_mip_run(
@@ -256,6 +278,12 @@ impl Solution {
     ///
     /// Panics if `var` is out of range for this solution.
     pub fn fix_var(self, var: Variable, val: f64) -> Result<SolveOutcome, Error> {
+        let range = self.state.coefficient_range();
+        self.fix(var, val).map_err(|error| range.annotate(error))
+    }
+
+    /// [`Solution::fix_var`], its loud errors not yet naming the range.
+    fn fix(self, var: Variable, val: f64) -> Result<SolveOutcome, Error> {
         let last_options = self.last_options.clone();
         let Self {
             direction,
@@ -319,6 +347,12 @@ impl Solution {
     ///
     /// Panics if `var` is out of range for this solution.
     pub fn unfix_var(self, var: Variable) -> Result<(SolveOutcome, bool), Error> {
+        let range = self.state.coefficient_range();
+        self.unfix(var).map_err(|error| range.annotate(error))
+    }
+
+    /// [`Solution::unfix_var`], its loud errors not yet naming the range.
+    fn unfix(self, var: Variable) -> Result<(SolveOutcome, bool), Error> {
         let last_options = self.last_options.clone();
         let Self {
             direction,

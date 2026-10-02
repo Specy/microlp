@@ -252,6 +252,17 @@ impl SolveOutcome {
         if self.is_optimal() {
             return Ok(self);
         }
+        let range = match &self {
+            Self::Solution(solution) => solution.state.coefficient_range(),
+            Self::Interrupted(interrupted) => interrupted.state.coefficient_range(),
+        };
+        self.resume_validated(options)
+            .map_err(|error| range.annotate(error))
+    }
+
+    /// [`SolveOutcome::resume_with`] of an outcome that is not optimal, with
+    /// validated `options`.
+    fn resume_validated(self, options: ResumeOptions) -> Result<Self, Error> {
         let (direction, num_vars, state) = match self {
             Self::Solution(solution) => {
                 debug_assert_eq!(solution.status, SolutionStatus::Feasible);

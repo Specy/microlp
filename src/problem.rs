@@ -4,6 +4,7 @@
 use core::time::Duration;
 use web_time::Instant;
 
+use crate::range::CoefficientRange;
 use crate::solver::Solver;
 use crate::{
     mip, presolve, ComparisonOp, CsVec, Error, LinearExpr, OptimizationDirection, ResumeOptions,
@@ -141,7 +142,10 @@ impl Problem {
     ///
     /// The expression may be a [`LinearExpr`] or any supported collection or
     /// iterator of `(Variable, coefficient)` pairs. Use variables created by
-    /// this problem, with each variable appearing at most once.
+    /// this problem, with each variable appearing at most once. Keep the
+    /// magnitudes of its nonzero coefficients within six orders of each other,
+    /// as those of each variable across the constraints: the recommended
+    /// range of the crate documentation.
     ///
     /// # Panics
     ///
@@ -237,6 +241,18 @@ impl Problem {
     pub fn solve_with(&self, options: SolveOptions) -> Result<SolveOutcome, Error> {
         options.validate()?;
         self.validate_objective()?;
+        let range = CoefficientRange::of(&self.constraints);
+        self.solve_validated(options, &range)
+            .map_err(|error| range.annotate(error))
+    }
+
+    /// [`Problem::solve_with`] once the options and the objective are
+    /// validated; `range` is this problem's ([`CoefficientRange`]).
+    fn solve_validated(
+        &self,
+        options: SolveOptions,
+        range: &CoefficientRange,
+    ) -> Result<SolveOutcome, Error> {
         let num_vars = self.obj_coeffs.len();
         if self.has_integer_vars() {
             let run = mip::run(self, options.clone())?;
@@ -289,6 +305,7 @@ impl Problem {
             if let Some(presolved) = presolved {
                 solver.set_validation_rows(presolved.validation_rows);
             }
+            solver.range = range.clone();
             solver.operation_time_limit = options.time_limit;
             let stop = solver.initial_solve()?;
             solver.elapsed += started.elapsed();

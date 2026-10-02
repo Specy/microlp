@@ -37,6 +37,7 @@ use core::time::Duration;
 use crate::{
     helpers::{resized_view, to_dense},
     lu::{lu_factorize, ScratchSpace},
+    range::CoefficientRange,
     sparse::{ScatteredVec, SparseVec},
     ComparisonOp, CsVec, Error, StopReason, VarDomain,
 };
@@ -142,6 +143,11 @@ pub(crate) struct Solver {
     /// The user's absolute feasibility tolerance
     /// ([`crate::Tolerances::feasibility`]), in user units.
     feasibility: f64,
+    /// The spread of the user's rows as written, which a pure-LP solve's loud
+    /// errors and those of its edits name ([`CoefficientRange`]): set by the
+    /// caller, which sees the model before presolve, and extended by each row
+    /// an edit adds.
+    pub(crate) range: CoefficientRange,
     /// Per total var, the absolute tolerances (scaled units) within which the
     /// var counts as within each of its bounds: [`structural_tol`] for a
     /// structural var, refreshed when its bounds change, and [`slack_tol`]
@@ -616,6 +622,7 @@ impl Solver {
             col_scales,
             unscaled_cols,
             feasibility,
+            range: CoefficientRange::default(),
             var_tols,
             dual_tols,
             validation_rows: Vec::new(),

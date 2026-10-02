@@ -11,13 +11,17 @@
 //! at `x*`. With coefficients from `1e-8` to `1e4`, a row met to `1e-7` lets a
 //! variable with a `1e-8` coefficient move by ten units, and that freedom
 //! reaches the objective, so the wide properties assert only that the model
-//! solves to a feasible point.
+//! solves to a feasible point. They split at the recommended coefficient
+//! range (`crate::range`): a draw within it must solve, and one outside it
+//! must give no wrong answer, a loud error that names the range being within
+//! the contract there.
 
 #[cfg(test)]
 mod tests_scaling {
     use crate::tests::oracle::{
-        assert_solves_feasibly_within_contract, assert_solves_within_contract, xstar_is_feasible,
-        Model, Row, Var,
+        assert_no_wrong_answer, assert_solves_feasibly_within_contract,
+        assert_solves_within_contract, within_recommended_range, xstar_is_feasible, Model, Row,
+        Var,
     };
     use crate::{ComparisonOp, OptimizationDirection};
 
@@ -195,8 +199,14 @@ mod tests_scaling {
 
     /// The oracle without the comparison with the objective at `x*`; the
     /// model is still solved with its objective, so the optimization runs.
+    /// Outside the recommended range a loud error is within the contract (see
+    /// the module docs).
     fn check_feasibility(model: &Model) {
-        assert_solves_feasibly_within_contract(model);
+        if within_recommended_range(model) {
+            assert_solves_feasibly_within_contract(model);
+        } else {
+            assert_no_wrong_answer(model);
+        }
     }
 
     #[hegel::test(settings())]

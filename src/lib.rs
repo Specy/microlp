@@ -53,6 +53,15 @@ forever produces [`Error::Unbounded`]. Invalid explicit numeric options produce
 [`Error::InvalidOperation`], and unrecoverable numerical failures produce
 [`Error::InternalError`].
 
+Keep the coefficients of each constraint, and those of each variable across
+the constraints, within six orders of magnitude: the largest magnitude at most
+`1e6` times the smallest. Nothing outside that range is refused or changed,
+and every answer is still checked against the model as written, but a solve
+can then fail with [`Error::InternalError`], whose message names the
+constraint (in the order added) and the variable (its index) whose
+coefficients span the most. Changing the units of a variable or of a
+constraint usually brings a model back into range.
+
 When a solve call returns successfully:
 
 * [`SolveOutcome::Solution`] contains a validated assignment. Its status is
@@ -106,6 +115,7 @@ mod ordering;
 mod outcome;
 mod presolve;
 mod problem;
+mod range;
 // Problem solvers built on top of the microlp library (not part of the
 // public API — exists only to exercise the crate's own tests).
 #[cfg(test)]
