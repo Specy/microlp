@@ -18,8 +18,9 @@ higher-level ways to write models.
 * Warm starts from a known solution.
 * Handles problems with hundreds of thousands of variables and constraints.
 
-Integer and boolean variables are handled with branch & bound. The solver may
-still cycle or lose precision on some hard problems.
+Integer and boolean variables are handled with branch & bound. On some hard or
+ill-conditioned problems a solve can still fail with [`Error::InternalError`]
+rather than answer.
 
 # Example
 
@@ -46,28 +47,52 @@ assert_eq!(solution.var_value(y).round(), 3.0);
 
 # Solving and reading the solution
 
-[`Problem::solve`] tries to find the optimal solution. Contradictory
-constraints produce [`Error::Infeasible`], while an objective that can improve
-forever produces [`Error::Unbounded`]. Invalid explicit numeric options produce
-[`Error::InvalidOptions`], a NaN or infinite objective coefficient produces
-[`Error::InvalidOperation`], and unrecoverable numerical failures produce
-[`Error::InternalError`].
+[`Problem::solve`] tries to find the optimal solution. Every solution meets
+each constraint and each variable bound within an absolute tolerance (`1e-7`
+by default, [`Tolerances::feasibility`], or the round-off of evaluating it in
+`f64` where that is larger), checked against the problem as written. Otherwise
+the solve returns an error:
+
+* [`Error::Infeasible`]: the solver proved, from the problem's data, that no
+  assignment meets the constraints and bounds within that tolerance with
+  every integer variable, and every variable whose bounds are equal, exactly
+  within its bounds (see [`Tolerances::feasibility`]).
+* [`Error::Unbounded`]: the objective can improve forever.
+* [`Error::InternalError`]: a numerical failure the solver could not recover
+  from. It returns this rather than an answer it could not verify.
+* [`Error::InvalidOptions`] for an invalid explicit numeric option, and
+  [`Error::InvalidOperation`] for a NaN or infinite objective coefficient.
+
+An optimal solution is optimal at the point the solver ends at, within the
+tolerance, not over every point the tolerance admits: on an ill-conditioned
+problem, where a small coefficient sits beside a large one, the tolerance can
+move the objective far from the exact optimum.
 
 Keep the coefficients of each constraint, and those of each variable across
 the constraints, within six orders of magnitude: the largest magnitude at most
 `1e6` times the smallest. Nothing outside that range is refused or changed,
-and every answer is still checked against the model as written, but a solve
+and every solution is still checked against the model as written, but a solve
 can then fail with [`Error::InternalError`], whose message names the
 constraint (in the order added) and the variable (its index) whose
-coefficients span the most. Changing the units of a variable or of a
-constraint usually brings a model back into range.
+coefficients span the most, those of them outside the range. Changing the
+units of a variable or of a constraint usually brings a model back into
+range. Within the range, please report an [`Error::InternalError`] as a bug.
+
+[`SolveOptions::presolve`], on by default, simplifies the problem before the
+search. It never removes a variable or changes a real variable's bounds, and
+it keeps, up to round-off, every solution whose integer variables are exactly
+integral. A solution that exists only by using [`SolveOptions::int_tol`] (an
+integer variable just off its integer under a big-M coefficient) can be lost,
+by presolve or by a branch on that variable, so such a problem can be answered
+[`Error::Infeasible`] with presolve on or off, and with presolve on where
+presolve off finds a solution.
 
 When a solve call returns successfully:
 
 * [`SolveOutcome::Solution`] contains a validated assignment. Its status is
-  [`SolutionStatus::Optimal`] when exact optimality was proved, or
-  [`SolutionStatus::Feasible`] when a valid assignment is available without an
-  exact proof, for example after reaching a time limit, node limit, or MIP gap.
+  [`SolutionStatus::Optimal`] when optimality was proved, with no MIP gap, or
+  [`SolutionStatus::Feasible`] when a valid assignment is available without
+  that proof, for example after reaching a time limit, node limit, or MIP gap.
 * [`SolveOutcome::Interrupted`] means a time or node limit fired before a usable
   assignment was found. It exposes the [`TerminationReason`] and [`Stats`], but
   no objective or variable values because no validated assignment is available.

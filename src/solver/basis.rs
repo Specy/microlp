@@ -104,9 +104,9 @@ pub(crate) struct DualStep {
     /// bound: the upper one if `true`.
     pub(crate) crosses: Option<bool>,
     /// Whether the entry was read off the refined row: a pivot the growth test
-    /// refined its row for, or the last resort's genuine entry, which enters
-    /// whatever its size (see `Solver::genuine_entry_step`). The pivot's
-    /// column is then refined too before the two are compared.
+    /// refined its row for, or a genuine entry of the first last resort, which
+    /// enters whatever its size (see `Solver::genuine_entry_step`). The
+    /// pivot's column is then refined too before the two are compared.
     pub(crate) refined: bool,
 }
 

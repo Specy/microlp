@@ -214,10 +214,11 @@ impl Problem {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Infeasible`] when no feasible assignment exists,
-    /// [`Error::Unbounded`] when the objective has no finite optimum,
-    /// [`Error::InvalidOperation`] when an objective coefficient is NaN or
-    /// infinite, or [`Error::InternalError`] when the solve cannot continue.
+    /// Returns [`Error::Infeasible`] when the solver proves the problem
+    /// infeasible (see [`Error::Infeasible`]), [`Error::Unbounded`] when the
+    /// objective has no finite optimum, [`Error::InvalidOperation`] when an
+    /// objective coefficient is NaN or infinite, or [`Error::InternalError`]
+    /// when the solve cannot reach an answer it can verify.
     pub fn solve(&self) -> Result<SolveOutcome, Error> {
         let options = SolveOptions {
             time_limit: self.time_limit,

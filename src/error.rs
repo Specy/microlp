@@ -5,7 +5,11 @@ use sprs::errors::StructureError;
 /// An error returned while validating, solving, or editing a problem.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
-    /// No assignment satisfies all variable bounds and constraints.
+    /// The solver proved, from the problem's data, that no assignment meets
+    /// the variable bounds and constraints within the feasibility tolerance
+    /// with every integer variable, and every variable whose bounds are equal,
+    /// exactly within its bounds (see
+    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility)).
     Infeasible,
     /// The objective can improve without a finite limit.
     Unbounded,
@@ -17,11 +21,13 @@ pub enum Error {
     /// outcome.
     InvalidOperation(String),
     /// The solve could not continue because of an unexpected numerical or
-    /// structural failure.
+    /// structural failure. The solver returns this rather than an answer it
+    /// could not verify.
     ///
     /// When the model lies outside the recommended coefficient range (see the
     /// crate documentation), the message names the constraint and the
-    /// variable whose coefficients span the most.
+    /// variable whose coefficients span the most, those of them outside it.
+    /// Within the range, please report it as a bug.
     InternalError(String),
 }
 impl From<StructureError> for Error {

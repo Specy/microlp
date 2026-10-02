@@ -1,12 +1,12 @@
 //! The recommended coefficient range of a model: within every row, and within
 //! every column, the largest nonzero coefficient magnitude is at most
 //! [`RECOMMENDED_DYNAMISM`] times the smallest. Nothing outside it is refused
-//! or changed, and every answer is checked against the model as written all
+//! or changed, and every solution is checked against the model as written all
 //! the same. The range is where the solver commits to an answer: a loud error
-//! on a model inside it is a bug, while outside it the spread of the data can
-//! leave the simplex no pivot it can trust. So a loud error names the row and
-//! the column of the widest spread when they lie outside the range
-//! ([`CoefficientRange::annotate`]).
+//! on a model inside it is a bug or a known limitation (ARCHITECTURE §7.9),
+//! while outside it the spread of the data can leave the simplex no pivot it
+//! can trust. So a loud error names the row and the column of the widest
+//! spread when they lie outside the range ([`CoefficientRange::annotate`]).
 
 use crate::{ComparisonOp, CsVec, Error};
 

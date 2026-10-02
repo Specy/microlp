@@ -27,9 +27,9 @@
 //!   violations this uncovers to the dual simplex.
 //!
 //! The true bounds are the bounds in force: the model's, but where the dual
-//! simplex's last resort widened one by its var's tolerance for the rest of
-//! the solve ([`Solver::widen`]), so that the phases can reach every point
-//! the infeasibility proof leaves open. Every solve starts from the model's
+//! simplex's widening moved one by its var's tolerance for the rest of the
+//! solve ([`Solver::widen`]), so that the phases can reach every point the
+//! infeasibility proof leaves open. Every solve starts from the model's
 //! ([`Solver::restore_model_bounds`]).
 
 use super::{
@@ -314,10 +314,10 @@ impl Solver {
         (val - bound).abs() <= tol
     }
 
-    /// How far past its bound on the side `up` the dual simplex's last resort
-    /// may widen the bound of `var` ([`Self::widen`]): none if it did
-    /// already; else the var's tolerance there, less, for a slack, its row's
-    /// evaluation margin ([`Self::slack_tols`]), which that side keeps.
+    /// How far past its bound on the side `up` the dual simplex may widen the
+    /// bound of `var` ([`Self::widen`]): none if it did already; else the var's
+    /// tolerance there, less, for a slack, its row's evaluation margin
+    /// ([`Self::slack_tols`]), which that side keeps.
     pub(super) fn widening_room(&self, var: usize, up: bool) -> f64 {
         if self.widened.iter().any(|w| w.var == var && w.up == up) {
             return 0.0;
