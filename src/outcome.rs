@@ -6,6 +6,7 @@ use crate::{
     mip, timed_lp_call, Error, OptimizationDirection, ResumeOptions, Solution, SolutionStatus,
     SolveState, Stats, StopReason, TerminationReason,
 };
+use web_time::Instant;
 
 /// The result of a successful solve.
 ///
@@ -34,18 +35,32 @@ impl std::fmt::Debug for SolveOutcome {
 }
 
 impl SolveOutcome {
-    /// Wraps a pure-LP engine state. A finished one becomes a [`Solution`] only
+    /// Wraps a pure-LP engine state. A finished one is first held to the rows
+    /// presolve dropped or rewrote: the engine takes over a row the answer
+    /// misses and resumes, within the call's deadline
+    /// ([`Solver::hold_validation_rows`]). It then becomes a [`Solution`] only
     /// if its values meet the problem's rows and bounds in user units (the
-    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility) contract).
-    /// The engine finishes only after that same check, so a failure here is an
-    /// internal contradiction, returned as [`Error::InternalError`].
+    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility) contract,
+    /// rows summed in compensated arithmetic). The engine holds its rows and
+    /// bounds to that contract less the round-off of its own evaluation, so a
+    /// failure here is an internal contradiction, returned as
+    /// [`Error::InternalError`].
     pub(crate) fn from_lp_stop(
         direction: OptimizationDirection,
         num_vars: usize,
         stop: StopReason,
-        solver: Box<Solver>,
+        mut solver: Box<Solver>,
         last_options: ResumeOptions,
     ) -> Result<Self, Error> {
+        let stop = match stop {
+            StopReason::Finished => {
+                let started = Instant::now();
+                let held = solver.hold_validation_rows();
+                solver.elapsed += started.elapsed();
+                held?
+            }
+            StopReason::Limit => StopReason::Limit,
+        };
         match stop {
             StopReason::Finished => {
                 let lp_values = solver.reported_values();

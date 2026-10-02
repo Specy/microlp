@@ -63,9 +63,9 @@ enum IntegralCandidate {
 
 /// Adopt the node's LP point, integral within `int_tol`, and close the
 /// subtree: its objective is the node's bound. The engine verified its own
-/// rows and bounds at these very values, with the evaluation the guard
-/// repeats (`Solver::check_rows` and `Solver::first_violated_row` share it),
-/// so a point fails the guard only on a row presolve dropped or rewrote. Such
+/// rows and bounds at these very values, within their contract less the
+/// round-off of its own evaluation, which the guard's compensated sums leave
+/// it, so a point fails the guard only on a row presolve dropped or rewrote. Such
 /// a row holds where the integer vars are exactly integral, but an LP value
 /// within `int_tol` of an integer, or past a bound within its tolerance, can
 /// break it (a rewritten coefficient is exact only at an integral binary):

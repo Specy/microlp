@@ -668,13 +668,13 @@ fn a_singular_basis_loads_repaired() {
     assert!(float_eq(solver.get_value(1), 4.0));
 }
 
-/// The optimum of `min -2 x - y` s.t. `x + y <= 4`, `x - y <= 0`: `-6` at
-/// `x = y = 2`, with the basis `{x, y}`.
+/// The optimum of `min -2 x - y` s.t. `x + y <= 4`, `x - y <= 0`,
+/// `x <= 10`, `y <= 7`: `-6` at `x = y = 2`, with the basis `{x, y}`.
 fn optimum_with_x_and_y_basic() -> Solver {
     let mut sol = Solver::try_new(
         &[-2.0, -1.0],
         &[0.0, 0.0],
-        &[10.0, 10.0],
+        &[10.0, 7.0],
         &[
             (to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 4.0),
             (to_sparse(&[1.0, -1.0]), ComparisonOp::Le, 0.0),
@@ -761,11 +761,12 @@ fn a_var_the_repair_takes_out_gives_back_its_cost_shift() {
 
 /// `verify_primal`'s second rung repairs a basis the fresh factorization finds
 /// singular. With the plant, the values no longer satisfy the rows, the
-/// refinement through the old factors cannot make them, and the fresh
-/// factorization finds `{x, y}` singular. The vertex the repair reaches is no
-/// verification: the answer is `false`, with the feasibility flags measured on
-/// it (it is neither primal nor dual feasible), and the re-solve reaches the
-/// planted model's optimum.
+/// refinement through the old factors cannot make them (it takes `y` to 4,
+/// nearer its upper bound than its lower), and the fresh factorization finds
+/// `{x, y}` singular. The vertex the repair reaches is no verification: the
+/// answer is `false`, with the feasibility flags measured on it (`y` leaves
+/// at its upper bound, so it is neither primal nor dual feasible), and the
+/// re-solve reaches the planted model's optimum.
 #[test]
 fn verify_primal_repairs_a_basis_its_fresh_factorization_finds_singular() {
     init();
@@ -773,7 +774,10 @@ fn verify_primal_repairs_a_basis_its_fresh_factorization_finds_singular() {
     plant_y_parallel_to_x(&mut sol);
     sol.values_dirty = true;
 
-    assert!(!sol.verify_primal().unwrap());
+    assert_eq!(
+        sol.verify_primal().unwrap(),
+        Verdict::Checked { feasible: false }
+    );
     assert!(
         (0..2).any(|v| matches!(sol.var_states[v], VarState::NonBasic(_))),
         "the repair takes x or y out"
@@ -782,6 +786,301 @@ fn verify_primal_repairs_a_basis_its_fresh_factorization_finds_singular() {
     assert!(!sol.is_dual_feasible && sol.calc_dual_infeasibility().0 > 0);
     assert_eq!(sol.reoptimize().unwrap(), StopReason::Finished);
     assert!(float_eq(sol.cur_obj_val, 0.0));
+}
+
+/// `n` rows `d x_j + x_{j-1} + x_{n-1}` of sense `op`, `d` the `diagonal`
+/// (no `x_j` term in the last, no `x_{j-1}` in the first), met with equality
+/// at `x = 1`, over free vars of zero cost, with every structural var basic.
+/// The basis is well conditioned, but a factorization that takes each
+/// column's `d` as its pivot beside the `1` below it (eligible at a threshold
+/// below `d`, and in the row with fewer entries) multiplies the last column's
+/// entries by about `1 / d` per column: its factors represent another matrix,
+/// and the values recomputed through them miss the rows.
+fn chain_basis(n: usize, diagonal: f64, op: ComparisonOp) -> Solver {
+    let mut sol = Solver::try_new(
+        &vec![0.0; n],
+        &vec![f64::NEG_INFINITY; n],
+        &vec![f64::INFINITY; n],
+        &chain_rows(n, n, diagonal, op),
+        &vec![VarDomain::Real; n],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let statuses = (0..2 * n).map(|v| {
+        if v < n {
+            VarStatus::Basic
+        } else {
+            VarStatus::AtLower
+        }
+    });
+    sol.load_basis(&Basis(statuses.collect())).unwrap();
+    sol
+}
+
+/// The rows of [`chain_basis`] over the first `n` of `cols` columns.
+fn chain_rows(
+    n: usize,
+    cols: usize,
+    diagonal: f64,
+    op: ComparisonOp,
+) -> Vec<(CsVec, ComparisonOp, f64)> {
+    (0..n)
+        .map(|i| {
+            let mut coeffs = vec![0.0; cols];
+            if i + 1 < n {
+                coeffs[i] = diagonal;
+            }
+            if i > 0 {
+                coeffs[i - 1] = 1.0;
+            }
+            coeffs[n - 1] = 1.0;
+            let rhs = coeffs.iter().sum();
+            (to_sparse(&coeffs), op, rhs)
+        })
+        .collect()
+}
+
+/// `verify_primal`'s third rung: a basis whose factors at
+/// [`LU_STABILITY_THRESHOLD`] grow by `9^n` (pivots of `0.11` beside a `1`),
+/// beyond what refinements through them repair, is refactorized at
+/// [`LU_STABLE_THRESHOLD`], which takes the `1`s, and the values recomputed
+/// through it satisfy the rows: `x = 1`.
+#[test]
+fn verify_primal_refactorizes_at_the_stable_threshold() {
+    init();
+    let mut sol = chain_basis(72, 0.11, ComparisonOp::Eq);
+    assert_eq!(
+        sol.verify_primal().unwrap(),
+        Verdict::Checked { feasible: true }
+    );
+    for v in 0..72 {
+        assert!(
+            (sol.get_value(v) - 1.0).abs() < 1e-9,
+            "x{v} = {}",
+            sol.get_value(v)
+        );
+    }
+}
+
+/// The ladder's last rung: no factorization represents a basis whose factors
+/// at both thresholds grow by about `1.8^n` (pivots of `0.55` beside a `1`),
+/// so the solve starts over from the slack basis, which here is optimal: the
+/// rows, `<=` and met with equality at `x = 1`, hold at `x = 0`.
+#[test]
+fn a_basis_no_factorization_represents_is_solved_from_the_slack_basis() {
+    init();
+    let sol = chain_basis(140, 0.55, ComparisonOp::Le);
+    assert_eq!(
+        sol.clone().verify_primal().unwrap(),
+        Verdict::Unrepresentable
+    );
+    let mut sol = sol;
+    assert_eq!(sol.reoptimize().unwrap(), StopReason::Finished);
+    let x: Vec<f64> = (0..140).map(|v| sol.get_value(v)).collect();
+    assert!(x.iter().all(|&x| x == 0.0), "{x:?}");
+    assert!(sol.first_violated_row(&x).is_none());
+}
+
+/// The chain of [`a_basis_no_factorization_represents_is_solved_from_the_slack_basis`]
+/// (`n = 140` vars, all basic when `planted`) beside two blocks that need
+/// the dual phase's tolerance mechanisms: `x + y >= 2 + 2.5e-7` over
+/// `x, y ∈ [0, 1]` at costs `-1` and `-0.5`, whose vertices all miss the
+/// row by more than its tolerance, and the equalities `u + v = 1` and
+/// `u + v + 1e8 z = 1e8 + 1 + 5e-7` over `u, v ∈ [0, 2]` with `z` fixed at
+/// 1, which disagree by less than the second row's tolerance. Planted, `x`
+/// and both equalities' slacks are basic, `y` and the first row's slack at
+/// their upper bounds; otherwise the slack basis is loaded.
+fn chain_beside_a_cover_and_two_equalities(planted: bool) -> Solver {
+    let n = 140;
+    let cols = n + 5;
+    let (x, y, u, v, z) = (n, n + 1, n + 2, n + 3, n + 4);
+    let row = |terms: &[(usize, f64)], op, rhs| {
+        let mut coeffs = vec![0.0; cols];
+        for &(var, coeff) in terms {
+            coeffs[var] = coeff;
+        }
+        (to_sparse(&coeffs), op, rhs)
+    };
+    let mut rows = chain_rows(n, cols, 0.55, ComparisonOp::Le);
+    rows.push(row(&[(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 2.0 + 2.5e-7));
+    rows.push(row(&[(u, 1.0), (v, 1.0)], ComparisonOp::Eq, 1.0));
+    rows.push(row(
+        &[(u, 1.0), (v, 1.0), (z, 1e8)],
+        ComparisonOp::Eq,
+        1e8 + 1.0 + 5e-7,
+    ));
+    let mut obj = vec![0.0; cols];
+    obj[x] = -1.0;
+    obj[y] = -0.5;
+    let (mut mins, mut maxs) = (vec![f64::NEG_INFINITY; cols], vec![f64::INFINITY; cols]);
+    for (var, min, max) in [
+        (x, 0.0, 1.0),
+        (y, 0.0, 1.0),
+        (u, 0.0, 2.0),
+        (v, 0.0, 2.0),
+        (z, 1.0, 1.0),
+    ] {
+        (mins[var], maxs[var]) = (min, max);
+    }
+    let mut sol = Solver::try_new(
+        &obj,
+        &mins,
+        &maxs,
+        &rows,
+        &vec![VarDomain::Real; cols],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let basis = if planted {
+        let cover_slack = cols + n;
+        Basis(
+            (0..cols + n + 3)
+                .map(|var| {
+                    if var <= x || var > cover_slack {
+                        VarStatus::Basic
+                    } else if var == y || var == cover_slack {
+                        VarStatus::AtUpper
+                    } else {
+                        VarStatus::AtLower
+                    }
+                })
+                .collect(),
+        )
+    } else {
+        sol.slack_basis()
+    };
+    sol.load_basis(&basis).unwrap();
+    sol
+}
+
+/// The slack-basis restart starts over from the model's bounds, with no
+/// absorption spent. From the planted basis the dual phase widens `x`'s and
+/// the cover row's slack's upper bounds and lets the second equality's slack
+/// absorb the equalities' disagreement, then the verification finds that
+/// no factorization represents the chain. The restart then solves as a solve
+/// from the slack basis does: it widens `x`'s and `y`'s bounds and absorbs
+/// into that slack again. Restarted on the widened bounds, the dual phase
+/// would leave `y` short of its widening; with the absorption spent, it
+/// would widen that slack's bound instead.
+#[test]
+fn the_slack_basis_restart_starts_from_the_models_bounds_with_no_absorption_spent() {
+    init();
+    let sides = |sol: &Solver| {
+        let mut sides: Vec<(usize, bool)> = sol.widened.iter().map(|w| (w.var, w.up)).collect();
+        sides.sort();
+        sides
+    };
+    let values = |sol: &Solver| {
+        (0..sol.num_vars)
+            .map(|v| sol.get_value(v))
+            .collect::<Vec<_>>()
+    };
+    let mut fresh = chain_beside_a_cover_and_two_equalities(false);
+    assert_eq!(fresh.reoptimize().unwrap(), StopReason::Finished);
+
+    let planted = chain_beside_a_cover_and_two_equalities(true);
+    let mut first = planted.clone();
+    assert_eq!(first.phase_rounds().unwrap(), None, "fixture: the restart");
+    assert!(
+        !first.absorbed.is_empty() && sides(&first) != sides(&fresh),
+        "fixture: the first attempt absorbs {:?} and widens {:?}, a solve from the slack basis \
+         widens {:?}",
+        first.absorbed,
+        sides(&first),
+        sides(&fresh)
+    );
+
+    let mut restarted = planted;
+    assert_eq!(restarted.reoptimize().unwrap(), StopReason::Finished);
+    assert_eq!(sides(&restarted), sides(&fresh));
+    assert_eq!(restarted.absorbed, fresh.absorbed);
+    assert_eq!(values(&restarted), values(&fresh));
+}
+
+/// A row presolve took over (a validation row) that a finished LP's answer
+/// misses is no error: the engine takes the row over and resumes, so the
+/// answer holds the model as written. Planted: `max x + y` over `[0, 2]^2`
+/// with the engine's row `x + 2 y <= 4` and `x + y <= 2.5` held back, as a
+/// wrong reduction would: the engine's optimum `(2, 1)` misses it by `0.5`,
+/// and the answer is the model's optimum, `2.5`. Held back with
+/// `x + y <= -1`, the model as written is infeasible, and so is the answer.
+/// Taken over at a deadline already passed, the re-solve stops before its
+/// first step: the answer is interrupted, and resumed, the optimum.
+#[test]
+fn a_validation_row_the_answer_misses_is_taken_over() {
+    init();
+    let solve = |held_back: f64, stopped: bool| {
+        let mut sol = Solver::try_new(
+            &[-1.0, -1.0],
+            &[0.0, 0.0],
+            &[2.0, 2.0],
+            &[(to_sparse(&[1.0, 2.0]), ComparisonOp::Le, 4.0)],
+            &[VarDomain::Real, VarDomain::Real],
+            None,
+            crate::Tolerances::default().feasibility,
+        )
+        .unwrap();
+        sol.set_validation_rows(vec![(to_sparse(&[1.0, 1.0]), ComparisonOp::Le, held_back)]);
+        let stop = sol.initial_solve().unwrap();
+        assert_eq!((sol.get_value(0), sol.get_value(1)), (2.0, 1.0));
+        if stopped {
+            sol.deadline = Some(Instant::now());
+        }
+        crate::SolveOutcome::from_lp_stop(
+            OptimizationDirection::Maximize,
+            2,
+            stop,
+            Box::new(sol),
+            crate::ResumeOptions::default(),
+        )
+    };
+    let solution = solve(2.5, false).unwrap().into_solution().unwrap();
+    assert!((solution.objective() - 2.5).abs() < 1e-9, "{solution:?}");
+    assert!(solve(-1.0, false).is_err_and(|e| e == Error::Infeasible));
+    let interrupted = solve(2.5, true).unwrap();
+    assert_eq!(
+        interrupted.termination_reason(),
+        crate::TerminationReason::TimeLimit
+    );
+    let solution = interrupted.resume().unwrap().into_solution().unwrap();
+    assert!((solution.objective() - 2.5).abs() < 1e-9, "{solution:?}");
+}
+
+/// The boundary sums a row in compensated arithmetic, so its verdict does not
+/// depend on the order of the terms: `2^53 x0 + 0.75 (x1 + ... + x300) -
+/// 2^53 x301 >= 225` holds exactly at `x = 1`, where a plain sum in the
+/// written order drops every `0.75` against `2^53` and finds the row `225`
+/// short, beyond its contract of `180` (the round-off floor of its magnitude,
+/// `1.8e16`).
+#[test]
+fn the_boundary_check_does_not_depend_on_the_order_of_a_rows_terms() {
+    let mut coeffs = vec![0.75; 302];
+    coeffs[0] = 2f64.powi(53);
+    coeffs[301] = -(2f64.powi(53));
+    let row = to_sparse(&coeffs);
+    let feasibility = crate::Tolerances::default().feasibility;
+    assert_eq!(
+        row_violation(&row, ComparisonOp::Ge, 225.0, |_| 1.0, feasibility),
+        None
+    );
+    assert!(row_violation(&row, ComparisonOp::Ge, 226e3, |_| 1.0, feasibility).is_some());
+}
+
+/// The boundary rounds a product whose factor Dekker's split would overflow
+/// to a NaN, which holds nothing: `x + y + 1e305 f >= 3` holds at
+/// `x = y = 1`, `f = 1e-305`.
+#[test]
+fn the_boundary_check_rounds_a_product_beyond_the_split_limit() {
+    let row = to_sparse(&[1.0, 1.0, 1e305]);
+    let value = |v: usize| if v == 2 { 1e-305 } else { 1.0 };
+    let feasibility = crate::Tolerances::default().feasibility;
+    assert_eq!(
+        row_violation(&row, ComparisonOp::Ge, 3.0, value, feasibility),
+        None
+    );
+    assert!(row_violation(&row, ComparisonOp::Ge, 3.1, value, feasibility).is_some());
 }
 
 /// `add_constraint` repairs a basis its factorization finds singular, and
@@ -808,8 +1107,7 @@ fn add_constraint_repairs_a_basis_its_factorization_finds_singular() {
         );
         if stopped {
             assert_eq!(stop, StopReason::Limit);
-            let mut residuals = Vec::new();
-            assert!(sol.check_rows(&mut residuals), "residuals {residuals:?}");
+            assert!(sol.check_rows(), "the rows miss at the values");
         } else {
             assert_eq!(stop, StopReason::Finished);
             assert!(float_eq(sol.cur_obj_val, 0.0));
@@ -2647,7 +2945,10 @@ fn a_leaving_var_holds_its_working_bounds_until_the_cleanup() {
 /// and reports the violation. Here the step toward `x3 = -1`, `x4 = 1000`
 /// passes the equality `1e4 x2 - 1e-7 x3 = 0` through an entry below its
 /// column's round-off floor and takes its slack `3e-12` past its bound,
-/// beyond its tolerance (the whole solve:
+/// beyond its tolerance. Planted: the vertex at the origin with `x3`, `x4`
+/// and the equality's slack basic, from which the primal phase takes that
+/// step, the slack halfway to its tolerance, as round-off can leave it, since
+/// the step alone takes it to the edge (the model of
 /// `an_equality_a_long_step_passes_below_its_floor_settles`).
 #[test]
 fn a_step_past_a_row_the_ratio_test_ignores_shifts_its_bound() {
@@ -2678,27 +2979,24 @@ fn a_step_past_a_row_the_ratio_test_ignores_shifts_its_bound() {
         crate::Tolerances::default().feasibility,
     )
     .unwrap();
-    // As in `run_phases`: the values the first dual phase ends on violate a
-    // bound once recomputed, and a cleanup dual phase repairs them.
-    for cleanup in [false, true] {
-        assert_eq!(
-            sol.restore_feasibility(cleanup).unwrap(),
-            StopReason::Finished
-        );
-        assert_eq!(sol.verify_primal().unwrap(), cleanup);
-    }
-    sol.recalc_obj_coeffs().unwrap();
+    use VarStatus::{AtLower, Basic};
+    let vertex = [
+        AtLower, AtLower, AtLower, Basic, Basic, AtLower, AtLower, Basic,
+    ];
+    sol.load_basis(&Basis(vertex.to_vec())).unwrap();
+    assert!(sol.is_primal_feasible);
     assert!(sol.calc_dual_infeasibility().0 > 0);
     let slack = sol.num_vars + 2;
     let VarState::Basic(row) = sol.var_states[slack] else {
         panic!("the slack of the equality is basic");
     };
+    let tol = sol.var_tols[slack].lo;
+    sol.basic_var_vals[row] = -tol / 2.0;
 
     sol.begin_primal_phase(true);
     assert!(!sol.bounds_modified);
     assert_eq!(sol.primal_phase(1.0).unwrap(), (StopReason::Finished, true));
     assert!(sol.bounds_modified);
-    let tol = sol.var_tols[slack].lo;
     let val = sol.basic_var_vals[row];
     assert!(
         val < -tol,

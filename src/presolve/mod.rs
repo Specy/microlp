@@ -88,8 +88,9 @@
 //!   it once dropped ([`row_violation`], full contract): nothing the engine
 //!   does can move it, since a var fixed on entry never leaves its value.
 //! * Every row presolve drops or rewrites is still checked against the answer
-//!   as written ([`Presolved::validation_rows`]), so a wrong rule fails loudly
-//!   at the boundary.
+//!   as written ([`Presolved::validation_rows`]), so a wrong rule cannot
+//!   return a point the model rejects: an LP takes over a row its answer
+//!   misses and resumes, and the MILP guard rejects such a candidate.
 //! * Presolve's own `Infeasible` carries no certificate, so it is not final:
 //!   the solve then goes on with the model as written ([`reduced_model`]),
 //!   where the engine decides on a proof. The engine's `Infeasible` on the
