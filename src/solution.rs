@@ -269,10 +269,18 @@ impl Solution {
     /// value this solution reports is accepted (for an integer variable, with
     /// [`SolveOptions::int_tol`] at most
     /// [`Tolerances::integrality_rounding`](crate::Tolerances::integrality_rounding),
-    /// as by default; one fixed at an integer lies on it): a value up to
-    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility) outside a
-    /// bound is fixed at that bound, and a value within `integrality_rounding`
-    /// of an integer is fixed at that integer.
+    /// as by default; one fixed at an integer lies on it): `val` may lie up to
+    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility), or the
+    /// round-off floor at a large bound, outside a bound. A continuous variable is fixed at `val` itself, and an integer
+    /// variable at the integer within `integrality_rounding` of `val` (of the
+    /// bound, where `val` lies outside it). A MILP edit searches anew: where
+    /// this solution has an integer variable past a bound or off its integer,
+    /// a fix at one of its values can leave a problem feasible only that way,
+    /// and the edit can then answer `Infeasible` (see
+    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility)). The same
+    /// holds for any edit where this solution used the tolerances of several
+    /// bounds and rows at once: with the variable fixed exactly there, the
+    /// others can be left less room than the infeasibility proof grants.
     ///
     /// # Panics
     ///
@@ -308,13 +316,17 @@ impl Solution {
                 if crate::solver::outside_bounds(val, min, max, tolerances.feasibility) {
                     return Err(Error::Infeasible);
                 }
-                let mut val = val.clamp(min, max);
+                // A continuous var is fixed at `val` itself, as on the LP path
+                // (`Solver::fix_var` says why); an integer var its bounds fix
+                // has no tolerance, so it is fixed at an integer within them.
+                let mut val = val;
                 if matches!(
                     state.base.var_domains[var.0],
                     VarDomain::Integer | VarDomain::Boolean
                 ) {
-                    let integer = val.round();
-                    if (val - integer).abs() > tolerances.integrality_rounding {
+                    let clamped = val.clamp(min, max);
+                    let integer = clamped.round();
+                    if (clamped - integer).abs() > tolerances.integrality_rounding {
                         return Err(Error::Infeasible);
                     }
                     val = integer;
