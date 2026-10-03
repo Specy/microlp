@@ -72,7 +72,10 @@ impl SolveOutcome {
                 }
                 if let Some((row, violation)) = solver.first_violated_row(&lp_values) {
                     return Err(Error::InternalError(format!(
-                        "LP solution violates constraint row {row} by {violation:e}"
+                        "LP solution violates engine row {row} by {violation:e} (the engine's \
+                         numbering, not the problem's: it leaves out the rows every point \
+                         satisfies, empty or with an infinite right-hand side on their open \
+                         side, and numbers the rows presolve took out last)"
                     )));
                 }
                 Ok(Self::Solution(Solution {

@@ -449,9 +449,6 @@ impl Solver {
             }
         }
         self.apply_flips(&moves);
-        for &(col, _) in &moves {
-            self.downgrade_dual_feasibility(col);
-        }
         self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
     }
 }

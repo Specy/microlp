@@ -27,7 +27,7 @@ fn initialize() {
 
     assert_eq!(sol.num_vars, 2);
     assert!(!sol.is_primal_feasible);
-    assert!(!sol.is_dual_feasible);
+    assert!(sol.artificial_obj.is_some());
 
     assert_eq!(&sol.orig_obj_coeffs, &[2.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
 
@@ -305,7 +305,7 @@ fn initial_solve() {
     sol.initial_solve().unwrap();
 
     assert!(sol.is_primal_feasible);
-    assert!(sol.is_dual_feasible);
+    assert_eq!(sol.calc_dual_infeasibility().0, 0);
 
     assert_eq!(&sol.basic_vars, &[0, 1]);
     assert_eq!(&sol.basic_var_vals, &[12.0, 8.0]);
@@ -389,7 +389,7 @@ fn set_var_bounds_tighten_matches_fresh_solve() {
     // Tighten x to [0, 2] and re-solve warm: optimum becomes x=2, y=2, obj 10.
     warm.set_var_bounds(0, 0.0, 2.0).unwrap();
     assert_eq!(warm.reoptimize().unwrap(), StopReason::Finished);
-    assert!(warm.is_primal_feasible && warm.is_dual_feasible);
+    assert!(warm.is_primal_feasible && warm.calc_dual_infeasibility().0 == 0);
     assert!(float_eq(warm.cur_obj_val, 10.0));
     assert!(float_eq(warm.get_value(0), 2.0));
     assert!(float_eq(warm.get_value(1), 2.0));
@@ -482,14 +482,14 @@ fn set_var_bounds_nan_is_infeasible_and_leaves_state_untouched() {
         let value_before = solver.get_value(0);
         let objective_before = solver.cur_obj_val;
         let primal_before = solver.is_primal_feasible;
-        let dual_before = solver.is_dual_feasible;
+        let reduced_costs_before = solver.nb_var_obj_coeffs.clone();
 
         assert_eq!(solver.set_var_bounds(0, min, max), Err(Error::Infeasible));
         assert_eq!(solver.get_var_bounds(0), bounds_before);
         assert_eq!(solver.get_value(0), value_before);
         assert_eq!(solver.cur_obj_val, objective_before);
         assert_eq!(solver.is_primal_feasible, primal_before);
-        assert_eq!(solver.is_dual_feasible, dual_before);
+        assert_eq!(solver.nb_var_obj_coeffs, reduced_costs_before);
     }
 
     let mut solver = original;
@@ -572,7 +572,7 @@ fn basis_snapshot_load_roundtrip() {
 
     // …then reload the optimal basis: objective and values must round-trip.
     solver.load_basis(&basis).unwrap();
-    assert!(solver.is_primal_feasible && solver.is_dual_feasible);
+    assert!(solver.is_primal_feasible && solver.calc_dual_infeasibility().0 == 0);
     assert!(float_eq(solver.cur_obj_val, obj));
     for v in 0..2 {
         assert!(float_eq(solver.get_value(v), vals[v]));
@@ -783,7 +783,7 @@ fn verify_primal_repairs_a_basis_its_fresh_factorization_finds_singular() {
         "the repair takes x or y out"
     );
     assert!(!sol.is_primal_feasible && sol.calc_primal_infeasibility().0 > 0);
-    assert!(!sol.is_dual_feasible && sol.calc_dual_infeasibility().0 > 0);
+    assert!(sol.calc_dual_infeasibility().0 > 0);
     assert_eq!(sol.reoptimize().unwrap(), StopReason::Finished);
     assert!(float_eq(sol.cur_obj_val, 0.0));
 }
@@ -1833,7 +1833,7 @@ fn dual_phase_starts_by_correcting_its_dual_infeasibilities() {
             VarStatus::Basic,
         ]);
         sol.load_basis(&at_lower).unwrap();
-        assert!(!sol.is_primal_feasible && !sol.is_dual_feasible);
+        assert!(!sol.is_primal_feasible && sol.calc_dual_infeasibility().0 > 0);
         sol
     };
 
@@ -2951,7 +2951,7 @@ fn primal_phase_is_perturbed_only_far_from_optimal_and_cleans_up_exactly() {
             crate::Tolerances::default().feasibility,
         )
         .unwrap();
-        assert!(sol.is_primal_feasible && !sol.is_dual_feasible);
+        assert!(sol.is_primal_feasible && sol.calc_dual_infeasibility().0 > 0);
         let label = format!("cost {cost}, cleanup {cleanup}");
         sol.begin_primal_phase(cleanup);
         assert_eq!(sol.bounds_modified, perturbed, "{label}");
@@ -3255,13 +3255,17 @@ fn primal_phase_fails_loudly_when_only_taboo_changes_are_left() {
     );
 }
 
-/// A ray is `Unbounded` only on fresh data. In `min x0` s.t. `x0 >= 1`, `x1`
-/// (in `[0, ∞)`) is in no row, so its column blocks nothing. With cost zero,
-/// its reduced cost planted at `-1e-8`, as drift past its tolerance leaves
-/// it, prices it into a ray, which the rebuild's exact reduced cost of zero
-/// takes back; with cost `-1`, the ray holds on fresh data too.
+/// The entering var's reduced cost, updated since its last recompute, is
+/// checked against the one its column gives before the ratio test (each
+/// planted value below is marked updated). In `min x0` s.t. `x0 >= 1`, `x1` (in
+/// `[0, ∞)`) is in no row, so its column is empty and its reduced cost is its
+/// cost. With cost zero, planted at `-1e-8`, as drift past its tolerance
+/// leaves it, it prices `x1`, but the column gives zero: `x1` does not enter,
+/// and no ray is found. With cost `2`, planted at `-1`, the column's `2` lies
+/// on the other side of zero, and the phase rebuilds: the slack's reduced
+/// cost, planted wrong too, is recomputed. With cost `-1` the ray stands.
 #[test]
-fn a_ray_found_on_a_drifted_reduced_cost_is_priced_again_on_fresh_data() {
+fn an_entering_reduced_cost_is_checked_against_its_column() {
     init();
     let new_solver = |x1_cost: f64| {
         Solver::try_new(
@@ -3275,24 +3279,96 @@ fn a_ray_found_on_a_drifted_reduced_cost_is_priced_again_on_fresh_data() {
         )
         .unwrap()
     };
+    let run_phase = |sol: &mut Solver| {
+        sol.begin_primal_phase(true);
+        let result = sol.primal_phase(1.0);
+        sol.end_primal_phase().unwrap();
+        result.unwrap()
+    };
 
     let mut sol = new_solver(0.0);
     assert_eq!(sol.initial_solve().unwrap(), StopReason::Finished);
+    let x1 = nb_col(&sol, 1);
+    sol.nb_var_obj_coeffs[x1] = -1e-8;
+    sol.reduced_costs_dirty = true;
+    assert!(matches!(
+        primal_pivot_choice(&mut sol, 1.0),
+        PivotChoice::Drifted { sign_error: false }
+    ));
+    assert_eq!(sol.nb_var_obj_coeffs[x1], 0.0);
+    sol.nb_var_obj_coeffs[x1] = -1e-8;
+    assert_eq!(run_phase(&mut sol), (StopReason::Finished, false));
+    assert_eq!(sol.get_value(1), 0.0);
+
+    let mut sol = new_solver(2.0);
+    assert_eq!(sol.initial_solve().unwrap(), StopReason::Finished);
+    let (x1, slack) = (nb_col(&sol, 1), nb_col(&sol, 2));
+    let slack_reduced_cost = sol.nb_var_obj_coeffs[slack];
+    assert!(slack_reduced_cost != 0.0);
+    sol.nb_var_obj_coeffs[x1] = -1.0;
+    sol.reduced_costs_dirty = true;
+    assert!(matches!(
+        primal_pivot_choice(&mut sol, 1.0),
+        PivotChoice::Drifted { sign_error: true }
+    ));
+    assert_eq!(sol.nb_var_obj_coeffs[x1], 2.0);
+    sol.nb_var_obj_coeffs[x1] = -1.0;
+    sol.nb_var_obj_coeffs[slack] = 5.0 * slack_reduced_cost;
+    assert_eq!(run_phase(&mut sol), (StopReason::Finished, false));
+    assert_eq!(sol.nb_var_obj_coeffs[slack], slack_reduced_cost);
+
+    let mut sol = new_solver(-1.0);
+    assert!(matches!(sol.initial_solve(), Err(Error::Unbounded)));
+}
+
+/// A reduced cost fresh from refined multipliers is not checked against its
+/// column, which a factorization computes no better. In the model of
+/// [`an_entering_reduced_cost_is_checked_against_its_column`], `x1`'s
+/// reduced cost planted at `-1e-8` right after a solve, unmarked, stands for
+/// a fresh one: it prices `x1` into a ray, which the phase then declares
+/// only on fresh data.
+#[test]
+fn a_fresh_reduced_cost_is_not_checked_against_its_column() {
+    init();
+    let mut sol = Solver::try_new(
+        &[1.0, 0.0],
+        &[0.0, 0.0],
+        &[f64::INFINITY, f64::INFINITY],
+        &[(to_sparse(&[1.0, 0.0]), ComparisonOp::Ge, 1.0)],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert_eq!(sol.initial_solve().unwrap(), StopReason::Finished);
+    assert!(!sol.reduced_costs_dirty);
     let x1 = nb_col(&sol, 1);
     sol.nb_var_obj_coeffs[x1] = -1e-8;
     assert!(matches!(
         primal_pivot_choice(&mut sol, 1.0),
         PivotChoice::Unbounded
     ));
-    sol.begin_primal_phase(true);
-    let result = sol.primal_phase(1.0);
-    sol.end_primal_phase().unwrap();
-    assert_eq!(result.unwrap(), (StopReason::Finished, false));
-    assert_eq!(sol.nb_var_obj_coeffs[nb_col(&sol, 1)], 0.0);
-    assert_eq!(sol.get_value(1), 0.0);
+}
 
-    let mut sol = new_solver(-1.0);
+/// An `Unbounded` verdict is taken on a fresh factorization: a ray found on
+/// data updated since the last rebuild is priced again after one. In
+/// `min -2 x0 - x1` s.t. `x0 - x1 <= 1`, `x0` enters first; then `x1`'s
+/// column blocks nothing, a ray found after a pivot.
+#[test]
+fn an_unbounded_verdict_is_taken_on_a_fresh_factorization() {
+    init();
+    let mut sol = Solver::try_new(
+        &[-2.0, -1.0],
+        &[0.0, 0.0],
+        &[f64::INFINITY, f64::INFINITY],
+        &[(to_sparse(&[1.0, -1.0]), ComparisonOp::Le, 1.0)],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
     assert!(matches!(sol.initial_solve(), Err(Error::Unbounded)));
+    assert!(sol.factorization_is_fresh());
 }
 
 /// A primal phase starts only on verified values, so that its `Unbounded`
@@ -3317,7 +3393,7 @@ fn a_primal_phase_starts_only_on_verified_values() {
         crate::Tolerances::default().feasibility,
     )
     .unwrap();
-    assert!(!sol.is_primal_feasible && !sol.is_dual_feasible);
+    assert!(!sol.is_primal_feasible && sol.artificial_obj.is_some());
     sol.is_primal_feasible = true;
     assert!(matches!(sol.run_phases(), Err(Error::Infeasible)));
 }
@@ -3326,9 +3402,10 @@ fn a_primal_phase_starts_only_on_verified_values() {
 /// tolerance of a var whose factor between the two is below one shrinks
 /// with it. In `max 0.1 x` s.t. `1e9 x <= 1e9` with `x` free, `x`'s column is
 /// scaled by `2^-30`, which puts its cost at `9.3e-11` and its tolerance at
-/// `1e-10 * 2^-30` (so `x` does not start dual feasible); `1e-6 y <= 1`,
-/// whose `y` the row `y <= 1` gives a column entry of one, is scaled up by a
-/// row factor `r`, which puts its slack's tolerance at `1e-10 / r`.
+/// `1e-10 * 2^-30`, so `x` does not start dual feasible and the primal
+/// phase's edge weights are kept; `1e-6 y <= 1`, whose `y` the row `y <= 1`
+/// gives a column entry of one, is scaled up by a row factor `r`, which puts
+/// its slack's tolerance at `1e-10 / r`.
 #[test]
 fn reduced_cost_tolerances_hold_in_user_units() {
     init();
@@ -3349,7 +3426,7 @@ fn reduced_cost_tolerances_hold_in_user_units() {
     let s = sol.col_scales[0];
     assert!(s < 1e-8, "x's column is scaled down: {s:e}");
     assert_eq!(sol.dual_tols[0], EPS * s);
-    assert!(!sol.is_dual_feasible);
+    assert!(sol.enable_primal_steepest_edge);
     let r = sol.row_scales[1];
     assert!(r > 1.0, "the second row is scaled up: {r:e}");
     assert_eq!(sol.dual_tols[sol.num_vars + 1], EPS / r);
