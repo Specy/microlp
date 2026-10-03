@@ -266,17 +266,17 @@ impl Solution {
     /// (see [`Error::Infeasible`]). A `min <= -2^52` or `max >= 2^52` counts as
     /// infinite here too (see [`Problem::add_var`](crate::Problem::add_var)),
     /// and the bound and domain checks allow the solve's tolerances, so any
-    /// value this solution reports is accepted (for an integer variable, with
-    /// [`SolveOptions::int_tol`] at most
-    /// [`Tolerances::integrality_rounding`](crate::Tolerances::integrality_rounding),
-    /// as by default; one fixed at an integer lies on it): `val` may lie up to
+    /// value this solution reports is accepted (an integer variable's within
+    /// [`SolveOptions::int_tol`] of an integer, one fixed at an integer on
+    /// it): `val` may lie up to
     /// [`Tolerances::feasibility`](crate::Tolerances::feasibility), or the
-    /// round-off floor at a large bound, outside a bound. A continuous variable is fixed at `val` itself, and an integer
-    /// variable at the integer within `integrality_rounding` of `val` (of the
-    /// bound, where `val` lies outside it). A MILP edit searches anew: where
-    /// this solution has an integer variable past a bound or off its integer,
-    /// a fix at one of its values can leave a problem feasible only that way,
-    /// and the edit can then answer `Infeasible` (see
+    /// round-off floor at a large bound, outside a bound. A continuous variable
+    /// is fixed at `val` itself, and an integer variable at the integer within
+    /// `int_tol` of `val` (of the bound, where `val` lies outside it). A MILP
+    /// edit searches anew: where this solution has an integer variable past a
+    /// bound or off its integer, a fix at one of its values can leave a
+    /// problem feasible only that way, and the edit can then answer
+    /// `Infeasible` (see
     /// [`Tolerances::feasibility`](crate::Tolerances::feasibility)). The same
     /// holds for any edit where this solution used the tolerances of several
     /// bounds and rows at once: with the variable fixed exactly there, the
@@ -326,7 +326,7 @@ impl Solution {
                 ) {
                     let clamped = val.clamp(min, max);
                     let integer = clamped.round();
-                    if (clamped - integer).abs() > tolerances.integrality_rounding {
+                    if (clamped - integer).abs() > state.options.int_tol {
                         return Err(Error::Infeasible);
                     }
                     val = integer;

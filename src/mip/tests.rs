@@ -245,6 +245,7 @@ fn plunge_and_jump_selection_preserves_optima() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn tolerances_default_matches_documented_values() {
     let t = Tolerances::default();
     assert_eq!(
@@ -363,7 +364,8 @@ fn incumbent_feasible_row_tolerance_is_absolute_not_relative_to_rhs() {
         &p,
         &fixed,
         &[1000.0 + 5e-8],
-        &tolerances
+        &tolerances,
+        SolveOptions::default().int_tol
     ));
 
     // A `5e-5` violation exceeds the `1e-7` absolute tolerance even though
@@ -372,7 +374,8 @@ fn incumbent_feasible_row_tolerance_is_absolute_not_relative_to_rhs() {
         &p,
         &fixed,
         &[1000.0 + 5e-5],
-        &tolerances
+        &tolerances,
+        SolveOptions::default().int_tol
     ));
 }
 
@@ -393,7 +396,8 @@ fn incumbent_feasible_takes_a_bound_from_2_pow_52_as_infinite() {
         &p,
         &fixed,
         &[solution[x], solution[n]],
-        &tolerances
+        &tolerances,
+        SolveOptions::default().int_tol
     ));
 }
 
@@ -404,18 +408,26 @@ fn candidate_validation_rejects_non_finite_and_malformed_values() {
     let fixed = BTreeMap::new();
     let tolerances = Tolerances::default();
 
-    assert!(!incumbent_feasible(&problem, &fixed, &[], &tolerances));
+    assert!(!incumbent_feasible(
+        &problem,
+        &fixed,
+        &[],
+        &tolerances,
+        SolveOptions::default().int_tol
+    ));
     assert!(!incumbent_feasible(
         &problem,
         &fixed,
         &[f64::NAN],
-        &tolerances
+        &tolerances,
+        SolveOptions::default().int_tol
     ));
     assert!(!incumbent_feasible(
         &problem,
         &fixed,
         &[f64::INFINITY],
-        &tolerances
+        &tolerances,
+        SolveOptions::default().int_tol
     ));
 
     let mut overflowing_row = Problem::new(OptimizationDirection::Minimize);
@@ -425,7 +437,8 @@ fn candidate_validation_rejects_non_finite_and_malformed_values() {
         &overflowing_row,
         &fixed,
         &[1.0e308],
-        &tolerances
+        &tolerances,
+        SolveOptions::default().int_tol
     ));
 }
 
@@ -649,6 +662,33 @@ fn incumbent_feasible_is_not_excluded_by_a_row_with_an_infinite_right_hand_side(
         &p,
         &fixed,
         &[5.0],
-        &Tolerances::default()
+        &Tolerances::default(),
+        SolveOptions::default().int_tol
+    ));
+}
+
+/// The post-edit prefilter decides integrality with `int_tol`, as the search
+/// does: `x = 2.00005` is integral at `int_tol = 1e-4`, not at the default.
+#[test]
+fn incumbent_feasible_decides_integrality_with_int_tol() {
+    let mut p = Problem::new(OptimizationDirection::Minimize);
+    let x = p.add_integer_var(1.0, (0, 10));
+    let y = p.add_var(0.0, (0.0, 10.0));
+    p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 2.00005);
+    let fixed = BTreeMap::new();
+    let tolerances = Tolerances::default();
+    assert!(incumbent_feasible(
+        &p,
+        &fixed,
+        &[2.00005, 0.0],
+        &tolerances,
+        1e-4
+    ));
+    assert!(!incumbent_feasible(
+        &p,
+        &fixed,
+        &[2.00005, 0.0],
+        &tolerances,
+        1e-6
     ));
 }

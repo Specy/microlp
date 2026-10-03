@@ -211,6 +211,23 @@ fn invalid_integrality_tolerances_are_rejected() {
     }
 }
 
+/// `tolerances.integrality_rounding` is deprecated and ignored: no value of it
+/// is invalid, `int_tol` deciding integrality everywhere.
+#[test]
+#[allow(deprecated)]
+fn a_deprecated_integrality_rounding_is_ignored() {
+    for value in [-1.0, f64::NAN, 0.5, f64::INFINITY] {
+        let mut options = SolveOptions::default();
+        options.tolerances.integrality_rounding = value;
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        p.add_integer_var(1.0, (0, 1));
+        assert!(
+            p.solve_with(options).is_ok(),
+            "integrality_rounding {value}"
+        );
+    }
+}
+
 #[test]
 fn invalid_gap_and_expert_tolerances_are_rejected() {
     fn assert_invalid(field: &str, options: SolveOptions) {
@@ -232,11 +249,6 @@ fn invalid_gap_and_expert_tolerances_are_rejected() {
         let mut options = SolveOptions::default();
         options.tolerances.feasibility = value;
         assert_invalid("tolerances.feasibility", options);
-    }
-    for value in [-1.0, f64::NAN, 0.5, f64::INFINITY] {
-        let mut options = SolveOptions::default();
-        options.tolerances.integrality_rounding = value;
-        assert_invalid("tolerances.integrality_rounding", options);
     }
     for value in [-1.0, f64::NAN, f64::INFINITY] {
         let mut options = SolveOptions::default();

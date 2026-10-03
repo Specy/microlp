@@ -246,7 +246,8 @@ let outcome = problem.solve_with(options)?;
   fixed integer variable's on its integer); the feasibility tolerance is
   absolute, for every variable bound and constraint.
   Values must be finite and non-negative, the feasibility tolerance at least
-  `1e-10`, and the two integrality tolerances below `0.5`.
+  `1e-10`, and `int_tol` below `0.5` (`tolerances.integrality_rounding` is
+  deprecated and ignored).
 * `presolve` (on by default): simplify the problem before the search. It never
   removes a variable or changes a real variable's bounds, and it keeps, up to
   round-off, every solution whose integer variables are exactly integral;
