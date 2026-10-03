@@ -170,11 +170,12 @@ works on *working costs* (`src/solver/costs.rs`): the costs in force, with its s
 infeasibilities corrected and an entering var's cost shifted wherever the dual step would
 otherwise run backwards. A primal phase works on *working bounds* (`src/solver/bounds.rs`):
 the true bounds, shifted wherever a basic var ends outside them beyond its tolerance. The
-first phase of a re-solve, and the primal phase after a phase-1 dual phase on the
-artificial objective (the real optimization), also perturb them at the start unless they
-start near optimal; every other phase cleans up after the one before it, unperturbed. A
-phase restores the true costs or bounds when it ends; `run_phases` verifies the result, and
-the next phase removes the infeasibility that uncovers. A vertex hash makes a basis change
+first phase of a re-solve, phase 1 (a dual phase on the artificial objective) again where
+its values fail the verification, and the primal phase after phase 1 (the real
+optimization) also perturb them at the start unless they start near optimal; every other
+phase cleans up after the one before it, unperturbed. A phase restores the true costs or
+bounds when it ends; `run_phases` verifies the result, and the next phase removes the
+infeasibility that uncovers. A vertex hash makes a basis change
 that keeps returning to visited vertices taboo, and a stall bound ends a phase whose
 objective does not move (`src/solver/cycling.rs`); both end in a loud error, never a hang.
 
@@ -206,9 +207,13 @@ State you need to know when reading it:
   change left it) at neither. The bounds are those in force: the model's, or one the
   widening of §7.3 moved by the var's tolerance for the rest of the solve, which the
   boundary's checks and the edits never see.
-- `is_primal_feasible` / `is_dual_feasible` — honest flags; every solve path is a state
-  machine over them. `initial_solve` = restore primal feasibility (dual simplex /
-  phase-1-style) then optimize (primal simplex).
+- `is_primal_feasible` — whether the values meet the bounds: a round runs the dual simplex
+  where it is false, then verifies the values and the reduced costs recomputed from the
+  multipliers, and runs the primal simplex where those are dual infeasible.
+  `is_dual_feasible`, kept by the phases and the edits, is asserted by `add_constraint`;
+  the rounds do not decide on it. `initial_solve` = restore primal feasibility (dual
+  simplex, phase 1 on the artificial objective from a start neither primal nor dual
+  feasible) then optimize (primal simplex).
 - `cur_obj_val`, `nb_var_obj_coeffs` (reduced costs), `lp_iterations` (cumulative pivot
   counter for stats).
 
@@ -708,12 +713,15 @@ resume (`SolveOutcome::from_lp_stop`), a MILP candidate by the incumbent guard (
 What an answer means:
 
 - **`Optimal`**: for an LP, the reported point meets the contract, and the reduced costs of
-  its basis, recomputed from the multipliers, are dual feasible within `dual_tol`. It is
-  optimal at its vertex, not over every point of the contract: the contract being absolute,
-  a small coefficient beside a large one lets a point within it move the objective far, so
-  on an ill-conditioned model the reported objective can lie far from the exact optimum of
-  the model as written. For a MILP, the incumbent meets the contract, and every other node
-  was pruned by its bound or proven infeasible.
+  its basis, recomputed from the multipliers refined once (§7.5), are dual feasible within
+  `dual_tol`, `1e-10` in the user's units as in the engine's (§7.2), the units of a slack
+  being those of its row's activity as written: a row written with large coefficients
+  scales its slack's reduced cost down with them, and can hide an improving edge or ray
+  (§7.9). It is optimal at its vertex, not over every point of the contract: the contract
+  being absolute, a small coefficient beside a large one lets a point within it move the
+  objective far, so on an ill-conditioned model the reported objective can lie far from the
+  exact optimum of the model as written. For a MILP, the incumbent meets the contract, and
+  every other node was pruned by its bound or proven infeasible.
 - **`Infeasible`**: a proof, summed from the model's data, that no point has every row and
   every continuous var within the room the engine can give it, the integer and fixed vars
   within their bounds (§7.3); never a row the simplex could not repair. For a MILP, every
@@ -766,7 +774,7 @@ contract is not in the box.
 |---|---|---|
 | Is a basic slack (row) within its bounds? | `slack_tol` (above) | `ROUNDOFF_FLOOR = 1e-14` |
 | Is a structural var within its bounds? | `structural_tol` (above) | |
-| Is a reduced cost zero? | `dual_tol`: `EPS` floored at the round-off of `\|c_j\| + Σ\|a_ij y_i\|`, refreshed with the multipliers | `EPS = 1e-10` |
+| Is a reduced cost zero? | `dual_tol`: `EPS` in the engine's units and in the user's, so that a cost a column factor shrinks still counts (`a_cost_tiny_beside_its_columns_coefficients_decides_the_optimum`), floored at the round-off of `\|c_j\| + Σ\|a_ij y_i\|`, refreshed with the multipliers | `EPS = 1e-10` |
 | Is a tableau entry a pivot? Do its two computations agree? | §7.7 | `dual_pivot_tolerance`, `primal_pivot_tolerance`, `PIVOT_GROWTH_TOL = 1e-9`, `PIVOT_AGREEMENT_TOL = 1e-7` |
 | Does a certificate prove infeasibility? | its gap beyond the room of its terms (§7.3) | `REFINEMENT_CONVERGED = 2^-53` |
 | Is an LU pivot column singular? | its eligible part below `LU_SINGULAR_REL` of its largest transformed entry (§7.7) | `= ROUNDOFF_FLOOR` |
@@ -898,6 +906,14 @@ where pivots updated them incrementally).
   values the rows and bounds accept into ones they reject, as the exact values of an
   ill-conditioned vertex can be: those keep their computed values, within the contract
   (`a_vertex_whose_exact_values_miss_a_bound_keeps_its_computed_ones`, §7.9).
+- *Dual check*: the reduced costs recomputed on multipliers refined once
+  (`refine_multipliers`: the residual `c_B - Bᵀy`, each entry summed in compensated
+  arithmetic, solved through the factorization). A solve leaves the multipliers with the
+  round-off of the basis inverse, which a coefficient far below its row's others carries
+  into reduced costs beyond their tolerance, and each primal phase would pivot back over it
+  (`phases_settle_on_the_reduced_costs_of_refined_multipliers`). A rebuild within the primal
+  phase refines them too: a ray is declared, and a phase that made no pivot ends, only on the
+  reduced costs of a rebuild or of the verification.
 - *The ladder*, where a row still misses: the values recomputed through a fresh
   factorization and refined, then, where the threshold in force is lower, through one at
   `LU_STABLE_THRESHOLD = 0.5`, whose pivots bound the growth of the factors; a factorization
@@ -971,7 +987,12 @@ through: `dual_pivot_tolerance` `1e-9`, `3e-8`, `1e-6` and `primal_pivot_toleran
   beyond the error measured for it bounds the step (every nonzero one where the refinement
   did not converge): `Unbounded` comes only from a column whose blocking entries are zero
   within their error, as `Infeasible` only from a certificate (`x + y <= 1` and
-  `x + (1 + 2^-48) y >= 1` block `x` through `2^-48`).
+  `x + (1 + 2^-48) y >= 1` block `x` through `2^-48`). It comes only on fresh data, too: a
+  reduced cost updated pivot by pivot can drift past its tolerance on a column that blocks
+  nothing, as a zero-cost var's can, so a ray found since the last rebuild is priced again
+  after one (`a_ray_found_on_a_drifted_reduced_cost_is_priced_again_on_fresh_data`). The
+  working bounds may be perturbed or shifted then: a ray depends only on which bounds are
+  infinite, which they keep, and the phase started on values the verification accepted.
 - *Genuine or round-off* is decided on refined values against the error the refinement
   measured, never on a size or on the plain computation, which can be off by any factor for
   a genuine entry two nearly parallel rows leave (`1.2e-15` computed as `7.1e-15`): an entry
@@ -1017,8 +1038,9 @@ never pivots on unverified values.
   not fixed (primal) move by pseudo-random amounts of about `5e-7` relative, fixed by the
   var's index so that every solve is deterministic (`perturb_costs`, `perturb_bounds`); a
   cost of `INFINITE_COST` or more stays put. A phase that starts near optimal, or that
-  cleans up after another (every phase of a re-solve after the first, except the primal
-  phase that follows a phase-1 dual phase on the artificial objective), is not perturbed.
+  cleans up after another (every phase of a re-solve after the first, except phase 1 run
+  again where its values fail the verification and the primal phase that follows phase
+  1), is not perturbed.
 - *Correction* (dual), at the start and at every rebuild: a dual infeasible reduced cost is
   removed by moving a boxed var to its other bound, or by shifting the var's cost. Shifts
   replace flips where a flip would move the point for nothing: at the start, where the
@@ -1067,9 +1089,7 @@ never pivots on unverified values.
 
 Each is pinned by a test that passes while it stands and fails once a change fixes it: a
 `#[should_panic]` test named `..._is_a_known_limitation` in `src/tests/magnitudes.rs` (drop
-the attribute to keep the model as a regression test) or, for a model outside the
-recommended range that fails loudly, a test that the error names the range
-(`assert_out_of_range_fails_loudly` in `src/tests/oracle.rs`). The wide-coefficient
+the attribute to keep the model as a regression test). The wide-coefficient
 properties split at the range: a draw within it must solve, a draw outside it must give no
 wrong answer.
 
@@ -1087,15 +1107,16 @@ wrong answer.
   worse than the optimum, `-1.4288` against `-1.5`
   (`a_vertex_whose_exact_values_miss_a_bound_is_kept_as_computed_and_is_a_known_limitation`,
   row dynamism `7.5e5`).
-- **Phases alternating over round-off reduced costs** (outside the range). A coefficient far
-  below its row's others amplifies a multiplier's round-off beyond the reduced-cost
-  tolerance, and each primal phase pivots back until `MAX_PHASE_ROUNDS`
-  (`phases_alternating_over_round_off_reduced_costs_are_out_of_range_and_loud`, row dynamism
-  `1e8`).
 - **A point within the round-off of the proof's room** (outside the range) is neither proven
   infeasible nor reached: the solve fails loudly, and in a MILP the node is not pruned
   (`a_node_point_within_the_round_off_of_its_rows_room_is_a_known_limitation`, row dynamism
   `1e10`).
+- **An improving ray or edge through a row written with large coefficients** (in range). A
+  slack's reduced cost is held to `1e-10` per unit of its row's activity as written, which a
+  row's large coefficients make a tiny unit: `max x` s.t. `2e10 x >= 2e10` improves by
+  `5e-11` per unit of the row's surplus, and is answered `Optimal` at `x = 1` though
+  unbounded (`an_improving_ray_through_a_row_written_large_is_a_known_limitation`), and a
+  model whose rows are written `1e12` times larger can end at a worse vertex.
 - **A MILP point that needs `int_tol`** (in range too): presolve and the search keep the
   integral points of the box (§7.4), so a point within the box only with an integer var off
   its integer, under a coefficient that makes the offset count, is found only where an LP

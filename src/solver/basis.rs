@@ -25,6 +25,9 @@ pub(crate) enum PivotChoice {
     /// highest threshold the pivot is taken with the column's element; a
     /// basis it leaves singular is repaired at the next factorization.
     Inconsistent { row: usize },
+    /// No entry bounds the step toward the entering var's infinite bound: an
+    /// unbounded ray, if the reduced cost that priced the var is fresh.
+    Unbounded,
 }
 
 #[derive(Debug)]

@@ -15,10 +15,9 @@
 #[cfg(test)]
 mod regression_tests {
     use crate::tests::oracle::{
-        assert_out_of_range_fails_loudly, assert_solves_feasibly_within_contract,
-        assert_solves_within_contract, assert_solves_within_contract_in_time,
-        assert_solves_within_contract_without_presolve, within_recommended_range,
-        xstar_is_feasible, Model, Row, Var,
+        assert_solves_feasibly_within_contract, assert_solves_within_contract,
+        assert_solves_within_contract_in_time, assert_solves_within_contract_without_presolve,
+        within_recommended_range, xstar_is_feasible, Model, Row, Var,
     };
     use crate::{ComparisonOp, Error, OptimizationDirection, SolveOptions, TerminationReason};
     use std::time::Duration;
@@ -644,14 +643,14 @@ mod regression_tests {
     }
 
     /// A model outside the recommended range (constraint 0 spans `1e8`) on
-    /// which the phases alternate between two vertices: each primal phase
-    /// ends where the recomputed reduced costs show the other's entering var
-    /// dual infeasible by `2.3e-10` to `3e-10`, round-off beyond the
-    /// reduced-cost tolerance that `-x0 + 1e-8 x4 = 0` amplifies into the
-    /// multipliers, and the solve fails loudly after `8 phase rounds`, naming
-    /// the constraint, with presolve on and off.
+    /// which the phases alternated between two vertices: on multipliers from
+    /// one solve, each primal phase ended where the reduced costs showed the
+    /// other's entering var dual infeasible by `2.3e-10` to `3e-10`, the
+    /// round-off `-x0 + 1e-8 x4 = 0` amplifies into the multipliers, until
+    /// `8 phase rounds`. The verification refines the multipliers once, and
+    /// the solve ends, with presolve on and off.
     #[test]
-    fn phases_alternating_over_round_off_reduced_costs_are_out_of_range_and_loud() {
+    fn phases_settle_on_the_reduced_costs_of_refined_multipliers() {
         let model = Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![
@@ -676,7 +675,8 @@ mod regression_tests {
             xstar_is_feasible(&model),
             "fixture error: x* must satisfy the model"
         );
-        assert_out_of_range_fails_loudly(&model, "constraint 0 spans 1.0e8");
+        assert_solves_within_contract(&model);
+        assert_solves_within_contract_without_presolve(&model);
     }
 
     /// LPs whose solve pivots on an entry some `1e-15` of its column (genuine,
@@ -1950,6 +1950,69 @@ mod regression_tests {
             "fixture error: x* must satisfy the model"
         );
         assert_solves_within_contract_in_time(&model, Duration::from_secs(10));
+    }
+
+    /// A cost tiny beside its column's coefficients still decides the optimum:
+    /// every reduced cost is held to its tolerance in the user's units as in
+    /// the engine's, so a column factor of `2^-30`, which takes a cost of
+    /// `0.1` below `1e-10`, does not hide it. Each model is `x <= 1` written
+    /// with a large coefficient (every row and column within the recommended
+    /// range), maximizing `cost · x`, with `x` nonnegative or free.
+    #[test]
+    fn a_cost_tiny_beside_its_columns_coefficients_decides_the_optimum() {
+        for (cost, coeff, lo) in [
+            (0.1, 1e9, 0.0),
+            (1.0, 2e10, 0.0),
+            (0.1, 1e9, f64::NEG_INFINITY),
+        ] {
+            for presolve in [true, false] {
+                let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+                let x = problem.add_var(cost, (lo, f64::INFINITY));
+                problem.add_constraint([(x, coeff)], ComparisonOp::Le, coeff);
+                let options = SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                };
+                let solution = problem
+                    .solve_with(options)
+                    .unwrap()
+                    .into_solution()
+                    .unwrap();
+                assert!(
+                    (solution[x] - 1.0).abs() <= 1e-9
+                        && (solution.objective() - cost).abs() <= 1e-9,
+                    "max {cost} x s.t. {coeff:e} x <= {coeff:e}, x >= {lo} (presolve {presolve}): \
+                     x = {}, objective {}",
+                    solution[x],
+                    solution.objective()
+                );
+            }
+        }
+    }
+
+    /// KNOWN LIMITATION: a slack's reduced cost is held to `1e-10` per unit of
+    /// its row's activity as written, which a row's large coefficients make a
+    /// tiny unit. `max x` s.t. `2e10 x >= 2e10`, `x >= 0`, is unbounded, its
+    /// ray through the row's surplus improving the objective by `5e-11` per
+    /// unit of the surplus, and is answered `Optimal` at `x = 1`, with
+    /// presolve on and off (ARCHITECTURE §7.9).
+    #[test]
+    #[should_panic(expected = "is answered")]
+    fn an_improving_ray_through_a_row_written_large_is_a_known_limitation() {
+        for presolve in [true, false] {
+            let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+            let x = problem.add_var(1.0, (0.0, f64::INFINITY));
+            problem.add_constraint([(x, 2e10)], ComparisonOp::Ge, 2e10);
+            let options = SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            };
+            let result = problem.solve_with(options);
+            assert!(
+                matches!(result, Err(Error::Unbounded)),
+                "presolve {presolve}: the unbounded LP is answered {result:?}"
+            );
+        }
     }
 
     /// A huge cost must not make a feasible model infeasible. The model

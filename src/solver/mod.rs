@@ -460,7 +460,9 @@ impl Solver {
                 // Fixed variable: the obj. coeff doesn't matter.
                 (min, true)
             } else {
-                initial_nonbasic_value(orig_obj_coeffs[v], min, max)
+                // At the slack basis a reduced cost is the objective coefficient.
+                let tol = dual_tol(orig_obj_coeffs[v].abs(), col_scales[v]);
+                initial_nonbasic_value(orig_obj_coeffs[v], min, max, tol)
             };
             if !var_dual_feasible {
                 is_dual_feasible = false;
@@ -588,10 +590,6 @@ impl Solver {
 
         let cur_obj_val = if need_artificial_obj { 0.0 } else { obj_val };
 
-        // The slack basis has zero multipliers, so a reduced cost is just the
-        // objective coefficient and its round-off floor follows from that.
-        let dual_tols = orig_obj_coeffs.iter().map(|c| dual_tol(c.abs())).collect();
-
         let mut scratch = ScratchSpace::with_capacity(num_constraints);
         let (lu_factors, replaced) = lu_factorize(
             basic_vars.len(),
@@ -608,7 +606,7 @@ impl Solver {
         debug_assert!(replaced.is_empty(), "the slack basis is the identity");
         let lu_factors_transp = lu_factors.transpose();
 
-        let res = Self {
+        let mut res = Self {
             num_vars,
             orig_obj_coeffs,
             orig_var_mins,
@@ -622,7 +620,7 @@ impl Solver {
             feasibility,
             range: CoefficientRange::default(),
             var_tols,
-            dual_tols,
+            dual_tols: vec![0.0; num_total_vars],
             validation_rows: Vec::new(),
             deadline,
             operation_time_limit: None,
@@ -672,6 +670,9 @@ impl Solver {
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
             flip_rhs: ScatteredVec::empty(num_constraints),
         };
+        // The slack basis has zero multipliers: a reduced cost is the
+        // objective coefficient.
+        res.refresh_dual_tols(&vec![0.0; num_constraints]);
 
         debug!(
             "initialized solver: vars: {}, constraints: {}, primal feasible: {}, dual feasible: {}, nnz: {}",
@@ -709,6 +710,18 @@ impl Solver {
             self.col_scales[var]
         } else {
             1.0
+        }
+    }
+
+    /// The factor between `var`'s reduced cost in the engine's units and in
+    /// the user's (see [`dual_tol`]): `s_j` for a structural var, `1 / r` for
+    /// the slack of a row of factor `r`.
+    #[inline]
+    fn dual_unit(&self, var: usize) -> f64 {
+        if var < self.num_vars {
+            self.col_scales[var]
+        } else {
+            1.0 / self.row_scales[var - self.num_vars]
         }
     }
 
@@ -813,7 +826,7 @@ impl Solver {
                     .iter()
                     .map(|(r, coeff)| (coeff * multipliers[r]).abs())
                     .sum::<f64>();
-            self.dual_tols[var] = dual_tol(magnitude);
+            self.dual_tols[var] = dual_tol(magnitude, self.dual_unit(var));
         }
     }
 
@@ -1015,17 +1028,21 @@ impl Solver {
     /// the factorization satisfy the rows and their bounds, and the reduced
     /// costs recomputed from the multipliers are dual feasible. A phase's own
     /// exit test runs on incrementally updated numbers and can end on drifted
-    /// values, so only a verified state is reported as `Finished`. The solve
-    /// starts from the model's bounds, restoring the ones a previous solve
-    /// widened ([`Self::restore_model_bounds`]).
+    /// values, so only a verified state is reported as `Finished`, and a
+    /// primal phase starts only on verified values: its `Unbounded` then rests
+    /// on a point the model admits. The solve starts from the model's bounds,
+    /// restoring the ones a previous solve widened
+    /// ([`Self::restore_model_bounds`]).
     ///
     /// A phase ends by restoring the costs in force ([`costs`]) or the true
     /// bounds ([`bounds`]), and the infeasibility that uncovers is left to the
     /// next phase of the other kind. Only the first phase of a re-solve may
     /// perturb; every later one is a cleanup: unperturbed, and a dual one with
     /// phase 2 forced, so that its dual infeasibilities are shifted rather
-    /// than flipped (the primal phase after a phase-1 dual on the artificial
-    /// objective is the real optimization, not a cleanup). The loop fails
+    /// than flipped. Phase 1, a dual phase on the artificial objective, is
+    /// not done until its values pass the verification, so it runs again
+    /// where they fail, and the primal phase after it is the real
+    /// optimization; neither is a cleanup. The loop fails
     /// loudly after [`MAX_PHASE_ROUNDS`] rounds; each round after the first
     /// cuts the primal ratio test's tolerance a hundredfold
     /// ([`LOOP_HARRIS_REDUCTION`]), so that a step no longer ends at a
@@ -1068,17 +1085,6 @@ impl Solver {
                 }
                 cleanup = cleanup || self.artificial_obj.is_none();
             }
-            if !self.is_dual_feasible {
-                // Leaving the dual phase for the primal one: the real
-                // objective is in force from here on.
-                self.artificial_obj = None;
-                self.recalc_obj_coeffs()?;
-                let stop = self.optimize(cleanup, harris_scale)?.0;
-                cleanup = true;
-                if stop == StopReason::Limit {
-                    return Ok(Some(StopReason::Limit));
-                }
-            }
             match self.verify_primal()? {
                 Verdict::Checked { feasible: true } => {}
                 Verdict::Checked { feasible: false } => {
@@ -1087,13 +1093,12 @@ impl Solver {
                 }
                 Verdict::Unrepresentable => return Ok(None),
             }
-            // Dual verification: exact reduced costs. If they still show an
-            // infeasibility, let the primal simplex act on them; no pivot at
-            // all means the vertex is optimal within tolerance.
-            if self.artificial_obj.is_some() || self.reduced_costs_dirty {
-                self.artificial_obj = None;
-                self.recalc_obj_coeffs()?;
-            }
+            // Dual verification: the reduced costs recomputed on multipliers
+            // refined once. If they still show an infeasibility, let the
+            // primal simplex act on them; no pivot at all means the vertex is
+            // optimal within tolerance.
+            self.artificial_obj = None;
+            self.recalc_obj_coeffs_refined();
             if self.calc_dual_infeasibility().0 == 0 {
                 self.is_dual_feasible = true;
                 return Ok(Some(StopReason::Finished));
@@ -1436,25 +1441,28 @@ impl Solver {
     /// with: the cost vector in force (the artificial one during phase 1) plus
     /// a running dual phase's perturbation and shifts (see [`costs`]).
     fn exact_obj_val(&self) -> f64 {
+        let mut obj = 0.0;
+        for (r, &var) in self.basic_vars.iter().enumerate() {
+            obj += self.cost_in_force(var) * self.basic_var_vals[r];
+        }
+        for (c, &var) in self.nb_vars.iter().enumerate() {
+            obj += self.cost_in_force(var) * self.nb_var_vals[c];
+        }
+        obj
+    }
+
+    /// The cost `var` has in the simplex: its cost in force (the artificial
+    /// one during phase 1), plus a running dual phase's perturbation and shift.
+    fn cost_in_force(&self, var: usize) -> f64 {
         let costs = self
             .artificial_obj
             .as_deref()
             .unwrap_or(&self.orig_obj_coeffs);
-        let cost = |var: usize| {
-            if self.costs_modified {
-                costs[var] + self.cost_perturbation[var] + self.cost_shifts[var]
-            } else {
-                costs[var]
-            }
-        };
-        let mut obj = 0.0;
-        for (r, &var) in self.basic_vars.iter().enumerate() {
-            obj += cost(var) * self.basic_var_vals[r];
+        if self.costs_modified {
+            costs[var] + self.cost_perturbation[var] + self.cost_shifts[var]
+        } else {
+            costs[var]
         }
-        for (c, &var) in self.nb_vars.iter().enumerate() {
-            obj += cost(var) * self.nb_var_vals[c];
-        }
-        obj
     }
 
     /// Whether the pivot element computed through the row and through the
@@ -1637,10 +1645,16 @@ impl Solver {
 
         self.factorize();
 
-        // Steepest-edge reference reset (standard practice after a warm-start load;
-        // only affects pivot ordering quality, not correctness).
+        // The weights belong to the positions the load renumbers (they only
+        // affect the pivot order, not correctness). The dual ones restart from
+        // a reference reset, standard after a warm-start load; the primal ones
+        // are recomputed exactly, cheap for the slack basis, the one basis
+        // loaded while they are in use (the restart of `run_phases`).
         if self.enable_dual_steepest_edge {
             self.dual_edge_sq_norms = vec![1.0; self.basic_vars.len()];
+        }
+        if self.enable_primal_steepest_edge {
+            self.recalc_primal_sq_norms();
         }
 
         self.recalc_basic_var_vals()?;
@@ -1736,13 +1750,19 @@ impl Solver {
     /// pivot element disagree, the factorization is renewed, at a raised
     /// threshold ([`Self::raise_lu_threshold`]), and the iteration redone.
     ///
+    /// A ray is `Unbounded` only on fresh data: a reduced cost updated pivot by
+    /// pivot can drift past its tolerance on a column that blocks nothing, as
+    /// a zero-cost var's can, so a ray found since the last rebuild is priced
+    /// again after one.
+    ///
     /// The phase fails loudly rather than run forever: when, after a rebuild,
     /// the only vars left to enter are taboo, and when the objective has not
     /// fallen beyond round-off in [`STALL_ITERATIONS`] iterations.
     fn primal_phase(&mut self, harris_scale: f64) -> Result<(StopReason, bool), Error> {
         let mut pivoted = false;
         // Whether the data are fresh from a rebuild with no step since: only
-        // then do taboo vars alone left to enter mean the phase is stuck.
+        // then do taboo vars alone left to enter mean the phase is stuck, and
+        // a ray mean `Unbounded`.
         let mut refreshed_since_step = false;
         // The objective at the last stall check.
         let mut stall_reference = self.cur_obj_val;
@@ -1856,6 +1876,15 @@ impl Solver {
                     );
                     self.raise_lu_threshold();
                     self.rebuild_primal()?;
+                    refreshed_since_step = true;
+                }
+                PivotChoice::Unbounded => {
+                    if refreshed_since_step {
+                        return Err(Error::Unbounded);
+                    }
+                    debug!("optimize iter {iter}: a ray on updated data; rebuilding");
+                    self.rebuild_primal()?;
+                    refreshed_since_step = true;
                 }
             }
         }
@@ -1865,13 +1894,17 @@ impl Solver {
         Ok((StopReason::Finished, pivoted))
     }
 
-    /// A rebuild within the primal phase: a fresh factorization and everything
-    /// derived from it ([`Self::rebuild`]), the working bounds shifted where
-    /// the recomputed values violate them, and every taboo lifted so that any
-    /// var may enter on fresh data (the records of bad basis changes stay: see
-    /// [`CycleGuard`]).
+    /// A rebuild within the primal phase: as [`Self::rebuild`], with the
+    /// reduced costs on multipliers refined once, as at the verification,
+    /// since a ray is declared, and a phase that made no pivot ends, only on
+    /// the reduced costs of a rebuild or of the verification; then the
+    /// working bounds shifted where the recomputed values violate them, and
+    /// every taboo lifted so that any var may enter on fresh data (the
+    /// records of bad basis changes stay: see [`CycleGuard`]).
     fn rebuild_primal(&mut self) -> Result<(), Error> {
-        self.rebuild()?;
+        self.factorize();
+        self.recalc_basic_var_vals()?;
+        self.recalc_obj_coeffs_refined();
         self.correct_primal();
         self.cycle_guard.clear_taboo();
         Ok(())
@@ -2358,7 +2391,7 @@ impl Solver {
         )));
         // The new slack's reduced cost is exactly zero until the multipliers
         // are next recomputed.
-        self.dual_tols.push(dual_tol(0.0));
+        self.dual_tols.push(dual_tol(0.0, 1.0 / row_scale));
 
         let new_num_total_vars = self.num_total_vars() + 1;
         let mut new_orig_constraints = CsMat::empty(CompressedStorage::CSR, new_num_total_vars);
@@ -2603,9 +2636,9 @@ impl Solver {
 
     /// The primal simplex's ratio test for the entering column `entering_c`,
     /// on the phase's working bounds (see [`bounds`]): the basic var that
-    /// leaves for it, or a flip of the entering var to its other bound.
-    /// `harris_scale` scales the tolerance by which the test lets a basic var
-    /// pass its bound (see `run_phases`).
+    /// leaves for it, a flip of the entering var to its other bound, or an
+    /// unbounded ray. `harris_scale` scales the tolerance by which the test
+    /// lets a basic var pass its bound (see `run_phases`).
     fn choose_pivot(&mut self, entering_c: usize, harris_scale: f64) -> Result<PivotChoice, Error> {
         let entering_cur_val = self.nb_var_vals[entering_c];
         // If true, entering variable will increase (because the objective function must decrease).
@@ -2730,7 +2763,7 @@ impl Solver {
             }))
         } else {
             if entering_other_val.is_infinite() {
-                return Err(Error::Unbounded);
+                return Ok(PivotChoice::Unbounded);
             }
 
             Ok(PivotChoice::Pivot(PivotInfo {
@@ -3875,46 +3908,88 @@ impl Solver {
     }
 
     /// Recompute the reduced costs and the objective from the costs the
-    /// simplex works with: the cost vector in force (the artificial one during
-    /// phase 1) plus a running dual phase's perturbation and shifts.
+    /// simplex works with ([`Self::cost_in_force`]).
     fn recalc_obj_coeffs(&mut self) -> Result<(), Error> {
-        let costs = self
-            .artificial_obj
-            .as_deref()
-            .unwrap_or(&self.orig_obj_coeffs);
-        let (perturbation, shifts) = (&self.cost_perturbation, &self.cost_shifts);
-        let modified = self.costs_modified;
-        let cost = |var: usize| {
-            if modified {
-                costs[var] + perturbation[var] + shifts[var]
-            } else {
-                costs[var]
-            }
-        };
-        // Same as recalc_basic_var_vals: pending etas participate in the
-        // (transposed) dense solve instead of forcing a refactorization.
-        let mut multipliers = vec![0.0; self.basic_vars.len()];
-        for (c, &var) in self.basic_vars.iter().enumerate() {
-            multipliers[c] = cost(var);
-        }
-        self.basis_solver
-            .solve_transp_dense_with_etas(&mut multipliers);
-
-        self.nb_var_obj_coeffs.clear();
-        for &var in &self.nb_vars {
-            //guaranteed to be a valid index
-            let col = self.orig_constraints_csc.outer_view(var).unwrap();
-            let dot_prod: f64 = col.iter().map(|(r, val)| val * multipliers[r]).sum();
-            self.nb_var_obj_coeffs.push(cost(var) - dot_prod);
-        }
-        self.refresh_dual_tols(&multipliers);
-
-        self.cur_obj_val = self.exact_obj_val();
-        self.reduced_costs_dirty = false;
+        let multipliers = self.multipliers();
+        self.set_reduced_costs(&multipliers);
         Ok(())
     }
 
-    #[allow(dead_code)]
+    /// [`Self::recalc_obj_coeffs`] on multipliers refined once
+    /// ([`Self::refine_multipliers`]): the reduced costs a solve's optimality
+    /// is verified on.
+    fn recalc_obj_coeffs_refined(&mut self) {
+        let mut multipliers = self.multipliers();
+        self.refine_multipliers(&mut multipliers);
+        self.set_reduced_costs(&multipliers);
+    }
+
+    /// The multipliers `y` of the basis, `B^T y = c_B`. As in
+    /// recalc_basic_var_vals, pending etas participate in the (transposed)
+    /// dense solve instead of forcing a refactorization.
+    fn multipliers(&mut self) -> Vec<f64> {
+        let mut multipliers: Vec<f64> = self
+            .basic_vars
+            .iter()
+            .map(|&var| self.cost_in_force(var))
+            .collect();
+        self.basis_solver
+            .solve_transp_dense_with_etas(&mut multipliers);
+        multipliers
+    }
+
+    /// One step of iterative refinement of the multipliers: the residual
+    /// `c_B - B^T y`, each entry summed in compensated arithmetic over its
+    /// basic column, solved through the factorization and added to `y`. A
+    /// solve leaves `y` with the round-off of the basis inverse, which a
+    /// reduced cost can carry beyond its tolerance, and the phases would
+    /// then alternate over it. Skipped where the residual or the correction
+    /// is not finite.
+    fn refine_multipliers(&mut self, multipliers: &mut [f64]) {
+        let mut residual: Vec<f64> = self
+            .basic_vars
+            .iter()
+            .map(|&var| {
+                let mut sum = CDouble::from(self.cost_in_force(var));
+                //guaranteed to be a valid index
+                for (r, &coeff) in self.orig_constraints_csc.outer_view(var).unwrap().iter() {
+                    sum.add_product(-coeff, multipliers[r]);
+                }
+                sum.value()
+            })
+            .collect();
+        if !residual.iter().all(|r| r.is_finite()) {
+            return;
+        }
+        self.basis_solver
+            .solve_transp_dense_with_etas(&mut residual);
+        if residual.iter().all(|d| d.is_finite()) {
+            for (y, delta) in multipliers.iter_mut().zip(&residual) {
+                *y += delta;
+            }
+        }
+    }
+
+    /// The reduced costs `c_j - a_j^T y` of the non-basic vars, their
+    /// tolerances and the objective, from the multipliers `y`.
+    fn set_reduced_costs(&mut self, multipliers: &[f64]) {
+        self.nb_var_obj_coeffs.clear();
+        for c in 0..self.nb_vars.len() {
+            let var = self.nb_vars[c];
+            //guaranteed to be a valid index
+            let col = self.orig_constraints_csc.outer_view(var).unwrap();
+            let dot_prod: f64 = col.iter().map(|(r, val)| val * multipliers[r]).sum();
+            self.nb_var_obj_coeffs
+                .push(self.cost_in_force(var) - dot_prod);
+        }
+        self.refresh_dual_tols(multipliers);
+
+        self.cur_obj_val = self.exact_obj_val();
+        self.reduced_costs_dirty = false;
+    }
+
+    /// The exact primal steepest-edge weights `||B^-1 a_j||^2 + 1` of the
+    /// non-basic columns: one solve each.
     fn recalc_primal_sq_norms(&mut self) {
         self.primal_edge_sq_norms.clear();
         for &var in &self.nb_vars {

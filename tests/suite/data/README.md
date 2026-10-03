@@ -13,11 +13,12 @@ The MIPLIB instances are one file with two cases: the integer solve's tier
 follows the folder, while the LP-relaxation case always runs in the medium
 tier (every relaxation is fast and doubles as a parser check).
 
-Large instances (multi-megabyte MILPBench `.lp` files) are stored gzipped as
-`<file>.lp.gz`; case tables always use the logical `.lp` name, `cases::locate`
-resolves whichever storage form exists, and `cases::read_instance`
-decompresses in memory at run time. Gzipping (or un-gzipping) a file is a
-pure data-directory change, like moving it between tiers.
+Large instances (multi-megabyte MILPBench `.lp` files, and netlib's
+greenbea) are stored gzipped as `<file>.gz`; case tables always use the
+logical name, `cases::locate` resolves whichever storage form exists, and
+`cases::read_instance` decompresses in memory at run time. Gzipping (or
+un-gzipping) a file is a pure data-directory change, like moving it between
+tiers.
 
 ## Licensing summary
 
@@ -48,9 +49,9 @@ vendored from the uncompressed mirrors in COIN-OR's Data-Netlib repository
 "Electronic mail distribution of linear programming test problems",
 COAL Newsletter 13 (1985) 10-12.
 
-Expected optimal objective values used by the suite are the official "BR"
-(best reported) values from netlib's `lp/data/readme` (all instances are
-minimization). Contributors per the same readme:
+Expected optimal objective values used by the suite are the optimal values
+of the problem summary table in netlib's `lp/data/readme` (all instances are
+minimization), but greenbea's (below). Contributors per the same readme:
 
 | instance | rows | optimal objective | contributed by |
 | -------- | ---- | ----------------- | -------------- |
@@ -68,6 +69,15 @@ minimization). Contributors per the same readme:
 | brandy   |  221 |  1.5185098965E+03 | B. Fourer |
 | beaconfd |  174 |  3.3592485807E+04 | B. Fourer |
 | sctap1   |  301 |  1.4122500000E+03 | B. Fourer |
+| greenbea | 2393 | -7.2555248130E+07 | B. Fourer |
+
+`greenbea.mps.gz` is the netlib instance as vendored, uncompressed, in the
+HiGHS repository (https://github.com/ERGO-Code/HiGHS,
+`check/instances/greenbea.mps`, commit `73cac48`), stored gzipped. Its
+expected value is its exact optimum, `-7.2555248129845987E+07` (T. Koch, "The
+final NETLIB-LP results", Oper. Res. Lett. 32 (2004) 138-142), the value
+netlib's readme reports CPLEX finding; the readme's problem table lists
+`-7.2462405908E+07`.
 
 Normalization: `blend.mps` as distributed uses fixed-format MPS with a *blank*
 RHS vector name (its RHS lines start directly with row names). Free-format,
