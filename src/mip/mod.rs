@@ -178,20 +178,21 @@ pub(crate) fn candidate_variables_feasible(
 }
 
 /// Cheap feasibility check of a value vector against base + fixes: bounds,
-/// domains, and every user-scale constraint row, under the boundary's contract
-/// ([`crate::solver::row_violation`]). The bounds are those `Problem` stores (a
-/// bound from 2^52 on is infinite, [`crate::solver::entry_bounds`]), so an
-/// incumbent the engine found beyond such a bound survives an edit. This is a
-/// warm-start prefilter; adoption re-validates the candidate through the
-/// active solver.
+/// domains (integral within `int_tol`), and every user-scale constraint row,
+/// under the boundary's contract ([`crate::solver::row_violation`]). The
+/// bounds are those `Problem` stores (a bound from 2^52 on is infinite,
+/// [`crate::solver::entry_bounds`]), so an incumbent the engine found beyond
+/// such a bound survives an edit. This is a warm-start prefilter; adoption
+/// re-validates the candidate through the active solver.
 pub(crate) fn incumbent_feasible(
     base: &Problem,
     fixed: &BTreeMap<usize, f64>,
     values: &[f64],
     tolerances: &Tolerances,
+    int_tol: f64,
 ) -> bool {
-    let (feasibility, integrality) = (tolerances.feasibility, tolerances.integrality_rounding);
-    candidate_variables_feasible(values, &base.var_domains, feasibility, integrality, |v| {
+    let feasibility = tolerances.feasibility;
+    candidate_variables_feasible(values, &base.var_domains, feasibility, int_tol, |v| {
         fixed
             .get(&v)
             .map_or((base.var_mins[v], base.var_maxs[v]), |&value| {
@@ -216,7 +217,15 @@ pub(crate) fn reedit_and_resolve(state: Box<MipState>) -> Result<MipRun, Error> 
     } = *state;
 
     options.warm_start = incumbent
-        .filter(|inc| incumbent_feasible(&base, &fixed, &inc.values, &options.tolerances))
+        .filter(|inc| {
+            incumbent_feasible(
+                &base,
+                &fixed,
+                &inc.values,
+                &options.tolerances,
+                options.int_tol,
+            )
+        })
         .map(|inc| {
             inc.values
                 .iter()

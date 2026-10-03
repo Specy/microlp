@@ -56,8 +56,10 @@ pub struct SolveOptions {
     /// rounded values need not meet the constraints: under `x <= 1e7 * y`, a
     /// `y` of `1e-6` allows `x` up to 10, which `y` rounded to zero forbids.
     /// Keep a big-M coefficient times this tolerance small against the
-    /// quantities it bounds. Default `1e-6`. Must be finite and in the
-    /// half-open range `[0, 0.5)`.
+    /// quantities it bounds. It also decides integrality in
+    /// [`crate::Solution::fix_var`] and in the check of an incumbent kept
+    /// across an edit. Default `1e-6`. Must be finite and in the half-open
+    /// range `[0, 0.5)`.
     pub int_tol: f64,
     /// Optional (partial) starting assignment used to seed the incumbent. The
     /// variables it leaves out are completed by an LP; a hint that is invalid or
@@ -121,14 +123,6 @@ impl SolveOptions {
                 "invalid SolveOptions.tolerances.feasibility: expected a finite value of at least \
                  {MIN_FEASIBILITY_TOLERANCE:e}"
             )));
-        }
-        if !self.tolerances.integrality_rounding.is_finite()
-            || !(0.0..0.5).contains(&self.tolerances.integrality_rounding)
-        {
-            return Err(Error::InvalidOptions(
-                "invalid SolveOptions.tolerances.integrality_rounding: expected a finite value in [0, 0.5)"
-                    .to_string(),
-            ));
         }
         if !self.tolerances.prune_epsilon.is_finite() || self.tolerances.prune_epsilon < 0.0 {
             return Err(Error::InvalidOptions(
@@ -207,14 +201,11 @@ pub struct Tolerances {
     /// the recommended range of the crate documentation keep small. Must be
     /// finite and at least `1e-10`. Default `1e-7`.
     pub feasibility: f64,
-    /// Distance from the nearest integer within which an integer/boolean
-    /// variable's value is still treated as exactly that integer: by the
-    /// post-edit warm-start pre-filter's integrality check, and by
-    /// [`crate::Solution::fix_var`], which fixes such a value at that integer.
-    /// A solution's integer values lie within [`SolveOptions::int_tol`] of an
-    /// integer (a fixed integer variable's on it), so with `int_tol` at most
-    /// this, as by default, `fix_var` accepts every value a solution reports.
-    /// Must be finite and in the half-open range `[0, 0.5)`. Default `1e-5`.
+    /// Ignored: [`SolveOptions::int_tol`] decides integrality everywhere,
+    /// [`crate::Solution::fix_var`] and the check of an incumbent kept across
+    /// an edit included, so that `fix_var` accepts every value a solution
+    /// reports. Default `1e-5`.
+    #[deprecated(note = "ignored: SolveOptions::int_tol decides integrality everywhere")]
     pub integrality_rounding: f64,
     /// Relative slack subtracted from the incumbent objective to form the
     /// branch & bound pruning cutoff: a node whose bound is not strictly
@@ -227,6 +218,7 @@ pub struct Tolerances {
     pub prune_epsilon: f64,
 }
 
+#[allow(deprecated)]
 impl Default for Tolerances {
     fn default() -> Self {
         Self {

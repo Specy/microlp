@@ -792,6 +792,39 @@ pub(crate) mod regression_tests {
         }
     }
 
+    /// `fix_var` decides integrality with `int_tol`, the tolerance a
+    /// solution's integer values meet: with `int_tol` raised to `1e-4`, a
+    /// value `5e-5` off an integer is fixed at that integer, and at the
+    /// default `1e-6` the same value is `Infeasible`.
+    #[test]
+    fn fix_var_decides_integrality_with_int_tol() {
+        for (int_tol, accepted) in [(1e-4, true), (1e-6, false)] {
+            let mut problem = Problem::new(OptimizationDirection::Maximize);
+            let x = problem.add_integer_var(1.0, (0, 10));
+            let y = problem.add_var(1.0, (0.0, 1.0));
+            problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 5.5);
+            let options = crate::SolveOptions {
+                int_tol,
+                ..crate::SolveOptions::default()
+            };
+            let solution = problem
+                .solve_with(options)
+                .unwrap()
+                .into_solution()
+                .unwrap();
+            let fixed = solution.fix_var(x, 2.00005);
+            if accepted {
+                let fixed = fixed.unwrap().into_solution().unwrap();
+                assert_eq!(fixed.var_value(x), 2.0, "int_tol {int_tol}");
+            } else {
+                assert!(
+                    matches!(fixed, Err(crate::Error::Infeasible)),
+                    "int_tol {int_tol}: {fixed:?}"
+                );
+            }
+        }
+    }
+
     /// The switchable DC network of issue #48: per line
     /// `(from, to, susceptance, rating)`, a flow within its rating and a
     /// binary `on` whose big-M rows tie the flow to the bus angles (free but
