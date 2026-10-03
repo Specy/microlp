@@ -7,7 +7,7 @@
 
 use crate::{ComparisonOp, CsVec, Error};
 
-use super::tolerances::{float_eq, slack_bounds, trivial_row_verdict};
+use super::tolerances::{slack_bounds, trivial_row_verdict};
 
 /// A variable bound at or beyond this magnitude on its side of infinity (a
 /// lower bound at or below `-INFINITE_BOUND`, an upper bound at or above it)
@@ -264,11 +264,17 @@ pub(crate) fn entry_bounds(min: f64, max: f64) -> (f64, f64) {
 /// keeps its reduced cost dual-feasible. Returns `(value, dual_feasible)`, where
 /// `dual_feasible` is false when no finite bound can satisfy dual feasibility (a
 /// free variable, or a variable unbounded on the side its objective coefficient
-/// pushes toward). Callers handle a fixed variable (`min == max`) separately.
-pub(crate) fn initial_nonbasic_value(obj_coeff: f64, min: f64, max: f64) -> (f64, bool) {
+/// pushes toward). `dual_tol` is the var's reduced-cost tolerance. Callers
+/// handle a fixed variable (`min == max`) separately.
+pub(crate) fn initial_nonbasic_value(
+    obj_coeff: f64,
+    min: f64,
+    max: f64,
+    dual_tol: f64,
+) -> (f64, bool) {
     if min.is_infinite() && max.is_infinite() {
         // Free variable: dual-feasible only if the objective coefficient is zero.
-        (0.0, float_eq(obj_coeff, 0.0))
+        (0.0, obj_coeff.abs() < dual_tol)
     } else if obj_coeff > 0.0 {
         // Prefer the lower bound; fall back to the upper if the lower is infinite.
         if min.is_finite() {

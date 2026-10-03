@@ -634,3 +634,21 @@ fn warm_start_re_solves_a_root_basis_its_restore_repairs() {
         );
     }
 }
+
+/// An edit keeps an incumbent a row every point satisfies cannot exclude:
+/// `x <= +inf` holds at `x = 5`, so the post-edit prefilter accepts the point
+/// and the edit's search starts from it.
+#[test]
+fn incumbent_feasible_is_not_excluded_by_a_row_with_an_infinite_right_hand_side() {
+    let mut p = Problem::new(OptimizationDirection::Maximize);
+    let x = p.add_integer_var(1.0, (0, 10));
+    p.add_constraint(&[(x, 1.0)], ComparisonOp::Le, 5.0);
+    p.add_constraint(&[(x, 1.0)], ComparisonOp::Le, f64::INFINITY);
+    let fixed = BTreeMap::new();
+    assert!(incumbent_feasible(
+        &p,
+        &fixed,
+        &[5.0],
+        &Tolerances::default()
+    ));
+}

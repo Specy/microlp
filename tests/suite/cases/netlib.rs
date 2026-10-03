@@ -1,15 +1,16 @@
 //! Netlib LP benchmark cases, read through the suite's own MPS adapter
 //! (`mps_milp`, the same reader `miplib.rs` uses) and checked against the
-//! official netlib "BR" values; see data/README.md.
+//! optimal values netlib's readme lists (greenbea's exact one); see
+//! data/README.md.
 //!
 //! Each case's tier is derived from the folder its `.mps` file lives in
 //! (`data/<tier>/netlib/`); moving a file re-tiers the case with no code
 //! change.
 
 use super::{locate, read_instance, Case};
-use crate::model::{Expected, Tol};
+use crate::model::{Builder, Domain, Expected, ModelSpec, Tol};
 use crate::mps_milp;
-use microlp::OptimizationDirection;
+use microlp::{OptimizationDirection, Problem};
 
 /// Instances explicitly expected to return `Err(Infeasible)` despite a
 /// published feasible optimum. Any other result fails the case so the marker
@@ -31,6 +32,7 @@ const NETLIB: &[(&str, f64)] = &[
     ("brandy", 1.5185098965e3),
     ("beaconfd", 3.3592485807e4),
     ("sctap1", 1.4122500000e3),
+    ("greenbea", -7.2555248130e7),
 ];
 
 pub fn register(cases: &mut Vec<Case>) {
@@ -82,6 +84,45 @@ pub fn register(cases: &mut Vec<Case>) {
             ))
         }));
     }
+    let (_, tier) = locate("netlib", "greenbea.mps");
+    cases.push(Case::solve(
+        "netlib/in-units-of-1024/greenbea".to_string(),
+        tier,
+        60,
+        move || {
+            let (spec, problem) = greenbea_in_units_of(1024.0)?;
+            let tol = Tol {
+                abs: 1e-6,
+                rel: 1e-6,
+            };
+            Ok((spec, problem, Expected::objective_tol(-7.2555248130e7, tol)))
+        },
+    ));
+}
+
+/// greenbea written in units of 1024: every column and its cost multiplied
+/// by 1024, its bounds divided by it, which leaves the optimum as it is. The
+/// reduced-cost tolerance in the user's units shrinks with the column
+/// factors to below the round-off of the multipliers, which the
+/// verification's refinement of them must cover.
+fn greenbea_in_units_of(k: f64) -> Result<(ModelSpec, Problem), String> {
+    let parsed = load("greenbea")?;
+    let mut builder = Builder::new(OptimizationDirection::Minimize);
+    for var in &parsed.spec.vars {
+        if var.domain != Domain::Real {
+            return Err("greenbea has no integer variables".to_string());
+        }
+        builder.real(var.obj_coeff * k, var.min / k, var.max / k);
+    }
+    for constraint in &parsed.spec.constraints {
+        let terms: Vec<_> = constraint
+            .terms
+            .iter()
+            .map(|&(var, coeff)| (builder.vars[var], coeff * k))
+            .collect();
+        builder.constraint(&terms, constraint.op, constraint.rhs);
+    }
+    Ok((builder.spec, builder.problem))
 }
 
 fn load(name: &str) -> Result<mps_milp::ParsedMps, String> {

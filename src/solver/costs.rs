@@ -211,9 +211,10 @@ impl Solver {
                     amount
                 };
         }
-        for (var, perturbation) in self.cost_perturbation.iter_mut().enumerate().skip(num_vars) {
-            *perturbation =
-                (0.5 - random_fraction(var, Stream::Perturbation)) * ROW_COST_PERTURBATION;
+        for var in num_vars..num_total_vars {
+            self.cost_perturbation[var] = (0.5 - random_fraction(var, Stream::Perturbation))
+                * ROW_COST_PERTURBATION
+                * self.dual_unit(var).min(1.0);
         }
         self.costs_modified = true;
     }
@@ -320,6 +321,8 @@ impl Solver {
 /// the model gives them. This caps the perturbation base at `0.05`.
 const INFINITE_COST: f64 = 1e20;
 
-/// The scale of the perturbation of a slack's cost: below any dual
-/// tolerance, it only breaks ties between rows.
+/// The scale of the perturbation of a slack's cost, bounding it in the
+/// user's units of its reduced cost and in the engine's (the engine's
+/// perturbation is scaled by the slack's [`super::dual_tol`] unit where below
+/// one): below its dual tolerance in both, it only breaks ties between rows.
 const ROW_COST_PERTURBATION: f64 = 1e-12;

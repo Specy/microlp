@@ -1068,6 +1068,31 @@ fn the_boundary_check_does_not_depend_on_the_order_of_a_rows_terms() {
     assert!(row_violation(&row, ComparisonOp::Ge, 226e3, |_| 1.0, feasibility).is_some());
 }
 
+/// A row every point satisfies, as an infinite right-hand side on the side
+/// the row leaves open makes it, is violated nowhere: the boundary's check
+/// agrees with the verdict the row gets before any point is looked at, so
+/// an edit keeps an incumbent such a row cannot exclude.
+#[test]
+fn a_row_with_an_infinite_right_hand_side_on_its_open_side_holds_everywhere() {
+    let row = to_sparse(&[1.0, 2.0]);
+    let feasibility = crate::Tolerances::default().feasibility;
+    assert_eq!(
+        row_violation(&row, ComparisonOp::Le, f64::INFINITY, |_| 1.0, feasibility),
+        None
+    );
+    assert_eq!(
+        row_violation(
+            &row,
+            ComparisonOp::Ge,
+            f64::NEG_INFINITY,
+            |_| 1.0,
+            feasibility
+        ),
+        None
+    );
+    assert!(row_violation(&row, ComparisonOp::Ge, f64::INFINITY, |_| 1.0, feasibility).is_some());
+}
+
 /// The boundary rounds a product whose factor Dekker's split would overflow
 /// to a NaN, which holds nothing: `x + y + 1e305 f >= 3` holds at
 /// `x = y = 1`, `f = 1e-305`.
@@ -1645,7 +1670,8 @@ fn primal_steepest_edge_weights_are_floored() {
 /// A reduced cost that is not a number never ends a phase as optimal: it
 /// counts as dual infeasible, and its steepest-edge score, a NaN too, would
 /// lose every comparison, leaving no entering column and the vertex taken for
-/// optimal. Planted: a NaN in a verified optimum's reduced costs.
+/// optimal. Planted: a NaN in a verified optimum's reduced costs, which a
+/// primal phase then prices (the verification would recompute them).
 #[test]
 fn nan_reduced_cost_is_an_error_not_an_optimum() {
     init();
@@ -1661,7 +1687,10 @@ fn nan_reduced_cost_is_an_error_not_an_optimum() {
     .unwrap();
     assert_eq!(sol.initial_solve().unwrap(), StopReason::Finished);
     sol.nb_var_obj_coeffs[0] = f64::NAN;
-    assert!(matches!(sol.reoptimize(), Err(Error::InternalError(_))));
+    assert!(matches!(
+        sol.optimize(true, 1.0),
+        Err(Error::InternalError(_))
+    ));
 }
 
 /// The same for a fixed var, dual feasible whatever its reduced cost as long
@@ -1683,7 +1712,10 @@ fn nan_reduced_cost_of_a_fixed_var_is_an_error_not_an_optimum() {
     assert_eq!(sol.initial_solve().unwrap(), StopReason::Finished);
     let col = nb_col(&sol, 2);
     sol.nb_var_obj_coeffs[col] = f64::NAN;
-    assert!(matches!(sol.reoptimize(), Err(Error::InternalError(_))));
+    assert!(matches!(
+        sol.optimize(true, 1.0),
+        Err(Error::InternalError(_))
+    ));
 }
 
 /// The non-basic column of `var`.
@@ -3221,6 +3253,133 @@ fn primal_phase_fails_loudly_when_only_taboo_changes_are_left() {
         matches!(&result, Err(Error::InternalError(msg)) if msg.contains("cycles")),
         "{result:?}"
     );
+}
+
+/// A ray is `Unbounded` only on fresh data. In `min x0` s.t. `x0 >= 1`, `x1`
+/// (in `[0, ∞)`) is in no row, so its column blocks nothing. With cost zero,
+/// its reduced cost planted at `-1e-8`, as drift past its tolerance leaves
+/// it, prices it into a ray, which the rebuild's exact reduced cost of zero
+/// takes back; with cost `-1`, the ray holds on fresh data too.
+#[test]
+fn a_ray_found_on_a_drifted_reduced_cost_is_priced_again_on_fresh_data() {
+    init();
+    let new_solver = |x1_cost: f64| {
+        Solver::try_new(
+            &[1.0, x1_cost],
+            &[0.0, 0.0],
+            &[f64::INFINITY, f64::INFINITY],
+            &[(to_sparse(&[1.0, 0.0]), ComparisonOp::Ge, 1.0)],
+            &[VarDomain::Real, VarDomain::Real],
+            None,
+            crate::Tolerances::default().feasibility,
+        )
+        .unwrap()
+    };
+
+    let mut sol = new_solver(0.0);
+    assert_eq!(sol.initial_solve().unwrap(), StopReason::Finished);
+    let x1 = nb_col(&sol, 1);
+    sol.nb_var_obj_coeffs[x1] = -1e-8;
+    assert!(matches!(
+        primal_pivot_choice(&mut sol, 1.0),
+        PivotChoice::Unbounded
+    ));
+    sol.begin_primal_phase(true);
+    let result = sol.primal_phase(1.0);
+    sol.end_primal_phase().unwrap();
+    assert_eq!(result.unwrap(), (StopReason::Finished, false));
+    assert_eq!(sol.nb_var_obj_coeffs[nb_col(&sol, 1)], 0.0);
+    assert_eq!(sol.get_value(1), 0.0);
+
+    let mut sol = new_solver(-1.0);
+    assert!(matches!(sol.initial_solve(), Err(Error::Unbounded)));
+}
+
+/// A primal phase starts only on verified values, so that its `Unbounded`
+/// rests on a point the model admits. `x0 >= 2` and `x0 <= 1` admit none,
+/// while `x1`, free with cost `-1`, is in no row: a ray. A start taken for
+/// primal feasible, as a dual phase ending on drifted values would leave it,
+/// is checked against the rows first, and the dual simplex proves the model
+/// infeasible.
+#[test]
+fn a_primal_phase_starts_only_on_verified_values() {
+    init();
+    let mut sol = Solver::try_new(
+        &[0.0, -1.0],
+        &[0.0, f64::NEG_INFINITY],
+        &[f64::INFINITY, f64::INFINITY],
+        &[
+            (to_sparse(&[1.0, 0.0]), ComparisonOp::Ge, 2.0),
+            (to_sparse(&[1.0, 0.0]), ComparisonOp::Le, 1.0),
+        ],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert!(!sol.is_primal_feasible && !sol.is_dual_feasible);
+    sol.is_primal_feasible = true;
+    assert!(matches!(sol.run_phases(), Err(Error::Infeasible)));
+}
+
+/// Reduced-cost tolerances hold in the user's units as in the engine's: the
+/// tolerance of a var whose factor between the two is below one shrinks
+/// with it. In `max 0.1 x` s.t. `1e9 x <= 1e9` with `x` free, `x`'s column is
+/// scaled by `2^-30`, which puts its cost at `9.3e-11` and its tolerance at
+/// `1e-10 * 2^-30` (so `x` does not start dual feasible); `1e-6 y <= 1`,
+/// whose `y` the row `y <= 1` gives a column entry of one, is scaled up by a
+/// row factor `r`, which puts its slack's tolerance at `1e-10 / r`.
+#[test]
+fn reduced_cost_tolerances_hold_in_user_units() {
+    init();
+    let sol = Solver::try_new(
+        &[-0.1, 0.0],
+        &[f64::NEG_INFINITY, 0.0],
+        &[f64::INFINITY, 1.0],
+        &[
+            (to_sparse(&[1e9, 0.0]), ComparisonOp::Le, 1e9),
+            (to_sparse(&[0.0, 1e-6]), ComparisonOp::Le, 1.0),
+            (to_sparse(&[0.0, 1.0]), ComparisonOp::Le, 1.0),
+        ],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let s = sol.col_scales[0];
+    assert!(s < 1e-8, "x's column is scaled down: {s:e}");
+    assert_eq!(sol.dual_tols[0], EPS * s);
+    assert!(!sol.is_dual_feasible);
+    let r = sol.row_scales[1];
+    assert!(r > 1.0, "the second row is scaled up: {r:e}");
+    assert_eq!(sol.dual_tols[sol.num_vars + 1], EPS / r);
+}
+
+/// A loaded basis recomputes the primal steepest-edge weights: they belong
+/// to the non-basic positions, which the load renumbers. Reloading the slack
+/// basis gives the weights it had at construction.
+#[test]
+fn load_basis_recomputes_the_primal_edge_weights() {
+    init();
+    let mut sol = Solver::try_new(
+        &[-1.0, -2.0],
+        &[0.0, 0.0],
+        &[f64::INFINITY, f64::INFINITY],
+        &[
+            (to_sparse(&[1.0, 1.0]), ComparisonOp::Le, 4.0),
+            (to_sparse(&[1.0, 3.0]), ComparisonOp::Le, 6.0),
+        ],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert!(sol.enable_primal_steepest_edge);
+    let at_construction = sol.primal_edge_sq_norms.clone();
+    sol.primal_edge_sq_norms.iter_mut().for_each(|w| *w = 7.0);
+    let basis = sol.slack_basis();
+    sol.load_basis(&basis).unwrap();
+    assert_eq!(sol.primal_edge_sq_norms, at_construction);
 }
 
 /// A pivot element whose row and column computations disagree renews the

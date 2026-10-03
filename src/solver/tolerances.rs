@@ -20,9 +20,11 @@
 use super::CDouble;
 use crate::{ComparisonOp, CsVec};
 
-/// The absolute part of the reduced-cost tolerance ([`dual_tol`]) and of
-/// [`float_eq`], in the engine's scaled units, where quantities are of order
-/// one: far above round-off, far below any decision the contract makes.
+/// The absolute part of the reduced-cost tolerance ([`dual_tol`]), in the
+/// engine's scaled units, where quantities are of order one and it is far
+/// above round-off, and in the user's, where the round-off floor of the
+/// tolerance and the refinement of the multipliers cover what a solve gets
+/// wrong.
 pub const EPS: f64 = 1e-10;
 
 /// Relative round-off allowance: about a hundred ulps of `f64`. A quantity
@@ -106,10 +108,11 @@ pub(crate) const PIVOT_GROWTH_TOL: f64 = 1e-9;
 pub(crate) const PIVOT_AGREEMENT_TOL: f64 = 1e-7;
 
 /// Upper bound on the number of primal/dual phase alternations
-/// [`super::Solver::run_phases`] performs before giving up loudly. A phase ends on
-/// values verified against the rows, so a second round is already rare, and
-/// each round after the first cuts the primal ratio test's tolerance
-/// ([`LOOP_HARRIS_REDUCTION`]); hitting this bound means the phases cannot
+/// [`super::Solver::run_phases`] performs before giving up loudly. A round
+/// verifies the values before its primal phase, so a solve whose primal
+/// phase pivots takes two rounds, and a third is rare; each round after the
+/// first cuts the primal ratio test's tolerance ([`LOOP_HARRIS_REDUCTION`]);
+/// hitting this bound means the phases cannot
 /// agree on a verified state, which must not be reported as an optimum.
 pub(crate) const MAX_PHASE_ROUNDS: usize = 8;
 
@@ -212,7 +215,8 @@ pub(crate) fn slack_bounds(op: ComparisonOp) -> (f64, f64) {
 /// How far the user-unit row `coeffs op rhs` is from holding at the point
 /// `value` (a var's value by index), if it violates the contract there
 /// (`row_tolerance(feasibility, m)` at the row's magnitude
-/// `m = |rhs| + Σ|a_j x_j|`); `None` if it holds. This is the check of a row
+/// `m = |rhs| + Σ|a_j x_j|`); `None` if it holds, as a row every point
+/// satisfies does ([`trivial_row_verdict`]). This is the check of a row
 /// as the user wrote it, for rows the engine does not hold itself (see
 /// `Solver::first_violated_row`), and presolve's verdict on a row whose vars
 /// it fixed, so that the two are the same evaluation: in compensated
@@ -224,6 +228,9 @@ pub(crate) fn row_violation(
     value: impl Fn(usize) -> f64,
     feasibility: f64,
 ) -> Option<f64> {
+    if trivial_row_verdict(coeffs, op, rhs, feasibility) == Some(true) {
+        return None;
+    }
     let (implied, magnitude) =
         implied_slack(rhs, coeffs.iter().map(|(v, &coeff)| (coeff, value(v))));
     let (smin, smax) = slack_bounds(op);
@@ -376,10 +383,15 @@ pub(crate) fn band_edge(bound: f64, tol: f64, up: bool) -> f64 {
     edge
 }
 
-/// Tolerance within which a reduced cost counts as zero, given the magnitude
-/// `|c_j| + sum |a_ij y_i|` of the terms it was computed from.
-pub(crate) fn dual_tol(magnitude: f64) -> f64 {
-    EPS.max(ROUNDOFF_FLOOR * magnitude)
+/// Tolerance within which a reduced cost counts as zero: [`EPS`] in the
+/// engine's units and in the user's, the engine's reduced cost being `unit`
+/// times the user's (`s_j` for a structural var, `1 / r` for the slack of a
+/// row of factor `r`), floored at the round-off of the terms
+/// `|c_j| + sum |a_ij y_i|` it was computed from (`magnitude`, engine units).
+/// In the engine's units alone, a cost scaling shrinks below `EPS` would not
+/// count: `max x` s.t. `2e10 x <= 2e10` would end at `x = 0`.
+pub(crate) fn dual_tol(magnitude: f64, unit: f64) -> f64 {
+    (EPS * unit.min(1.0)).max(ROUNDOFF_FLOOR * magnitude)
 }
 
 /// The smallest value a dual steepest-edge weight `||e_r^T B^-1||^2` is
@@ -418,6 +430,8 @@ pub(crate) const LU_STABILITY_THRESHOLD: f64 = 0.1;
 /// solve through them errs by.
 pub(crate) const LU_STABLE_THRESHOLD: f64 = 0.5;
 
+/// Whether two values agree to [`EPS`]: a comparison for the tests.
+#[cfg(test)]
 pub(crate) fn float_eq(a: f64, b: f64) -> bool {
     (a - b).abs() < EPS
 }
