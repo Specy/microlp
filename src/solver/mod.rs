@@ -200,7 +200,6 @@ pub(crate) struct Solver {
     cycle_guard: CycleGuard,
 
     is_primal_feasible: bool,
-    is_dual_feasible: bool,
 
     /// Whether the basic values have changed (pivots, bound shifts, a
     /// recompute, which is not a verification) since [`Self::verify_primal`]
@@ -347,11 +346,10 @@ impl std::fmt::Debug for Solver {
         writeln!(f, "Solver")?;
         writeln!(
             f,
-            "num_vars: {}, num_constraints: {}, is_primal_feasible: {}, is_dual_feasible: {}",
+            "num_vars: {}, num_constraints: {}, is_primal_feasible: {}",
             self.num_vars,
             self.num_constraints(),
             self.is_primal_feasible,
-            self.is_dual_feasible,
         )?;
         writeln!(f, "orig_obj_coeffs:\n{:?}", self.orig_obj_coeffs)?;
         writeln!(f, "orig_var_mins:\n{:?}", self.orig_var_mins)?;
@@ -638,7 +636,6 @@ impl Solver {
             bounds_modified: false,
             cycle_guard: CycleGuard::default(),
             is_primal_feasible,
-            is_dual_feasible,
             values_dirty: false,
             reduced_costs_dirty: false,
             pivots_since_drift_check: 0,
@@ -679,7 +676,7 @@ impl Solver {
             res.num_vars,
             res.orig_constraints.rows(),
             res.is_primal_feasible,
-            res.is_dual_feasible,
+            is_dual_feasible,
             res.orig_constraints.nnz(),
         );
 
@@ -830,10 +827,11 @@ impl Solver {
         }
     }
 
-    /// The first original row that `values` (one entry per structural var,
-    /// user units) violates beyond the contract, with the violation in user
-    /// units. A row's sense is encoded by its slack's bounds (`lhs + s = rhs`
-    /// with `s` in `[smin, smax]`), which branching never touches.
+    /// The first row that `values` (one entry per structural var, user units)
+    /// violates beyond the contract, with the violation in user units, in the
+    /// engine's numbering: its own rows, then the validation rows. A row's
+    /// sense is encoded by its slack's bounds (`lhs + s = rhs` with `s` in
+    /// `[smin, smax]`), which branching never touches.
     ///
     /// The slack the row implies, summed in compensated arithmetic
     /// ([`implied_slack`]), is held by [`outside`] to the slack's bounds within
@@ -1009,8 +1007,6 @@ impl Solver {
                     self.values_dirty = true;
                 }
                 self.nb_var_states[col] = NonBasicVarState::at(new_val, min, max);
-                // A var at a loosened bound may no longer justify its reduced cost.
-                self.downgrade_dual_feasibility(col);
             }
         }
         Ok(())
@@ -1100,7 +1096,6 @@ impl Solver {
             self.artificial_obj = None;
             self.recalc_obj_coeffs_refined();
             if self.calc_dual_infeasibility().0 == 0 {
-                self.is_dual_feasible = true;
                 return Ok(Some(StopReason::Finished));
             }
             debug!("phase round {round}: recomputed reduced costs are dual infeasible; continuing");
@@ -1361,7 +1356,6 @@ impl Solver {
                 self.recalc_basic_var_vals()?;
                 self.recalc_obj_coeffs()?;
                 self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
-                self.is_dual_feasible = self.calc_dual_infeasibility().0 == 0;
                 return Ok(Verdict::Checked { feasible: false });
             }
             self.recalc_basic_var_vals()?;
@@ -1661,7 +1655,6 @@ impl Solver {
         self.recalc_obj_coeffs()?;
 
         self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
-        self.is_dual_feasible = self.calc_dual_infeasibility().0 == 0;
         Ok(())
     }
 
@@ -1729,7 +1722,6 @@ impl Solver {
     /// is near optimal or the phase is a `cleanup` (see [`Self::run_phases`]),
     /// and that return to the true bounds however the phase ends. Returns the
     /// stop reason and whether any pivot was made; ends with
-    /// `is_dual_feasible` provisionally set (the caller verifies it) and
     /// `is_primal_feasible` measured on the true bounds.
     fn optimize(&mut self, cleanup: bool, harris_scale: f64) -> Result<(StopReason, bool), Error> {
         self.begin_primal_phase(cleanup);
@@ -1749,11 +1741,14 @@ impl Solver {
     /// tolerance ([`Self::correct_primal`]). Where the two computations of the
     /// pivot element disagree, the factorization is renewed, at a raised
     /// threshold ([`Self::raise_lu_threshold`]), and the iteration redone.
+    /// Where the reduced costs were updated since their last recompute, the
+    /// entering var's is first recomputed from its column: a var it shows no
+    /// longer improving does not enter, and a value on the other side of
+    /// zero beyond its tolerance has the data rebuilt.
     ///
-    /// A ray is `Unbounded` only on fresh data: a reduced cost updated pivot by
-    /// pivot can drift past its tolerance on a column that blocks nothing, as
-    /// a zero-cost var's can, so a ray found since the last rebuild is priced
-    /// again after one.
+    /// A ray is `Unbounded` only on fresh data: a ray found since the last
+    /// rebuild is priced again after one, so that its reduced cost comes from
+    /// refined multipliers and its column through a fresh factorization.
     ///
     /// The phase fails loudly rather than run forever: when, after a rebuild,
     /// the only vars left to enter are taboo, and when the objective has not
@@ -1886,11 +1881,21 @@ impl Solver {
                     self.rebuild_primal()?;
                     refreshed_since_step = true;
                 }
+                PivotChoice::Drifted { sign_error } => {
+                    // The var's reduced cost is its column's now; price
+                    // again, on fresh data where the drift crossed zero.
+                    if sign_error {
+                        debug!(
+                            "optimize iter {iter}: an entering reduced cost has the other sign \
+                             on its column; rebuilding"
+                        );
+                        self.rebuild_primal()?;
+                        refreshed_since_step = true;
+                    }
+                }
             }
         }
 
-        // Provisional: `run_phases` confirms it on recomputed reduced costs.
-        self.is_dual_feasible = true;
         Ok((StopReason::Finished, pivoted))
     }
 
@@ -2346,7 +2351,6 @@ impl Solver {
         rhs: f64,
     ) -> Result<StopReason, Error> {
         assert!(self.is_primal_feasible);
-        assert!(self.is_dual_feasible);
 
         let coeffs = scale_columns(coeffs, &self.col_scales);
         let Some(PreparedRow {
@@ -2637,19 +2641,12 @@ impl Solver {
     /// The primal simplex's ratio test for the entering column `entering_c`,
     /// on the phase's working bounds (see [`bounds`]): the basic var that
     /// leaves for it, a flip of the entering var to its other bound, or an
-    /// unbounded ray. `harris_scale` scales the tolerance by which the test
-    /// lets a basic var pass its bound (see `run_phases`).
+    /// unbounded ray; none where the reduced cost that priced the var, updated
+    /// since its last recompute, is not confirmed by the column
+    /// ([`Self::check_entering_reduced_cost`]).
+    /// `harris_scale` scales the tolerance by which the test lets a basic var
+    /// pass its bound (see `run_phases`).
     fn choose_pivot(&mut self, entering_c: usize, harris_scale: f64) -> Result<PivotChoice, Error> {
-        let entering_cur_val = self.nb_var_vals[entering_c];
-        // If true, entering variable will increase (because the objective function must decrease).
-        let entering_diff_sign = self.nb_var_obj_coeffs[entering_c] < 0.0;
-        let (entering_min, entering_max) = self.working_bounds(self.nb_vars[entering_c]);
-        let entering_other_val = if entering_diff_sign {
-            entering_max
-        } else {
-            entering_min
-        };
-
         self.calc_col_coeffs(entering_c);
 
         // An entry of the column, or the value of a basic var in a row the
@@ -2666,6 +2663,25 @@ impl Solver {
                 )));
             }
         }
+
+        // Reduced costs updated pivot by pivot drift: the one that priced the
+        // var is checked against its column. Fresh ones, from refined
+        // multipliers, are not: a column computed through the factorization
+        // is no better.
+        if self.reduced_costs_dirty {
+            if let Some(drifted) = self.check_entering_reduced_cost(entering_c)? {
+                return Ok(drifted);
+            }
+        }
+        let entering_cur_val = self.nb_var_vals[entering_c];
+        // If true, entering variable will increase (because the objective function must decrease).
+        let entering_diff_sign = self.nb_var_obj_coeffs[entering_c] < 0.0;
+        let (entering_min, entering_max) = self.working_bounds(self.nb_vars[entering_c]);
+        let entering_other_val = if entering_diff_sign {
+            entering_max
+        } else {
+            entering_min
+        };
 
         // An entry at or below the pivot tolerance (absolute, larger the
         // longer the eta file the column was computed through, see
@@ -2773,6 +2789,35 @@ impl Solver {
                 elem: None,
             }))
         }
+    }
+
+    /// Check the reduced cost that priced the entering var at `col`, updated
+    /// pivot by pivot, against the one its column `col_coeffs` gives,
+    /// `c_q - sum_r c_B(r) alpha_r`, summed in compensated arithmetic. The
+    /// column's value replaces it; where that value no longer improves the
+    /// objective, or has the other sign, the var does not enter
+    /// ([`PivotChoice::Drifted`]).
+    fn check_entering_reduced_cost(&mut self, col: usize) -> Result<Option<PivotChoice>, Error> {
+        let var = self.nb_vars[col];
+        let mut sum = CDouble::from(self.cost_in_force(var));
+        for (r, &alpha) in self.col_coeffs.iter() {
+            sum.add_product(-self.cost_in_force(self.basic_vars[r]), alpha);
+        }
+        let computed = sum.value();
+        if !computed.is_finite() {
+            return Err(Error::InternalError(format!(
+                "reduced cost of var {var} computed from its column is not finite: {computed}"
+            )));
+        }
+        let updated = std::mem::replace(&mut self.nb_var_obj_coeffs[col], computed);
+        let tol = self.dual_tols[var];
+        let same_sign = (updated > 0.0 && computed > 0.0) || (updated < 0.0 && computed < 0.0);
+        if same_sign && !self.nb_var_states[col].is_dual_feasible(computed, tol) {
+            return Ok(None);
+        }
+        Ok(Some(PivotChoice::Drifted {
+            sign_error: !same_sign && computed.abs() >= tol,
+        }))
     }
 
     /// The two passes of the primal ratio test (Harris's rule) over the
@@ -3635,16 +3680,6 @@ impl Solver {
             .collect();
         changes.extend(self.pivot_vertex_changes(col, row, leaving_new_val));
         changes
-    }
-
-    /// Clear `is_dual_feasible` if the non-basic var at `col` no longer
-    /// justifies its reduced cost at the bound it now sits at: after a move
-    /// that no dual step went with (a bound change).
-    fn downgrade_dual_feasibility(&mut self, col: usize) {
-        let var = self.nb_vars[col];
-        self.is_dual_feasible = self.is_dual_feasible
-            && self.nb_var_states[col]
-                .is_dual_feasible(self.nb_var_obj_coeffs[col], self.dual_tols[var]);
     }
 
     /// Whether the basic var of `row` is within its bounds up to its

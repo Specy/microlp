@@ -28,6 +28,11 @@ pub(crate) enum PivotChoice {
     /// No entry bounds the step toward the entering var's infinite bound: an
     /// unbounded ray, if the reduced cost that priced the var is fresh.
     Unbounded,
+    /// The entering var's reduced cost, recomputed from its column, no longer
+    /// improves the objective: the value that priced it had drifted. The
+    /// recomputed value has replaced it; `sign_error` where it lies on the
+    /// other side of zero beyond its tolerance.
+    Drifted { sign_error: bool },
 }
 
 #[derive(Debug)]

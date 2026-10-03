@@ -209,11 +209,10 @@ State you need to know when reading it:
   boundary's checks and the edits never see.
 - `is_primal_feasible` — whether the values meet the bounds: a round runs the dual simplex
   where it is false, then verifies the values and the reduced costs recomputed from the
-  multipliers, and runs the primal simplex where those are dual infeasible.
-  `is_dual_feasible`, kept by the phases and the edits, is asserted by `add_constraint`;
-  the rounds do not decide on it. `initial_solve` = restore primal feasibility (dual
-  simplex, phase 1 on the artificial objective from a start neither primal nor dual
-  feasible) then optimize (primal simplex).
+  multipliers, and runs the primal simplex where those are dual infeasible. No flag tracks
+  dual feasibility: the rounds decide on the recomputed reduced costs. `initial_solve` =
+  restore primal feasibility (dual simplex, phase 1 on the artificial objective from a start
+  neither primal nor dual feasible) then optimize (primal simplex).
 - `cur_obj_val`, `nb_var_obj_coeffs` (reduced costs), `lp_iterations` (cumulative pivot
   counter for stats).
 
@@ -225,9 +224,8 @@ The engine exposes a small contract surface; everything the B&B does goes throug
 place. Basic variable: update the row's bound mirrors, flag primal-infeasible if its value
 fell outside. Non-basic variable: move it to the new bound its state names (a var that was
 fixed goes to the bound at which its reduced cost is dual feasible, and one between its
-bounds stays where it is if they still hold it), propagate the delta into the basic values
-through the variable's column (same mechanism as `fix_var`), and downgrade
-`is_dual_feasible` if the move broke the reduced-cost/bound pairing. Crossing bounds
+bounds stays where it is if they still hold it), and propagate the delta into the basic
+values through the variable's column (same mechanism as `fix_var`). Crossing bounds
 (`min > max`) or either bound being NaN returns `Err(Infeasible)` with state untouched.
 Infinite bounds remain valid. It does **not** run simplex — callers decide when to
 reoptimize.
@@ -878,9 +876,11 @@ with an integer var off its integer, within `int_tol`, under a coefficient that 
 offset count: fixing, tightening or rewriting that var takes it away (§7.9).
 
 The rows presolve dropped or rewrote stay checked, as written, against every solution
-(validation rows, §7.5), so a wrong reduction costs pivots or fails loudly, and never
-returns a point the model rejects. Presolve's own `Infeasible` carries no certificate: the
-solve then goes on with the model as written (`presolve::reduced_model`), where the engine
+(validation rows, §7.5), so a reduction that lets through a point the model rejects costs
+pivots or fails loudly, and never returns that point. A reduction that cuts points the model
+admits does not show there, only as a worse optimum or an `Infeasible`: that is why presolve
+applies only exact reductions. Presolve's own `Infeasible` carries no certificate: the solve
+then goes on with the model as written (`presolve::reduced_model`), where the engine
 decides. An `Infeasible` the engine proves on the reduced model is final, but for a model
 whose every point needs the integrality tolerance. `Mode::Lp` applies only reductions that
 keep the feasible set, so the live solver stays sound under every later edit; `Mode::Mip`'s
@@ -980,18 +980,24 @@ through: `dual_pivot_tolerance` `1e-9`, `3e-8`, `1e-6` and `primal_pivot_toleran
   units, so its `1e17` says nothing of a genuine `1` beside it) is small, so the row is
   refined and the test run again, after which a small pivot is left out. A row with no
   candidate left is the proof's (§7.3).
-- *Primal*: an entry at or below the tolerance neither bounds the step nor pivots, its basic
+- *Primal*: where the reduced costs were updated pivot by pivot since their last
+  recompute, the entering var's is first recomputed from its column, `c_q - c_Bᵀ B⁻¹ a_q`
+  in compensated arithmetic, and replaced by it: a var it shows no longer improving does
+  not enter, and one whose value crossed zero beyond its tolerance has the data rebuilt
+  (`an_entering_reduced_cost_is_checked_against_its_column`). Fresh reduced costs, from
+  refined multipliers, are not checked: a column computed through the factorization is no
+  better. An entry at or below the tolerance neither bounds the step nor pivots, its basic
   var's bound shifted where the step leaves it outside (§7.8). A step nothing above the
   tolerance bounds, toward an infinite bound, refines its column twice, and every entry
   beyond the error measured for it bounds the step (every nonzero one where the refinement
   did not converge): `Unbounded` comes only from a column whose blocking entries are zero
   within their error, as `Infeasible` only from a certificate (`x + y <= 1` and
   `x + (1 + 2^-48) y >= 1` block `x` through `2^-48`). It comes only on fresh data, too: a
-  reduced cost updated pivot by pivot can drift past its tolerance on a column that blocks
-  nothing, as a zero-cost var's can, so a ray found since the last rebuild is priced again
-  after one (`a_ray_found_on_a_drifted_reduced_cost_is_priced_again_on_fresh_data`). The
-  working bounds may be perturbed or shifted then: a ray depends only on which bounds are
-  infinite, which they keep, and the phase started on values the verification accepted.
+  ray found since the last rebuild is priced again after one, so that its reduced cost
+  comes from refined multipliers and its column through a fresh factorization, not an eta
+  file (`an_unbounded_verdict_is_taken_on_a_fresh_factorization`). The working bounds may
+  be perturbed or shifted then: a ray depends only on which bounds are infinite, which they
+  keep, and the phase started on values the verification accepted.
 - *Genuine or round-off* is decided on refined values against the error the refinement
   measured, never on a size or on the plain computation, which can be off by any factor for
   a genuine entry two nearly parallel rows leave (`1.2e-15` computed as `7.1e-15`): an entry
