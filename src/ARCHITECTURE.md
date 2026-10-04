@@ -192,7 +192,7 @@ terms, the violated row's basic var its tolerance and every other term the room 
 bound can be widened. A row that no var can repair and whose certificate proves nothing is
 made taboo; when only such rows are left, its last resorts are a pivot on a genuine entry
 below the pivot tolerance, then widening the bounds of the vars that can help by that room
-for the rest of the solve, before a loud error (§7.3).
+for the rest of the solve, then one solve from the slack basis, before a loud error (§7.3).
 
 State you need to know when reading it:
 
@@ -394,8 +394,9 @@ cost of the visit: **is the solver already sitting at this node's parent's optim
   well-conditioned bases) and, times its var's value, made room at every point of the node.
 - `Err(Unbounded)` → impossible for a bounded node → surfaced as `InternalError`.
 - Any other error, such as a row the dual simplex can neither repair nor prove infeasible
-  → **retry once from the slack basis** (all slacks basic), re-solving the node from
-  scratch; a second failure propagates. The retry is per-node-visit — it cannot mask a
+  even after the engine's own start from the slack basis, → **retry once from the slack
+  basis** (all slacks basic), re-solving the node from scratch; a second failure
+  propagates. The retry is per-node-visit — it cannot mask a
   systematic failure.
 - `Ok(Limit)` → the deadline fired mid-solve → the node is pushed back **unsolved** and the
   search returns `Interrupted`. Nothing uses the coherent but non-optimal state as a solved
@@ -404,14 +405,15 @@ cost of the visit: **is the solver already sitting at this node's parent's optim
 Inside the engine, `run_phases` alternates the dual phase (`restore_feasibility`) and the
 primal phase (`optimize`) until a state passes verification (§7.5): a phase's own exit test
 runs on incrementally updated numbers, so a phase may end on drifted values, and only a
-verified state is reported as `Finished`. A vertex no factorization represents starts the
-solve over from the slack basis once, inside the engine, before the node's own retry. "No
+verified state is reported as `Finished`. A vertex no factorization represents, or a row
+the dual phase can neither repair nor prove infeasible, starts the solve over from the slack
+basis once, inside the engine, before the node's own retry. "No
 eligible entering column for a violated row" is not a proof of infeasibility: the dual phase
 first rebuilds (fresh factorization, values, reduced costs) and re-examines the row, where a
 phantom violation dissolves, and declares infeasibility only if the row's certificate proves
 it (§7.3). The rebuild is armed once per stall and any successful pivot re-arms it, so it
-cannot loop; a row the proof leaves open is made taboo, and its last resorts end in a loud
-error rather than a verdict.
+cannot loop; a row the proof leaves open is made taboo, and its last resorts end in the
+engine's start from the slack basis, then a loud error rather than a verdict.
 
 ### 5.4 Incumbents and the feasibility guard
 
@@ -712,13 +714,14 @@ What an answer means:
 - **`Optimal`**: for an LP, the reported point meets the contract, and the reduced costs of
   its basis, recomputed from the multipliers refined once (§7.5), are dual feasible within
   `dual_tol`, `1e-10` in the user's units as in the engine's (§7.2), the units of a slack
-  being those of its row's activity as written: a row written with large coefficients
-  scales its slack's reduced cost down with them, and can hide an improving edge or ray
-  (§7.9). It is optimal at its vertex, not over every point of the contract: the contract
-  being absolute, a small coefficient beside a large one lets a point within it move the
-  objective far, so on an ill-conditioned model the reported objective can lie far from the
-  exact optimum of the model as written. For a MILP, the incumbent meets the contract, and
-  every other node was pruned by its bound or proven infeasible.
+  being those of its row's activity divided by the row's largest coefficient as written, so
+  that no factor a row is written at hides an improving edge or ray
+  (`an_improving_ray_through_a_row_written_large_is_found`). It is optimal at its vertex,
+  not over every point of the contract: the contract being absolute, a small coefficient
+  beside a large one lets a point within it move the objective far, so on an
+  ill-conditioned model the reported objective can lie far from the exact optimum of the
+  model as written. For a MILP, the incumbent meets the contract, and every other node was
+  pruned by its bound or proven infeasible.
 - **`Infeasible`**: a proof, summed from the model's data, that no point has every row and
   every continuous var within the room the engine can give it, the integer and fixed vars
   within their bounds (§7.3); never a row the simplex could not repair. For a MILP, every
@@ -771,7 +774,7 @@ contract is not in the box.
 |---|---|---|
 | Is a basic slack (row) within its bounds? | `slack_tol` (above) | `ROUNDOFF_FLOOR = 1e-14` |
 | Is a structural var within its bounds? | `structural_tol` (above) | |
-| Is a reduced cost zero? | `dual_tol`: `EPS` in the engine's units and in the user's, so that a cost a column factor shrinks still counts (`a_cost_tiny_beside_its_columns_coefficients_decides_the_optimum`), floored at the round-off of `\|c_j\| + Σ\|a_ij y_i\|`, refreshed with the multipliers | `EPS = 1e-10` |
+| Is a reduced cost zero? | `dual_tol`: `EPS` in the engine's units and in the user's (a slack's per unit of its row's activity divided by the row's largest coefficient), so that a cost a column factor shrinks still counts (`a_cost_tiny_beside_its_columns_coefficients_decides_the_optimum`), floored at the round-off of `\|c_j\| + Σ\|a_ij y_i\|`, refreshed with the multipliers | `EPS = 1e-10` |
 | Is a tableau entry a pivot? Do its two computations agree? | §7.7 | `dual_pivot_tolerance`, `primal_pivot_tolerance`, `PIVOT_GROWTH_TOL = 1e-9`, `PIVOT_AGREEMENT_TOL = 1e-7` |
 | Does a certificate prove infeasibility? | its gap beyond the room of its terms (§7.3) | `REFINEMENT_CONVERGED = 2^-53` |
 | Is an LU pivot column singular? | its eligible part below `LU_SINGULAR_REL` of its largest transformed entry (§7.7) | `= ROUNDOFF_FLOOR` |
@@ -837,8 +840,9 @@ from drift dissolves):
      (`refit_widened_slacks`), and every solve restores the model's bounds
      (`restore_model_bounds`).
 
-  Then the phase fails loudly: no var can repair the row, and it proves nothing. The search
-  prunes a node only on a proof (§5.3).
+  Then the phase fails: no var can repair the row, and it proves nothing. The solve starts
+  over once from the slack basis (`run_phases`), whose path can avoid that row, and fails
+  loudly where that ends at such a row too. The search prunes a node only on a proof (§5.3).
 
 ### 7.4 Presolve's guarantee
 
@@ -936,7 +940,9 @@ covers but the solve carries into rows it can miss many times over
 verification: through an ill-conditioned basis it can leave a residual above a row's
 tolerance, so the values wait for the next phase exit. The periodic refactorization checks
 the rows once per basis turnover and recomputes values found drifted, which restarts the
-cycling detection (§7.8).
+cycling detection (§7.8). Values the rows accept are not recomputed: a recompute can move a
+var on its bound past it by a round-off amount the rows allow but its own tolerance does not,
+and the phases would alternate over it (`a_refactorization_keeps_the_values_the_rows_accept`).
 
 The phases alternate for at most `MAX_PHASE_ROUNDS = 8` rounds before a loud error. Each
 round after the first cuts the primal Harris allowance a hundredfold
@@ -1101,9 +1107,10 @@ wrong answer.
 - **Nearly dependent rows** (in range). An answer reached only through a basis the
   factorization finds singular, through a pivot on a genuine entry the refinement cannot
   settle, or through a proof whose refinement does not converge, can end in an
-  `InternalError` ("no var can repair row", or a singular basis). The models found so are
-  infeasible: `a_proof_of_infeasibility_through_a_singular_basis_is_a_known_limitation` (two
-  rows whose columns differ by `2^-48`) and
+  `InternalError` ("no var can repair row", from the slack basis too, or a singular basis).
+  The models found so are infeasible:
+  `a_proof_of_infeasibility_through_a_singular_basis_is_a_known_limitation` (two rows whose
+  columns differ by `2^-48`) and
   `an_infeasible_lp_of_nearly_dependent_rows_is_a_known_limitation` (a third row nearly a
   combination of the other two).
 - **An ill-conditioned vertex keeps its computed values** (in range). Where the refined
@@ -1116,12 +1123,6 @@ wrong answer.
   infeasible nor reached: the solve fails loudly, and in a MILP the node is not pruned
   (`a_node_point_within_the_round_off_of_its_rows_room_is_a_known_limitation`, row dynamism
   `1e10`).
-- **An improving ray or edge through a row written with large coefficients** (in range). A
-  slack's reduced cost is held to `1e-10` per unit of its row's activity as written, which a
-  row's large coefficients make a tiny unit: `max x` s.t. `2e10 x >= 2e10` improves by
-  `5e-11` per unit of the row's surplus, and is answered `Optimal` at `x = 1` though
-  unbounded (`an_improving_ray_through_a_row_written_large_is_a_known_limitation`), and a
-  model whose rows are written `1e12` times larger can end at a worse vertex.
 - **A MILP point that needs `int_tol`** (in range too): presolve and the search keep the
   integral points of the box (§7.4), so a point within the box only with an integer var off
   its integer, under a coefficient that makes the offset count, is found only where an LP
@@ -1145,7 +1146,7 @@ wrong answer.
 | An objective coefficient is NaN or infinite | `InvalidOperation` from `solve_with`, before presolve and the engine (the value as the user gave it, with the var's index) |
 | Root LP unbounded on a MILP | run a resumable zero-objective integer-feasibility search; any integer point proves `Unbounded`, exhaustion proves `Infeasible` |
 | Node LP infeasible | prune (correct: the engine returns `Infeasible` only on a proof, §7.3) |
-| A violated row no var can repair and whose certificate proves nothing, after the rebuild, the taboo and the last resorts | `InternalError`, never `Infeasible`; on a node LP, the one slack-basis retry, then the error |
+| A violated row no var can repair and whose certificate proves nothing, after the rebuild, the taboo and the last resorts | one solve from the slack basis, then `InternalError`, never `Infeasible`; on a node LP, the search's own slack-basis retry too |
 | Node LP unbounded | impossible when the node is bounded → `InternalError` |
 | A basis the factorization finds singular (after a pivot on an entry tiny beside its column, or loaded) | repaired: the slack of a row no pivot took replaces each dependent column, and the solve goes on; within a phase the change back is taboo, unless the step whose refactorization found the basis singular moved its row (§3, §7.8) |
 | Basis bookkeeping found inconsistent when a singular basis is repaired (a var basic twice, or a slack's non-basic position held by another var) | panic: a bug, never repaired |

@@ -3403,22 +3403,26 @@ fn a_primal_phase_starts_only_on_verified_values() {
 /// with it. In `max 0.1 x` s.t. `1e9 x <= 1e9` with `x` free, `x`'s column is
 /// scaled by `2^-30`, which puts its cost at `9.3e-11` and its tolerance at
 /// `1e-10 * 2^-30`, so `x` does not start dual feasible and the primal
-/// phase's edge weights are kept; `1e-6 y <= 1`, whose `y` the row `y <= 1`
-/// gives a column entry of one, is scaled up by a row factor `r`, which puts
-/// its slack's tolerance at `1e-10 / r`.
+/// phase's edge weights are kept. A slack's reduced cost is in units of its
+/// row's activity divided by the row's largest coefficient as written on a
+/// var its bounds do not fix: the slack of `1e9 x + 1e12 z <= 1e9 + 1e12`,
+/// with `z` fixed at one and a row factor `r`, has the tolerance
+/// `1e-10 / (1e9 r)`; `1e-6 y <= 1`, whose `y` the row `y <= 1` gives a
+/// column entry of one, is scaled up by its factor, but `1e-6 r` is below
+/// one, so the engine's `1e-10` holds its slack.
 #[test]
 fn reduced_cost_tolerances_hold_in_user_units() {
     init();
     let sol = Solver::try_new(
-        &[-0.1, 0.0],
-        &[f64::NEG_INFINITY, 0.0],
-        &[f64::INFINITY, 1.0],
+        &[-0.1, 0.0, 0.0],
+        &[f64::NEG_INFINITY, 0.0, 1.0],
+        &[f64::INFINITY, 1.0, 1.0],
         &[
-            (to_sparse(&[1e9, 0.0]), ComparisonOp::Le, 1e9),
-            (to_sparse(&[0.0, 1e-6]), ComparisonOp::Le, 1.0),
-            (to_sparse(&[0.0, 1.0]), ComparisonOp::Le, 1.0),
+            (to_sparse(&[1e9, 0.0, 1e12]), ComparisonOp::Le, 1e9 + 1e12),
+            (to_sparse(&[0.0, 1e-6, 0.0]), ComparisonOp::Le, 1.0),
+            (to_sparse(&[0.0, 1.0, 0.0]), ComparisonOp::Le, 1.0),
         ],
-        &[VarDomain::Real, VarDomain::Real],
+        &[VarDomain::Real, VarDomain::Real, VarDomain::Real],
         None,
         crate::Tolerances::default().feasibility,
     )
@@ -3427,9 +3431,14 @@ fn reduced_cost_tolerances_hold_in_user_units() {
     assert!(s < 1e-8, "x's column is scaled down: {s:e}");
     assert_eq!(sol.dual_tols[0], EPS * s);
     assert!(sol.enable_primal_steepest_edge);
+    let r = sol.row_scales[0];
+    assert_eq!(sol.dual_tols[sol.num_vars], EPS * (1.0 / (r * 1e9)));
     let r = sol.row_scales[1];
-    assert!(r > 1.0, "the second row is scaled up: {r:e}");
-    assert_eq!(sol.dual_tols[sol.num_vars + 1], EPS / r);
+    assert!(
+        r > 1.0 && 1e-6 * r < 1.0,
+        "the second row is scaled up: {r:e}"
+    );
+    assert_eq!(sol.dual_tols[sol.num_vars + 1], EPS);
 }
 
 /// A loaded basis recomputes the primal steepest-edge weights: they belong

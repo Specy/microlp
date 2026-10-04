@@ -553,6 +553,38 @@ fn a_network_completion_with_a_line_off_is_proven_infeasible() {
     }
 }
 
+/// The completion of [`network_with_line_8_off_infeasible`] with line 2's
+/// two big-M rows written `2^-8` times smaller, the same problem: re-solved
+/// from the warm start, the dual phase ends at a row no var can repair and
+/// that proves nothing, and the solve starts over from the slack basis,
+/// which proves the node infeasible, with presolve on and off.
+#[test]
+fn a_network_completion_ending_at_an_unrepaired_row_starts_over_from_the_slack_basis() {
+    let (mut problem, on_8) = network_with_line_8_off_infeasible();
+    for row in [12, 13] {
+        let (coeffs, _, rhs) = &mut problem.constraints[row];
+        coeffs.map_inplace(|c| c / 256.0);
+        *rhs /= 256.0;
+    }
+    for presolve in [true, false] {
+        let hinted = SolveOptions {
+            presolve,
+            warm_start: Some(vec![(on_8, 0.0)]),
+            ..SolveOptions::default()
+        };
+        let mut state = build_state(&problem, hinted.clone()).unwrap();
+        assert_eq!(state.solver.initial_solve().unwrap(), StopReason::Finished);
+        state.solver.set_var_bounds(on_8.idx(), 0.0, 0.0).unwrap();
+        assert_eq!(
+            state.solver.reoptimize(),
+            Err(Error::Infeasible),
+            "presolve {presolve}"
+        );
+        let solution = problem.solve_with(hinted).unwrap().into_solution().unwrap();
+        assert!((solution.objective() - 29.4617904).abs() < 1e-6);
+    }
+}
+
 /// `min x - y - 100 z` s.t. `x + (1 + 2^-48) y <= -2 + 20 z` and
 /// `x + y >= -1 - 20 z`, `x >= 0`, `y` in `[-10, 10]`, `z` binary: the
 /// optimum is `-110` at `(0, 10, 1)`, the root LP's, and with `z = 0` the LP
