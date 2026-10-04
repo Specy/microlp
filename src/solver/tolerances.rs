@@ -385,8 +385,9 @@ pub(crate) fn band_edge(bound: f64, tol: f64, up: bool) -> f64 {
 
 /// Tolerance within which a reduced cost counts as zero: [`EPS`] in the
 /// engine's units and in the user's, the engine's reduced cost being `unit`
-/// times the user's (`s_j` for a structural var, `1 / r` for the slack of a
-/// row of factor `r`), floored at the round-off of the terms
+/// times the user's (`s_j` for a structural var; for a slack, per unit of its
+/// row's activity divided by the row's largest coefficient as written,
+/// [`super::slack_dual_unit`]), floored at the round-off of the terms
 /// `|c_j| + sum |a_ij y_i|` it was computed from (`magnitude`, engine units).
 /// In the engine's units alone, a cost scaling shrinks below `EPS` would not
 /// count: `max x` s.t. `2e10 x <= 2e10` would end at `x = 0`.

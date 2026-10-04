@@ -56,6 +56,24 @@ mod regression_tests {
         assert_solves_within_contract(&model);
     }
 
+    /// `model` with `count` more rows `z + z' <= 1.5` over vars of their own,
+    /// in `[0, 1]` at zero cost, which the optimum does not involve: the
+    /// factors of the larger basis take the eta file longer to outgrow, and a
+    /// turnover of the basis takes more pivots, so the refactorizations and
+    /// their drift checks fall elsewhere on the path.
+    fn with_idle_rows(mut model: Model, count: usize) -> Model {
+        for _ in 0..count {
+            let z = model.vars.len();
+            model.vars.push(real(0.0, 0.0, 1.0));
+            model.vars.push(real(0.0, 0.0, 1.0));
+            model
+                .rows
+                .push(row(&[(z, 1.0), (z + 1, 1.0)], ComparisonOp::Le, 1.5));
+            model.xstar.extend([0.0, 0.0]);
+        }
+        model
+    }
+
     /// One equality row whose coefficients span eleven orders of magnitude,
     /// with variable magnitudes up to 1e6, must hold within its tolerance of
     /// 1.3e-7 whatever the pivot path: an eta file storing the pivot row's
@@ -1878,10 +1896,14 @@ mod regression_tests {
     /// that vertex. The drift check after the next pivot recomputes the
     /// values; the way back to the vertex followed a revisit, which made the
     /// change back taboo for good ("dual simplex cycles"), presolve on and
-    /// off. Within the recommended range (row dynamism `6.7e5`).
+    /// off. The model is solved again with eight rows the optimum does not
+    /// involve, which put the refactorizations and the drift checks elsewhere
+    /// on the path: there, values recomputed at every refactorization without
+    /// a restart of the cycling detection made the return a cycle. Within the
+    /// recommended range (row dynamism `6.7e5`).
     #[test]
     fn a_vertex_left_on_drifted_values_can_be_returned_to() {
-        let model = Model {
+        let model = || Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![
                 int(-1.0, 0, 1),
@@ -1905,11 +1927,54 @@ mod regression_tests {
             ],
             xstar: vec![0.0, -651624630.0, 0.0, 0.0, -422117194.0000001],
         };
+        for idle_rows in [0, 8] {
+            let model = with_idle_rows(model(), idle_rows);
+            assert!(
+                xstar_is_feasible(&model),
+                "fixture error: x* must satisfy the model"
+            );
+            assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+        }
+    }
+
+    /// A refactorization does not recompute basic values the rows accept: a
+    /// recompute can move a var on its bound past it by a round-off amount
+    /// the rows allow but its own tolerance does not.
+    /// `-1.9979395087316894 x0 - 0.1 x2 = 268435456.33020216`, with `x0` fixed
+    /// at `-134356148` by the first row, holds at `x2 = 0` within its
+    /// tolerance, but a solve from the rows puts `x2` at `-1.6e-7`, past its
+    /// tolerance `1e-7` at its lower bound: the round-off of terms at `2.7e8`,
+    /// through the coefficient `0.1`. The primal step that makes `x2` basic
+    /// leaves it exactly on that bound, and the basis of two rows is
+    /// refactorized right after it. Recomputed there, `x2` went past its
+    /// bound, the dual simplex took it back out, and the phases alternated
+    /// over the vertex until the rounds ran out ("8 phase rounds"), presolve
+    /// on and off. Within the recommended range (row dynamism `20`).
+    #[test]
+    fn a_refactorization_keeps_the_values_the_rows_accept() {
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(0.0, -134356148.0, -134356147.0),
+                real(1.0, 0.0, 0.0),
+                real(-1.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(0, 1.0)], ComparisonOp::Eq, -134356148.0),
+                row(
+                    &[(0, -1.9979395087316894), (2, -0.1)],
+                    ComparisonOp::Eq,
+                    268435456.33020216,
+                ),
+            ],
+            xstar: vec![-134356148.0, 0.0, 0.0],
+        };
         assert!(
-            xstar_is_feasible(&model),
-            "fixture error: x* must satisfy the model"
+            within_recommended_range(&model),
+            "fixture error: the model must lie within the recommended range"
         );
-        assert_solves_within_contract_in_time(&model, Duration::from_secs(60));
+        assert_solves_within_contract_without_presolve(&model);
+        check(model);
     }
 
     /// The node `x0 = 2` holds only with two terms past their bounds at once,
@@ -1990,28 +2055,40 @@ mod regression_tests {
         }
     }
 
-    /// KNOWN LIMITATION: a slack's reduced cost is held to `1e-10` per unit of
-    /// its row's activity as written, which a row's large coefficients make a
-    /// tiny unit. `max x` s.t. `2e10 x >= 2e10`, `x >= 0`, is unbounded, its
+    /// A slack's reduced cost is held per unit of its row's activity divided by
+    /// the row's largest coefficient as written, whatever factor the row is
+    /// written at. `max x` s.t. `2e10 x >= 2e10`, `x >= 0`, is unbounded, its
     /// ray through the row's surplus improving the objective by `5e-11` per
-    /// unit of the surplus, and is answered `Optimal` at `x = 1`, with
-    /// presolve on and off (ARCHITECTURE §7.9).
+    /// unit of the surplus as written, one per unit of `x`; with `x <= 3` the
+    /// edge through the surplus ends at `x = 3`. Presolve on and off.
     #[test]
-    #[should_panic(expected = "is answered")]
-    fn an_improving_ray_through_a_row_written_large_is_a_known_limitation() {
-        for presolve in [true, false] {
-            let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
-            let x = problem.add_var(1.0, (0.0, f64::INFINITY));
-            problem.add_constraint([(x, 2e10)], ComparisonOp::Ge, 2e10);
-            let options = SolveOptions {
-                presolve,
-                ..SolveOptions::default()
-            };
-            let result = problem.solve_with(options);
-            assert!(
-                matches!(result, Err(Error::Unbounded)),
-                "presolve {presolve}: the unbounded LP is answered {result:?}"
-            );
+    fn an_improving_ray_through_a_row_written_large_is_found() {
+        for (max, expected) in [(f64::INFINITY, None), (3.0, Some(3.0))] {
+            for presolve in [true, false] {
+                let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+                let x = problem.add_var(1.0, (0.0, max));
+                problem.add_constraint([(x, 2e10)], ComparisonOp::Ge, 2e10);
+                let options = SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                };
+                let result = problem.solve_with(options);
+                let label = format!("x <= {max}, presolve {presolve}");
+                match expected {
+                    None => assert!(
+                        matches!(result, Err(Error::Unbounded)),
+                        "{label}: the unbounded LP is answered {result:?}"
+                    ),
+                    Some(value) => {
+                        let solution = result.unwrap().into_solution().unwrap();
+                        assert!(
+                            (solution[x] - value).abs() <= 1e-9,
+                            "{label}: x = {}",
+                            solution[x]
+                        );
+                    }
+                }
+            }
         }
     }
 

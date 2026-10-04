@@ -60,6 +60,31 @@ fn equilibration_scale(coeffs: &CsVec, rhs: f64, is_fixed: impl Fn(usize) -> boo
     }
 }
 
+/// The factor between the reduced cost of a row's slack in the engine's units
+/// and in the user's (see [`super::dual_tol`]): `1 / (r m)`, for the row
+/// factor `r` and `m` the row's largest coefficient as written on a var its
+/// bounds do not fix (the vars [`equilibration_scale`] reads), so
+/// that the slack's reduced cost is held per unit of the row's activity
+/// divided by `m`, whatever factor the row was written at; one for a row with
+/// no such coefficient.
+pub(crate) fn slack_dual_unit(
+    coeffs: &CsVec,
+    row_scale: f64,
+    is_fixed: impl Fn(usize) -> bool,
+) -> f64 {
+    let max_coeff = coeffs
+        .iter()
+        .filter(|&(var, _)| !is_fixed(var))
+        .map(|(_, coeff)| coeff.abs())
+        .fold(0.0, f64::max);
+    let span = row_scale * max_coeff;
+    if span > 0.0 && span.is_finite() {
+        1.0 / span
+    } else {
+        1.0
+    }
+}
+
 /// Number of alternating geometric-mean column/row passes used to derive the
 /// column scales; four are enough for the scales to settle on the coefficient
 /// ranges this solver sees.

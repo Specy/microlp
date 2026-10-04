@@ -130,6 +130,9 @@ pub(crate) struct Solver {
     /// these internally; validation multiplies its absolute user tolerance by
     /// the same factor so the public feasibility contract stays unscaled.
     row_scales: Vec<f64>,
+    /// Per row, the factor between its slack's reduced cost in the engine's
+    /// units and in the user's ([`slack_dual_unit`]).
+    slack_dual_units: Vec<f64>,
     /// Positive power-of-two column factors `s_j` of the structural vars (see
     /// [`column_scales`]). The engine stores a structural var in the scaled
     /// units `x'_j = x_j / s_j`; every value or bound that crosses the
@@ -241,6 +244,10 @@ pub(crate) struct Solver {
     /// upper): a var crosses a bound by absorbing once per solve (see
     /// `choose_entering_col_dual`).
     absorbed: Vec<(usize, bool)>,
+    /// The row at which the last dual phase failed loudly, neither repaired by
+    /// any var nor proving the model infeasible: [`Self::run_phases`] starts
+    /// over once from the slack basis.
+    unrepaired_row: Option<usize>,
     /// The bounds the certificate repair widened by their var's tolerance in
     /// this solve, with the model's values ([`Self::widen`]): `orig_var_mins`
     /// and `orig_var_maxs` hold the bounds in force. The boundary's checks
@@ -414,9 +421,11 @@ impl Solver {
         // Rows in scaled units.
         let is_fixed = |var: usize| var_mins[var] == var_maxs[var];
         let mut prepared_rows = Vec::with_capacity(constraints.len());
+        let mut slack_dual_units = Vec::with_capacity(constraints.len());
         for (coeffs, cmp_op, rhs) in constraints {
-            let coeffs = scale_columns(coeffs.clone(), &col_scales);
-            if let Some(row) = prepare_row(coeffs, *cmp_op, *rhs, feasibility, is_fixed)? {
+            let scaled = scale_columns(coeffs.clone(), &col_scales);
+            if let Some(row) = prepare_row(scaled, *cmp_op, *rhs, feasibility, is_fixed)? {
+                slack_dual_units.push(slack_dual_unit(coeffs, row.row_scale, is_fixed));
                 prepared_rows.push(row);
             }
         }
@@ -613,6 +622,7 @@ impl Solver {
             orig_constraints_csc,
             orig_rhs,
             row_scales,
+            slack_dual_units,
             col_scales,
             lu_threshold: LU_STABILITY_THRESHOLD,
             feasibility,
@@ -659,6 +669,7 @@ impl Solver {
             primal_edge_sq_norms,
             fixed_var_bounds: vec![None; num_vars],
             absorbed: Vec::new(),
+            unrepaired_row: None,
             widened: Vec::new(),
             cur_obj_val,
             col_coeffs: SparseVec::new(),
@@ -711,14 +722,14 @@ impl Solver {
     }
 
     /// The factor between `var`'s reduced cost in the engine's units and in
-    /// the user's (see [`dual_tol`]): `s_j` for a structural var, `1 / r` for
-    /// the slack of a row of factor `r`.
+    /// the user's (see [`dual_tol`]): `s_j` for a structural var, and for a
+    /// slack its row's [`slack_dual_unit`].
     #[inline]
     fn dual_unit(&self, var: usize) -> f64 {
         if var < self.num_vars {
             self.col_scales[var]
         } else {
-            1.0 / self.row_scales[var - self.num_vars]
+            self.slack_dual_units[var - self.num_vars]
         }
     }
 
@@ -1045,28 +1056,41 @@ impl Solver {
     /// tolerance the verification's recomputation finds exceeded.
     ///
     /// When no factorization represents the vertex
-    /// ([`Verdict::Unrepresentable`]), the solve starts over once from the
-    /// slack basis, the last rung of the verification's ladder; a second time
-    /// is an `InternalError`.
+    /// ([`Verdict::Unrepresentable`]), or the dual phase meets a violated row
+    /// that no var can repair and that does not prove the model infeasible,
+    /// the solve starts over once from the slack basis, the last rung of the
+    /// ladder; a second time is an `InternalError`.
     fn run_phases(&mut self) -> Result<StopReason, Error> {
         self.restore_model_bounds();
         self.absorbed.clear();
-        if let Some(stop) = self.phase_rounds()? {
-            return Ok(stop);
+        self.unrepaired_row = None;
+        let first = self.phase_rounds();
+        match (first, self.unrepaired_row.take()) {
+            (Ok(Some(stop)), _) => return Ok(stop),
+            (Ok(None), _) => debug!(
+                "verify: no factorization represents the vertex; solving again from the slack basis"
+            ),
+            (Err(_), Some(row)) => debug!(
+                "dual simplex: no var can repair row {row}, which proves nothing; solving again \
+                 from the slack basis"
+            ),
+            (Err(error), None) => return Err(error),
         }
-        debug!(
-            "verify: no factorization represents the vertex; solving again from the slack basis"
-        );
         self.restore_model_bounds();
         self.absorbed.clear();
         self.artificial_obj = None;
         let basis = self.slack_basis();
         self.load_basis(&basis)?;
-        self.phase_rounds()?.ok_or_else(|| {
-            Error::InternalError(
+        match self.phase_rounds() {
+            Ok(Some(stop)) => Ok(stop),
+            Ok(None) => Err(Error::InternalError(
                 "basis too ill-conditioned: recomputed values do not satisfy the rows".to_string(),
-            )
-        })
+            )),
+            Err(Error::InternalError(message)) if self.unrepaired_row.is_some() => Err(
+                Error::InternalError(format!("{message} (from the slack basis too)")),
+            ),
+            Err(error) => Err(error),
+        }
     }
 
     /// The rounds of [`Self::run_phases`], or `None` when the verification
@@ -1988,14 +2012,16 @@ impl Solver {
     /// tolerance, and the solve fails loudly otherwise.
     ///
     /// The phase fails loudly rather than run forever or guess: when only
-    /// taboo rows are left after a rebuild and no last resort remains, and
-    /// when the dual objective has not risen beyond round-off in
-    /// [`STALL_ITERATIONS`] iterations. The room an unrepaired row's
-    /// certificate leaves then lies where no step reaches: in an entry the
-    /// refinement cannot settle of a var with no bound in its direction, in a
-    /// coefficient below the round-off of its terms, within the round-off of
-    /// the room every term can give, or beyond the values computed through the
-    /// basis (see the known limitations in ARCHITECTURE §7.9).
+    /// taboo rows are left after a rebuild and no last resort remains (a row
+    /// the last resorts leave unrepaired has [`Self::run_phases`] start over
+    /// once from the slack basis), and when the dual objective has not risen
+    /// beyond round-off in [`STALL_ITERATIONS`] iterations. The room an
+    /// unrepaired row's certificate leaves then lies where no step reaches:
+    /// in an entry the refinement cannot settle of a var with no bound in its
+    /// direction, in a coefficient below the round-off of its terms, within
+    /// the round-off of the room every term can give, or beyond the values
+    /// computed through the basis (see the known limitations in ARCHITECTURE
+    /// §7.9).
     fn dual_phase(&mut self) -> Result<StopReason, Error> {
         let obj_str = if self.artificial_obj.is_some() {
             "artificial obj."
@@ -2080,6 +2106,7 @@ impl Solver {
                             // nothing can repair the row. A widening changes
                             // the LP, so the cycling detection starts afresh.
                             if !self.certificate_repair(row) {
+                                self.unrepaired_row = Some(row);
                                 return Err(Error::InternalError(format!(
                                     "dual simplex: no var can repair row {row} (basic var {}) by \
                                      a pivot or through a coefficient above round-off, and the \
@@ -2352,6 +2379,8 @@ impl Solver {
     ) -> Result<StopReason, Error> {
         assert!(self.is_primal_feasible);
 
+        let is_fixed = |var: usize| self.orig_var_mins[var] == self.orig_var_maxs[var];
+        let user_coeffs = coeffs.clone();
         let coeffs = scale_columns(coeffs, &self.col_scales);
         let Some(PreparedRow {
             mut coeffs,
@@ -2359,12 +2388,11 @@ impl Solver {
             row_scale,
             slack_var_min,
             slack_var_max,
-        }) = prepare_row(coeffs, cmp_op, rhs, self.feasibility, |var| {
-            self.orig_var_mins[var] == self.orig_var_maxs[var]
-        })?
+        }) = prepare_row(coeffs, cmp_op, rhs, self.feasibility, is_fixed)?
         else {
             return Ok(StopReason::Finished);
         };
+        let slack_unit = slack_dual_unit(&user_coeffs, row_scale, is_fixed);
 
         let slack_var = self.num_total_vars();
 
@@ -2395,7 +2423,7 @@ impl Solver {
         )));
         // The new slack's reduced cost is exactly zero until the multipliers
         // are next recomputed.
-        self.dual_tols.push(dual_tol(0.0, 1.0 / row_scale));
+        self.dual_tols.push(dual_tol(0.0, slack_unit));
 
         let new_num_total_vars = self.num_total_vars() + 1;
         let mut new_orig_constraints = CsMat::empty(CompressedStorage::CSR, new_num_total_vars);
@@ -2409,6 +2437,7 @@ impl Solver {
 
         self.orig_rhs.push(rhs);
         self.row_scales.push(row_scale);
+        self.slack_dual_units.push(slack_unit);
 
         self.orig_constraints = new_orig_constraints;
         self.orig_constraints_csc = self.orig_constraints.to_csc();

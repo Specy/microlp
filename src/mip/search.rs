@@ -217,7 +217,8 @@ enum NodeLp {
 ///
 /// Robustness valve: if the first `reoptimize` fails with an internal error class
 /// — anything that is neither [`Error::Infeasible`] nor [`Error::Unbounded`], e.g.
-/// a row the dual simplex can neither repair nor prove infeasible — fall back ONCE
+/// a row the dual simplex can neither repair nor prove infeasible even after the
+/// engine's own start from the slack basis — fall back ONCE
 /// to the all-slack basis and re-solve the node from scratch, then take that
 /// retry's outcome as final. The retry cannot loop: it is attempted at most once
 /// and its own internal error is propagated rather than retried again. Only
