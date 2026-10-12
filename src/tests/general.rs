@@ -1056,10 +1056,8 @@ mod tests_general {
     /// An infeasible LP whose proof needs a non-basic var's coefficient on an
     /// infinite bound to count as zero: `x3` (`x3 >= 0`, unbounded above) has
     /// a zero tableau entry, but the refinement's second correction leaves
-    /// its coefficient `3.6e-33` of its terms. That lies within the bound the
-    /// refinement puts on the multipliers' error and counts as zero, as a
-    /// basic var's residual does; a concession for basic vars only voided the
-    /// proof.
+    /// its coefficient `3.6e-33` of its terms, within the round-off of its
+    /// compensated sum, where it counts as zero.
     #[test]
     fn a_non_basic_vars_residual_does_not_void_a_proof() {
         init();

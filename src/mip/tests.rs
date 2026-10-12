@@ -585,21 +585,33 @@ fn a_network_completion_ending_at_an_unrepaired_row_starts_over_from_the_slack_b
     }
 }
 
-/// `min x - y - 100 z` s.t. `x + (1 + 2^-48) y <= -2 + 20 z` and
-/// `x + y >= -1 - 20 z`, `x >= 0`, `y` in `[-10, 10]`, `z` binary: the
-/// optimum is `-110` at `(0, 10, 1)`, the root LP's, and with `z = 0` the LP
-/// is the pinned model of
-/// `a_proof_of_infeasibility_through_a_singular_basis_is_a_known_limitation`
+/// `min 0.4 x0 + 0.4 x1 - 100 z` s.t. three nearly dependent rows, the first
+/// with `+ s`, and `-z <= s <= z`, `x0 >= 0`, `x1` free, `s` in `[-1, 1]`,
+/// `z` binary: the optimum is `-100 - 0.4 * 19.25 / 3.95` at `x0 = 0`,
+/// `z = 1`, and with `z = 0`, which holds `s` at zero, the LP is the pinned
+/// model of
+/// `an_infeasible_lp_whose_dependency_has_no_boxed_var_is_a_known_limitation`
 /// in `src/tests/magnitudes.rs`, whose solve fails loudly. Returns the
 /// problem and `z`.
 fn milp_whose_lp_with_z_off_fails() -> (Problem, Variable) {
     let mut problem = Problem::new(OptimizationDirection::Minimize);
-    let x = problem.add_var(1.0, (0.0, f64::INFINITY));
-    let y = problem.add_var(-1.0, (-10.0, 10.0));
+    let x0 = problem.add_var(0.4, (0.0, f64::INFINITY));
+    let x1 = problem.add_var(0.4, (f64::NEG_INFINITY, f64::INFINITY));
+    let s = problem.add_var(0.0, (-1.0, 1.0));
     let z = problem.add_binary_var(-100.0);
-    let slanted = 1.0 + 2f64.powi(-48);
-    problem.add_constraint([(x, 1.0), (y, slanted), (z, -20.0)], ComparisonOp::Le, -2.0);
-    problem.add_constraint([(x, 1.0), (y, 1.0), (z, 20.0)], ComparisonOp::Ge, -1.0);
+    problem.add_constraint(
+        [(x0, 70.9800000000001), (x1, -35.945), (s, 1.0)],
+        ComparisonOp::Eq,
+        175.17600000000053,
+    );
+    problem.add_constraint([(x0, -7.8), (x1, 3.95)], ComparisonOp::Eq, -19.25);
+    problem.add_constraint(
+        [(x0, 17.16000000372529), (x1, -8.690000000000001)],
+        ComparisonOp::Le,
+        42.549000018626444,
+    );
+    problem.add_constraint([(s, 1.0), (z, -1.0)], ComparisonOp::Le, 0.0);
+    problem.add_constraint([(s, 1.0), (z, 1.0)], ComparisonOp::Ge, 0.0);
     (problem, z)
 }
 
@@ -633,7 +645,7 @@ fn warm_start_drops_a_hint_whose_completion_fails() {
             Err(err) => panic!("the hinted solve returned {err:?} (presolve {presolve})"),
         };
         let (with, without) = (with.solution().unwrap(), without.solution().unwrap());
-        assert!((without.objective() + 110.0).abs() < 1e-6);
+        assert!((without.objective() + 100.0 + 0.4 * 19.25 / 3.95).abs() < 1e-6);
         assert_eq!(with.status(), SolutionStatus::Optimal);
         assert_eq!(with.objective(), without.objective());
         assert_eq!(

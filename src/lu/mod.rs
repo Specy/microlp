@@ -134,6 +134,33 @@ pub fn lu_factorize<'a>(
     stability_coeff: f64,
     scratch: &mut ScratchSpace,
 ) -> (LUFactors, Vec<(usize, usize)>) {
+    let col_order = super::ordering::order_simple(size, |c| get_col(c).0);
+    factorize_in_order(size, get_col, stability_coeff, scratch, col_order)
+}
+
+/// [`lu_factorize`] with the columns taken by `rank`, the lowest first, each
+/// rank in the order of [`lu_factorize`]: a column the factorization finds
+/// dependent is the last of its dependency in that order, so one of the
+/// highest rank in it.
+pub fn lu_factorize_ranked<'a>(
+    size: usize,
+    get_col: impl Fn(usize) -> (&'a [usize], &'a [f64]),
+    stability_coeff: f64,
+    scratch: &mut ScratchSpace,
+    rank: impl Fn(usize) -> u8,
+) -> (LUFactors, Vec<(usize, usize)>) {
+    let col_order = super::ordering::order_ranked(size, |c| get_col(c).0, rank);
+    factorize_in_order(size, get_col, stability_coeff, scratch, col_order)
+}
+
+/// [`lu_factorize`] with the columns taken in `col_order`.
+fn factorize_in_order<'a>(
+    size: usize,
+    get_col: impl Fn(usize) -> (&'a [usize], &'a [f64]),
+    stability_coeff: f64,
+    scratch: &mut ScratchSpace,
+    col_order: Perm,
+) -> (LUFactors, Vec<(usize, usize)>) {
     // Implementation of the Gilbert-Peierls algorithm:
     //
     // Gilbert, John R., and Tim Peierls. "Sparse partial pivoting in time
@@ -141,8 +168,6 @@ pub fn lu_factorize<'a>(
     // Statistical Computing 9.5 (1988): 862-874.
     //
     // https://ecommons.cornell.edu/bitstream/handle/1813/6623/86-783.pdf
-
-    let col_order = super::ordering::order_simple(size, |c| get_col(c).0);
 
     let mat_nnz = (0..size).map(|c| get_col(c).0.len()).sum::<usize>();
     trace!(

@@ -59,6 +59,19 @@ pub(crate) fn check_deadline(deadline: &Deadline) -> StopReason {
     StopReason::Finished
 }
 
+/// The rank by which a basis repair's second factorization takes the column
+/// of a var with these bounds ([`Solver::factorize_at`]): one with no finite
+/// bound first, then one finite bound, then two, a fixed var last (Bixby
+/// 1992's order of preference for the basis).
+fn bound_rank(min: f64, max: f64) -> u8 {
+    match (min.is_finite(), max.is_finite()) {
+        _ if min == max => 3,
+        (true, true) => 2,
+        (false, false) => 0,
+        _ => 1,
+    }
+}
+
 /// A 64-bit hash of `x` (splitmix64's finalizer): the vertex hash of the
 /// cycling detection and the pseudo-random fractions of the perturbations.
 fn mix(x: u64) -> u64 {
@@ -1421,12 +1434,43 @@ impl Solver {
     }
 
     /// [`Self::factorize`] at the pivot `threshold` of the factorization.
+    ///
+    /// A dependency loses the column the factorization takes last, which the
+    /// sparsity order decides. Where that is a var with an infinite bound,
+    /// the dependency leaves its coefficient in every later certificate,
+    /// genuine but below what the arithmetic resolves, on that bound unless
+    /// its sign points the other way, where it voids the proof
+    /// ([`Self::proof_of`]). So the basis is factorized again with the
+    /// columns ordered by their vars' bounds ([`bound_rank`]), and that repair
+    /// is taken where it replaces as many columns, each a var with both
+    /// bounds finite, whose coefficient counts at a bound whatever its sign.
+    /// Otherwise the first repair stands: one that drops a var with an
+    /// infinite bound instead guarantees the proof nothing for the change of
+    /// path, and a second factorization that finds another number of
+    /// dependencies would keep a basis the first found singular, or drop
+    /// more.
     fn factorize_at(&mut self, threshold: f64) -> bool {
-        let replaced =
+        let mut replaced =
             self.basis_solver
                 .reset(&self.orig_constraints_csc, &self.basic_vars, threshold);
         if replaced.is_empty() {
             return false;
+        }
+        let (mins, maxs) = (&self.orig_var_mins, &self.orig_var_maxs);
+        let boxed = |var: usize| mins[var].is_finite() && maxs[var].is_finite();
+        if !replaced.iter().all(|&(pos, _)| boxed(self.basic_vars[pos])) {
+            let (lu_factors, ranked) = self.basis_solver.factorize_ranked(
+                &self.orig_constraints_csc,
+                &self.basic_vars,
+                threshold,
+                |var| bound_rank(mins[var], maxs[var]),
+            );
+            if ranked.len() == replaced.len()
+                && ranked.iter().all(|&(pos, _)| boxed(self.basic_vars[pos]))
+            {
+                self.basis_solver.install(lu_factors);
+                replaced = ranked;
+            }
         }
         for (pos, &var) in self.basic_vars.iter().enumerate() {
             assert!(
@@ -3524,14 +3568,15 @@ impl Solver {
     /// below the pivot tolerance, or small beside its row, can be the only one
     /// that repairs the row, as in a row the model's ratios carry through a
     /// chain of others or two nearly parallel rows leave, and only how far the
-    /// refinement moves it tells it from round-off, which no size can. These
-    /// are the entries the proof cannot count as zero, so a row it leaves open
-    /// has one. Every regular pivot and every proof of the other rows comes
-    /// first: the step through a tiny entry is huge and the basis it leads to
-    /// ill-conditioned, as when a boxed var whose genuine but tiny entry
-    /// cannot carry a row the proof closes enters far past its other bound, or
-    /// a basis of nearly parallel rows keeps the next proof's refinement from
-    /// converging.
+    /// refinement moves it tells it from round-off, which no size can. The
+    /// proof counts these entries too, so a row it leaves open has one,
+    /// unless a non-basic entry within the refinement's error keeps it open,
+    /// which neither concedes. Every regular pivot and every proof of the
+    /// other rows comes first: the step through a tiny entry is huge and the
+    /// basis it leads to ill-conditioned, as when a boxed var whose genuine
+    /// but tiny entry cannot carry a row the proof closes enters far past its
+    /// other bound, or a basis of nearly parallel rows keeps the next proof's
+    /// refinement from converging.
     fn genuine_entry_step(
         &mut self,
         row: usize,

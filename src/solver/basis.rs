@@ -6,7 +6,7 @@
 //! [`super::Solver`] produce and then apply.
 
 use crate::{
-    lu::{lu_factorize, LUFactors, ScratchSpace},
+    lu::{lu_factorize, lu_factorize_ranked, LUFactors, ScratchSpace},
     sparse::{ScatteredVec, SparseMat, SparseVec},
     CsVec,
 };
@@ -220,9 +220,42 @@ impl BasisSolver {
             threshold,
             &mut self.scratch,
         );
-        self.lu_factors = lu_factors;
-        self.lu_factors_transp = self.lu_factors.transpose();
+        self.install(lu_factors);
         replaced
+    }
+
+    /// The factorization of [`Self::reset`] with the columns taken by the
+    /// `rank` of their var ([`lu_factorize_ranked`]), and the pairs its
+    /// repair replaces, not put in force: the one `reset` built stays in
+    /// force unless the caller installs this one ([`Self::install`]).
+    pub(crate) fn factorize_ranked(
+        &mut self,
+        orig_constraints_csc: &CsMat,
+        basic_vars: &[usize],
+        threshold: f64,
+        rank: impl Fn(usize) -> u8,
+    ) -> (LUFactors, Vec<(usize, usize)>) {
+        self.scratch.clear_sparse(basic_vars.len());
+        lu_factorize_ranked(
+            basic_vars.len(),
+            |c| {
+                orig_constraints_csc
+                    .outer_view(basic_vars[c])
+                    //guaranteed to be a valid index
+                    .unwrap()
+                    .into_raw_storage()
+            },
+            threshold,
+            &mut self.scratch,
+            |c| rank(basic_vars[c]),
+        )
+    }
+
+    /// Put `lu_factors` in force: factors of the basis as it stands, the eta
+    /// file empty.
+    pub(crate) fn install(&mut self, lu_factors: LUFactors) {
+        self.lu_factors_transp = lu_factors.transpose();
+        self.lu_factors = lu_factors;
     }
 
     pub(crate) fn solve<'a>(

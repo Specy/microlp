@@ -2974,37 +2974,31 @@ fn non_finite_certificate_data_void_the_proof() {
 }
 
 /// An error bound that is not finite voids the proof too, rather than count
-/// every coefficient within it as zero. Planted: the multiplier of
-/// `x + y + j >= 3` (`j` free) with an infinite error, as an overflow of
-/// `Σ e_i |a_ij|` would leave it; counted as zero, `j`'s coefficient would
-/// prove the model, feasible at `j >= 1`, infeasible.
+/// a basic var's coefficient within it as zero. Planted, on the infeasible
+/// model of `a_coefficient_on_an_infinite_bound_counts_as_zero_only_within_its_error`
+/// at the basis `{j}` and the first row's slack, the multipliers
+/// `(1, -(1 + 2^-80))` with an infinite error in the second, as an overflow
+/// of `Σ e_i |a_ij|` would leave it: counted as zero, the free basic `j`'s
+/// coefficient `-2^-80` would prove the model whatever its error.
 #[test]
 fn an_error_bound_that_is_not_finite_voids_the_proof() {
     init();
-    let sol = Solver::try_new(
-        &[0.0; 3],
-        &[0.0, 0.0, f64::NEG_INFINITY],
-        &[1.0, 1.0, f64::INFINITY],
-        &[(to_sparse(&[1.0, 1.0, 1.0]), ComparisonOp::Ge, 3.0)],
-        &vec![VarDomain::Real; 3],
-        None,
-        crate::Tolerances::default().feasibility,
-    )
-    .unwrap();
-    let row = 0;
-    assert_eq!(
-        sol.basic_vars[row], sol.num_vars,
-        "fixture: the slack basis"
-    );
+    let (sol, row) = slanted_proof_fixture(false);
+    let d = 2f64.powi(-80);
     let unbounded_error = proof::RefinedRow {
-        rho: multipliers(&[1.0]),
-        error: Some(vec![f64::INFINITY]),
-        second: vec![f64::INFINITY],
+        rho: slanted_row(d),
+        error: Some(vec![0.0, f64::INFINITY]),
+        second: vec![0.0, f64::INFINITY],
     };
     let proof = sol.proof_of(&unbounded_error, row, false);
     assert!(!proof.holds, "{proof:?}");
     assert!(proof.gap.is_nan(), "{proof:?}");
-    let proof = sol.proof_of(&exact_row(&[1.0]), row, false);
+    let exact = proof::RefinedRow {
+        rho: slanted_row(d),
+        error: Some(vec![0.0, 0.0]),
+        second: vec![0.0, 0.0],
+    };
+    let proof = sol.proof_of(&exact, row, false);
     assert!(!proof.holds, "{proof:?}");
     assert_eq!(proof.gap, f64::NEG_INFINITY, "{proof:?}");
 }
@@ -3099,32 +3093,26 @@ fn a_basic_vars_coefficient_in_a_row_left_out_voids_the_proof() {
     assert_eq!(proof.gap, f64::NEG_INFINITY, "{proof:?}");
 }
 
-/// A coefficient on an infinite bound counts as zero exactly where the
-/// multipliers' error could make it zero: within each multiplier's error
-/// bound carried through the var's entries, plus its compensated sum's own
-/// error. Planted, on an infeasible model at the basis `{j}` and the first
-/// row's slack: the multipliers `(1, -(1 + d))` leave the basic `j` and the
-/// non-basic `w`, both free, the coefficient `-d` and the rest out of reach
-/// by one. `d = 2^-80` is proven with an error bound of `2^-79`, not with
-/// `2^-82` or none; `d = 2^-100`, within the sums' own error, is proven
-/// either way.
-#[test]
-fn a_coefficient_on_an_infinite_bound_counts_as_zero_only_within_its_error() {
-    init();
+/// `x0 + x1 + j (+ w) >= 3` and `x2 + j (+ w) = 0`, `x0`, `x1`, `x2` in
+/// `[0, 1]`, `j` and `w` free, infeasible, at the basis `{j}` and the first
+/// row's slack, `3` above its bound, `w` non-basic where it is in the rows.
+/// Returns the solver and the slack's row.
+fn slanted_proof_fixture(with_w: bool) -> (Solver, usize) {
+    let w = if with_w { 1.0 } else { 0.0 };
     let mut sol = Solver::try_new(
         &[0.0; 5],
         &[0.0, 0.0, 0.0, f64::NEG_INFINITY, f64::NEG_INFINITY],
         &[1.0, 1.0, 1.0, f64::INFINITY, f64::INFINITY],
         &[
-            (to_sparse(&[1.0, 1.0, 0.0, 1.0, 1.0]), ComparisonOp::Ge, 3.0),
-            (to_sparse(&[0.0, 0.0, 1.0, 1.0, 1.0]), ComparisonOp::Eq, 0.0),
+            (to_sparse(&[1.0, 1.0, 0.0, 1.0, w]), ComparisonOp::Ge, 3.0),
+            (to_sparse(&[0.0, 0.0, 1.0, 1.0, w]), ComparisonOp::Eq, 0.0),
         ],
         &vec![VarDomain::Real; 5],
         None,
         crate::Tolerances::default().feasibility,
     )
     .unwrap();
-    let (j, w, s0) = (3, 4, sol.num_vars);
+    let (j, s0) = (3, sol.num_vars);
     sol.load_basis(&Basis(vec![
         VarStatus::AtLower,
         VarStatus::AtLower,
@@ -3137,37 +3125,107 @@ fn a_coefficient_on_an_infinite_bound_counts_as_zero_only_within_its_error() {
     .unwrap();
     let row = sol.basic_vars.iter().position(|&var| var == s0).unwrap();
     assert!(
-        (sol.basic_var_vals[row] - 3.0).abs() < 1e-12,
-        "fixture: the slack of the first row 3 above its bound, {:?}",
+        (sol.basic_var_vals[row] - 3.0).abs() < 1e-12
+            && matches!(sol.var_states[j], VarState::Basic(_)),
+        "fixture: j basic, the first row's slack 3 above its bound, {:?}",
         sol.basic_var_vals
     );
-    assert!(
-        matches!(sol.var_states[j], VarState::Basic(_))
-            && matches!(sol.var_states[w], VarState::NonBasic(_)),
-        "fixture: j basic, w non-basic"
-    );
-    let proof = |d: f64, error: Option<f64>| {
-        let mut second = proof::CDouble::default();
-        second.add_product(-1.0, 1.0);
-        second.add_product(-d, 1.0);
+    (sol, row)
+}
+
+/// `(1, -(1 + d))`, compensated: the multipliers that leave `j`, and `w`
+/// where it is in the rows, the coefficient `-d` in
+/// [`slanted_proof_fixture`], and the rest out of reach by one.
+fn slanted_row(d: f64) -> Vec<proof::CDouble> {
+    let mut second = proof::CDouble::default();
+    second.add_product(-1.0, 1.0);
+    second.add_product(-d, 1.0);
+    vec![proof::CDouble::from(1.0), second]
+}
+
+/// A coefficient on an infinite bound counts as zero only within its error:
+/// a basic var's within each multiplier's error bound carried through its
+/// entries, plus its compensated sum's own error, and a non-basic var's
+/// within that round-off alone, since its tableau entry can be the data's
+/// own. Planted, at [`slanted_proof_fixture`]: with the basic `j` alone
+/// left `-d`, `d = 2^-80` is proven with an error bound of `2^-79`, not with
+/// `2^-82` or none; with the non-basic `w` left `-d` too, it is not proven
+/// with any bound. `d = 2^-100`, within the sums' own error, is proven
+/// either way.
+#[test]
+fn a_coefficient_on_an_infinite_bound_counts_as_zero_only_within_its_error() {
+    init();
+    let proof = |with_w: bool, d: f64, error: Option<f64>| {
+        let (sol, row) = slanted_proof_fixture(with_w);
         let refined = proof::RefinedRow {
-            rho: vec![proof::CDouble::from(1.0), second],
+            rho: slanted_row(d),
             error: error.map(|e| vec![0.0, e]),
             second: vec![0.0, error.unwrap_or(f64::INFINITY)],
         };
         sol.proof_of(&refined, row, false)
     };
-    let proven = proof(2f64.powi(-80), Some(2f64.powi(-79)));
+    let proven = proof(false, 2f64.powi(-80), Some(2f64.powi(-79)));
     assert!(proven.holds, "{proven:?}");
     assert!((proven.gap - 1.0).abs() < 1e-14, "{proven:?}");
     for error in [Some(2f64.powi(-82)), None] {
-        let unproven = proof(2f64.powi(-80), error);
+        let unproven = proof(false, 2f64.powi(-80), error);
         assert!(!unproven.holds, "{error:?}: {unproven:?}");
         assert_eq!(unproven.gap, f64::NEG_INFINITY, "{error:?}: {unproven:?}");
     }
-    for error in [Some(0.0), None] {
-        let proven = proof(2f64.powi(-100), error);
-        assert!(proven.holds, "{error:?}: {proven:?}");
+    let unproven = proof(true, 2f64.powi(-80), Some(2f64.powi(-79)));
+    assert!(!unproven.holds, "{unproven:?}");
+    assert_eq!(unproven.gap, f64::NEG_INFINITY, "{unproven:?}");
+    for with_w in [false, true] {
+        for error in [Some(0.0), None] {
+            let proven = proof(with_w, 2f64.powi(-100), error);
+            assert!(proven.holds, "w {with_w}, {error:?}: {proven:?}");
+        }
+    }
+}
+
+/// A basis repair drops, from a dependency, a var with both bounds finite
+/// where the factorization's own choice has an infinite bound, and keeps
+/// that choice where the alternative has one too. Loaded: the basis
+/// `{x, y}` of `x + (1 + 2^-48) y <= -2`, `x + y >= -1`, which the
+/// factorization finds singular and repairs by dropping `y`. With `x` in
+/// `[0, 1]` and `y >= -10`, the repair drops `x`; with `x >= 0` and `y`
+/// free, a second factorization would drop `x`, ranked last for its finite
+/// bound though its other one is infinite, and the repair keeps dropping
+/// `y`.
+#[test]
+fn a_basis_repair_drops_a_var_with_both_bounds_finite() {
+    init();
+    for (x_max, y_min, out) in [(1.0, -10.0, 0), (f64::INFINITY, f64::NEG_INFINITY, 1)] {
+        let mut sol = Solver::try_new(
+            &[1.0, -1.0],
+            &[0.0, y_min],
+            &[x_max, f64::INFINITY],
+            &[
+                (
+                    to_sparse(&[1.0, 1.0 + 2f64.powi(-48)]),
+                    ComparisonOp::Le,
+                    -2.0,
+                ),
+                (to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, -1.0),
+            ],
+            &vec![VarDomain::Real; 2],
+            None,
+            crate::Tolerances::default().feasibility,
+        )
+        .unwrap();
+        sol.load_basis(&Basis(vec![
+            VarStatus::Basic,
+            VarStatus::Basic,
+            VarStatus::AtLower,
+            VarStatus::AtLower,
+        ]))
+        .unwrap();
+        assert!(
+            matches!(sol.var_states[out], VarState::NonBasic(_))
+                && matches!(sol.var_states[1 - out], VarState::Basic(_)),
+            "x max {x_max}, y min {y_min}: var {out} out, {:?}",
+            sol.var_states
+        );
     }
 }
 
