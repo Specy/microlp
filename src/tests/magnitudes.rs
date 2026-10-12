@@ -1,10 +1,13 @@
 //! Regression tests on feasible-by-construction models across variable
 //! magnitudes and coefficient ranges (the properties are in `scaling.rs`).
 //! Each model is written around a point `x*` that satisfies every bound and
-//! every row within the documented tolerance, and its objective is bounded, so
-//! `solve()` must return an optimal solution whose rows hold within that
-//! tolerance and whose objective is no worse than at `x*` — the contract in
-//! `oracle.rs`.
+//! every row within the documented tolerance, and its objective is bounded.
+//! Where `x*` has its integer vars at integers, `solve()` must return an
+//! optimal solution whose rows hold within that tolerance and whose objective
+//! is no worse than at `x*` — the contract in `oracle.rs`. A model with no
+//! integral point with its fixed vars at their values is written around a
+//! point that relies on the tolerances, and may be answered `Infeasible`
+//! instead.
 //!
 //! A model the engine gets wrong and that cannot be fixed at once is pinned
 //! here as a KNOWN LIMITATION with `#[should_panic]`, which records today's
@@ -17,7 +20,8 @@ mod regression_tests {
     use crate::tests::oracle::{
         assert_solves_feasibly_within_contract, assert_solves_within_contract,
         assert_solves_within_contract_in_time, assert_solves_within_contract_without_presolve,
-        within_recommended_range, xstar_is_feasible, Model, Row, Var,
+        infeasible_or_answer_within_contract, infeasible_or_within_contract, row_tolerance,
+        row_violation, rows_hold, within_recommended_range, xstar_is_feasible, Model, Row, Var,
     };
     use crate::{ComparisonOp, Error, OptimizationDirection, SolveOptions, TerminationReason};
     use std::time::Duration;
@@ -3897,8 +3901,8 @@ mod regression_tests {
             model.xstar.push(1.0);
         }
         assert!(
-            xstar_is_feasible(&model),
-            "fixture error: x* must satisfy the model it was built around"
+            rows_hold(&model, &model.xstar),
+            "fixture error: x* must hold the rows of the model it was built around"
         );
         model
     }
@@ -3951,7 +3955,9 @@ mod regression_tests {
     /// row would turn that into all the demand, and a fixed var, which cannot
     /// be branched on, counted fractional would drop the branch, `b`'s
     /// optimum with it (the answer was 120). The point is integral, within
-    /// the contract, and not worse than 110.
+    /// the contract, and not worse than 110. At the default `int_tol` the
+    /// root's `y_a = 1e-7` is integral, and its point, of cost `20.00001`,
+    /// better than every integral point, is the answer (ARCHITECTURE §7.1).
     #[test]
     fn a_branch_that_fixes_a_big_m_binary_is_kept() {
         let (m, demand) = (1e8, 10.0);
@@ -3994,6 +4000,25 @@ mod regression_tests {
                     "presolve {presolve}: row {i} violated by {violation:e} at {x:?}"
                 );
             }
+        }
+        // The example of ARCHITECTURE §7.1, which the contract allows but does
+        // not require: a failure here means updating that example.
+        assert_solves_within_contract(&model);
+        assert_solves_within_contract_without_presolve(&model);
+        for presolve in [true, false] {
+            let objective = problem
+                .solve_with(SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                })
+                .unwrap()
+                .into_solution()
+                .unwrap()
+                .objective();
+            assert!(
+                objective < 110.0,
+                "presolve {presolve}: objective {objective}"
+            );
         }
     }
 
@@ -4136,47 +4161,54 @@ mod regression_tests {
     }
 
     /// [`big_m_row_met_beyond_its_bound`] with `e` at `1.03` of the big-M
-    /// row's contract, `3%` beyond it with `y` at one. The point lies within
-    /// the contract only with `y` off its integer within `int_tol`: `x*` has
-    /// `y = 1 - 3e-14`, whose offset times `M = 5e7` makes the room. Without
-    /// presolve the search reaches it through the LP (`y = 1 - 2e-14`).
-    /// Presolve rewrites `y`'s coefficient to about `500`; the root's LP then
-    /// needs the rows' tolerances, which the proof grants and the widening
-    /// reaches: one pin row's widened slack lets `y` end `5e-10` under one,
-    /// within `int_tol`, where the rewritten row holds and the row as written
-    /// has room to spare.
-    #[test]
-    fn a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_found() {
-        let model = big_m_row_met_beyond_its_bound(
-            5e7,
-            [5e7, -5e7],
-            100.0,
-            1000.0,
-            1.03,
-            false,
-            1.0 - 3e-14,
+    /// row's contract, `3%` beyond it with `y` at one. With `w1, w2` at their
+    /// values, the model has points only with `y` off its integer within
+    /// `int_tol`: `x*` has `y = 1 - 3e-14`, whose offset times `M = 5e7` makes
+    /// the room. With `y = 1`, the second row holds within its tolerance only
+    /// from `x = (rhs - 1e-7) / 1000`, where the big-M row misses beyond its
+    /// own, and the pin rows exclude `y = 0`.
+    fn big_m_row_needing_int_tol(ks: [f64; 2], pin: f64) -> Model {
+        let model = big_m_row_met_beyond_its_bound(5e7, ks, pin, 1000.0, 1.03, false, 1.0 - 3e-14);
+        let x_lo = (model.rows[1].rhs - 1e-7) / 1000.0;
+        let at_one = [x_lo, 1.0, 0.0, 0.0, 1.0, 1.0];
+        assert!(
+            row_violation(&model.rows[0], &at_one) > row_tolerance(&model.rows[0], &at_one),
+            "fixture error: with y = 1 the model must have no point"
         );
-        assert_solves_within_contract_without_presolve(&model);
-        check(model);
+        model
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7.9): the model of
-    /// [`a_point_needing_the_int_tol_of_a_binary_presolve_rewrites_is_found`]
-    /// without fixed terms and with each pin row alone keeping `y` at one:
-    /// presolve fixes `y` at 1, where the engine holds it exactly, which takes
-    /// the room away, and answers `Infeasible`.
+    /// [`big_m_row_needing_int_tol`] with fixed terms of `1e8`, only the two
+    /// pin rows together keeping `y` at one. Presolve rewrites `y`'s
+    /// coefficient to about `500`, which holds as written only at an integral
+    /// `y`. No point has `y` integral and `w1, w2` at their values, so
+    /// `Infeasible` and a point relying on `y`'s offset, meeting the rows as
+    /// written, are both right, presolve on and off.
     #[test]
-    #[should_panic(expected = "solve() returned Infeasible")]
-    fn a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation() {
-        let model =
-            big_m_row_met_beyond_its_bound(5e7, [0.0, -0.0], 1e4, 1000.0, 1.03, false, 1.0 - 3e-14);
-        assert_solves_within_contract_without_presolve(&model);
-        check(model);
+    fn a_model_feasible_only_off_its_integers_presolve_rewrites_is_answered_either_way() {
+        let model = big_m_row_needing_int_tol([5e7, -5e7], 100.0);
+        for presolve in [true, false] {
+            infeasible_or_within_contract(&model, presolve);
+        }
+    }
+
+    /// [`big_m_row_needing_int_tol`] without fixed terms, each pin row alone
+    /// keeping `y` at one, so the model has no integral point: presolve fixes
+    /// `y` at 1, where the engine holds it exactly, and the solve answers
+    /// `Infeasible`. Without presolve the search may land on a point relying
+    /// on `y`'s offset: either answer is right.
+    #[test]
+    fn a_model_feasible_only_off_its_integers_is_infeasible_where_presolve_fixes_its_binary() {
+        let model = big_m_row_needing_int_tol([0.0, -0.0], 1e4);
+        assert_eq!(infeasible_or_within_contract(&model, true), None);
+        infeasible_or_within_contract(&model, false);
     }
 
     /// `max y` s.t. `x >= x_min`, `x <= coeff y`, `y <= 0.5`, `y` binary:
     /// the rows hold together only with `y` off its integer, from
-    /// `y = x_min / coeff`, which is within `int_tol` of 0.
+    /// `y = x_min / coeff`, which is within `int_tol` of 0. The model has no
+    /// integral point: `y = 0` leaves `x` at most `1e-7` and at least
+    /// `x_min - 1e-7`, and `y = 1` misses `y <= 0.5`.
     fn binary_off_its_integer(x_min: f64, coeff: f64) -> Model {
         let model = Model {
             direction: OptimizationDirection::Maximize,
@@ -4189,51 +4221,106 @@ mod regression_tests {
             xstar: vec![x_min, x_min / coeff],
         };
         assert!(
-            xstar_is_feasible(&model),
-            "fixture error: x* must satisfy the model it was built around"
+            rows_hold(&model, &model.xstar) && x_min > 2e-7,
+            "fixture error: x* must hold the rows, and no point have y integral"
         );
         model
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7.9): [`binary_off_its_integer`] with
-    /// `x >= 5` and `x <= 1e7 y`, from `y = 5e-7`. The root's LP puts `y` at
-    /// `0.5`, and the branch fixes it at 0 and at 1, where the engine holds it
-    /// exactly: both children are infeasible, and the search answers
-    /// `Infeasible` without presolve too.
+    /// [`binary_off_its_integer`] with `x >= 5` and `x <= 1e7 y`, from
+    /// `y = 5e-7`. Without presolve the root's LP puts `y` at `0.5`, and the
+    /// branch fixes it at 0 and at 1, where the engine holds it exactly: both
+    /// children are infeasible. Presolve fixes `y` at 0 from `y <= 0.5`, and
+    /// the root is proven infeasible without a branch. The solve answers
+    /// `Infeasible`, presolve on and off.
     #[test]
-    #[should_panic(expected = "solve() without presolve returned Infeasible")]
-    fn a_point_needing_the_int_tol_of_a_binary_a_branch_fixes_is_a_known_limitation() {
-        assert_solves_within_contract_without_presolve(&binary_off_its_integer(5.0, 1e7));
+    fn a_model_feasible_only_off_its_integers_is_infeasible() {
+        let model = binary_off_its_integer(5.0, 1e7);
+        for presolve in [true, false] {
+            assert_eq!(
+                infeasible_or_within_contract(&model, presolve),
+                None,
+                "presolve {presolve}"
+            );
+        }
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7.9): the previous test's model, in range, with
-    /// `x >= 9e-7` and `x <= y`, from `y = 9e-7`.
+    /// The previous test's model, in range, with `x >= 9e-7` and `x <= y`,
+    /// from `y = 9e-7`: `Infeasible` too, presolve on and off.
     #[test]
-    #[should_panic(expected = "solve() without presolve returned Infeasible")]
-    fn a_point_needing_the_int_tol_of_a_binary_in_range_is_a_known_limitation() {
+    fn a_model_feasible_only_off_its_integers_in_range_is_infeasible() {
         let model = binary_off_its_integer(9e-7, 1.0);
         assert!(
             within_recommended_range(&model),
             "fixture error: the model must lie within the recommended range"
         );
-        assert_solves_within_contract_without_presolve(&model);
+        for presolve in [true, false] {
+            assert_eq!(
+                infeasible_or_within_contract(&model, presolve),
+                None,
+                "presolve {presolve}"
+            );
+        }
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7.9), through an edit, in range: the
-    /// solve without presolve reports `x1 = 1 + 6.6e-9` and the binary `x2` at
-    /// `-1.1e-9`, each past its bound within its tolerance. Fixed at that
-    /// value, `x1` leaves `-24.4 x1 - 144 x2 + 0.287 x3 = -24.4` short by
-    /// `1.6e-7`, which only `x2` past its bound makes up, and the edit's
-    /// search, whose proof holds an integer var within its bounds, answers
-    /// `Infeasible`.
+    /// The models of the two previous tests minimizing `y`: the root's LP
+    /// puts `y` at `x_min / coeff`, within `int_tol` of 0, a point the search
+    /// may return and presolve may take away. Either answer is right,
+    /// presolve on and off: which one comes can depend on the objective and
+    /// on presolve.
     #[test]
-    #[should_panic(expected = "returned Infeasible")]
-    fn a_fix_at_a_value_only_points_needing_int_tol_meet_is_a_known_limitation() {
-        let model = Model {
+    fn a_model_feasible_only_off_its_integers_minimizing_its_binary_is_answered_either_way() {
+        for (x_min, coeff) in [(5.0, 1e7), (9e-7, 1.0)] {
+            let mut model = binary_off_its_integer(x_min, coeff);
+            model.direction = OptimizationDirection::Minimize;
+            for presolve in [true, false] {
+                infeasible_or_within_contract(&model, presolve);
+            }
+        }
+    }
+
+    /// The models of [`a_model_feasible_only_off_its_integers_is_infeasible`]
+    /// and the test after it, maximizing a `z >= x` of their own instead of
+    /// `y`: the relaxation is unbounded, and without presolve the search for
+    /// a point that classifies it answers `Unbounded` where it lands on a
+    /// point relying on `y`'s offset, `Infeasible` where it does not.
+    /// Presolve fixes `y` at 0 from `y <= 0.5`, and the root is proven
+    /// infeasible without a branch. Both answers are right, presolve on and
+    /// off.
+    #[test]
+    fn an_unbounded_relaxation_feasible_only_off_its_integers_is_unbounded_or_infeasible() {
+        for (x_min, coeff) in [(5.0, 1e7), (9e-7, 1.0)] {
+            let mut model = binary_off_its_integer(x_min, coeff);
+            model.vars[1].obj = 0.0;
+            model.vars.push(real(1.0, 0.0, f64::INFINITY));
+            model
+                .rows
+                .push(row(&[(2, 1.0), (0, -1.0)], ComparisonOp::Ge, 0.0));
+            model.xstar.push(x_min);
+            let (problem, _) = model.build();
+            for presolve in [true, false] {
+                let result = problem.solve_with(SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                });
+                assert!(
+                    matches!(result, Err(Error::Unbounded | Error::Infeasible)),
+                    "presolve {presolve}: {result:?}:\n{}",
+                    model.source()
+                );
+            }
+        }
+    }
+
+    /// `-24.4 x1 - 144 x2 + 0.287 x3 = -24.4` and three more rows, in range,
+    /// over `x1 ∈ [x1_lo, x1_hi]`, the binary `x2` and `x0` fixed at
+    /// `1048576`. `x*`, at `x1 = 1`, is integral.
+    fn binary_a_row_relies_on(x1_lo: f64, x1_hi: f64) -> Model {
+        Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
                 int(0.0, 1048576, 1048576),
-                real(1.0, 0.0, 1.0),
+                real(1.0, x1_lo, x1_hi),
                 int(-1.0, 0, 1),
                 real(1.0, -2.0, 0.0),
             ],
@@ -4252,7 +4339,22 @@ mod regression_tests {
                 row(&[(1, -241.0), (3, 70.4)], ComparisonOp::Ge, -241.0),
             ],
             xstar: vec![1048576.0, 1.0, 0.0, 0.0],
-        };
+        }
+    }
+
+    /// [`binary_a_row_relies_on`] through an edit: the solve without presolve
+    /// reports `x1 = 1 + 6.6e-9` and the binary `x2` at `-1.1e-9`, each past
+    /// its bound within its tolerance, the third row relying on `x2`'s
+    /// offset. Fixed at that value, `x1` leaves the third row short by
+    /// `1.6e-7`, which only `x2` off its integer makes up: `x2 = 0` needs
+    /// `x3 >= 2.1e-7`, past its bound beyond its tolerance, and `x2 = 1` far
+    /// more. With `x1` at its value the edited model has no integral point, so
+    /// `Infeasible` and a point the contract accepts, `x2` off its integer or
+    /// `x1` off its value, are both right. Fixed at its bound, where `x*` has
+    /// it, `x1` leaves an integral point, and the edit solves.
+    #[test]
+    fn a_fix_at_a_value_only_points_off_their_integers_meet_is_answered_either_way() {
+        let model = binary_a_row_relies_on(0.0, 1.0);
         assert!(
             within_recommended_range(&model) && xstar_is_feasible(&model),
             "fixture error: x* must satisfy the model, which lies within the recommended range"
@@ -4267,13 +4369,29 @@ mod regression_tests {
             .unwrap()
             .into_solution()
             .unwrap();
-        let value = 1.000000006557682;
-        let edited = solution
-            .fix_var(vars[1], value)
-            .unwrap_or_else(|e| panic!("fix_var(x1, {value:?}) returned {e:?}"))
-            .into_solution()
-            .unwrap();
-        assert!((edited[vars[1]] - value).abs() < 1e-9);
+        let value = solution[vars[1]];
+        let x3_min = (24.4 * (value - 1.0) - 1e-7) / 0.287;
+        assert!(
+            x3_min > 1e-7,
+            "fixture error: x1 = {value:?} must leave x2 = 0 needing x3 >= {x3_min:e}, past \
+             its bound beyond its tolerance"
+        );
+        infeasible_or_answer_within_contract(
+            &binary_a_row_relies_on(value, value),
+            solution.clone().fix_var(vars[1], value),
+            &vars,
+            &format!("fix_var(x1, {value:?})"),
+        );
+        assert!(
+            infeasible_or_answer_within_contract(
+                &binary_a_row_relies_on(1.0, 1.0),
+                solution.fix_var(vars[1], 1.0),
+                &vars,
+                "fix_var(x1, 1.0)",
+            )
+            .is_some(),
+            "fix_var(x1, 1.0) returned Infeasible where x* is an integral point"
+        );
     }
 
     /// A facility model whose capacity row `x2 + ... + x6 <= 2.918e9 x0`

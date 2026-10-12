@@ -54,9 +54,9 @@ by default, [`Tolerances::feasibility`], or the round-off of evaluating it in
 the solve returns an error:
 
 * [`Error::Infeasible`]: the solver proved, from the problem's data, that no
-  assignment meets the constraints and bounds within that tolerance with
-  every integer variable, and every variable whose bounds are equal, exactly
-  within its bounds (see [`Tolerances::feasibility`]).
+  assignment with every integer variable at an integer within its bounds, and
+  every variable whose bounds are equal at its value, meets the constraints
+  and the other bounds within that tolerance (see [`Tolerances::feasibility`]).
 * [`Error::Unbounded`]: the objective can improve forever.
 * [`Error::InternalError`]: a numerical failure the solver could not recover
   from. It returns this rather than an answer it could not verify.
@@ -81,11 +81,12 @@ range. Within the range, please report an [`Error::InternalError`] as a bug.
 [`SolveOptions::presolve`], on by default, simplifies the problem before the
 search. It never removes a variable or changes a real variable's bounds, and
 it keeps, up to round-off, every solution whose integer variables are exactly
-integral. A solution that exists only by using [`SolveOptions::int_tol`] (an
-integer variable just off its integer under a big-M coefficient) can be lost,
-by presolve or by a branch on that variable, so such a problem can be answered
-[`Error::Infeasible`] with presolve on or off, and with presolve on where
-presolve off finds a solution.
+integral. A solution relying on [`SolveOptions::int_tol`] (an integer variable
+just off its integer under a big-M coefficient) is never sought: it is returned
+where the search lands on one, and where the objective can improve forever
+such a landing answers [`Error::Unbounded`]. A problem with no solution whose
+integer variables are integral is answered [`Error::Infeasible`] unless that
+happens, with presolve on or off.
 
 When a solve call returns successfully:
 

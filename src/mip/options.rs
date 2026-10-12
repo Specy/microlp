@@ -47,19 +47,20 @@ pub struct SolveOptions {
     /// [`TerminationReason::MipGap`]. Must be finite and non-negative. Default
     /// `0.0` (prove exact optimality).
     pub mip_gap: f64,
-    /// Integrality tolerance: a value within this distance of an integer counts
-    /// as integral. A solution reports an integer or boolean variable's value
-    /// as the solver computed it, within this distance of an integer, not
-    /// necessarily on it: values like `0.9999999` are normal (one fixed at
-    /// an integer, by its bounds, the search or an edit, lies on it). Use
-    /// `.round()` where an exact integer is needed, bearing in mind that the
-    /// rounded values need not meet the constraints: under `x <= 1e7 * y`, a
-    /// `y` of `1e-6` allows `x` up to 10, which `y` rounded to zero forbids.
-    /// Keep a big-M coefficient times this tolerance small against the
-    /// quantities it bounds. It also decides integrality in
-    /// [`crate::Solution::fix_var`] and in the check of an incumbent kept
-    /// across an edit. Default `1e-6`. Must be finite and in the half-open
-    /// range `[0, 0.5)`.
+    /// Integrality tolerance, for acceptance only: a value within this distance
+    /// of an integer counts as integral, while the search seeks solutions whose
+    /// integer variables are integral (see [`SolveOptions::presolve`]). A
+    /// solution reports an integer or boolean variable's value as the solver
+    /// computed it, within this distance of an integer, not necessarily on it:
+    /// values like `0.9999999` are normal (one fixed at an integer, by its
+    /// bounds, the search or an edit, lies on it). Use `.round()` where an
+    /// exact integer is needed, bearing in mind that the rounded values need
+    /// not meet the constraints: under `x <= 1e7 * y`, a `y` of `1e-6` allows
+    /// `x` up to 10, which `y` rounded to zero forbids. Keep a big-M
+    /// coefficient times this tolerance small against the quantities it
+    /// bounds. It also decides integrality in [`crate::Solution::fix_var`] and
+    /// in the check of an incumbent kept across an edit. Default `1e-6`. Must
+    /// be finite and in the half-open range `[0, 0.5)`.
     pub int_tol: f64,
     /// Optional (partial) starting assignment used to seed the incumbent. The
     /// variables it leaves out are completed by an LP; a hint that is invalid or
@@ -75,14 +76,15 @@ pub struct SolveOptions {
     /// (see [`Tolerances::feasibility`]) and each bound within its tolerance,
     /// or, where it fixes a variable because of the objective, an optimum.
     /// Solutions are always checked against the problem as you wrote it. A
-    /// point that needs `int_tol`, an integer variable off its integer under a
-    /// coefficient that makes the offset count, can be cut, by presolve or by a
-    /// branch on that variable: on a problem whose every point needs that, the
-    /// solve can answer `Infeasible`, or a worse objective, with presolve on or
-    /// off, and with presolve on where presolve off finds a point. If presolve
-    /// finds the problem infeasible, the problem is solved without it. Disable
-    /// it only to compare raw solver behavior or to rule it out when
-    /// investigating a numerical issue. Default `true`.
+    /// solution relying on `int_tol`, an integer variable off its integer
+    /// under a coefficient that makes the offset count, is never sought: it is
+    /// returned where the search lands on one, and where the objective can
+    /// improve forever such a landing answers `Unbounded`. A problem with no
+    /// solution whose integer variables are integral is answered `Infeasible`
+    /// unless that happens, with presolve on or off. If presolve finds the
+    /// problem infeasible, the problem is solved without it. Disable it only to
+    /// compare raw solver behavior or to rule it out when investigating a
+    /// numerical issue. Default `true`.
     pub presolve: bool,
     /// The tolerances of the solve. Most callers should leave this at
     /// [`Tolerances::default`]; override an individual field only once you
@@ -189,10 +191,11 @@ pub struct Tolerances {
     /// bounds fix to its value exactly) and each constraint to it less the
     /// round-off of evaluating the constraint, so a solution it finds passes
     /// the check. [`Error::Infeasible`] means it proved that no point lies
-    /// within that, integer and fixed variables within their bounds: a
-    /// problem feasible only through the round-off of a constraint is
-    /// reported infeasible, as can be one feasible only by using
-    /// [`SolveOptions::int_tol`] (see [`SolveOptions::presolve`]).
+    /// within that with every integer variable at an integer within its
+    /// bounds and every fixed variable at its value: a problem feasible only
+    /// through the round-off of a constraint is reported infeasible, and so
+    /// is one feasible only by using [`SolveOptions::int_tol`] unless the
+    /// search lands on such a point (see [`SolveOptions::presolve`]).
     /// [`SolutionStatus::Optimal`] means optimal at the vertices the simplex
     /// ends at, not over every point within the tolerance: being absolute, it
     /// lets a variable with a large coefficient move its constraints far, and

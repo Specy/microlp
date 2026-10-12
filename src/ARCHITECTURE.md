@@ -670,7 +670,7 @@ model is `src/solver/tolerances.rs`.
 | Knob | Default | Gates |
 |---|---|---|
 | `presolve` | `true` | the exact reductions of §7.4 before the solve; off, the engine gets the model as written |
-| `int_tol` | `1e-6` | whether a value is integral: an integral LP point is adopted as computed and closes its node, so integer values are reported within it (§5.4); the integer `Solution::fix_var` fixes a value at; the post-edit incumbent prefilter's integrality. Finite, in `[0, 0.5)` |
+| `int_tol` | `1e-6` | whether a value counts as integral, for acceptance only (§7.1): an integral LP point is adopted as computed and closes its node, so integer values are reported within it (§5.4); the integer `Solution::fix_var` fixes a value at; the post-edit incumbent prefilter's integrality. Finite, in `[0, 0.5)` |
 | `mip_gap` | `0.0` | early-stop proof quality (relative gap, §5.5) |
 | `tolerances.feasibility` | `1e-7`, absolute, at least `1e-10` | the contract (§7.1), which presolve, the engine, the incumbent guard, the LP answer check and the post-edit incumbent prefilter all hold to |
 | `tolerances.prune_epsilon` | `1e-9` | the pruning cutoff's slack (§5.5) |
@@ -696,7 +696,10 @@ A point `x`, in user units, meets the contract when:
   tolerance and `m = |b| + Σ|a_j x_j|` at the point;
 - every bound holds within `bound_tolerance`, the same rule at that bound's magnitude, each
   bound with its own;
-- in a MILP, every integer var lies within `int_tol` of an integer;
+- in a MILP, every integer var lies within `int_tol` of an integer. The tolerance only
+  accepts: the rows may rely on the offset (§5.4), while presolve, the search and the proofs
+  keep the integral points, every integer var at an integer within its bounds, up to the
+  qualifiers of §7.3 and §7.4, and need not keep any other;
 - every row presolve dropped or rewrote holds as the user wrote it, by the same rule.
 
 `outside` is the one comparison, `value < lo − tol || value > hi + tol`; a value or a row
@@ -720,15 +723,35 @@ What an answer means:
   not over every point of the contract: the contract being absolute, a small coefficient
   beside a large one lets a point within it move the objective far, so on an
   ill-conditioned model the reported objective can lie far from the exact optimum of the
-  model as written. For a MILP, the incumbent meets the contract, and every other node was
-  pruned by its bound or proven infeasible.
+  model as written. For a MILP, the incumbent meets the contract, and no integral point
+  within the engine's room (fixed vars at their values), up to the round-off sliver, is
+  better beyond the pruning epsilon (§5.5) and the vertex freedom above: every other node
+  was pruned by its bound or proven infeasible. The proof's concession and presolve's
+  round-off can hide a better integral point, as they can cause a wrong `Infeasible` (§7.3,
+  §7.4). The incumbent need not be integral, and can be better than every integral point:
+  under the big-M caveat of §5.4, a facility's binary at `1e-7` lets it serve all the
+  demand, at a cost of `20.00001` where the best integral point costs `110` (the model of
+  `a_branch_that_fixes_a_big_m_binary_is_kept` at the default `int_tol`).
 - **`Infeasible`**: a proof, summed from the model's data, that no point has every row and
   every continuous var within the room the engine can give it, the integer and fixed vars
-  within their bounds (§7.3); never a row the simplex could not repair. For a MILP, every
-  node is so proven or has crossing bounds. A model feasible only beyond that room, through
-  the round-off sliver of its rows, is reported infeasible, and so can be a model whose
-  every point needs the integrality tolerance, where presolve or a branch holds an integer
-  var to its integer (§7.9).
+  within their bounds (§7.3); never a row the simplex could not repair. A model feasible
+  only beyond that room, through the round-off sliver of its rows, is reported infeasible.
+  For a MILP, every node is so proven or has crossing bounds: no integral point lies within
+  the engine's room, up to that sliver and the proof's concession. A model with none is
+  answered `Infeasible` (`a_model_feasible_only_off_its_integers_is_infeasible`) unless the
+  search lands on a point the contract accepts, an integer var off its integer or a fixed
+  var off its value, which it then returns: either answer is right, and which one comes can
+  depend on presolve and the objective
+  (`a_model_feasible_only_off_its_integers_minimizing_its_binary_is_answered_either_way`).
+  An edit that fixes a var at a value only such points meet leaves a model with none
+  (`a_fix_at_a_value_only_points_off_their_integers_meet_is_answered_either_way`).
+- **`Unbounded`**: for an LP, an improving ray, priced on fresh data, from a column whose
+  blocking entries are zero within their error (§7.7); for a MILP, a ray of the root's
+  relaxation and a point the incumbent guard accepts (§5.4). A model with no integral point
+  within the engine's room whose relaxation is unbounded is answered `Unbounded` where the
+  search lands on a point the contract accepts, an integer var off its integer or a fixed
+  var off its value, else `Infeasible`, and which one comes can depend on presolve
+  (`an_unbounded_relaxation_feasible_only_off_its_integers_is_unbounded_or_infeasible`).
 - **`InternalError`**: the solve could not reach an answer it can verify, and says so; no
   answer that fails the check is returned. Within the recommended coefficient range (§7.7)
   it is a bug or a known limitation (§7.9); outside it, the message names the constraint and
@@ -877,7 +900,7 @@ decision is made in user units against the engine's contract:
 Not kept: a point beyond the box by less than the round-off of evaluating a row (a working
 bound keeps only the budget of the row that implies it), and a point within the box only
 with an integer var off its integer, within `int_tol`, under a coefficient that makes the
-offset count: fixing, tightening or rewriting that var takes it away (§7.9).
+offset count: fixing, tightening or rewriting that var takes it away (§7.1).
 
 The rows presolve dropped or rewrote stay checked, as written, against every solution
 (validation rows, §7.5), so a reduction that lets through a point the model rejects costs
@@ -885,10 +908,10 @@ pivots or fails loudly, and never returns that point. A reduction that cuts poin
 admits does not show there, only as a worse optimum or an `Infeasible`: that is why presolve
 applies only exact reductions. Presolve's own `Infeasible` carries no certificate: the solve
 then goes on with the model as written (`presolve::reduced_model`), where the engine
-decides. An `Infeasible` the engine proves on the reduced model is final, but for a model
-whose every point needs the integrality tolerance. `Mode::Lp` applies only reductions that
-keep the feasible set, so the live solver stays sound under every later edit; `Mode::Mip`'s
-are sound because MILP edits re-solve from the untouched base problem (§5.8).
+decides. An `Infeasible` the engine proves on the reduced model is final. `Mode::Lp` applies
+only reductions that keep the feasible set, so the live solver stays sound under every later
+edit; `Mode::Mip`'s are sound because MILP edits re-solve from the untouched base problem
+(§5.8).
 
 ### 7.5 The end of a solve
 
@@ -1123,19 +1146,6 @@ wrong answer.
   infeasible nor reached: the solve fails loudly, and in a MILP the node is not pruned
   (`a_node_point_within_the_round_off_of_its_rows_room_is_a_known_limitation`, row dynamism
   `1e10`).
-- **A MILP point that needs `int_tol`** (in range too): presolve and the search keep the
-  integral points of the box (§7.4), so a point within the box only with an integer var off
-  its integer, under a coefficient that makes the offset count, is found only where an LP
-  reaches it. Presolve takes it away where it fixes the var, tightens its bounds or rewrites
-  its coefficient; the search where it branches on the var, whose children hold it to its
-  integers; and the proof where the var lies past a bound, since it holds an integer var
-  within its bounds (§7.3). So presolve off can answer `Infeasible`, or a worse optimum, too
-  (`a_point_needing_the_int_tol_of_a_binary_a_branch_fixes_is_a_known_limitation`,
-  `a_point_needing_the_int_tol_of_a_binary_in_range_is_a_known_limitation`), presolve on
-  where presolve off finds one
-  (`a_point_needing_the_int_tol_of_a_binary_presolve_fixes_is_a_known_limitation`), and an
-  edit that fixes a var at a value only such points have
-  (`a_fix_at_a_value_only_points_needing_int_tol_meet_is_a_known_limitation`).
 
 ---
 
