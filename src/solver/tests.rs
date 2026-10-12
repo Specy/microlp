@@ -1171,6 +1171,95 @@ fn add_constraint_evaluates_a_long_row_as_check_rows_does() {
     assert_eq!(checked.var_tols[slack], sol.var_tols[slack]);
 }
 
+/// A row's slack as the plain sum gives it and as the compensated one does,
+/// with how far beyond the slack's edge each puts it and the row's evaluation
+/// margin, at the current values of `sol` (row 0).
+fn plain_and_compensated_slack(sol: &Solver) -> ((f64, f64), (f64, f64), f64) {
+    let (lhs, magnitude) = sol.row_activity(0, |v| sol.internal_value(v));
+    let plain = sol.orig_rhs[0] - lhs;
+    let row = sol.orig_constraints.outer_view(0).unwrap();
+    let terms = row
+        .iter()
+        .filter(|&(v, _)| v < sol.num_vars)
+        .map(|(v, &coeff)| (coeff, sol.internal_value(v)));
+    let compensated = implied_slack(sol.orig_rhs[0], terms).0;
+    let tols = sol.var_tols[sol.num_vars];
+    let margin = slack_margin(
+        sol.feasibility * sol.row_scales[0],
+        magnitude,
+        sol.row_terms(0),
+    );
+    (
+        (plain, sol.slack_excess(0, plain, tols)),
+        (compensated, sol.slack_excess(0, compensated, tols)),
+        margin,
+    )
+}
+
+/// A plain sum that puts a row's slack beyond its edge by at most twice the
+/// row's evaluation margin is summed again, compensated, and the slack takes
+/// that value: `-1125 x0 - 1.125e-7 x1 = -5876999.999999887` at `x0 = 5224`,
+/// `x1 = -2` (both fixed), which the plain sum puts `3.7e-10` beyond the
+/// row's room, its exact slack `1.02e-11` inside it. A plain acceptance
+/// stands: `x0 + x1 + x2 >= 348952339.66500664` at `348952339`, `0.665` and
+/// `4.594137084480981e-8` keeps the plain sum's slack, `3.5e-8` inside the
+/// room, which the compensated sum puts `2e-21` beyond it.
+#[test]
+fn a_plain_rejection_near_the_edge_is_summed_again_compensated() {
+    init();
+    let fixed = |values: &[f64], row: (CsVec, ComparisonOp, f64)| {
+        Solver::try_new(
+            &vec![0.0; values.len()],
+            values,
+            values,
+            &[row],
+            &vec![VarDomain::Real; values.len()],
+            None,
+            crate::Tolerances::default().feasibility,
+        )
+        .unwrap()
+    };
+
+    let sol = fixed(
+        &[5224.0, -2.0],
+        (
+            to_sparse(&[-1125.0, -1.125e-7]),
+            ComparisonOp::Eq,
+            -5876999.999999887,
+        ),
+    );
+    let ((plain, plain_beyond), (compensated, compensated_beyond), margin) =
+        plain_and_compensated_slack(&sol);
+    assert!(
+        plain_beyond > 0.0 && plain_beyond <= 2.0 * margin && compensated_beyond < 0.0,
+        "fixture: the plain sum {plain:e} rejects the slack near its edge ({plain_beyond:e} \
+         beyond, margin {margin:e}), the compensated one {compensated:e} accepts it"
+    );
+    assert_eq!(sol.basic_var_vals[0].to_bits(), compensated.to_bits());
+    assert_eq!(sol.calc_primal_infeasibility().0, 0);
+    let mut checked = sol.clone();
+    assert!(checked.check_rows());
+    assert_eq!(checked.basic_var_vals[0].to_bits(), compensated.to_bits());
+
+    let sol = fixed(
+        &[348952339.0, 0.665, 4.594137084480981e-8],
+        (
+            to_sparse(&[1.0, 1.0, 1.0]),
+            ComparisonOp::Ge,
+            348952339.66500664,
+        ),
+    );
+    let ((plain, plain_beyond), (compensated, compensated_beyond), _) =
+        plain_and_compensated_slack(&sol);
+    assert!(
+        plain_beyond < 0.0 && compensated_beyond > 0.0,
+        "fixture: the plain sum {plain:e} accepts the slack, the compensated one \
+         {compensated:e} rejects it"
+    );
+    assert_eq!(sol.basic_var_vals[0].to_bits(), plain.to_bits());
+    assert_eq!(sol.calc_primal_infeasibility().0, 0);
+}
+
 /// A row every point satisfies, as an infinite right-hand side on the side
 /// the row leaves open makes it, is violated nowhere: the boundary's check
 /// agrees with the verdict the row gets before any point is looked at, so
@@ -2968,6 +3057,68 @@ fn the_repair_keeps_a_fixed_var_at_its_value() {
     assert!(!sol.basic_var_within_bounds(0), "{:?}", sol.basic_var_vals);
     let up = sol.leaving_target(0) > sol.basic_var_vals[0];
     assert!(sol.prove_infeasible(0, up).holds);
+}
+
+/// The certificate repair lands a leaving slack within its tolerance less the
+/// proof's cut. `2^-30 x1 + 2^-31 x2 >= 1.0000000009313221e-7` over
+/// `x1, x2 ∈ [-1, 0]`, both at 0 at the slack basis: the row's slack lies
+/// past the edge of its room by `x1`'s reach, `2^-30 1e-7`, and the proof
+/// fails, both vars having room. Moving `x1` alone lands the slack exactly on
+/// the edge, within its tolerance but not within the cut; the repair moves
+/// `x2` too. The test pins the rule: the slack is evaluated exactly here, so
+/// the edge is accepted too, and the solve ends optimal with either target.
+#[test]
+fn the_repair_lands_a_slack_within_its_tolerance_less_the_proofs_cut() {
+    init();
+    let mut sol = Solver::try_new(
+        &[-1.0, -1.0],
+        &[-1.0, -1.0],
+        &[0.0, 0.0],
+        &[(
+            to_sparse(&[2f64.powi(-30), 2f64.powi(-31)]),
+            ComparisonOp::Ge,
+            1.0000000009313221e-7,
+        )],
+        &[VarDomain::Real, VarDomain::Real],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let slack = sol.num_vars;
+    assert_eq!(sol.basic_vars, [slack], "fixture: the slack basis");
+    assert_eq!(sol.nb_var_vals, [0.0, 0.0], "fixture: x1 = x2 = 0");
+    let tol = sol.var_tols[slack].hi;
+    let proof = sol.prove_infeasible(0, false);
+    assert!(!proof.holds && proof.cut > 0.0, "{proof:?}");
+    // `x1`'s move to the farthest value within its room, in the engine's
+    // units, carries the slack by its coefficient times that.
+    let reach = sol
+        .orig_constraints
+        .outer_view(0)
+        .unwrap()
+        .get(0)
+        .copied()
+        .unwrap()
+        * band_edge(0.0, sol.var_tols[0].hi, true);
+    let alone = sol.basic_var_vals[0] - reach;
+    assert!(
+        alone == tol && proof.cut < tol,
+        "fixture: x1 alone lands the slack at {alone:e}, on its tolerance {tol:e}"
+    );
+    assert!(sol.certificate_repair(0));
+    for var in [0, 1] {
+        assert!(
+            sol.nb_var_vals[var] > 0.0 && sol.nb_var_vals[var] == sol.orig_var_maxs[var],
+            "x{} on its widened bound: {:?}",
+            var + 1,
+            sol.nb_var_vals
+        );
+    }
+    assert!(
+        sol.basic_var_vals[0] <= tol - proof.cut,
+        "the slack at {:e}",
+        sol.basic_var_vals[0]
+    );
 }
 
 /// The bound perturbation of a primal phase: every finite bound moves outward

@@ -24,7 +24,8 @@
 //! engine can give its terms, plus the round-off allowance of the compensated
 //! sums: the leaving var the tolerance by which the dual simplex found the
 //! row violated (`var_tols`: for a slack, its row's contract less the
-//! round-off of evaluating the row; for a structural var, its whole bound
+//! round-off of evaluating the row, and less the cut of
+//! [`Solver::leaving_slack_cut`]; for a structural var, its whole bound
 //! contract, none for an integer var its bounds fix), and every other term
 //! the room by which the widening can move its bound in the direction
 //! that helps ([`Solver::widening_room`]: a structural var's tolerance, a
@@ -38,11 +39,11 @@
 //! solved, not reported infeasible. The price: a model whose points all need
 //! more room than that is reported infeasible.
 
-use super::{band_edge, Solver, ROUNDOFF_FLOOR};
+use super::{band_edge, implied_slack_error, slack_margin, Solver, ROUNDOFF_FLOOR, UNIT_ROUNDOFF};
 
 /// A compensated double: the unevaluated sum `hi + lo` of two `f64`, which
 /// carries about twice the precision of one. The proof accumulates products
-/// with it ([`COMPENSATED_ERROR`] is the allowance for their round-off),
+/// with it ([`compensated_error`] is the allowance for their round-off),
 /// presolve the bound of a row it rewrites, and the test oracle a row's
 /// residual.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -107,6 +108,18 @@ impl CDouble {
         }
     }
 
+    /// `self`, exactly, its high part the nearest `f64` and its low part
+    /// within half an ulp of it.
+    pub(super) fn normalized(self) -> Self {
+        let (hi, lo) = Self::two_sum(self.hi, self.lo);
+        Self { hi, lo }
+    }
+
+    /// The nearest `f64` at or above `|self|`.
+    fn abs_up(self) -> f64 {
+        if self.value() < 0.0 { self.neg() } else { self }.rounded(true)
+    }
+
     /// The nearest `f64`.
     pub(crate) fn value(self) -> f64 {
         self.hi + self.lo
@@ -131,14 +144,55 @@ impl From<f64> for CDouble {
     }
 }
 
-/// The allowance for the round-off of the compensated sums, per term and per
-/// unit of the terms' magnitude: `16 · 2^-104`. The products are exact but
-/// for a compensated multiplier's low part (rounded at `2^-106` of the term);
-/// accumulating the low parts in `f64` errs by up to `n^2 · 2^-106` of the
-/// terms' magnitude (`Dot2`, Ogita–Rump–Oishi 2005), so this is a bound up to
-/// 64 terms and an allowance for the typical error beyond. It matters only
-/// where the terms are some `1e22` times the tolerance.
-pub(super) const COMPENSATED_ERROR: f64 = 16.0 * 4.930_380_657_631_324e-32; // 16 · 2^-104
+/// `a + b`, rounded up: the nearest `f64` at or above the exact sum.
+fn add_up(a: f64, b: f64) -> f64 {
+    let (sum, error) = CDouble::two_sum(a, b);
+    if error > 0.0 {
+        sum.next_up()
+    } else {
+        sum
+    }
+}
+
+/// `a · b` for `a, b >= 0`, rounded up.
+fn mul_up(a: f64, b: f64) -> f64 {
+    let (product, error) = CDouble::two_product(a, b);
+    if error > 0.0 {
+        product.next_up()
+    } else {
+        product
+    }
+}
+
+/// `|a - b|`, rounded up.
+fn distance_up(a: f64, b: f64) -> f64 {
+    let (hi, lo) = CDouble::two_sum(a, -b);
+    CDouble { hi, lo }.abs_up()
+}
+
+/// The allowance for the round-off of compensated sums, per term and per unit
+/// of the terms' magnitude, where no sum has more than six terms:
+/// `16 · 2^-104` ([`compensated_error`]). It matters only where the terms are
+/// some `1e22` times the tolerance.
+const COMPENSATED_ERROR: f64 = 16.0 * 4.930_380_657_631_324e-32; // 16 · 2^-104
+
+/// The allowance for the round-off of compensated sums of `terms` terms in
+/// all, the longest of `longest` terms, over terms of `magnitude` in all:
+/// `(terms + 1) max(1, (longest + 2) / 8)` times [`COMPENSATED_ERROR`] times
+/// `magnitude`. A sum adds three low parts per term (the two-sum error of a
+/// product's high part, its low part, and the rounded product of a
+/// multiplier's low part, which [`CDouble::normalized`] keeps within half an
+/// ulp of its high part) and accumulates them in `f64`, their partial sums
+/// growing by an ulp of the magnitude per term: a sum of `n` terms errs by at
+/// most `(1.5 n^2 + 7.5 n + 1) 2^-106` of its magnitude, to first order, and a
+/// certificate's gap, which adds each coefficient's error and low part times
+/// its bound and has the leaving var's room taken off, by at most
+/// `(6 n^2 + 24 n + 14) 2^-106` of its magnitude, `n` its longest sum. The
+/// allowance bounds both whatever the count.
+pub(super) fn compensated_error(terms: usize, longest: usize, magnitude: f64) -> f64 {
+    let scale = ((longest as f64 + 2.0) / 8.0).max(1.0);
+    (terms as f64 + 1.0) * scale * COMPENSATED_ERROR * magnitude
+}
 
 /// The test of a converged refinement: a correction of at most `2^-53` of the
 /// solution in the max norm. Only a refinement whose second correction passes
@@ -191,8 +245,15 @@ pub(super) struct Proof {
     pub(super) gap: f64,
     /// The room of the certificate's terms the gap must exceed (see the
     /// module doc), plus the allowance for the error of the compensated sums
-    /// ([`COMPENSATED_ERROR`]).
+    /// ([`compensated_error`]), rounded up.
     pub(super) allowance: f64,
+    /// The round-off withheld from the room of a leaving slack
+    /// ([`Solver::leaving_slack_cut`]); zero for a structural var, and where
+    /// the gap is not finite.
+    pub(super) cut: f64,
+    /// How many coefficients counted as zero within their error (the
+    /// concession of [`Solver::proof_of`]).
+    pub(super) zero_within_error: usize,
 }
 
 /// The row of the basis inverse the proof reads, refined, with a bound on
@@ -253,14 +314,13 @@ impl Certificate {
     /// How far from zero the coefficient of `var` can come out where it is
     /// zero for the exact multipliers: what the error of the multipliers
     /// carries into it, plus the round-off of its compensated sum
-    /// ([`COMPENSATED_ERROR`] per term), or that round-off alone where the
+    /// ([`compensated_error`]), or that round-off alone where the
     /// multipliers' error has no bound. On an infinite bound a coefficient
     /// within this counts as zero ([`Solver::proof_of`]).
     fn error_of_zero(&self, var: usize) -> f64 {
         let multipliers_error = self.errors.as_ref().map_or(0.0, |errors| errors[var]);
-        let sum_error =
-            (f64::from(self.terms_of[var]) + 1.0) * COMPENSATED_ERROR * self.magnitudes[var];
-        multipliers_error + sum_error
+        let terms = self.terms_of[var] as usize;
+        multipliers_error + compensated_error(terms, terms, self.magnitudes[var])
     }
 }
 
@@ -393,7 +453,7 @@ impl Solver {
             rows: 0,
         };
         for (r, &rho) in refined.rho.iter().enumerate() {
-            let y = if leaving_up { rho.neg() } else { rho };
+            let y = if leaving_up { rho.neg() } else { rho }.normalized();
             let y_value = y.value();
             let slack = self.num_vars + r;
             let needs_infinite_side = if y_value > 0.0 {
@@ -469,27 +529,59 @@ impl Solver {
     /// refinement's noise for terms. The concession can still prove a
     /// feasible model infeasible through a coefficient the data leave within
     /// the error bound, which the arithmetic cannot tell from zero, and only
-    /// where the var times it makes the room the gap lacks.
+    /// where the var times it makes the room the gap lacks. So can a
+    /// coefficient within the round-off of its sum of zero whose computed sign
+    /// picks a finite bound where its exact sign picks an infinite one: it
+    /// counts at the finite bound, where the exact certificate is void.
     ///
     /// A number of the certificate that is not finite (an overflow: a huge
     /// multiplier or coefficient, or Dekker's split of one beyond about
     /// `1.3e300`) voids it, with a NaN gap. The gap must exceed the room of
-    /// every term at the bound it counts at (the leaving var's tolerance, any
-    /// other's widening room) plus the round-off allowance of the sums (see
-    /// the module doc).
+    /// every term at the bound it counts at (the leaving var's tolerance, a
+    /// slack's less its cut, any other's widening room) plus the round-off
+    /// allowance of the sums (see the module doc).
     pub(super) fn proof_of(&self, refined: &RefinedRow, row: usize, leaving_up: bool) -> Proof {
         let cert = self.certificate(refined, leaving_up);
+        let proof = self.judge(&cert, row);
+        debug!(
+            "infeasibility proof for row {row} (basic var {}, {} rows combined, {} \
+             coefficients zero within the multipliers' error{}): gap {:e}, allowance {:e} \
+             (cut {:e}): {}",
+            self.basic_vars[row],
+            cert.rows,
+            proof.zero_within_error,
+            if cert.errors.is_some() {
+                ""
+            } else {
+                ", which has no bound"
+            },
+            proof.gap,
+            proof.allowance,
+            proof.cut,
+            if proof.holds { "proven" } else { "not proven" },
+        );
+        proof
+    }
+
+    /// [`Self::proof_of`] on the certificate `cert` of the violated `row`.
+    fn judge(&self, cert: &Certificate, row: usize) -> Proof {
         let leaving = self.basic_vars[row];
         let (mut magnitude, mut terms) = (cert.magnitude, cert.terms);
         // Whether every number of the certificate is finite (see above).
         let mut finite = cert.beta.value().is_finite();
         // The largest value of `p^T z` over the box.
         let mut implied_max = CDouble::default();
-        // How far past that the terms' room carries it.
+        // How far past that the room of the terms but the leaving var carries
+        // it, and the leaving var's room, which ends at `leaving_edge`, each
+        // rounded up from the exact one.
         let mut room = 0.0;
+        let (mut leaving_room, mut leaving_edge) = (0.0, 0.0);
         let mut unbounded = false;
         // How many coefficients count as zero (see above), for the log.
         let mut zero_within_error = 0;
+        // The most terms a sum of the gap has: `beta`'s, a coefficient's,
+        // `implied_max`'s.
+        let (mut longest, mut bounded) = (cert.rows, 0);
         for var in 0..self.num_total_vars() {
             let p = cert.coeff(var);
             if p == 0.0 {
@@ -520,56 +612,117 @@ impl Solver {
                 break;
             }
             implied_max.add_scaled(cert.coeffs[var], bound);
-            // The coefficient's own error, relative to the terms it was
-            // summed from, not to what they left, is carried by the bound.
-            magnitude += cert.magnitudes[var] * bound.abs();
-            terms += 1;
+            // The farthest value of the var's room: the leaving var's
+            // tolerance past its bound, any other's widening room, none for a
+            // var the engine keeps on its bounds.
+            let up = p > 0.0;
+            let edge = if var == leaving {
+                leaving_edge = band_edge(bound, self.var_tols[var].toward(up), up);
+                leaving_edge
+            } else if self.holds_on_bounds(var) {
+                bound
+            } else {
+                band_edge(bound, self.widening_room(var, up), up)
+            };
+            let width = distance_up(edge, bound);
+            let reach = mul_up(cert.coeffs[var].abs_up(), width);
             if var == leaving {
-                let tol = self.var_tols[var].toward(p > 0.0);
-                room += p.abs() * (band_edge(bound, tol, p > 0.0) - bound).abs();
-            } else if !self.holds_on_bounds(var) {
-                let reach = self.widening_room(var, p > 0.0);
-                room += p.abs() * (band_edge(bound, reach, p > 0.0) - bound).abs();
+                leaving_room = reach;
+            } else {
+                room = add_up(room, reach);
             }
+            // The coefficient's own error, relative to the terms it was
+            // summed from, not to what they left, is carried by the farthest
+            // value of its var.
+            magnitude += cert.magnitudes[var] * (bound.abs() + width);
+            terms += 1;
+            bounded += 1;
+            longest = longest.max(cert.terms_of[var] as usize).max(bounded);
         }
-        let gap = if !finite {
-            f64::NAN
-        } else if unbounded {
-            f64::NEG_INFINITY
-        } else {
+        // `beta` less the largest value of `p^T z` over the box, compensated.
+        let gap_sum = (finite && !unbounded).then(|| {
             let mut gap = cert.beta;
             gap.add_scaled(implied_max, -1.0);
+            gap
+        });
+        let gap = match gap_sum {
+            Some(sum) if sum.value().is_finite() => sum.value(),
             // A sum that overflowed voids the proof too.
-            let gap = gap.value();
-            if gap.is_finite() {
-                gap
-            } else {
-                f64::NAN
-            }
+            Some(_) => f64::NAN,
+            None if unbounded => f64::NEG_INFINITY,
+            None => f64::NAN,
         };
-        // Every term's room (see the module doc), plus the round-off
-        // allowance of the compensated sums.
-        let allowance = room + (terms as f64 + 1.0) * COMPENSATED_ERROR * magnitude;
-        let proof = Proof {
-            holds: gap > allowance,
+        let sums = compensated_error(terms, longest, magnitude);
+        let cut = if leaving >= self.num_vars && gap.is_finite() {
+            self.leaving_slack_cut(row, leaving_edge, sums, gap)
+        } else {
+            0.0
+        };
+        // Every term's room (see the module doc), a leaving slack's less its
+        // cut, plus the round-off allowance of the compensated sums, weighed
+        // so that rounding errs against the proof: the rooms rounded up, the
+        // leaving var's taken off the compensated gap, which is then rounded
+        // down, and the rest, less the cut, rounded up. A proof then holds
+        // only where the exact gap exceeds the exact rooms. Of the leaving
+        // var's room only its own rounding up enters the verdict, an ulp at
+        // most, none where its coefficient is one and its bound zero, as a
+        // slack's in a certificate of its row alone
+        // ([`Self::leaving_slack_cut`]).
+        let others = add_up(room, sums);
+        let (holds, allowance) = match gap_sum {
+            Some(mut excess) if gap.is_finite() && leaving_room > cut => {
+                let rest = add_up(others, -cut);
+                excess.add(-leaving_room);
+                let holds = gap > others && excess.rounded(false) > rest;
+                (holds, add_up(rest, leaving_room))
+            }
+            _ => (gap > others, others),
+        };
+        Proof {
+            holds,
             gap,
             allowance,
-        };
-        debug!(
-            "infeasibility proof for row {row} (basic var {leaving}, {} rows combined, {} \
-             coefficients zero within the multipliers' error{}): gap {:e}, allowance {:e}: {}",
-            cert.rows,
+            cut,
             zero_within_error,
-            if cert.errors.is_some() {
-                ""
-            } else {
-                ", which has no bound"
-            },
-            proof.gap,
-            proof.allowance,
-            if proof.holds { "proven" } else { "not proven" },
-        );
-        proof
+        }
+    }
+
+    /// The round-off `E` the proof of `row` withholds from the room of its
+    /// leaving slack, whose room ends at `edge`, for a certificate whose sums
+    /// have the allowance `sums` and whose gap came out `gap`:
+    /// `E = min(4 u min(|s|, |edge|) + 4 (n + 2)^2 u^2 m + 2 sums + u |gap|, δ)`,
+    /// `s` the engine's value of the slack, `n`, `m` and `δ` the terms,
+    /// magnitude and evaluation margin ([`slack_margin`]) of its row at the
+    /// current values, `u = 2^-53`.
+    ///
+    /// The engine found the slack beyond its edge: by a plain sum, more than
+    /// twice the row's evaluation margin past it, so the exact slack lies past
+    /// it too, or by a compensated one ([`Self::row_slack`]), which errs by at
+    /// most the first two terms ([`implied_slack_error`]). They take the slack
+    /// at most at the edge: a value less its error, `s - u |s|`, grows with
+    /// `s`, so a compensated value past the edge puts the exact slack past it
+    /// less the error there. The gap errs by `sums`, which the allowance counts
+    /// once more; the verdict weighs the compensated gap, so `u |gap|`, the
+    /// rounding of its value, is spare. So where the certificate is the slack's
+    /// row alone, as when no basic structural var lies in that row, the
+    /// computed gap of a slack the engine finds violated exceeds its room, its
+    /// tolerance `α` less `E`, plus `sums`: the proof holds unless other terms'
+    /// room closes the gap, which the repair then spends
+    /// ([`Self::certificate_repair`], whose target for the slack is `α - E`),
+    /// and no such row is left neither reached nor proven. The cap leaves that
+    /// so: the errors the cut covers there come to at most `2 u m` and terms in
+    /// `u^2`, within `δ`. It keeps the slack at least `α - δ`, the room every
+    /// other slack of a certificate gets, where a certificate of several rows
+    /// has an allowance beyond its row's round-off. The price: the proof can
+    /// hold where a point needs the slack within `E` of the edge of its room.
+    fn leaving_slack_cut(&self, row: usize, edge: f64, sums: f64, gap: f64) -> f64 {
+        let r = self.basic_vars[row] - self.num_vars;
+        let (_, magnitude) = self.row_activity(r, |v| self.internal_value(v));
+        let (tol, terms) = (self.feasibility * self.row_scales[r], self.row_terms(r));
+        let slack = self.basic_var_vals[row].abs().min(edge.abs());
+        let cut =
+            implied_slack_error(slack, magnitude, terms) + 2.0 * sums + UNIT_ROUNDOFF * gap.abs();
+        cut.min(slack_margin(tol, magnitude, terms))
     }
 
     /// The last of the dual simplex's last resorts for a violated `row` that
@@ -584,7 +737,11 @@ impl Solver {
     /// is the room the proof grants every term but the leaving var
     /// ([`Self::proof_of`]), so a row it leaves open has a widening until the
     /// room of every var that can help it is spent, and a phase widens
-    /// finitely often. Returns whether it widened a bound.
+    /// finitely often. The target is the leaving var's tolerance, a slack's
+    /// less the proof's cut ([`Self::leaving_slack_cut`]): where the engine's
+    /// value of the slack is compensated, near its edge, the cut covers the
+    /// round-off of predicting the slack from it and of the engine's next
+    /// verdict on it. Returns whether it widened a bound.
     ///
     /// The widening is the room of a row every var that could move sits at
     /// the bound that blocks, short of its bound by a tolerance, alone or with
@@ -614,9 +771,10 @@ impl Solver {
         let cert = self.certificate(&refined, leaving_up);
         let tols = self.var_tols[self.basic_vars[row]];
         // How far the leaving var must move, and the tolerance within which it
-        // counts as there.
+        // counts as there (see above).
         let need = (val - leaving_new_val).abs();
-        let target_tol = if leaving_up { tols.lo } else { tols.hi };
+        let tol = if leaving_up { tols.lo } else { tols.hi };
+        let target_tol = (tol - self.judge(&cert, row).cut).max(0.0);
         // The vars that can help past the bound they sit at, as (col, var,
         // up, the widened bound, how far its move carries the leaving var). A
         // var helps by moving up where its coefficient is positive, down where

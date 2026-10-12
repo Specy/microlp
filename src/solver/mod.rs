@@ -26,7 +26,7 @@ mod tolerances;
 
 pub(crate) use basis::*;
 pub(crate) use proof::CDouble;
-use proof::{refinement_error, COMPENSATED_ERROR};
+use proof::{compensated_error, refinement_error};
 pub(crate) use scaling::*;
 pub(crate) use tolerances::*;
 
@@ -788,14 +788,18 @@ impl Solver {
     /// and its tolerances there ([`Self::slack_tols`]): the plain sum of
     /// [`Self::row_activity`] where its round-off fits the row's evaluation
     /// margin ([`plain_sum_resolves`]), else compensated ([`implied_slack`]).
-    /// The one evaluation every slack set from its row takes (the row check,
-    /// the starting vertex, an added row).
+    /// A plain sum that puts the slack beyond its edge by at most twice that
+    /// margin is summed again, compensated: there the exact slack can lie
+    /// within the room, where the infeasibility proof, summed exactly, cannot
+    /// prove the row violated ([`Self::leaving_slack_cut`]). A plain
+    /// acceptance stands, the margin covering it. The one evaluation every
+    /// slack set from its row takes (the row check, the starting vertex, an
+    /// added row).
     fn row_slack(&self, r: usize) -> (f64, BoundTols) {
         let (lhs, magnitude) = self.row_activity(r, |v| self.internal_value(v));
-        let tol = self.feasibility * self.row_scales[r];
-        let implied = if plain_sum_resolves(tol, magnitude, self.row_terms(r)) {
-            self.orig_rhs[r] - lhs
-        } else {
+        let (tol, terms) = (self.feasibility * self.row_scales[r], self.row_terms(r));
+        let tols = self.slack_tols(r, magnitude);
+        let compensated = || {
             //guaranteed to be a valid index
             let row = self.orig_constraints.outer_view(r).unwrap();
             let terms = row
@@ -804,7 +808,31 @@ impl Solver {
                 .map(|(v, &coeff)| (coeff, self.internal_value(v)));
             implied_slack(self.orig_rhs[r], terms).0
         };
-        (implied, self.slack_tols(r, magnitude))
+        if !plain_sum_resolves(tol, magnitude, terms) {
+            return (compensated(), tols);
+        }
+        let plain = self.orig_rhs[r] - lhs;
+        let beyond = self.slack_excess(r, plain, tols);
+        if beyond > 0.0 && beyond <= 2.0 * slack_margin(tol, magnitude, terms) {
+            return (compensated(), tols);
+        }
+        (plain, tols)
+    }
+
+    /// How far the slack of row `r`, at `value`, lies beyond the edge the
+    /// engine holds it to with the tolerances `tols` (not positive within it):
+    /// a basic slack's bounds in the basis, a non-basic slack's residual
+    /// `value` less its own value, which [`Self::check_rows`] holds within
+    /// `tols` of zero.
+    fn slack_excess(&self, r: usize, value: f64, tols: BoundTols) -> f64 {
+        match self.var_states[self.num_vars + r] {
+            VarState::Basic(pos) => (self.basic_var_mins[pos] - tols.lo - value)
+                .max(value - (self.basic_var_maxs[pos] + tols.hi)),
+            VarState::NonBasic(col) => {
+                let residual = value - self.nb_var_vals[col];
+                (-tols.lo - residual).max(residual - tols.hi)
+            }
+        }
     }
 
     /// The number of structural nonzeros of row `r`, which the round-off of
@@ -2020,9 +2048,9 @@ impl Solver {
     /// unrepaired row's certificate leaves then lies where no step reaches:
     /// in an entry the refinement cannot settle of a var with no bound in its
     /// direction, in a coefficient below the round-off of its terms, within
-    /// the round-off of the room every term can give, or beyond the values
-    /// computed through the basis (see the known limitations in ARCHITECTURE
-    /// §7.9).
+    /// the round-off of the room every term of a certificate of several rows
+    /// can give ([`Self::leaving_slack_cut`]), or beyond the values computed
+    /// through the basis (see the known limitations in ARCHITECTURE §7.9).
     fn dual_phase(&mut self) -> Result<StopReason, Error> {
         let obj_str = if self.artificial_obj.is_some() {
             "artificial obj."
@@ -2568,6 +2596,7 @@ impl Solver {
         let mut magnitudes = vec![0.0; num_cols];
         let mut terms = vec![0u32; num_cols];
         for (r, &y) in refined.rho.iter().enumerate() {
+            let y = y.normalized();
             let y_value = y.value();
             let second = refined.second.get(r).copied().unwrap_or(0.0);
             if y_value == 0.0 && second == 0.0 {
@@ -2586,7 +2615,8 @@ impl Solver {
         let settled = !refined.second.is_empty();
         let genuine = (0..num_cols)
             .map(|idx| {
-                let sum_error = (f64::from(terms[idx]) + 1.0) * COMPENSATED_ERROR * magnitudes[idx];
+                let count = terms[idx] as usize;
+                let sum_error = compensated_error(count, count, magnitudes[idx]);
                 settled && entries[idx].value().abs() > moves[idx].value().abs() + sum_error
             })
             .collect();
