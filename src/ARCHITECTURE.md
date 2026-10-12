@@ -920,10 +920,13 @@ phase reports `Finished` only after `verify_primal` and exact reduced costs (rec
 where pivots updated them incrementally).
 
 - *Check* (`check_rows`): every basic slack is re-derived from its row at the current values
-  (plain, or compensated where `δ` is capped), so a row's violation lives in its slack,
-  where the dual simplex sees it; the slack tolerances are refreshed; and the basic values
-  must solve every row whose slack is non-basic within that slack's tolerance, on the side
-  the residual moves it (a widened side: `δ`).
+  (`row_slack`: plain, or compensated where `δ` is capped), so a row's violation lives in its
+  slack, where the dual simplex sees it; the slack tolerances are refreshed; and the basic
+  values must solve every row whose slack is non-basic within that slack's tolerance, on the
+  side the residual moves it (a widened side: `δ`). The starting vertex and an added row set
+  their slacks by the same evaluation: the starting vertex, every slack basic, counts as
+  verified as it stands, and the dual phase sees an added row's true violation from its
+  first step.
 - *Refinement* (`refine`): one step, the residual of every row whose slack is non-basic
   summed in compensated arithmetic, which sees what a plain sum over large terms rounds
   away, solved through the factorization. It runs where the rows hold too, since a residual

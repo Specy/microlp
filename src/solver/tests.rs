@@ -1068,6 +1068,109 @@ fn the_boundary_check_does_not_depend_on_the_order_of_a_rows_terms() {
     assert!(row_violation(&row, ComparisonOp::Ge, 226e3, |_| 1.0, feasibility).is_some());
 }
 
+/// `x0 + x1 + ... + x300 + y >= 2^50 + 75` over the vars of
+/// [`long_row_solver`]. At `y = 0` the row is `37.5` short; a plain sum in
+/// the written order rounds each `0.12500001` it adds to `2^50` up to
+/// `0.25`, the spacing of `f64` there, and finds it held exactly. The row is
+/// too long for that sum's round-off to fit its evaluation margin.
+fn long_row() -> (CsVec, ComparisonOp, f64) {
+    (
+        to_sparse(&[1.0; 302]),
+        ComparisonOp::Ge,
+        2f64.powi(50) + 75.0,
+    )
+}
+
+/// The solver of `rows` over `x0` fixed at `2^50`, `x1, ..., x300` fixed at
+/// `0.12500001`, and `y ∈ [0, 100]` at cost one.
+fn long_row_solver(rows: &[(CsVec, ComparisonOp, f64)]) -> Solver {
+    let mut mins = vec![2f64.powi(50)];
+    mins.extend([0.12500001; 300]);
+    let mut maxs = mins.clone();
+    mins.push(0.0);
+    maxs.push(100.0);
+    let mut costs = vec![0.0; 302];
+    costs[301] = 1.0;
+    Solver::try_new(
+        &costs,
+        &mins,
+        &maxs,
+        rows,
+        &vec![VarDomain::Real; 302],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap()
+}
+
+/// The constructor evaluates a row as `check_rows` does: the slack of
+/// [`long_row`] starts at the row's shortfall, summed in compensated
+/// arithmetic, with the value and tolerances `check_rows` computes, bit for
+/// bit. So the starting values are verified as they stand: a verification
+/// leaves them as they are.
+#[test]
+fn the_constructor_evaluates_a_long_row_as_check_rows_does() {
+    init();
+    let sol = long_row_solver(&[long_row()]);
+    assert_eq!(sol.row_scales, [1.0], "fixture: the row is not scaled");
+    let (lhs, magnitude) = sol.row_activity(0, |v| sol.internal_value(v));
+    assert!(
+        !plain_sum_resolves(sol.feasibility, magnitude, sol.row_terms(0))
+            && sol.orig_rhs[0] - lhs == 0.0,
+        "fixture: a row too long for the plain sum, which finds it held"
+    );
+    let slack = sol.num_vars;
+    let value = sol.basic_var_vals[0];
+    assert!((value - 37.5).abs() < 1e-5, "the row's shortfall: {value}");
+    assert!(!sol.is_primal_feasible);
+
+    let mut checked = sol.clone();
+    assert!(checked.check_rows());
+    assert_eq!(checked.basic_var_vals[0].to_bits(), value.to_bits());
+    assert_eq!(checked.var_tols[slack], sol.var_tols[slack]);
+
+    assert!(!sol.values_dirty);
+    let mut verified = sol.clone();
+    verified.values_dirty = true;
+    assert_eq!(
+        verified.verify_primal().unwrap(),
+        Verdict::Checked { feasible: false }
+    );
+    assert_eq!(verified.basic_var_vals[0].to_bits(), value.to_bits());
+    assert_eq!(verified.var_tols[slack], sol.var_tols[slack]);
+}
+
+/// `add_constraint` evaluates the row it adds as `check_rows` does: added to
+/// `y <= 50` at its optimum, [`long_row`] gets its shortfall as its slack's
+/// value, with the tolerances `check_rows` computes, bit for bit. With a
+/// deadline already passed, the re-solve stops before its first step, on
+/// that value.
+#[test]
+fn add_constraint_evaluates_a_long_row_as_check_rows_does() {
+    init();
+    let mut y = vec![0.0; 302];
+    y[301] = 1.0;
+    let mut sol = long_row_solver(&[(to_sparse(&y), ComparisonOp::Le, 50.0)]);
+    assert_eq!(sol.initial_solve().unwrap(), StopReason::Finished);
+    sol.deadline = Some(Instant::now());
+    let (coeffs, op, rhs) = long_row();
+    assert_eq!(
+        sol.add_constraint(coeffs, op, rhs).unwrap(),
+        StopReason::Limit
+    );
+    let slack = sol.num_vars + 1;
+    let VarState::Basic(pos) = sol.var_states[slack] else {
+        panic!("the new slack is basic");
+    };
+    let value = sol.basic_var_vals[pos];
+    assert!((value - 37.5).abs() < 1e-5, "the row's shortfall: {value}");
+
+    let mut checked = sol.clone();
+    assert!(checked.check_rows());
+    assert_eq!(checked.basic_var_vals[pos].to_bits(), value.to_bits());
+    assert_eq!(checked.var_tols[slack], sol.var_tols[slack]);
+}
+
 /// A row every point satisfies, as an infinite right-hand side on the side
 /// the row leaves open makes it, is violated nowhere: the boundary's check
 /// agrees with the verdict the row gets before any point is looked at, so
