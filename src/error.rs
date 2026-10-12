@@ -5,10 +5,10 @@ use sprs::errors::StructureError;
 /// An error returned while validating, solving, or editing a problem.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
-    /// The solver proved, from the problem's data, that no assignment meets
-    /// the variable bounds and constraints within the feasibility tolerance
-    /// with every integer variable, and every variable whose bounds are equal,
-    /// exactly within its bounds (see
+    /// The solver proved, from the problem's data, that no assignment with
+    /// every integer variable at an integer within its bounds, and every
+    /// variable whose bounds are equal at its value, meets the constraints and
+    /// the other bounds within the feasibility tolerance (see
     /// [`Tolerances::feasibility`](crate::Tolerances::feasibility)).
     Infeasible,
     /// The objective can improve without a finite limit.

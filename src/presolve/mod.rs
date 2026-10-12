@@ -27,7 +27,7 @@
 //! or shrinking its coefficient takes that path away, as a branch on the
 //! var does. So where every point of a model needs the integrality
 //! tolerance, presolve on can answer `Infeasible`, or a worse optimum,
-//! where presolve off finds one (ARCHITECTURE §7.9).
+//! where presolve off finds one: either answer is right (ARCHITECTURE §7.1).
 //!
 //! The variable set never changes: a var presolve "removes" gets `lo == hi`
 //! bounds, which the simplex prices out, and its value is substituted out of
@@ -93,10 +93,9 @@
 //! * Presolve's own `Infeasible` carries no certificate, so it is not final:
 //!   the solve then goes on with the model as written ([`reduced_model`]),
 //!   where the engine decides on a proof. The engine's `Infeasible` on the
-//!   reduced model is final but for a model whose every point needs the
-//!   integrality tolerance (above): the reductions keep, up to round-off, a
-//!   point within the box with its integer vars exactly integral wherever the
-//!   model as written has one.
+//!   reduced model is final. The reductions keep, up to round-off, a point
+//!   within the box with its integer vars exactly integral wherever the model
+//!   as written has one.
 //!
 //! [`row_tolerance`]: crate::solver::row_tolerance
 //! [`ROUNDOFF_FLOOR`]: crate::solver::ROUNDOFF_FLOOR

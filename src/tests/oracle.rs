@@ -1,7 +1,9 @@
 //! What a correct answer to a feasible, bounded model must satisfy, shared by
 //! the property tests and the regression tests built from their counterexamples.
 //!
-//! The models are built around a point `x*` chosen first, so `solve()` must
+//! The models are built around a point `x*` chosen first, an integral point
+//! (every integer variable at an integer within its bounds, which presolve,
+//! the search and the proofs keep: ARCHITECTURE §7.1), so `solve()` must
 //! return a solution at least as good as `x*`. In the units the user sees:
 //!
 //! * A row holds within [`crate::Tolerances::feasibility`] (default `1e-7`),
@@ -23,11 +25,16 @@
 //! instead fail loudly, with an `InternalError` that names a constraint or a
 //! variable outside it, but never with a wrong answer
 //! ([`assert_no_wrong_answer`]).
+//!
+//! A MILP with no integral point with its fixed variables at their values
+//! may be answered `Infeasible` or with a point the contract accepts, an
+//! integer variable off its integer or a fixed variable off its value
+//! ([`infeasible_or_within_contract`]).
 
 use crate::range::CoefficientRange;
 use crate::{
-    ComparisonOp, Error, OptimizationDirection, Problem, SolutionStatus, SolveOptions, Tolerances,
-    Variable,
+    ComparisonOp, Error, OptimizationDirection, Problem, SolutionStatus, SolveOptions,
+    SolveOutcome, Tolerances, Variable,
 };
 use std::time::Duration;
 
@@ -161,13 +168,26 @@ fn bound_tolerance(v: &Var) -> f64 {
     Tolerances::default().feasibility.max(ROUNDOFF * mag)
 }
 
-/// Whether `x*` satisfies every row of `model` within the tolerance above:
-/// true by construction, and assumed by a generator before drawing conclusions.
+/// Whether `x*` is an integral point of `model` that holds its rows: every
+/// integer var at an integer within its bounds, and every row within the
+/// tolerance above. True by construction, and assumed by a generator before
+/// drawing conclusions.
 pub(crate) fn xstar_is_feasible(model: &Model) -> bool {
+    let integral = model
+        .vars
+        .iter()
+        .zip(&model.xstar)
+        .all(|(v, &x)| !v.integer || (x == x.round() && v.lo <= x && x <= v.hi));
+    integral && rows_hold(model, &model.xstar)
+}
+
+/// Whether every row of `model` holds at `x` within the tolerance above
+/// (bounds and integrality not checked).
+pub(crate) fn rows_hold(model: &Model, x: &[f64]) -> bool {
     model
         .rows
         .iter()
-        .all(|row| row_violation(row, &model.xstar) <= row_tolerance(row, &model.xstar))
+        .all(|row| row_violation(row, x) <= row_tolerance(row, x))
 }
 
 /// Whether `model` lies within the recommended coefficient range: the
@@ -236,16 +256,17 @@ fn check_contract_with(
     time_limit: Option<Duration>,
     loud_allowed: bool,
 ) {
+    assert!(
+        xstar_is_feasible(model),
+        "fixture error: x* must be an integral point, its integer vars at integers within \
+         their bounds, that holds every row:\n{}",
+        model.source()
+    );
     let (problem, vars) = model.build();
     let mut options = SolveOptions::default();
     options.presolve = presolve;
     options.time_limit = time_limit;
-    let int_tol = options.int_tol;
-    let call = if presolve {
-        "solve()"
-    } else {
-        "solve() without presolve"
-    };
+    let call = solve_call(presolve);
     let outcome = match problem.solve_with(options) {
         Ok(outcome) => outcome,
         Err(Error::InternalError(message))
@@ -258,56 +279,7 @@ fn check_contract_with(
             model.source()
         ),
     };
-    let solution = match outcome.into_solution() {
-        Ok(solution) => solution,
-        Err(interrupted) => panic!(
-            "into_solution() returned {interrupted:?} (time limit {time_limit:?}):\n{}",
-            model.source()
-        ),
-    };
-    assert_eq!(
-        solution.status(),
-        SolutionStatus::Optimal,
-        "no limit was reached, so the status must be Optimal:\n{}",
-        model.source()
-    );
-
-    let x: Vec<f64> = vars.iter().map(|&v| solution.var_value(v)).collect();
-    for (j, v) in model.vars.iter().enumerate() {
-        let tol = bound_tolerance(v);
-        assert!(
-            x[j] >= v.lo - tol && x[j] <= v.hi + tol,
-            "x{j} = {:e} is outside [{:e}, {:e}] (tolerance {tol:e}):\n{}",
-            x[j],
-            v.lo,
-            v.hi,
-            model.source()
-        );
-        let off = (x[j] - x[j].round()).abs();
-        assert!(
-            !v.integer || off <= int_tol,
-            "x{j} = {:e} is {off:e} off its integer (tolerance {int_tol:e}):\n{}",
-            x[j],
-            model.source()
-        );
-    }
-    for (i, row) in model.rows.iter().enumerate() {
-        let violation = row_violation(row, &x);
-        let tol = row_tolerance(row, &x);
-        assert!(
-            violation <= tol,
-            "row {i} is violated by {violation:e} (tolerance {tol:e}) at x = {x:?}:\n{}",
-            model.source()
-        );
-    }
-
-    let objective = solution.objective();
-    let recomputed = model.objective_at(&x);
-    assert!(
-        (objective - recomputed).abs() <= 1e-9 * (1.0 + objective.abs()),
-        "reported objective {objective:e} does not match the reported values ({recomputed:e}):\n{}",
-        model.source()
-    );
+    let (_, objective) = assert_answer_within_contract(model, outcome, &vars, call, time_limit);
     if !compare_objective {
         return;
     }
@@ -329,4 +301,111 @@ fn check_contract_with(
          feasible point the model was built around (slack {slack:e}):\n{}",
         model.source()
     );
+}
+
+/// The solve call a failure report names.
+fn solve_call(presolve: bool) -> &'static str {
+    if presolve {
+        "solve()"
+    } else {
+        "solve() without presolve"
+    }
+}
+
+/// The values and objective of the answer in `outcome`, held to the contract
+/// of the module doc but for the comparison with `x*`.
+fn assert_answer_within_contract(
+    model: &Model,
+    outcome: SolveOutcome,
+    vars: &[Variable],
+    call: &str,
+    time_limit: Option<Duration>,
+) -> (Vec<f64>, f64) {
+    let solution = match outcome.into_solution() {
+        Ok(solution) => solution,
+        Err(interrupted) => panic!(
+            "{call}: into_solution() returned {interrupted:?} (time limit {time_limit:?}):\n{}",
+            model.source()
+        ),
+    };
+    assert_eq!(
+        solution.status(),
+        SolutionStatus::Optimal,
+        "{call}: no limit was reached, so the status must be Optimal:\n{}",
+        model.source()
+    );
+
+    let int_tol = SolveOptions::default().int_tol;
+    let x: Vec<f64> = vars.iter().map(|&v| solution.var_value(v)).collect();
+    for (j, v) in model.vars.iter().enumerate() {
+        let tol = bound_tolerance(v);
+        assert!(
+            x[j] >= v.lo - tol && x[j] <= v.hi + tol,
+            "{call}: x{j} = {:e} is outside [{:e}, {:e}] (tolerance {tol:e}):\n{}",
+            x[j],
+            v.lo,
+            v.hi,
+            model.source()
+        );
+        let off = (x[j] - x[j].round()).abs();
+        assert!(
+            !v.integer || off <= int_tol,
+            "{call}: x{j} = {:e} is {off:e} off its integer (tolerance {int_tol:e}):\n{}",
+            x[j],
+            model.source()
+        );
+    }
+    for (i, row) in model.rows.iter().enumerate() {
+        let violation = row_violation(row, &x);
+        let tol = row_tolerance(row, &x);
+        assert!(
+            violation <= tol,
+            "{call}: row {i} is violated by {violation:e} (tolerance {tol:e}) at x = {x:?}:\n{}",
+            model.source()
+        );
+    }
+
+    let objective = solution.objective();
+    let recomputed = model.objective_at(&x);
+    assert!(
+        (objective - recomputed).abs() <= 1e-9 * (1.0 + objective.abs()),
+        "{call}: reported objective {objective:e} does not match the reported values \
+         ({recomputed:e}):\n{}",
+        model.source()
+    );
+    (x, objective)
+}
+
+/// The asymmetric contract on a MILP with no integral point with its fixed
+/// vars at their values (ARCHITECTURE §7.1): the solve with `presolve`
+/// answers `Infeasible` (`None`), or a point the contract of the module doc
+/// accepts, but for the comparison with `x*` (`Some`, its values). Any other
+/// answer panics.
+pub(crate) fn infeasible_or_within_contract(model: &Model, presolve: bool) -> Option<Vec<f64>> {
+    let (problem, vars) = model.build();
+    let options = SolveOptions {
+        presolve,
+        ..SolveOptions::default()
+    };
+    infeasible_or_answer_within_contract(
+        model,
+        problem.solve_with(options),
+        &vars,
+        solve_call(presolve),
+    )
+}
+
+/// [`infeasible_or_within_contract`] on the `result` of `call`, such as an
+/// edit, that `model` describes, `vars` being its vars as built.
+pub(crate) fn infeasible_or_answer_within_contract(
+    model: &Model,
+    result: Result<SolveOutcome, Error>,
+    vars: &[Variable],
+    call: &str,
+) -> Option<Vec<f64>> {
+    match result {
+        Err(Error::Infeasible) => None,
+        Err(err) => panic!("{call} returned {err:?}:\n{}", model.source()),
+        Ok(outcome) => Some(assert_answer_within_contract(model, outcome, vars, call, None).0),
+    }
 }

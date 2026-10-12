@@ -60,7 +60,10 @@ assert_eq!(solution.var_value(y).round(), 3.0);
 A `Problem` is created with an optimization direction and filled with
 variables and constraints. Each variable is defined by its objective
 coefficient and its bounds, and is represented by a `Variable` handle that you
-keep to reference it later.
+keep to reference it later. A handle belongs to the problem that created it:
+use it only with that problem and its solutions. Another problem does not
+detect a foreign handle; it refers to that problem's variable with the same
+index, or panics if there is none.
 
 ```rust
 use microlp::{ComparisonOp, LinearExpr, OptimizationDirection, Problem};
@@ -107,9 +110,9 @@ where that is larger), checked against the problem as you wrote it. Otherwise
 the solve returns an error:
 
 * `Error::Infeasible`: the solver proved, from the problem's data, that no
-  assignment meets the constraints and bounds within that tolerance with
-  every integer variable, and every variable whose bounds are equal, exactly
-  within its bounds (see `Tolerances::feasibility`).
+  assignment with every integer variable at an integer within its bounds, and
+  every variable whose bounds are equal at its value, meets the constraints
+  and the other bounds within that tolerance (see `Tolerances::feasibility`).
 * `Error::Unbounded`: the objective can improve forever.
 * `Error::InternalError`: a numerical failure the solver could not recover
   from. It returns this rather than an answer it could not verify.
@@ -242,9 +245,10 @@ let outcome = problem.solve_with(options)?;
   A good one gives the solver an immediate solution to improve on. It is
   advisory: if it isn't usable it is ignored.
 * `int_tol`, `tolerances`: numeric tolerances. A value within `int_tol` of an
-  integer counts as integral, and integer values are reported within it (a
-  fixed integer variable's on its integer); the feasibility tolerance is
-  absolute, for every variable bound and constraint.
+  integer counts as integral, for acceptance only (see `presolve` below), and
+  integer values are reported within it (a fixed integer variable's on its
+  integer); the feasibility tolerance is absolute, for every variable bound
+  and constraint.
   Values must be finite and non-negative, the feasibility tolerance at least
   `1e-10`, and `int_tol` below `0.5` (`tolerances.integrality_rounding` is
   deprecated and ignored).
@@ -252,11 +256,12 @@ let outcome = problem.solve_with(options)?;
   removes a variable or changes a real variable's bounds, and it keeps, up to
   round-off, every solution whose integer variables are exactly integral;
   every solution is still checked against the problem as you wrote it. A
-  solution that exists only by using `int_tol` (an integer variable just off
-  its integer under a big-M coefficient) can be lost, by presolve or by a
-  branch on that variable, so such a problem can be answered `Infeasible`
-  with presolve on or off, and with presolve on where presolve off finds a
-  solution.
+  solution relying on `int_tol` (an integer variable just off its integer
+  under a big-M coefficient) is never sought: it is returned where the search
+  lands on one, and where the objective can improve forever such a landing
+  answers `Unbounded`. A problem with no solution whose integer variables are
+  integral is answered `Infeasible` unless that happens, with presolve on or
+  off.
 
 ## Changing a solved problem
 
