@@ -60,7 +60,10 @@ assert_eq!(solution.var_value(y).round(), 3.0);
 A `Problem` is created with an optimization direction and filled with
 variables and constraints. Each variable is defined by its objective
 coefficient and its bounds, and is represented by a `Variable` handle that you
-keep to reference it later.
+keep to reference it later. A handle belongs to the problem that created it:
+use it only with that problem and its solutions. Another problem does not
+detect a foreign handle; it refers to that problem's variable with the same
+index, or panics if there is none.
 
 ```rust
 use microlp::{ComparisonOp, LinearExpr, OptimizationDirection, Problem};
