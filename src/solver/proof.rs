@@ -18,7 +18,8 @@
 //! Every coefficient counts at the bound of its var that raises `p^T z` where
 //! that bound is finite, however small the coefficient, and makes the range
 //! unbounded where it is infinite, with one concession for the error of the
-//! multipliers ([`Solver::proof_of`]).
+//! multipliers in a basic var's coefficient ([`Solver::proof_of`]), granted
+//! only to a refinement that converges in two steps.
 //!
 //! The certificate proves infeasibility when its gap exceeds the room the
 //! engine can give its terms, plus the round-off allowance of the compensated
@@ -39,7 +40,9 @@
 //! solved, not reported infeasible. The price: a model whose points all need
 //! more room than that is reported infeasible.
 
-use super::{band_edge, implied_slack_error, slack_margin, Solver, ROUNDOFF_FLOOR, UNIT_ROUNDOFF};
+use super::{
+    band_edge, implied_slack_error, slack_margin, Solver, VarState, ROUNDOFF_FLOOR, UNIT_ROUNDOFF,
+};
 
 /// A compensated double: the unevaluated sum `hi + lo` of two `f64`, which
 /// carries about twice the precision of one. The proof accumulates products
@@ -201,6 +204,14 @@ pub(super) fn compensated_error(terms: usize, longest: usize, magnitude: f64) ->
 /// could make a coefficient or an entry of the model's own count as zero.
 const REFINEMENT_CONVERGED: f64 = f64::EPSILON / 2.0;
 
+/// The most steps of the refinement a failed proof goes on with
+/// ([`Solver::prove_infeasible`]), and the ratio of a correction to the one
+/// before beyond which it no longer converges (Demmel et al. 2006). A step
+/// multiplies the error by about the basis's condition times `2^-53`, so ten
+/// reach [`REFINEMENT_CONVERGED`] through a condition of some `1e14`.
+const REFINEMENT_MAX_STEPS: usize = 10;
+const REFINEMENT_RATIO: f64 = 0.5;
+
 /// The bound on the error of each entry of a solution refined twice, `x`:
 /// the magnitude of its entry of the refinement's `second` correction, where
 /// the refinement converged ([`REFINEMENT_CONVERGED`]); `None` where it did
@@ -263,12 +274,16 @@ pub(super) struct RefinedRow {
     /// Per row, its multiplier, compensated.
     pub(super) rho: Vec<CDouble>,
     /// Per row, a bound on the error of its multiplier
-    /// ([`refinement_error`]); `None` where the refinement did not converge,
-    /// and then a coefficient counts as zero only within the round-off of the
-    /// certificate's own sums ([`Solver::proof_of`]).
+    /// ([`refinement_error`]); `None` where the refinement did not converge in
+    /// two steps, a later convergence included
+    /// ([`Solver::converged_basis_inverse_row`]), and then a coefficient
+    /// counts as zero only within the round-off of the certificate's own sums
+    /// ([`Solver::proof_of`]).
     pub(super) error: Option<Vec<f64>>,
-    /// Per row, the second correction, taken off its multiplier; empty where
-    /// a correction is not finite. Carried through a column's entries, it is
+    /// Per row, the second correction (the last, for
+    /// [`Solver::converged_basis_inverse_row`]), taken off its multiplier;
+    /// empty where a correction is not finite. Carried through a column's
+    /// entries, it is
     /// how far the second step moved that column's coefficient, against which
     /// the dual ratio test weighs the coefficient (`Solver::refine_pivot_row`).
     pub(super) second: Vec<f64>,
@@ -283,9 +298,10 @@ struct Certificate {
     /// summed from (see [`Certificate::is_round_off`]), and how many terms.
     magnitudes: Vec<f64>,
     terms_of: Vec<u32>,
-    /// Per total var, how far the error of the multipliers can carry its
+    /// Per basic var, how far the error of the multipliers can carry its
     /// coefficient, `Σ e_i |a_ij|` over the rows the certificate keeps (`e_i`
-    /// the bound of [`RefinedRow::error`]); `None` where there is no bound.
+    /// the bound of [`RefinedRow::error`]), zero for a non-basic var; `None`
+    /// where there is no bound.
     errors: Option<Vec<f64>>,
     beta: CDouble,
     /// The magnitude of every term summed so far, and their count, for the
@@ -312,11 +328,11 @@ impl Certificate {
     }
 
     /// How far from zero the coefficient of `var` can come out where it is
-    /// zero for the exact multipliers: what the error of the multipliers
-    /// carries into it, plus the round-off of its compensated sum
-    /// ([`compensated_error`]), or that round-off alone where the
-    /// multipliers' error has no bound. On an infinite bound a coefficient
-    /// within this counts as zero ([`Solver::proof_of`]).
+    /// zero for the exact multipliers: the round-off of its compensated sum
+    /// ([`compensated_error`]), plus, for a basic var, what the error of the
+    /// multipliers carries into it where that error has a bound. On an
+    /// infinite bound a coefficient within this counts as zero
+    /// ([`Solver::proof_of`]).
     fn error_of_zero(&self, var: usize) -> f64 {
         let multipliers_error = self.errors.as_ref().map_or(0.0, |errors| errors[var]);
         let terms = self.terms_of[var] as usize;
@@ -476,11 +492,46 @@ impl Solver {
                 cert.terms_of[var] += 1;
                 cert.terms += 1;
                 if let (Some(errors), Some(error)) = (&mut cert.errors, error) {
-                    errors[var] += error * a.abs();
+                    if matches!(self.var_states[var], VarState::Basic(_)) {
+                        errors[var] += error * a.abs();
+                    }
                 }
             }
         }
         cert
+    }
+
+    /// The row of the basis inverse for `row` ([`Self::basis_inverse_row`]),
+    /// refined until a correction converges ([`REFINEMENT_CONVERGED`]), for
+    /// up to [`REFINEMENT_MAX_STEPS`] steps while each correction is at most
+    /// [`REFINEMENT_RATIO`] of the one before (Demmel et al. 2006), the steps
+    /// of [`Self::refine_basis_inverse_row`]; `None` where it does not
+    /// converge. Its multipliers come with no bound on their error
+    /// ([`RefinedRow::error`]), so a proof concedes them nothing beyond the
+    /// round-off of each sum: refining longer never widens what a proof
+    /// concedes.
+    fn converged_basis_inverse_row(&mut self, row: usize) -> Option<RefinedRow> {
+        let mut rho = self.basis_inverse_row(row);
+        let mut last = f64::INFINITY;
+        for _ in 0..REFINEMENT_MAX_STEPS {
+            let correction = self.basis_inverse_row_correction(row, &rho)?;
+            for (r, c) in rho.iter_mut().zip(&correction) {
+                r.add(-c);
+            }
+            if refinement_error(&rho, &correction).is_some() {
+                return Some(RefinedRow {
+                    rho,
+                    error: None,
+                    second: correction,
+                });
+            }
+            let size = finite_max_norm(correction.iter().copied())?;
+            if size > REFINEMENT_RATIO * last {
+                return None;
+            }
+            last = size;
+        }
+        None
     }
 
     /// Whether the row of the basis inverse for `row`, whose basic var is to
@@ -488,9 +539,23 @@ impl Solver {
     /// proves the model infeasible (see the module doc). The caller runs it
     /// on a fresh factorization, on which the row is solved for and refined
     /// ([`Self::refined_basis_inverse_row`]); [`Self::proof_of`] judges it.
+    ///
+    /// Where that proof fails and the refinement did not converge, the row is
+    /// refined further ([`Self::converged_basis_inverse_row`]) and judged
+    /// again where that converges, a coefficient on an infinite bound counting
+    /// as zero only within the round-off of its sum: refining longer concedes
+    /// nothing more, and leaves residuals the second step's could not
+    /// (`an_infeasible_lp_of_nearly_dependent_rows_is_proven_infeasible`).
     pub(super) fn prove_infeasible(&mut self, row: usize, leaving_up: bool) -> Proof {
         let refined = self.refined_basis_inverse_row(row);
-        self.proof_of(&refined, row, leaving_up)
+        let proof = self.proof_of(&refined, row, leaving_up);
+        if proof.holds || refined.error.is_some() {
+            return proof;
+        }
+        match self.converged_basis_inverse_row(row) {
+            Some(further) => self.proof_of(&further, row, leaving_up),
+            None => proof,
+        }
     }
 
     /// Whether the multipliers of `refined` prove the model infeasible for
@@ -513,23 +578,27 @@ impl Solver {
     ///
     /// Where that bound is infinite, a coefficient makes the range unbounded
     /// and the proof void, however small it is, unless it lies within
-    /// [`Certificate::error_of_zero`]: the refinement's bound on each
-    /// multiplier's error carried through the var's entries in the rows the
-    /// certificate keeps, plus the round-off of its compensated sum (that
-    /// round-off alone where the refinement did not converge). Such a
-    /// coefficient counts as zero, the one concession. It covers what the
-    /// multipliers' error leaves of a coefficient that is zero for the exact
-    /// multipliers (a basic var's, a non-basic var's whose tableau entry is
-    /// zero, or one whose rows' exact multipliers are zero), and nothing
-    /// above that. No fixed threshold tells such a residual from a
-    /// coefficient the data leave: where a row of its column is left out, a
-    /// basic var keeps the model's own coefficient, however small beside its
-    /// terms (`a_basic_vars_coefficient_in_a_row_left_out_voids_the_proof`),
-    /// and a var whose rows' exact multipliers are zero has nothing but the
-    /// refinement's noise for terms. The concession can still prove a
-    /// feasible model infeasible through a coefficient the data leave within
-    /// the error bound, which the arithmetic cannot tell from zero, and only
-    /// where the var times it makes the room the gap lacks. So can a
+    /// [`Certificate::error_of_zero`]: the round-off of its compensated sum,
+    /// plus, for a basic var, the refinement's bound on each multiplier's
+    /// error carried through the var's entries in the rows the certificate
+    /// keeps (where the refinement converged in two steps). Such a
+    /// coefficient counts as zero, the one concession. A basic var's
+    /// coefficient is zero for the exact multipliers, and the bound covers
+    /// what their error leaves of it. A non-basic var's is its tableau entry,
+    /// which the arithmetic cannot tell from a residual where it lies within
+    /// that bound, and counted as zero there it can prove a feasible model
+    /// infeasible
+    /// (`an_unbounded_lp_of_nearly_dependent_rows_is_not_proven_infeasible`),
+    /// so it is conceded only the round-off of its sum. No fixed threshold
+    /// tells a residual from a coefficient the data leave: where a row of
+    /// its column is left out, a basic var keeps the model's own coefficient,
+    /// however small beside its terms
+    /// (`a_basic_vars_coefficient_in_a_row_left_out_voids_the_proof`). The
+    /// concession can still prove a feasible model infeasible through a
+    /// coefficient the data leave within it, which the arithmetic cannot
+    /// tell from zero: a basic var's whose column a left-out row reaches,
+    /// within the error bound, or any var's within the round-off of its sum,
+    /// and only where the var times it makes the room the gap lacks. So can a
     /// coefficient within the round-off of its sum of zero whose computed sign
     /// picks a finite bound where its exact sign picks an infinite one: it
     /// counts at the finite bound, where the exact certificate is void.
@@ -545,7 +614,7 @@ impl Solver {
         let proof = self.judge(&cert, row);
         debug!(
             "infeasibility proof for row {row} (basic var {}, {} rows combined, {} \
-             coefficients zero within the multipliers' error{}): gap {:e}, allowance {:e} \
+             coefficients counted as zero within their error{}): gap {:e}, allowance {:e} \
              (cut {:e}): {}",
             self.basic_vars[row],
             cert.rows,
@@ -553,7 +622,7 @@ impl Solver {
             if cert.errors.is_some() {
                 ""
             } else {
-                ", which has no bound"
+                ", the multipliers' error with no bound"
             },
             proof.gap,
             proof.allowance,

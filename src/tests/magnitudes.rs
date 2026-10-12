@@ -1177,76 +1177,594 @@ mod regression_tests {
         }
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7.9): `min x - y` s.t.
-    /// `x + (1 + 2^-48) y <= -2` and `x + y >= -1`, `x >= 0`, `y` in
-    /// `[-10, 10]`, within the recommended range, is infeasible: the rows need
-    /// `2^-48 y <= -1`. The second row proves nothing (`x`'s genuine `3.6e-15`
-    /// on its infinite bound), and its first last resort repairs it through
-    /// `x`, the only var that can; the basis that enters `x`, with `y` basic,
-    /// is one the factorization finds singular. The first row, `y`'s, `2.8e14`
-    /// past its bound there, gets no verdict: the fresh factorization before
-    /// it takes `x` out, the widening of the second row's slack cannot close
-    /// its gap, and the solve fails loudly where it should answer
-    /// `Infeasible`.
-    #[test]
-    #[should_panic(expected = "no var can repair row")]
-    fn a_proof_of_infeasibility_through_a_singular_basis_is_a_known_limitation() {
-        for presolve in [true, false] {
-            let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
-            let x = problem.add_var(1.0, (0.0, f64::INFINITY));
-            let y = problem.add_var(-1.0, (-10.0, 10.0));
-            let slanted = 1.0 + 2f64.powi(-48);
-            problem.add_constraint([(x, 1.0), (y, slanted)], ComparisonOp::Le, -2.0);
-            problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Ge, -1.0);
-            match problem.solve_with(SolveOptions {
+    /// Answers of a solve, presolve on and off.
+    fn both_ways(problem: &crate::Problem) -> [Result<crate::SolveOutcome, Error>; 2] {
+        [true, false].map(|presolve| {
+            problem.solve_with(SolveOptions {
                 presolve,
                 ..SolveOptions::default()
-            }) {
+            })
+        })
+    }
+
+    /// Assert that `problem` is answered `Infeasible`, presolve on and off.
+    fn assert_infeasible(problem: &crate::Problem, what: &str) {
+        for (got, presolve) in both_ways(problem).into_iter().zip([true, false]) {
+            match got {
                 Err(Error::Infeasible) => {}
-                other => panic!("presolve {presolve}: {other:?}"),
+                other => panic!("{what}, presolve {presolve}: {other:?}"),
             }
         }
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7.9): three rows within the recommended
-    /// range, the third `9` times the second less `2.8` times the first but
-    /// for `x2`'s coefficient (`1.8e-9` off) and its right-hand side, are
-    /// infeasible: on the line the two equalities leave, the second row misses
-    /// by `0.111` wherever `x0` lies within its bounds. The second row's
-    /// certificate proves nothing alone (`x2`'s genuine `1e-10` on its
-    /// infinite bound); its first last resort pivots on that entry, which puts
-    /// `x0` at `-2.7e10`, and the refinement of `x0`'s row of the basis
-    /// inverse, through the nearly dependent rows, does not converge, so that
-    /// row's proof, which needs `x0`'s bound, fails too. The widening cannot
-    /// close such a gap, and the solve fails loudly where it should answer
-    /// `Infeasible`.
+    /// Assert that `problem` is answered with a solution or `Unbounded`,
+    /// presolve on and off, and return the solutions' objectives (`None` for
+    /// `Unbounded`). A solution is the one the solve checked against the
+    /// model as written.
+    fn assert_answered(problem: &crate::Problem, what: &str) -> [Option<f64>; 2] {
+        let [on, off] = both_ways(problem).map(|got| match got {
+            Ok(outcome) if outcome.solution().is_some() => {
+                Ok(Some(outcome.solution().unwrap().objective()))
+            }
+            Err(Error::Unbounded) => Ok(None),
+            other => Err(format!("{other:?}")),
+        });
+        match (on, off) {
+            (Ok(on), Ok(off)) => [on, off],
+            (on, off) => panic!("{what}: presolve on {on:?}, off {off:?}"),
+        }
+    }
+
+    /// Assert that `problem` is answered with a solution, presolve on and
+    /// off, and return its objectives.
+    fn assert_solved(problem: &crate::Problem, what: &str) -> [f64; 2] {
+        assert_answered(problem, what).map(|got| got.unwrap_or_else(|| panic!("{what}: Unbounded")))
+    }
+
+    /// Assert that `problem` is answered `Unbounded` or with a solution whose
+    /// objective lies within `1e-9` of `optimum`, relatively, presolve on and
+    /// off: the solve need not reach the optimum of nearly parallel rows,
+    /// whose near-null direction, within the contract, is also a ray.
+    fn assert_optimal_or_unbounded(problem: &crate::Problem, optimum: f64, what: &str) {
+        for got in assert_answered(problem, what).into_iter().flatten() {
+            assert!(
+                (got - optimum).abs() <= 1e-9 * optimum.abs().max(1.0),
+                "{what}: {got} vs {optimum}"
+            );
+        }
+    }
+
+    /// Assert that `problem` is answered `Unbounded`, presolve on and off.
+    fn assert_unbounded(problem: &crate::Problem, what: &str) {
+        for got in assert_answered(problem, what) {
+            assert_eq!(got, None, "{what}: a solution");
+        }
+    }
+
+    /// `min x - y` s.t. `x + (1 + 2^-k) y <= -2` and `x + y >= -1`,
+    /// `x >= 0`, `y` in `[y_min, 10]`, within the recommended range: the rows
+    /// need `2^-k y <= -1`, so the model is infeasible for `y_min > -2^k`
+    /// and its optimum is `2^(k+1) - 1` at `x = 2^k - 1`, `y = -2^k`, for
+    /// `y_min = -2^(k+2)`.
+    fn slanted_rows(k: i32, y_min: f64) -> crate::Problem {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_var(1.0, (0.0, f64::INFINITY));
+        let y = problem.add_var(-1.0, (y_min, 10.0));
+        let slanted = 1.0 + 2f64.powi(-k);
+        problem.add_constraint([(x, 1.0), (y, slanted)], ComparisonOp::Le, -2.0);
+        problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Ge, -1.0);
+        problem
+    }
+
+    /// [`slanted_rows`] at `k = 48` and `y` in `[-10, 10]`, within the
+    /// recommended range, is infeasible: the rows need `2^-48 y <= -1`. The
+    /// second row's proof needs `x`'s genuine entry, and the basis that
+    /// enters it, with `y` basic, is one the factorization finds singular.
+    /// A repair that drops `x` leaves its coefficient on its infinite bound
+    /// in the first row's certificate, which then proves nothing, and the
+    /// solve fails loudly ("no var can repair row"); the repair drops `y`,
+    /// both of whose bounds are finite, and the model is proven infeasible.
     #[test]
-    #[should_panic(expected = "no var can repair row")]
-    fn an_infeasible_lp_of_nearly_dependent_rows_is_a_known_limitation() {
-        for presolve in [true, false] {
-            let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
-            let x0 = problem.add_var(-0.3, (-10.0, 10.0));
-            let x1 = problem.add_var(-2.2, (f64::NEG_INFINITY, f64::INFINITY));
-            let x2 = problem.add_var(-0.6, (0.0, f64::INFINITY));
-            problem.add_constraint([(x0, 0.31), (x1, 0.81), (x2, 6.17)], ComparisonOp::Eq, 0.42);
-            problem.add_constraint(
-                [(x0, -0.77), (x1, -3.35), (x2, -0.36)],
-                ComparisonOp::Ge,
-                2.4,
-            );
-            problem.add_constraint(
-                [(x0, -7.798), (x1, -32.418), (x2, -20.516000001846947)],
-                ComparisonOp::Eq,
-                19.424,
-            );
-            match problem.solve_with(SolveOptions {
-                presolve,
-                ..SolveOptions::default()
-            }) {
-                Err(Error::Infeasible) => {}
-                other => panic!("presolve {presolve}: {other:?}"),
+    fn an_infeasible_lp_through_a_singular_basis_is_proven_infeasible() {
+        assert_infeasible(&slanted_rows(48, -10.0), "2^-48");
+    }
+
+    /// [`slanted_rows`] for every slant `2^-k`, `k` from `20` to `52`, is
+    /// proven infeasible with `y` in `[-10, 10]`, and solved at its optimum
+    /// with `y` down to `-2^(k+2)`: from `k = 47`, where the factorization
+    /// finds the basis of both rows singular, the singular basis must not
+    /// cost the proof, nor the repair the feasible twins their optimum.
+    #[test]
+    fn rows_slanted_by_a_power_of_two_are_proven_infeasible_or_solved() {
+        for k in 20..=52 {
+            assert_infeasible(&slanted_rows(k, -10.0), &format!("2^-{k}"));
+            let want = 2f64.powi(k + 1) - 1.0;
+            for got in assert_solved(&slanted_rows(k, -(2f64.powi(k + 2))), &format!("2^-{k}")) {
+                assert!(
+                    (got - want).abs() <= 1e-12 * want,
+                    "2^-{k}: {got} vs {want}"
+                );
             }
         }
+    }
+
+    /// `min -0.3 x0 - 2.2 x1 - 0.6 x2` s.t. `0.31 x0 + 0.81 x1 + 6.17 x2 =
+    /// 0.42`, `-0.77 x0 - 3.35 x1 - 0.36 x2 >= 2.4` and `-7.798 x0 - 32.418 x1
+    /// - (20.516 + delta) x2 = 19.424`, `x0` in `[-x0_max, x0_max]`, `x1`
+    /// free, `x2 >= 0`, within the recommended range: the third row is
+    /// `9` times the second less `2.8` times the first but for `x2`'s
+    /// coefficient (`delta` off) and its right-hand side, so on the line the
+    /// two equalities leave, the second row misses by `0.111` wherever `x0`
+    /// lies within `[-10, 10]`.
+    fn nearly_dependent_rows(delta: f64, x0_max: f64) -> crate::Problem {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let x0 = problem.add_var(-0.3, (-x0_max, x0_max));
+        let x1 = problem.add_var(-2.2, (f64::NEG_INFINITY, f64::INFINITY));
+        let x2 = problem.add_var(-0.6, (0.0, f64::INFINITY));
+        problem.add_constraint([(x0, 0.31), (x1, 0.81), (x2, 6.17)], ComparisonOp::Eq, 0.42);
+        problem.add_constraint(
+            [(x0, -0.77), (x1, -3.35), (x2, -0.36)],
+            ComparisonOp::Ge,
+            2.4,
+        );
+        problem.add_constraint(
+            [(x0, -7.798), (x1, -32.418), (x2, -20.516 - delta)],
+            ComparisonOp::Eq,
+            19.424,
+        );
+        problem
+    }
+
+    /// [`nearly_dependent_rows`], `x2`'s coefficient `1.8e-9` off, is
+    /// infeasible. The second row's proof needs `x2`'s genuine entry, and the
+    /// basis that enters it is so nearly singular that two refinement steps
+    /// of `x0`'s row of its inverse do not converge: they leave the free
+    /// basic `x1` a residual beyond the round-off of its sum, which voided
+    /// the proof, and the solve failed loudly ("no var can repair row").
+    /// Refined until it converges, the row proves the model infeasible.
+    #[test]
+    fn an_infeasible_lp_of_nearly_dependent_rows_is_proven_infeasible() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let x0 = problem.add_var(-0.3, (-10.0, 10.0));
+        let x1 = problem.add_var(-2.2, (f64::NEG_INFINITY, f64::INFINITY));
+        let x2 = problem.add_var(-0.6, (0.0, f64::INFINITY));
+        problem.add_constraint([(x0, 0.31), (x1, 0.81), (x2, 6.17)], ComparisonOp::Eq, 0.42);
+        problem.add_constraint(
+            [(x0, -0.77), (x1, -3.35), (x2, -0.36)],
+            ComparisonOp::Ge,
+            2.4,
+        );
+        problem.add_constraint(
+            [(x0, -7.798), (x1, -32.418), (x2, -20.516000001846947)],
+            ComparisonOp::Eq,
+            19.424,
+        );
+        assert_infeasible(&problem, "1.8e-9");
+    }
+
+    /// [`nearly_dependent_rows`] for every `delta` from `1.8e-9` down to
+    /// `1.8e-17` is proven infeasible with `x0` in `[-10, 10]`, and, for
+    /// `delta` down to `1.8e-12`, solved at its exact optimum with `x0` in
+    /// `[-1e12, 1e12]` scaled by `1.8e-9 / delta`, where the rows meet.
+    #[test]
+    fn nearly_dependent_rows_off_by_a_delta_are_proven_infeasible_or_solved() {
+        let optima = [
+            -213072495199.00894,
+            -2130724952027.2402,
+            -21307249520309.55,
+            -213072495203132.7,
+        ];
+        let deltas = [
+            1.846947e-9,
+            1.846947e-10,
+            1.846947e-11,
+            1.846947e-12,
+            1.846947e-13,
+            1.846947e-14,
+            1.846947e-15,
+            1.846947e-16,
+            1.846947e-17,
+        ];
+        for (j, delta) in deltas.into_iter().enumerate() {
+            assert_infeasible(&nearly_dependent_rows(delta, 10.0), &format!("{delta:e}"));
+            if let Some(&want) = optima.get(j) {
+                let twin = nearly_dependent_rows(delta, 1e12 * 10f64.powi(j as i32));
+                for got in assert_solved(&twin, &format!("{delta:e}")) {
+                    assert!(
+                        (got - want).abs() <= 1e-9 * want.abs(),
+                        "{delta:e}: {got} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Three rows within the recommended range, the second and the third
+    /// `-3.333` and `-13` times the first but for `x0`'s coefficient in the
+    /// first, meet only far out: every point has a var beyond `3.7e13`.
+    /// Counted as zero within the error bound of a refinement that converged
+    /// only after its second step, the non-basic `x4`'s coefficient proved
+    /// the model infeasible.
+    #[test]
+    fn a_long_refinement_concedes_no_coefficient_of_a_feasible_lp_far_out() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let x0 = problem.add_var(1.1, (f64::NEG_INFINITY, 5.0));
+        let x1 = problem.add_var(-1.9, (f64::NEG_INFINITY, 4.0));
+        problem.add_var(2.5, (0.0, f64::INFINITY));
+        problem.add_var(-2.7, (-3.0, 11.0));
+        let x4 = problem.add_var(2.7, (0.0, f64::INFINITY));
+        problem.add_constraint(
+            [(x0, 2.2400999999995452), (x1, 1.185), (x4, 0.3567)],
+            ComparisonOp::Eq,
+            -2.369,
+        );
+        problem.add_constraint(
+            [(x0, -7.467), (x1, -3.95), (x4, -1.189)],
+            ComparisonOp::Le,
+            7.9,
+        );
+        problem.add_constraint(
+            [
+                (x0, -29.12129999999999),
+                (x1, -15.405000000000001),
+                (x4, -4.6371),
+            ],
+            ComparisonOp::Eq,
+            30.815,
+        );
+        assert_answered(&problem, "points beyond 3.7e13");
+    }
+
+    /// Two equalities within the recommended range, the second `4.3` times
+    /// the first but for `x0`'s coefficient and the right-hand side, and an
+    /// inequality nearly `1.1` times the first, meet only far out: every
+    /// point has a var beyond `2.6e15`. Counted as zero within the error
+    /// bound of a refinement that converged only after its second step, the
+    /// non-basic `x4`'s coefficient proved the model infeasible.
+    #[test]
+    fn a_long_refinement_concedes_no_non_basic_coefficient() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let x0 = problem.add_var(-0.8, (0.0, 13.0));
+        let x1 = problem.add_var(0.4, (-6.0, 1.0));
+        problem.add_var(0.2, (0.0, f64::INFINITY));
+        let x3 = problem.add_var(-2.2, (f64::NEG_INFINITY, f64::INFINITY));
+        let x4 = problem.add_var(0.7, (-2.0, f64::INFINITY));
+        problem.add_constraint(
+            [(x0, 0.82), (x1, -2.08), (x3, 1.743), (x4, 3.017)],
+            ComparisonOp::Eq,
+            23.009,
+        );
+        problem.add_constraint(
+            [
+                (x0, 3.5260000000004545),
+                (x1, -8.943999999999999),
+                (x3, 7.4949),
+                (x4, 12.973099999999999),
+            ],
+            ComparisonOp::Eq,
+            97.93870000000409,
+        );
+        problem.add_constraint(
+            [
+                (x0, 0.902),
+                (x1, -2.2880000000000003),
+                (x3, 1.917300000000002),
+                (x4, 3.3187),
+            ],
+            ComparisonOp::Le,
+            25.508900000000008,
+        );
+        assert_answered(&problem, "points beyond 2.6e15");
+    }
+
+    /// Three rows within the recommended range, nearly multiples of one
+    /// another, are unbounded, every point with a var beyond `3.4e12`.
+    /// Counted as zero within the multipliers' error bound of a refinement
+    /// that converged in two steps, two non-basic coefficients proved the
+    /// model infeasible; a non-basic coefficient counts as zero only within
+    /// the round-off of its sum, and the model is unbounded.
+    #[test]
+    fn an_unbounded_lp_of_nearly_dependent_rows_is_not_proven_infeasible() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+        let x0 = problem.add_var(2.2, (-8.0, -6.0));
+        let x1 = problem.add_var(-0.9, (f64::NEG_INFINITY, 1.0));
+        let x2 = problem.add_var(2.0, (-5.0, f64::INFINITY));
+        let x3 = problem.add_var(0.5, (-4.0, f64::INFINITY));
+        problem.add_constraint(
+            [(x0, -9.282), (x1, -7.88), (x2, 8.253), (x3, -8.7)],
+            ComparisonOp::Le,
+            113.994,
+        );
+        problem.add_constraint(
+            [
+                (x0, -32.486999999999995),
+                (x1, -27.58),
+                (x2, 28.8855),
+                (x3, -30.449999999999996),
+            ],
+            ComparisonOp::Ge,
+            398.62999999999994,
+        );
+        problem.add_constraint(
+            [
+                (x0, 50.122800238418584),
+                (x1, 42.552),
+                (x2, -44.5662),
+                (x3, 46.98),
+            ],
+            ComparisonOp::Eq,
+            -615.0226016689301,
+        );
+        assert_unbounded(&problem, "points beyond 3.4e12");
+    }
+
+    /// An inequality and an equality within the recommended range, nearly
+    /// parallel, meet only far out, every point with a var beyond `2.8e11`,
+    /// the optimum `-2.186155248e11`. Counted as zero within the
+    /// multipliers' error bound of a refinement that converged in two steps,
+    /// a non-basic coefficient proved the model infeasible.
+    #[test]
+    fn a_feasible_lp_of_nearly_parallel_rows_is_not_proven_infeasible() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+        let x0 = problem.add_var(-2.6, (0.0, f64::INFINITY));
+        let x1 = problem.add_var(-2.4, (-7.0, 2.0));
+        let x2 = problem.add_var(2.1, (-3.0, f64::INFINITY));
+        problem.add_constraint(
+            [(x0, 6.734), (x1, 3.02), (x2, -7.759)],
+            ComparisonOp::Ge,
+            18.625,
+        );
+        problem.add_constraint(
+            [
+                (x0, -40.403999999999996),
+                (x1, -18.11999988079071),
+                (x2, 46.554),
+            ],
+            ComparisonOp::Eq,
+            -111.74900071525573,
+        );
+        assert_optimal_or_unbounded(&problem, -218615524799.95874, "points beyond 2.8e11");
+    }
+
+    /// Two equalities and two inequalities within the recommended range, the
+    /// fourth nearly a combination of the others, meet only far out, every
+    /// point with a var beyond `1.2e13`, the optimum `4.413385618588e14`.
+    /// Counted as zero within the multipliers' error bound of a refinement
+    /// that converged in two steps, non-basic coefficients proved the model
+    /// infeasible.
+    #[test]
+    fn a_feasible_lp_met_far_out_is_not_proven_infeasible() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+        let x0 = problem.add_var(0.3, (-5.0, f64::INFINITY));
+        let x1 = problem.add_var(-0.4, (0.0, 5.0));
+        let x2 = problem.add_var(2.9, (-8.0, 11.0));
+        let x3 = problem.add_var(0.9, (-5.0, f64::INFINITY));
+        let x4 = problem.add_var(1.7, (f64::NEG_INFINITY, f64::INFINITY));
+        problem.add_constraint(
+            [
+                (x0, 14.300000000000004),
+                (x1, -4.73),
+                (x2, -3.06),
+                (x3, 138.6932),
+                (x4, -44.8324),
+            ],
+            ComparisonOp::Le,
+            -213.9716,
+        );
+        problem.add_constraint(
+            [(x0, 5.944), (x1, 3.17), (x3, -8.324)],
+            ComparisonOp::Eq,
+            19.817999999999998,
+        );
+        problem.add_constraint(
+            [
+                (x0, -9.97),
+                (x1, -3.5),
+                (x2, 0.45),
+                (x3, -9.379),
+                (x4, 6.593),
+            ],
+            ComparisonOp::Le,
+            5.421999999999999,
+        );
+        problem.add_constraint(
+            [
+                (x0, -101.86860000000001),
+                (x1, -42.153),
+                (x2, 3.0150000030150004),
+                (x3, -13.727699999999999),
+                (x4, 44.1731),
+            ],
+            ComparisonOp::Eq,
+            -81.939799978895,
+        );
+        assert_optimal_or_unbounded(&problem, 441338561858807.9, "points beyond 1.2e13");
+    }
+
+    /// Three equalities within the recommended range, nearly multiples of
+    /// one another (`x3`'s coefficient in the second `1e-11` off), are
+    /// unbounded, every point with a var beyond `2.3e13`. The factorization
+    /// finds a basis of their columns singular, and the repair that drops a
+    /// fixed slack, both of whose bounds are finite, leads to a proof that
+    /// counted two non-basic coefficients as zero within the multipliers'
+    /// error bound and proved the model infeasible; a non-basic coefficient
+    /// counts as zero only within the round-off of its sum.
+    #[test]
+    fn a_repaired_basis_leads_to_no_proof_through_a_non_basic_coefficient() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        problem.add_var(0.7, (f64::NEG_INFINITY, 0.0));
+        let x1 = problem.add_var(1.2, (-3.0, f64::INFINITY));
+        let x2 = problem.add_var(1.7, (-2.0, f64::INFINITY));
+        let x3 = problem.add_var(2.2, (f64::NEG_INFINITY, 1.0));
+        problem.add_constraint(
+            [(x1, -4.428), (x2, 9.02), (x3, 3.1119)],
+            ComparisonOp::Eq,
+            21.1469,
+        );
+        problem.add_constraint(
+            [
+                (x1, 7.776000000000001),
+                (x2, -15.840000000000002),
+                (x3, -5.464800054648),
+            ],
+            ComparisonOp::Eq,
+            -37.139800054648006,
+        );
+        problem.add_constraint(
+            [(x1, -1.08), (x2, 2.2), (x3, 0.759)],
+            ComparisonOp::Eq,
+            5.159000000000001,
+        );
+        assert_unbounded(&problem, "points beyond 2.3e13");
+    }
+
+    /// `min 1.9 x0 - 1.5 x1` s.t. two equalities within the recommended
+    /// range, the second `-4.5` times the first but for the last digits,
+    /// `x0` free, `x1 >= -3`, meet at one point, the optimum `3.8939321` at
+    /// `(4.2566, 2.7958)`. The factorization finds their basis singular and
+    /// drops the free `x0`. A repair that drops `x1` instead, whose other
+    /// bound is infinite, put it at `-3`, and the solve failed loudly ("every
+    /// basis change left leads to a singular basis"): a repair drops another
+    /// var than the factorization's only where each it drops has both bounds
+    /// finite.
+    #[test]
+    fn a_basis_repair_keeps_its_drop_where_the_other_has_an_infinite_bound() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let x0 = problem.add_var(1.9, (f64::NEG_INFINITY, f64::INFINITY));
+        let x1 = problem.add_var(-1.5, (-3.0, f64::INFINITY));
+        problem.add_constraint([(x0, -0.08), (x1, -2.059)], ComparisonOp::Eq, -6.097);
+        problem.add_constraint(
+            [(x0, 0.3599999999999998), (x1, 9.265500000000001)],
+            ComparisonOp::Eq,
+            27.436500000000002,
+        );
+        assert_optimal_or_unbounded(&problem, 3.893932106797555, "one point");
+    }
+
+    /// Three equalities within the recommended range, the first two `-5.3`
+    /// and `-8.6` times the third but for their last digits, are infeasible:
+    /// the smallest relaxation of the rows that admits a point is `0.24`.
+    /// The factorization finds a basis of their columns singular; ordered by
+    /// the vars' bounds it finds no dependency, and a repair that kept that
+    /// basis led to values near `1.8e13`, where the rows' round-off floor
+    /// accepted them: `Optimal`. Where the second factorization finds
+    /// another number of dependencies, the first one's repair stands, and
+    /// the model is proven infeasible.
+    #[test]
+    fn a_basis_repair_stands_where_the_ranked_factorization_finds_no_dependency() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let x0 = problem.add_var(0.6, (f64::NEG_INFINITY, 5.0));
+        problem.add_var(0.4, (-7.0, 10.0));
+        let x2 = problem.add_var(1.1, (-4.0, f64::INFINITY));
+        problem.add_var(1.0, (-2.0, f64::INFINITY));
+        let x4 = problem.add_var(1.8, (f64::NEG_INFINITY, f64::INFINITY));
+        problem.add_constraint(
+            [(x0, -39.56450000000005), (x2, -51.7439), (x4, 51.5372)],
+            ComparisonOp::Eq,
+            -299.27680000000026,
+        );
+        problem.add_constraint(
+            [(x0, -64.19900000000091), (x2, -83.9618), (x4, 83.6264)],
+            ComparisonOp::Eq,
+            -486.24160000000455,
+        );
+        problem.add_constraint(
+            [(x0, 7.465), (x2, 9.763), (x4, -9.724)],
+            ComparisonOp::Eq,
+            56.656,
+        );
+        assert_infeasible(&problem, "relaxation 0.24");
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): `min 0.4 x0 + 0.4 x1` s.t. two
+    /// equalities and an inequality within the recommended range, each
+    /// nearly a multiple of the others, `x0 >= 0`, `x1` free, are infeasible:
+    /// the smallest relaxation of the rows that admits a point is `9.8e-5`.
+    /// The factorization finds the basis of `x0` and `x1` singular and drops
+    /// `x1`, whose coefficient then voids the proof on its infinite bounds;
+    /// `x0`, the only other var of the dependency, has an infinite bound
+    /// too, so no repair counts both at a bound, and the solve fails loudly
+    /// where it should answer `Infeasible`.
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn an_infeasible_lp_whose_dependency_has_no_boxed_var_is_a_known_limitation() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let x0 = problem.add_var(0.4, (0.0, f64::INFINITY));
+        let x1 = problem.add_var(0.4, (f64::NEG_INFINITY, f64::INFINITY));
+        problem.add_constraint(
+            [(x0, 70.9800000000001), (x1, -35.945)],
+            ComparisonOp::Eq,
+            175.17600000000053,
+        );
+        problem.add_constraint([(x0, -7.8), (x1, 3.95)], ComparisonOp::Eq, -19.25);
+        problem.add_constraint(
+            [(x0, 17.16000000372529), (x1, -8.690000000000001)],
+            ComparisonOp::Le,
+            42.549000018626444,
+        );
+        assert_infeasible(&problem, "relaxation 9.8e-5");
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): `max -2.1 x0 + 1.9 x1` s.t. two
+    /// equalities within the recommended range, the first `8.6` times the
+    /// second but for the last digits, `x0 >= -4`, `x1` free, meet at one
+    /// point, the optimum `10.1246858` at `(-1.6009, 3.5594)`, where
+    /// `Unbounded`, through the rows' near-null direction, is as admissible
+    /// within the contract. The factorization finds the basis of `x0` and
+    /// `x1` singular, and neither has both bounds finite: the repair drops
+    /// `x0`, the primal simplex is left only changes that lead back to that
+    /// basis, and the solve fails loudly where it should answer.
+    #[test]
+    #[should_panic(expected = "every basis change left leads to a singular basis")]
+    fn a_feasible_lp_whose_dependency_has_no_boxed_var_is_a_known_limitation() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+        let x0 = problem.add_var(-2.1, (-4.0, f64::INFINITY));
+        let x1 = problem.add_var(1.9, (f64::NEG_INFINITY, f64::INFINITY));
+        problem.add_constraint(
+            [(x0, 68.7054), (x1, -49.02000000000001)],
+            ComparisonOp::Eq,
+            -284.47080000000005,
+        );
+        problem.add_constraint([(x0, 7.989), (x1, -5.7)], ComparisonOp::Eq, -33.078);
+        assert_optimal_or_unbounded(&problem, 10.124685778557733, "one point");
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): three rows within the
+    /// recommended range, each nearly a multiple of the others, over
+    /// `x1 >= 0`, `x3 >= -1` and `x4 <= 4`, are infeasible: the smallest
+    /// relaxation of the rows that admits a point is `6e-4`. The proof needs
+    /// the non-basic `x1`'s coefficient, on its infinite bound, within the
+    /// multipliers' error but beyond the round-off of its sum, to count as
+    /// zero, and the solve fails loudly where it should answer `Infeasible`.
+    #[test]
+    #[should_panic(expected = "no var can repair row")]
+    fn a_proof_through_a_non_basic_coefficient_within_its_error_is_a_known_limitation() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        problem.add_var(-0.8, (f64::NEG_INFINITY, f64::INFINITY));
+        let x1 = problem.add_var(0.9, (0.0, f64::INFINITY));
+        problem.add_var(-2.3, (f64::NEG_INFINITY, f64::INFINITY));
+        let x3 = problem.add_var(-2.2, (-1.0, f64::INFINITY));
+        let x4 = problem.add_var(2.5, (f64::NEG_INFINITY, 4.0));
+        problem.add_constraint(
+            [(x1, -48.68500000000005), (x3, 56.0742), (x4, -34.0522)],
+            ComparisonOp::Ge,
+            85.42599999999977,
+        );
+        problem.add_constraint(
+            [
+                (x1, -35.309999999999995),
+                (x3, 40.6692),
+                (x4, -24.697200246972),
+            ],
+            ComparisonOp::Eq,
+            62.101,
+        );
+        problem.add_constraint(
+            [(x1, 5.35), (x3, -6.162), (x4, 3.742)],
+            ComparisonOp::Le,
+            -9.41,
+        );
+        assert_infeasible(&problem, "relaxation 6e-4");
     }
 
     /// A model whose exact optimum, `x*` at `x2 = 5000`, is reached only

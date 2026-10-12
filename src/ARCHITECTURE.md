@@ -68,7 +68,7 @@ Three principles shape everything:
 | `src/range.rs` | The recommended coefficient range: the spread of each row and column as written, which the loud errors of a solve, a resume or an edit name (§7.7). |
 | `src/presolve/` | Presolve's exact reductions: redundant-row elimination, and in MIP mode integer bound rounding and tightening, integer fixings (forcing and singleton rows, dual fixing) with substitution, and binary coefficient tightening; a continuous variable keeps its bounds. All on the original variable indices, so there is no postsolve (§2, §7.4). `mod.rs` holds the contract and the entry point, `work.rs` the reduction passes, `model.rs` the data, `params.rs` the constants. |
 | `src/solver/` | The simplex engine. `mod.rs` is `Solver` itself (bounded-variable primal/dual simplex, basis management, and the small contract surface the MIP layer uses); `tolerances.rs` the tolerance model; `scaling.rs` the scaled representation and the starting vertex; `basis.rs` the basis inverse and the pivot descriptions; `costs.rs` the dual simplex's working costs and `bounds.rs` the primal simplex's working bounds; `cycling.rs` the cycling and stall detection of both; `proof.rs` the infeasibility proof and its last resorts (§3, §7.3). |
-| `src/lu/`, `src/sparse/`, `src/ordering/` | LU factorization with eta-file updates, sparse containers, and the column ordering of the factorization (`order_simple`: the sparsest columns first, from the bucket queue in `ordering/cols_queue.rs`). |
+| `src/lu/`, `src/sparse/`, `src/ordering/` | LU factorization with eta-file updates, sparse containers, and the column ordering of the factorization (`order_simple`: the sparsest columns first, from the bucket queue in `ordering/cols_queue.rs`; `order_ranked`: that order sorted by a rank, for a basis repair's second factorization, §7.8). |
 | `src/mip/mod.rs` | The branch & bound lifecycle: building a search from a `Problem`, starting / resuming / re-editing it, bound and gap accounting, and validating a candidate against the user's original rows. |
 | `src/mip/search.rs` | The search itself: node visits, warm starts, branching, pruning, and the outer search loop. |
 | `src/mip/state.rs` | `MipState` (the complete, resumable search state) and `MipRun`. |
@@ -181,10 +181,11 @@ objective does not move (`src/solver/cycling.rs`); both end in a loud error, nev
 
 A basis the factorization finds singular is repaired wherever it is factorized: each
 dependent column is replaced by the slack of a row no pivot took, whose unit column completes
-the factors (`src/lu/`), the dependent var leaves the basis at its working bound nearest its
-value (0 if free), and the values and reduced costs are recomputed. Within a phase, the change
-back is taboo (§7.8), unless the step whose refactorization found the basis singular moved its
-row.
+the factors (`src/lu/`); where that column is a var's with an infinite bound, a second
+factorization can pick another of the dependency, with both bounds finite (§7.8). The
+dependent var leaves the basis at its working bound nearest its value (0 if free), and the
+values and reduced costs are recomputed. Within a phase, the change back is taboo (§7.8),
+unless the step whose refactorization found the basis singular moved its row.
 
 The dual simplex returns `Infeasible` only on a proof (`src/solver/proof.rs`): a certificate
 summed from the model's data that leaves a gap beyond the room the engine can give its
@@ -805,7 +806,7 @@ contract is not in the box.
 | Is a structural var within its bounds? | `structural_tol` (above) | |
 | Is a reduced cost zero? | `dual_tol`: `EPS` in the engine's units and in the user's (a slack's per unit of its row's activity divided by the row's largest coefficient), so that a cost a column factor shrinks still counts (`a_cost_tiny_beside_its_columns_coefficients_decides_the_optimum`), floored at the round-off of `\|c_j\| + Σ\|a_ij y_i\|`, refreshed with the multipliers | `EPS = 1e-10` |
 | Is a tableau entry a pivot? Do its two computations agree? | §7.7 | `dual_pivot_tolerance`, `primal_pivot_tolerance`, `PIVOT_GROWTH_TOL = 1e-9`, `PIVOT_AGREEMENT_TOL = 1e-7` |
-| Does a certificate prove infeasibility? | its gap beyond the room of its terms (§7.3) | `REFINEMENT_CONVERGED = 2^-53`, `COMPENSATED_ERROR = 16·2^-104` |
+| Does a certificate prove infeasibility? | its gap beyond the room of its terms (§7.3) | `REFINEMENT_CONVERGED = 2^-53`, `REFINEMENT_MAX_STEPS = 10`, `REFINEMENT_RATIO = 1/2`, `COMPENSATED_ERROR = 16·2^-104` |
 | Is an LU pivot column singular? | its eligible part below `LU_SINGULAR_REL` of its largest transformed entry (§7.7) | `= ROUNDOFF_FLOOR` |
 
 ### 7.3 Infeasibility only from a proof
@@ -823,21 +824,34 @@ from drift dissolves):
   value `p·z` takes over the bounds falls short of `β` by more than the room of its terms.
   `ρ` is refined twice in doubled precision: through an ill-conditioned basis, its residual
   alone, times a huge bound, can void the proof of an infeasible node
-  (`an_ill_conditioned_basis_does_not_void_a_nodes_proof`). A coefficient on a finite bound
-  counts however far it cancelled, since it can be the data's own (`1` and `−(1 + 2^-50)`
-  leave `−2^-50`: `room_through_a_round_off_coefficient`). A row whose multiplier would need
-  its slack's infinite bound is left out, and a number that is not finite voids the proof.
-- *The concession*: on an infinite bound a coefficient voids the proof unless the
-  multipliers' error could make it zero (their second refinement corrections, where the
-  refinement converged to `REFINEMENT_CONVERGED`, carried through the var's entries, plus
-  the round-off of the compensated sum); then it counts as zero. That covers a coefficient
-  that is zero for the exact multipliers (`issue_48_switchable_dc_network_solves`). No fixed
-  threshold would do: one at the round-off of the terms takes the data's `2^-50` for zero,
-  and a lower one fails the proofs of infeasible models. What is left: a coefficient the
-  data leave within that bound, some `1e-30` of its terms in a well-conditioned basis,
-  counts as zero and could prove a feasible model infeasible; and one within the round-off
-  of its sum of zero whose computed sign picks a finite bound where its exact sign picks an
-  infinite one counts at the finite bound, where the exact certificate is void.
+  (`an_ill_conditioned_basis_does_not_void_a_nodes_proof`). Where two steps do not converge
+  and the proof fails, `ρ` is refined again, for up to `REFINEMENT_MAX_STEPS` steps while
+  each correction is at most `REFINEMENT_RATIO` of the one before (Demmel et al. 2006), and
+  judged again where that converges
+  (`an_infeasible_lp_of_nearly_dependent_rows_is_proven_infeasible`). A coefficient on a
+  finite bound counts however far it cancelled, since it can be the data's own (`1` and
+  `−(1 + 2^-50)` leave `−2^-50`: `room_through_a_round_off_coefficient`). A row whose
+  multiplier would need its slack's infinite bound is left out, and a number that is not
+  finite voids the proof.
+- *The concession*: on an infinite bound a coefficient voids the proof unless it lies
+  within the round-off of its compensated sum or, a basic var's, within what the
+  multipliers' error carries into it (their second refinement corrections, where the
+  refinement converged to `REFINEMENT_CONVERGED` in two steps, carried through the var's
+  entries); then it counts as zero. A basic var's coefficient is zero for the exact
+  multipliers (`issue_48_switchable_dc_network_solves`). A non-basic var's is its tableau
+  entry, which the arithmetic cannot tell from a residual within that error, and counted as
+  zero there it proves feasible models infeasible
+  (`an_unbounded_lp_of_nearly_dependent_rows_is_not_proven_infeasible`), so it gets the
+  round-off alone (`a_non_basic_vars_residual_does_not_void_a_proof`). No fixed threshold
+  would do: one at the round-off of the terms takes the data's `2^-50` for zero, and a lower
+  one fails the proofs of infeasible models. A refinement that converges only after its
+  second step concedes the round-off alone, so refining longer never widens what a proof
+  concedes (`a_long_refinement_concedes_no_non_basic_coefficient`). What is left: a
+  coefficient the data leave within what is conceded counts as zero and could prove a
+  feasible model infeasible, a non-basic var's within the round-off of its sum, some `1e-30`
+  of its terms, or a basic var's whose column a row left out reaches; and one within the
+  round-off of its sum of zero whose computed sign picks a finite bound where its exact sign
+  picks an infinite one counts at the finite bound, where the exact certificate is void.
 - *The room*: the gap must exceed what the engine can give the terms, each to the farthest
   value `f64` holds within its room (`band_edge`) times its coefficient: the leaving var its
   tolerance (`α − E` for a slack, below; the bound contract for a structural var, none for
@@ -869,9 +883,11 @@ from drift dissolves):
 - *A failed proof* makes the row taboo (§7.8) until a rebuild.
 - *The last resorts*, when only taboo rows are left on fresh data and one failed its proof:
   1. Once per rebuild, the dual ratio test over the genuine entries of that row, refined
-     (§7.7), whatever their size (`genuine_entry_step`). They are the entries the proof
-     cannot count as zero, so a row it leaves open has one, and such an entry can be a row's
-     only repair (`1.5e-15` beside `1.95` in `wide_coefficients_reached_by_a_partial_move`).
+     (§7.7), whatever their size (`genuine_entry_step`). The proof counts them too, and
+     such an entry can be a row's only repair (`1.5e-15` beside `1.95` in
+     `wide_coefficients_reached_by_a_partial_move`); a row the proof leaves open has one
+     unless a non-basic coefficient within the multipliers' error keeps it open, which
+     neither concedes (§7.9).
      It comes after every regular pivot and every other row's proof, since its step is huge
      and the basis it leads to ill-conditioned.
   2. The widening (`certificate_repair`): the non-basic vars whose certificate coefficients
@@ -1156,12 +1172,27 @@ never pivots on unverified values.
   `vertex_hash_makes_a_repeated_basis_change_taboo`). A basis change that leads to a visited
   vertex right after another one did is recorded as bad and made taboo until a rebuild,
   which lifts the taboos and keeps the records; a record goes once a pivot moves its row
-  beyond its tolerance. A basis repair records its change back as bad. A drift check that
-  recomputes the values, and a widening, start the detection afresh, the phase having
-  reached its vertices on other values or another LP
+  beyond its tolerance. A basis repair records its change back as bad (below). A drift
+  check that recomputes the values, and a widening, start the detection afresh, the phase
+  having reached its vertices on other values or another LP
   (`a_vertex_left_on_drifted_values_can_be_returned_to`). When a rebuild leaves only taboo
   changes and no last resort, the phase fails with an `InternalError`, naming a singular
   basis where a change leads to one.
+- *Basis repair* (`factorize_at`): a dependency loses the column the factorization takes
+  last, in the order of the columns' sparsity. Where that is a var with an infinite bound,
+  the coefficient the dependency leaves it, genuine but below what the arithmetic resolves,
+  can void every later certificate in which it points at that bound. So the basis is
+  factorized again with the columns ordered by their vars' bounds (free first, then one
+  finite bound, two, fixed last; Bixby 1992), and that repair is taken where it replaces as
+  many columns, each a var with both bounds finite, whose coefficient counts at a bound
+  whatever its sign (`an_infeasible_lp_through_a_singular_basis_is_proven_infeasible`).
+  Otherwise the first repair stands: a var with an infinite bound dropped in its place
+  guarantees the proof nothing for the change of path, which can end where only the taboo
+  change back leads on
+  (`a_basis_repair_keeps_its_drop_where_the_other_has_an_infinite_bound`), and a second
+  factorization that finds another number of dependencies, none included, would keep a
+  basis the first found singular, or drop more
+  (`a_basis_repair_stands_where_the_ranked_factorization_finds_no_dependency`).
 - *Stall bound*: every `STALL_ITERATIONS` (10,000) iterations the objective of a phase
   (dual: of the working costs) must have improved beyond round-off, or the phase fails
   loudly, so a cycle the hash misses cannot hang. The objective alone is measured, so a
@@ -1176,15 +1207,23 @@ fails once a change fixes it: a `#[should_panic]` test named `..._is_a_known_lim
 wide-coefficient properties split at the range: a draw within it must solve, a draw outside
 it must give no wrong answer.
 
-- **Nearly dependent rows** (in range). An answer reached only through a basis the
-  factorization finds singular, through a pivot on a genuine entry the refinement cannot
-  settle, or through a proof whose refinement does not converge, can end in an
-  `InternalError` ("no var can repair row", from the slack basis too, or a singular basis).
-  The models found so are infeasible:
-  `a_proof_of_infeasibility_through_a_singular_basis_is_a_known_limitation` (two rows whose
-  columns differ by `2^-48`) and
-  `an_infeasible_lp_of_nearly_dependent_rows_is_a_known_limitation` (a third row nearly a
-  combination of the other two).
+- **Nearly dependent rows** (in range). A basis the factorization finds singular whose
+  repair keeps a var with an infinite bound out (no var of the dependency has both bounds
+  finite, or a second factorization finds another number of dependencies) keeps its
+  coefficient on that bound (§7.8). An answer reached only through such a basis, through a
+  pivot on a genuine entry the refinement cannot settle, or through a proof whose
+  refinement does not converge in `REFINEMENT_MAX_STEPS` steps, can end in an
+  `InternalError` ("no var can repair row", from the slack basis too, or "every basis
+  change left leads to a singular basis"), for infeasible and feasible models alike:
+  `an_infeasible_lp_whose_dependency_has_no_boxed_var_is_a_known_limitation` and
+  `a_feasible_lp_whose_dependency_has_no_boxed_var_is_a_known_limitation` (rows nearly
+  parallel over a var with one finite bound and a free one).
+- **A proof that needs a non-basic coefficient within the multipliers' error** (in range).
+  A non-basic var's coefficient on an infinite bound counts as zero only within the
+  round-off of its sum (§7.3), so an infeasible model whose certificate leaves one beyond
+  that round-off, if within the error, is not proven, and the solve fails loudly ("no var
+  can repair row", from the slack basis too):
+  `a_proof_through_a_non_basic_coefficient_within_its_error_is_a_known_limitation`.
 - **A point within the round-off of the room of a certificate of several rows** (in range
   too; no model known, so unpinned). Where the violated slack's row has a basic structural
   var, the proof combines rows, and its verdict on the slack and the engine's can disagree
@@ -1204,7 +1243,7 @@ it must give no wrong answer.
 | Node LP infeasible | prune (correct: the engine returns `Infeasible` only on a proof, §7.3) |
 | A violated row no var can repair and whose certificate proves nothing, after the rebuild, the taboo and the last resorts | one solve from the slack basis, then `InternalError`, never `Infeasible`; on a node LP, the search's own slack-basis retry too |
 | Node LP unbounded | impossible when the node is bounded → `InternalError` |
-| A basis the factorization finds singular (after a pivot on an entry tiny beside its column, or loaded) | repaired: the slack of a row no pivot took replaces each dependent column, and the solve goes on; within a phase the change back is taboo, unless the step whose refactorization found the basis singular moved its row (§3, §7.8) |
+| A basis the factorization finds singular (after a pivot on an entry tiny beside its column, or loaded) | repaired: the slack of a row no pivot took replaces each dependent column (a var with both bounds finite where the factorization's choice has an infinite bound and a second factorization allows, §7.8), and the solve goes on; within a phase the change back is taboo, unless the step whose refactorization found the basis singular moved its row (§3, §7.8) |
 | Basis bookkeeping found inconsistent when a singular basis is repaired (a var basic twice, or a slack's non-basic position held by another var) | panic: a bug, never repaired |
 | Integral candidate failing the guard with no integer variable to branch on | `InternalError`, never force-accepted. The engine verified the point on its own rows, and with nothing to branch on every integer variable is exactly integral (one its bounds fix the engine holds on its value), where a row presolve dropped or rewrote holds as written: the failure is a reduction that did not keep the point (§5.4) |
 | Verified state unreachable (`MAX_PHASE_ROUNDS` alternations, or a vertex whose values miss its rows through every factorization of the verification's ladder, again after the solve starts over from the slack basis) | `InternalError`, never an unverified optimum |
