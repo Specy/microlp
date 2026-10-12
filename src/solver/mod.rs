@@ -244,6 +244,23 @@ pub(crate) struct Solver {
     /// upper): a var crosses a bound by absorbing once per solve (see
     /// `choose_entering_col_dual`).
     absorbed: Vec<(usize, bool)>,
+    /// The bounds the phases went past on refined values in this attempt of
+    /// [`Self::run_phases`], as (var, upper): refined values go on only where
+    /// they miss a bound not held yet ([`Self::refined_first`]), so at most
+    /// twice per var and attempt, each time at the cost of a phase round and
+    /// of the cut of the primal ratio test's tolerance that comes with it
+    /// ([`LOOP_HARRIS_REDUCTION`]). A held bound is passed again where refined
+    /// values miss it beside a new one.
+    held: Vec<(usize, bool)>,
+    /// The refined values the last verification undid ([`Self::rows_hold`]),
+    /// which [`Self::refined_first`] weighs once the dual check accepts the
+    /// vertex; `None` where the verification undid none.
+    undone: Option<UndoneRefinement>,
+    /// The answer the first excursion on refined values in this attempt
+    /// started from ([`Self::refined_first`]), which [`Self::run_phases`]
+    /// returns to where the excursion ends worse or fails
+    /// ([`Self::keep_the_better_answer`]).
+    fallback: Option<Box<VerifiedAnswer>>,
     /// The row at which the last dual phase failed loudly, neither repaired by
     /// any var nor proving the model infeasible: [`Self::run_phases`] starts
     /// over once from the slack basis.
@@ -265,6 +282,39 @@ pub(crate) struct Solver {
     /// The combined column `Σ Δx_c a_c` of the bound flips of one dual step
     /// (see [`Self::apply_flips`]).
     flip_rhs: ScatteredVec,
+}
+
+/// Refined values the verification undid ([`Solver::rows_hold`]), one per
+/// basis position, and the bounds they miss, as (var, upper).
+#[derive(Clone, Debug)]
+struct UndoneRefinement {
+    values: Vec<f64>,
+    misses: Vec<(usize, bool)>,
+}
+
+/// An answer the verification and the dual check accepted, to return to
+/// ([`Solver::return_to`]): the basis, the values, the bounds in force and
+/// what the checks derived from them. The factorization is left out: a return
+/// builds it afresh.
+#[derive(Clone, Debug)]
+struct VerifiedAnswer {
+    basic_vars: Vec<usize>,
+    basic_var_vals: Vec<f64>,
+    nb_vars: Vec<usize>,
+    nb_var_vals: Vec<f64>,
+    nb_var_states: Vec<NonBasicVarState>,
+    nb_var_obj_coeffs: Vec<f64>,
+    dual_tols: Vec<f64>,
+    orig_var_mins: Vec<f64>,
+    orig_var_maxs: Vec<f64>,
+    var_tols: Vec<BoundTols>,
+    widened: Vec<WidenedBound>,
+    dual_edge_sq_norms: Vec<f64>,
+    primal_edge_sq_norms: Vec<f64>,
+    /// Its objective, and how far above it another answer still counts as no
+    /// worse ([`Solver::refinement_gain`]).
+    objective: f64,
+    allowance: f64,
 }
 
 /// A bound of `var`, the upper one if `up`, that the certificate repair
@@ -632,6 +682,9 @@ impl Solver {
             primal_edge_sq_norms,
             fixed_var_bounds: vec![None; num_vars],
             absorbed: Vec::new(),
+            held: Vec::new(),
+            undone: None,
+            fallback: None,
             unrepaired_row: None,
             widened: Vec::new(),
             cur_obj_val: obj_val,
@@ -1103,12 +1156,14 @@ impl Solver {
     /// ([`Verdict::Unrepresentable`]), or the dual phase meets a violated row
     /// that no var can repair and that does not prove the model infeasible,
     /// the solve starts over once from the slack basis, the last rung of the
-    /// ladder; a second time is an `InternalError`.
+    /// ladder; a second time is an `InternalError`. An attempt that went on
+    /// from refined values ends no worse than the answer its first excursion
+    /// started from ([`Self::keep_the_better_answer`]).
     fn run_phases(&mut self) -> Result<StopReason, Error> {
-        self.restore_model_bounds();
-        self.absorbed.clear();
+        self.start_attempt();
         self.unrepaired_row = None;
         let first = self.phase_rounds();
+        let first = self.keep_the_better_answer(first);
         match (first, self.unrepaired_row.take()) {
             (Ok(Some(stop)), _) => return Ok(stop),
             (Ok(None), _) => debug!(
@@ -1120,12 +1175,8 @@ impl Solver {
             ),
             (Err(error), None) => return Err(error),
         }
-        self.restore_model_bounds();
-        self.absorbed.clear();
-        self.artificial_obj = None;
-        let basis = self.slack_basis();
-        self.load_basis(&basis)?;
-        match self.phase_rounds() {
+        let second = self.phase_rounds_from_slack_basis();
+        match self.keep_the_better_answer(second) {
             Ok(Some(stop)) => Ok(stop),
             Ok(None) => Err(Error::InternalError(
                 "basis too ill-conditioned: recomputed values do not satisfy the rows".to_string(),
@@ -1135,6 +1186,151 @@ impl Solver {
             ),
             Err(error) => Err(error),
         }
+    }
+
+    /// What each attempt of [`Self::run_phases`] starts from: the model's
+    /// bounds, no absorption spent ([`Self::absorbed`]), no bound held
+    /// ([`Self::held`]) and no answer to return to ([`Self::fallback`]).
+    fn start_attempt(&mut self) {
+        self.restore_model_bounds();
+        self.absorbed.clear();
+        self.held.clear();
+        self.undone = None;
+        self.fallback = None;
+    }
+
+    /// The outcome of an attempt of [`Self::run_phases`] that went on from
+    /// refined values ([`Self::fallback`]): its own where it ends with an
+    /// answer worse by at most the allowance than the one its first excursion
+    /// started from; else, where it ends worse, without an answer or in an
+    /// error, that answer, which the verification and the dual check accepted
+    /// ([`Self::return_to`]). At the deadline the solve stops there, still a
+    /// `Limit`, and a later call ends at once on that answer: its values are
+    /// verified and no refined values wait to be weighed.
+    fn keep_the_better_answer(
+        &mut self,
+        outcome: Result<Option<StopReason>, Error>,
+    ) -> Result<Option<StopReason>, Error> {
+        let Some(answer) = self.fallback.take() else {
+            return outcome;
+        };
+        if matches!(outcome, Ok(Some(StopReason::Finished)))
+            && self.cur_obj_val <= answer.objective + answer.allowance
+        {
+            return outcome;
+        }
+        let (ended, objective) = (self.cur_obj_val, answer.objective);
+        if !self.return_to(*answer) {
+            return outcome;
+        }
+        debug!(
+            "verify: the excursion on refined values ended at {outcome:?}, objective {ended}; back \
+             to the answer it left, objective {objective}"
+        );
+        match outcome {
+            Ok(Some(StopReason::Limit)) => Ok(Some(StopReason::Limit)),
+            _ => Ok(Some(StopReason::Finished)),
+        }
+    }
+
+    /// The current state as an answer to return to ([`VerifiedAnswer`]),
+    /// another counting as no worse within `allowance` of its objective.
+    fn verified_answer(&self, allowance: f64) -> VerifiedAnswer {
+        VerifiedAnswer {
+            basic_vars: self.basic_vars.clone(),
+            basic_var_vals: self.basic_var_vals.clone(),
+            nb_vars: self.nb_vars.clone(),
+            nb_var_vals: self.nb_var_vals.clone(),
+            nb_var_states: self.nb_var_states.clone(),
+            nb_var_obj_coeffs: self.nb_var_obj_coeffs.clone(),
+            dual_tols: self.dual_tols.clone(),
+            orig_var_mins: self.orig_var_mins.clone(),
+            orig_var_maxs: self.orig_var_maxs.clone(),
+            var_tols: self.var_tols.clone(),
+            widened: self.widened.clone(),
+            dual_edge_sq_norms: self.dual_edge_sq_norms.clone(),
+            primal_edge_sq_norms: self.primal_edge_sq_norms.clone(),
+            objective: self.cur_obj_val,
+            allowance,
+        }
+    }
+
+    /// Return to `answer`: its basis, factorized afresh, and its values,
+    /// bounds and reduced costs, as the checks accepted them. Where the
+    /// factorization finds the basis singular, nothing changes and the return
+    /// fails.
+    fn return_to(&mut self, answer: VerifiedAnswer) -> bool {
+        let m = answer.basic_vars.len();
+        let mut scratch = ScratchSpace::with_capacity(m);
+        let (lu_factors, replaced) = lu_factorize(
+            m,
+            |c| {
+                self.orig_constraints_csc
+                    .outer_view(answer.basic_vars[c])
+                    //guaranteed to be a valid index
+                    .unwrap()
+                    .into_raw_storage()
+            },
+            self.lu_threshold,
+            &mut scratch,
+        );
+        if !replaced.is_empty() {
+            return false;
+        }
+        self.basis_solver = BasisSolver {
+            lu_factors_transp: lu_factors.transpose(),
+            lu_factors,
+            scratch,
+            eta_matrices: EtaMatrices::new(m),
+            rhs: ScatteredVec::empty(m),
+        };
+        for (pos, &var) in answer.basic_vars.iter().enumerate() {
+            self.var_states[var] = VarState::Basic(pos);
+        }
+        for (col, &var) in answer.nb_vars.iter().enumerate() {
+            self.var_states[var] = VarState::NonBasic(col);
+        }
+        self.basic_var_mins = answer
+            .basic_vars
+            .iter()
+            .map(|&var| answer.orig_var_mins[var])
+            .collect();
+        self.basic_var_maxs = answer
+            .basic_vars
+            .iter()
+            .map(|&var| answer.orig_var_maxs[var])
+            .collect();
+        self.basic_vars = answer.basic_vars;
+        self.basic_var_vals = answer.basic_var_vals;
+        self.nb_vars = answer.nb_vars;
+        self.nb_var_vals = answer.nb_var_vals;
+        self.nb_var_states = answer.nb_var_states;
+        self.nb_var_obj_coeffs = answer.nb_var_obj_coeffs;
+        self.dual_tols = answer.dual_tols;
+        self.orig_var_mins = answer.orig_var_mins;
+        self.orig_var_maxs = answer.orig_var_maxs;
+        self.var_tols = answer.var_tols;
+        self.widened = answer.widened;
+        self.dual_edge_sq_norms = answer.dual_edge_sq_norms;
+        self.primal_edge_sq_norms = answer.primal_edge_sq_norms;
+        self.cur_obj_val = answer.objective;
+        self.is_primal_feasible = true;
+        self.values_dirty = false;
+        self.reduced_costs_dirty = false;
+        self.pivots_since_drift_check = 0;
+        self.unrepaired_row = None;
+        self.undone = None;
+        true
+    }
+
+    /// The second attempt of [`Self::run_phases`]: its rounds from the slack
+    /// basis, on the real objective, started as the first.
+    fn phase_rounds_from_slack_basis(&mut self) -> Result<Option<StopReason>, Error> {
+        self.start_attempt();
+        self.artificial_obj = None;
+        let basis = self.slack_basis();
+        self.load_basis(&basis)?;
+        self.phase_rounds()
     }
 
     /// The rounds of [`Self::run_phases`], or `None` when the verification
@@ -1164,6 +1360,9 @@ impl Solver {
             self.artificial_obj = None;
             self.recalc_obj_coeffs_refined();
             if self.calc_dual_infeasibility().0 == 0 {
+                if self.refined_first() {
+                    continue;
+                }
                 return Ok(Some(StopReason::Finished));
             }
             debug!("phase round {round}: recomputed reduced costs are dual infeasible; continuing");
@@ -1175,6 +1374,9 @@ impl Solver {
             if !pivoted {
                 match self.verify_primal()? {
                     Verdict::Checked { feasible: true } => {
+                        if self.refined_first() {
+                            continue;
+                        }
                         return Ok(Some(StopReason::Finished));
                     }
                     Verdict::Checked { feasible: false } => {}
@@ -1392,6 +1594,7 @@ impl Solver {
                 feasible: self.is_primal_feasible,
             });
         }
+        self.undone = None;
         self.refit_widened_slacks();
         let mut hold = self.rows_hold();
         let ladder = [self.lu_threshold, LU_STABLE_THRESHOLD];
@@ -1431,17 +1634,26 @@ impl Solver {
     /// any basic var, inside its bounds or past one, and the basis or another
     /// row can amplify it into the objective. Such a refinement is undone
     /// where it turns values the rows and bounds accept into ones they do
-    /// not, as the exact values of an ill-conditioned vertex can be: those
-    /// keep their computed values.
+    /// not, as the exact values of an ill-conditioned vertex can be; where
+    /// only the bounds reject them, the refined values are kept aside
+    /// ([`Self::undone`]), for [`Self::refined_first`] to weigh.
     fn rows_hold(&mut self) -> bool {
         if self.check_rows() {
             let computed = self.basic_var_vals.clone();
             let accepted = self.calc_primal_infeasibility().0 == 0;
             self.refine();
-            let kept = self.check_rows() && (!accepted || self.calc_primal_infeasibility().0 == 0);
+            let rows = self.check_rows();
+            let misses = self.bound_misses();
+            let kept = rows && (!accepted || misses.is_empty());
             debug!("verify: refined values the rows hold (kept: {kept})");
             if !kept {
-                self.basic_var_vals = computed;
+                let refined = std::mem::replace(&mut self.basic_var_vals, computed);
+                if rows {
+                    self.undone = Some(UndoneRefinement {
+                        values: refined,
+                        misses,
+                    });
+                }
                 self.check_rows();
             }
             return true;
@@ -1453,6 +1665,100 @@ impl Solver {
             if hold { "rows hold" } else { "rows still miss" }
         );
         hold
+    }
+
+    /// Whether the phases go on from the refined values the verification
+    /// undid ([`Self::undone`]) at a vertex the dual check accepts, rather
+    /// than end there: where some bound they miss is not held yet, and they
+    /// gain the objective more than its allowance ([`Self::refinement_gain`]),
+    /// evidence that the computed values fall short of the vertex. The bounds
+    /// they miss are then held ([`Self::held`]), the answer is kept to return
+    /// to where none is yet ([`Self::fallback`]), and the refined values,
+    /// which the rows accept and a bound does not, are the values the next
+    /// round starts from. Elsewhere the computed values stay, within the
+    /// contract, and the answer is theirs.
+    fn refined_first(&mut self) -> bool {
+        let Some(undone) = self.undone.take() else {
+            return false;
+        };
+        if undone.misses.iter().all(|miss| self.held.contains(miss)) {
+            return false;
+        }
+        let (gain, allowance) = self.refinement_gain(&undone.values);
+        let worse = gain > allowance;
+        debug!(
+            "verify: the refined values gain {gain:e} on the computed ones (allowance \
+             {allowance:e}): {}",
+            if worse {
+                format!("they go on, past {:?}", undone.misses)
+            } else {
+                "the computed values stay".to_string()
+            }
+        );
+        if !worse {
+            return false;
+        }
+        if self.fallback.is_none() {
+            self.fallback = Some(Box::new(self.verified_answer(allowance)));
+        }
+        for miss in undone.misses {
+            if !self.held.contains(&miss) {
+                self.held.push(miss);
+            }
+        }
+        self.basic_var_vals = undone.values;
+        self.check_rows();
+        self.cur_obj_val = self.exact_obj_val();
+        self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
+        true
+    }
+
+    /// How much the refined values `x̄` (`refined`, one per basis position)
+    /// lower the objective from the current, computed ones `x`, `c_B (x - x̄)`
+    /// summed in compensated arithmetic, and the allowance for what is no
+    /// evidence that the computed values fall short of the vertex. On reduced costs the dual
+    /// check accepts, the refined values' objective is the vertex's dual bound
+    /// (Neumaier and Shcherbina 2004) to within the dual tolerance, so the gain
+    /// is how far the computed values lie above it. Where each basic var lies
+    /// within its bound tolerance `tol_j` of its refined value, which the
+    /// contract cannot tell apart, the gain is at most `Σ_B |c_j| tol_j`; the
+    /// allowance adds the round-off of plain sums of both objectives,
+    /// `(n + 2) 2^-53` of their magnitude for `n` terms, which also bounds
+    /// what rounding each value to `f64` moves them by.
+    fn refinement_gain(&self, refined: &[f64]) -> (f64, f64) {
+        let mut gain = CDouble::default();
+        let (mut magnitude, mut terms, mut room) = (0.0, 0u32, 0.0);
+        for (pos, &var) in self.basic_vars.iter().enumerate() {
+            let cost = self.cost_in_force(var);
+            if cost == 0.0 {
+                continue;
+            }
+            let (x, x_refined) = (self.basic_var_vals[pos], refined[pos]);
+            gain.add_product(cost, x);
+            gain.add_product(-cost, x_refined);
+            magnitude += (cost * x).abs() + (cost * x_refined).abs();
+            terms += 2;
+            let tols = self.var_tols[var];
+            room += cost.abs() * tols.lo.max(tols.hi);
+        }
+        let round_off = (f64::from(terms) + 2.0) * UNIT_ROUNDOFF * magnitude;
+        (gain.value(), room + round_off)
+    }
+
+    /// The bounds the basic vars lie past beyond their tolerances, as (var,
+    /// upper).
+    fn bound_misses(&self) -> Vec<(usize, bool)> {
+        let mut misses = Vec::new();
+        for (r, &val) in self.basic_var_vals.iter().enumerate() {
+            let var = self.basic_vars[r];
+            let tol = self.var_tols[var];
+            if val < self.basic_var_mins[r] - tol.lo {
+                misses.push((var, false));
+            } else if val > self.basic_var_maxs[r] + tol.hi {
+                misses.push((var, true));
+            }
+        }
+        misses
     }
 
     /// One step of iterative refinement of the basic values: the residual

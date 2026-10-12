@@ -1578,27 +1578,28 @@ mod regression_tests {
         }
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7.9): an ill-conditioned vertex whose
-    /// computed values the rows and bounds accept, but whose exact values miss
-    /// a bound, keeps its computed values, and the basis amplifies their
-    /// round-off into the objective. `53.3 x0 + 0.0016 x2 = 3576909.7016` with
-    /// `x0` fixed at `67109` puts `x2` at `1 - 7.9e-9`, which the plain sum
-    /// computes as `1 + 4.7e-8`, within its tolerance; the active
+    /// An ill-conditioned vertex whose computed values the rows and bounds
+    /// accept, but whose exact values miss a bound, goes on from its refined
+    /// values where they gain the objective beyond the tolerances.
+    /// `53.3 x0 + 0.0016 x2 = 3576909.7016` with `x0` fixed at `67109` puts
+    /// `x2` at `1 - 7.9e-9`, which the plain sum computes as `1 + 4.7e-8`,
+    /// within its tolerance; the active
     /// `-0.0194 x1 - 824 x2 - 0.0011 x3 >= -824.0011` amplifies the difference
     /// `7.5e5` times, so the vertex with `x3` basic in it has `x3 = 0.964` as
-    /// computed and `1.0059`, past its bound, exactly. The answer is the
-    /// computed vertex's, `-1.4288`, where the optimum is `-1.5` at `x*`, with
-    /// `x3` on its bound. The rows lie inside the recommended range (row
-    /// dynamism `7.5e5`).
+    /// computed and `1.0059`, past its bound, exactly. Kept as computed, the
+    /// answer would be that vertex's, `-1.4288`, within the contract; the
+    /// refined values gain `0.083` on it, and lead to the optimum,
+    /// `-1.5000000039580001`, presolve on and off, with idle rows that move
+    /// the refactorizations, and with no upper bound on `x2`. The rows lie
+    /// inside the recommended range (row dynamism `7.5e5`).
     #[test]
-    #[should_panic(expected = "is worse than the objective")]
-    fn a_vertex_whose_exact_values_miss_a_bound_is_kept_as_computed_and_is_a_known_limitation() {
-        check(Model {
+    fn a_vertex_whose_exact_values_miss_a_bound_goes_on_from_its_refined_values() {
+        let model = |x2_max: f64| Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
                 real(0.0, 67109.0, 67109.0),
                 real(-2.0, 0.0, 1.0),
-                real(0.5, 0.0, 1.0),
+                real(0.5, 0.0, x2_max),
                 real(-2.0, 0.0, 1.0),
             ],
             rows: vec![
@@ -1611,6 +1612,392 @@ mod regression_tests {
                 row(&[(1, 0.0155)], ComparisonOp::Eq, 0.0),
             ],
             xstar: vec![67109.0, 0.0, 1.0, 1.0],
+        };
+        for x2_max in [1.0, f64::INFINITY] {
+            for idle_rows in [0, 1, 2, 4, 8] {
+                let model = with_idle_rows(model(x2_max), idle_rows);
+                assert_exact_optimum(&model, -1.5000000039580001);
+                assert_solves_within_contract_without_presolve(&model);
+                check(model);
+            }
+        }
+    }
+
+    /// Solves `model` with presolve on and off, and asserts each answer within
+    /// the contract and its objective no worse than at `x*` beyond `1e-6` of
+    /// it.
+    fn assert_no_worse_than_xstar(model: &Model) {
+        assert_solves_within_contract_without_presolve(model);
+        assert_solves_within_contract(model);
+        let at_star = model.objective_at(&model.xstar);
+        let (problem, _) = model.build();
+        for presolve in [true, false] {
+            let options = SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            };
+            let objective = problem
+                .solve_with(options)
+                .unwrap()
+                .into_solution()
+                .unwrap()
+                .objective();
+            let excess = match model.direction {
+                OptimizationDirection::Minimize => objective - at_star,
+                OptimizationDirection::Maximize => at_star - objective,
+            };
+            assert!(
+                excess <= 1e-6 * (1.0 + at_star.abs()),
+                "presolve {presolve}: objective {objective:e}, at x* {at_star:e}:\n{}",
+                model.source()
+            );
+        }
+    }
+
+    /// Blocks of the model of
+    /// `a_vertex_whose_exact_values_miss_a_bound_goes_on_from_its_refined_values`
+    /// coupled through `x0`, whose data are infeasible: the model is feasible
+    /// only within the contract. At the answer, `x*`, within `5e-7` of the
+    /// optimum of the model relaxed by a tenth of the contract,
+    /// `-6.8952036`, the refined values put the first row's slack past its
+    /// bound and gain `5.8e-9` on the computed ones: `x6`, at a cost of `0.1`,
+    /// is `5.5e-8` from its refined value, within its tolerance, and the
+    /// computed values stay. Gone on from the refined values, the solve would
+    /// end at `-5.9000`, and return to `x*`.
+    #[test]
+    fn computed_values_within_their_tolerances_of_the_vertex_stay() {
+        assert_no_worse_than_xstar(&Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(-3.0, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(-2.0, 0.0, 1.0),
+                real(0.0, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(-2.0, 0.0, 1.0),
+                real(0.1, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(-2.0, 0.0, 1.0),
+                real(1.0, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(-1.0, 0.0, 1.0),
+                real(0.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(
+                    &[(5, -0.0194), (6, -412.0), (0, -0.0022)],
+                    ComparisonOp::Le,
+                    -412.0022,
+                ),
+                row(&[(4, 53.3), (6, 0.0016)], ComparisonOp::Eq, 3576909.7016),
+                row(&[(1, 53.3), (3, 0.0016)], ComparisonOp::Le, 3576909.7016),
+                row(
+                    &[(8, -0.0194), (9, -824.0), (0, -0.0022)],
+                    ComparisonOp::Ge,
+                    -824.0022,
+                ),
+                row(
+                    &[(10, 53.3), (12, 0.0016), (0, -0.5)],
+                    ComparisonOp::Le,
+                    3576909.2065999997,
+                ),
+                row(
+                    &[(2, -0.0194), (3, -412.0), (0, -0.0022)],
+                    ComparisonOp::Le,
+                    -412.0022,
+                ),
+                row(
+                    &[(7, 53.3), (9, 0.0016), (0, -1.0)],
+                    ComparisonOp::Eq,
+                    3576908.7016,
+                ),
+                row(
+                    &[(11, -0.0194), (12, -824.0), (0, -0.0011)],
+                    ComparisonOp::Ge,
+                    -824.0011,
+                ),
+                row(&[(11, 0.0155)], ComparisonOp::Eq, 0.0),
+                row(&[(5, 0.0155)], ComparisonOp::Eq, 0.0),
+            ],
+            xstar: vec![
+                0.9983999999240041,
+                67109.0,
+                1.0,
+                0.9999529211650491,
+                67109.0,
+                0.0,
+                1.0000000474974513,
+                67109.0,
+                1.0,
+                0.0,
+                67109.0,
+                0.0,
+                0.0,
+            ],
+        });
+    }
+
+    /// Coupled blocks as in
+    /// `computed_values_within_their_tolerances_of_the_vertex_stay`, data
+    /// infeasible: at the answer, `x*`, the refined values miss a bound and
+    /// lose `0.011` on the computed ones, which stay. Gone on from the
+    /// refined values, the solve would end at `-1.59200`, and return to `x*`,
+    /// at `-1.59876`.
+    #[test]
+    fn computed_values_better_than_the_vertex_stay() {
+        assert_no_worse_than_xstar(&Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(-3.0, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(0.0, 0.0, 1.0),
+                real(-0.1, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(0.0, 0.0, 1.0),
+                real(0.5, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(-1.0, 0.0, 1.0),
+                real(1.0, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(-1.0, 0.0, 1.0),
+                real(-0.1, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(1, 53.3), (3, 0.0016)], ComparisonOp::Eq, 3576909.7016),
+                row(&[(8, 0.0155)], ComparisonOp::Eq, 0.0),
+                row(
+                    &[(8, -0.0194), (9, -412.0), (0, -0.0011)],
+                    ComparisonOp::Ge,
+                    -412.0011,
+                ),
+                row(
+                    &[(2, -0.0194), (3, -1648.0), (0, -0.00055)],
+                    ComparisonOp::Ge,
+                    -1648.00055,
+                ),
+                row(
+                    &[(7, 53.3), (9, 0.0016), (0, 1.0)],
+                    ComparisonOp::Eq,
+                    3576910.6656,
+                ),
+                row(
+                    &[(11, -0.0194), (12, -1648.0), (0, -0.0022)],
+                    ComparisonOp::Ge,
+                    -1648.0022,
+                ),
+                row(
+                    &[(4, 53.3), (6, 0.0016), (0, 1.0)],
+                    ComparisonOp::Ge,
+                    3576910.6656,
+                ),
+                row(&[(2, 0.0155)], ComparisonOp::Eq, 0.0),
+                row(
+                    &[(5, -0.0194), (6, -412.0), (0, -0.0022)],
+                    ComparisonOp::Ge,
+                    -412.0022,
+                ),
+                row(
+                    &[(10, 53.3), (12, 0.0016), (0, -0.01)],
+                    ComparisonOp::Eq,
+                    3576909.69196,
+                ),
+            ],
+            xstar: vec![
+                0.9640000002287328,
+                67109.0,
+                0.0,
+                1.0,
+                67109.0,
+                0.0,
+                1.0,
+                67109.0,
+                0.0,
+                1.0,
+                67109.0,
+                0.006761683774244132,
+                0.999999968460761,
+            ],
+        });
+    }
+
+    /// Coupled blocks as in
+    /// `computed_values_within_their_tolerances_of_the_vertex_stay`, data
+    /// infeasible: the dual phase ends at a vertex whose reduced costs the
+    /// dual check rejects, and whose refined values miss a bound and gain
+    /// `0.021` on the computed ones. The refined values are weighed only at a
+    /// vertex the dual check accepts: the phases go on from the computed
+    /// values, and the answer is `x*`, at `-0.98999`. Gone on from the refined
+    /// values at that vertex, the excursion would end at `0.0089`, and the
+    /// solve would return to the vertex, at `-0.98221`, which is no answer.
+    #[test]
+    fn a_vertex_the_phases_leave_keeps_its_computed_values() {
+        assert_no_worse_than_xstar(&Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(-1.0, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(-2.0, 0.0, 1.0),
+                real(1.0, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(-1.0, 0.0, 1.0),
+                real(-0.1, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(-1.0, 0.0, 1.0),
+                real(0.1, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(
+                    &[(8, -0.0194), (9, -824.0), (0, -0.0022)],
+                    ComparisonOp::Le,
+                    -824.0022,
+                ),
+                row(&[(1, 53.3), (3, 0.0016)], ComparisonOp::Eq, 3576909.7016),
+                row(&[(8, 0.0155)], ComparisonOp::Eq, 0.0),
+                row(&[(2, 0.0155)], ComparisonOp::Eq, 0.0),
+                row(&[(7, 53.3), (9, 0.0016)], ComparisonOp::Eq, 3576909.7016),
+                row(
+                    &[(4, 53.3), (6, 0.0016), (0, -1.0)],
+                    ComparisonOp::Ge,
+                    3576908.7115999996,
+                ),
+                row(
+                    &[(5, -0.0194), (6, -412.0), (0, -0.0022)],
+                    ComparisonOp::Ge,
+                    -412.0022,
+                ),
+                row(
+                    &[(2, -0.0194), (3, -412.0), (0, -0.00055)],
+                    ComparisonOp::Ge,
+                    -412.00055,
+                ),
+            ],
+            xstar: vec![
+                0.9899999245419873,
+                67109.0,
+                0.0,
+                1.0000000133496152,
+                67109.0,
+                1.0,
+                0.9999529660198204,
+                67109.0,
+                0.0,
+                1.0000000474974513,
+            ],
+        });
+    }
+
+    /// Coupled blocks as in
+    /// `computed_values_within_their_tolerances_of_the_vertex_stay`, whose
+    /// exact optimum is `-2.0999999992084`: at the vertex the dual check
+    /// accepts first, the computed values put `x0` at `0.964`, the refined
+    /// ones past its upper bound, and the refined values gain `0.083` on the
+    /// computed ones: they go on, to `x*`, at `-2.1`, where kept as computed
+    /// the answer would be `-2.0288`.
+    #[test]
+    fn coupled_refined_values_that_gain_beyond_the_tolerances_go_on() {
+        assert_no_worse_than_xstar(&Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(-2.0, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(0.0, 0.0, 1.0),
+                real(-0.1, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(-1.0, 0.0, 1.0),
+                real(0.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(5, 0.0155)], ComparisonOp::Eq, 0.0),
+                row(
+                    &[(5, -0.0194), (6, -824.0), (0, -0.0011)],
+                    ComparisonOp::Ge,
+                    -824.0011,
+                ),
+                row(&[(1, 53.3), (3, 0.0016)], ComparisonOp::Eq, 3576909.7016),
+                row(
+                    &[(2, -0.0194), (3, -824.0), (0, -0.0011)],
+                    ComparisonOp::Ge,
+                    -824.0011,
+                ),
+                row(&[(4, 53.3), (6, 0.0016)], ComparisonOp::Eq, 3576909.7016),
+            ],
+            xstar: vec![1.0, 67109.0, 0.0, 1.0, 67109.0, 0.0, 0.9999999920839997],
+        });
+    }
+
+    /// Coupled blocks as in
+    /// `computed_values_within_their_tolerances_of_the_vertex_stay`, data
+    /// infeasible: at the answer, `x*`, at `-0.8644`, the refined values gain
+    /// `0.042` on the computed ones and go on; the excursion ends at `0.110`,
+    /// worse, and the solve returns to `x*`.
+    #[test]
+    fn an_excursion_on_refined_values_that_ends_worse_returns_to_the_answer() {
+        assert_no_worse_than_xstar(&Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(-1.0, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(-2.0, 0.0, 1.0),
+                real(0.0, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(-1.0, 0.0, 1.0),
+                real(0.0, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(0.0, 0.0, 1.0),
+                real(0.1, 0.0, 1.0),
+                real(0.0, 67109.0, 67109.0),
+                real(-2.0, 0.0, 1.0),
+                real(1.0, 0.0, 1.0),
+            ],
+            rows: vec![
+                row(
+                    &[(5, -0.0194), (6, -824.0), (0, -0.0011)],
+                    ComparisonOp::Le,
+                    -824.0011,
+                ),
+                row(&[(1, 53.3), (3, 0.0016)], ComparisonOp::Eq, 3576909.7016),
+                row(
+                    &[(10, 53.3), (12, 0.0016), (0, -0.5)],
+                    ComparisonOp::Ge,
+                    3576909.2065999997,
+                ),
+                row(&[(7, 53.3), (9, 0.0016)], ComparisonOp::Eq, 3576909.7016),
+                row(&[(2, 0.0155)], ComparisonOp::Eq, 0.0),
+                row(&[(8, 0.0155)], ComparisonOp::Eq, 0.0),
+                row(
+                    &[(2, -0.0194), (3, -824.0), (0, -0.00055)],
+                    ComparisonOp::Ge,
+                    -824.00055,
+                ),
+                row(
+                    &[(8, -0.0194), (9, -824.0), (0, -0.0011)],
+                    ComparisonOp::Ge,
+                    -824.0011,
+                ),
+                row(&[(5, 0.0155)], ComparisonOp::Eq, 0.0),
+                row(
+                    &[(11, -0.0194), (12, -412.0), (0, -0.00055)],
+                    ComparisonOp::Ge,
+                    -412.00055,
+                ),
+                row(&[(11, 0.0155)], ComparisonOp::Eq, 0.0),
+                row(&[(4, 53.3), (6, 0.0016)], ComparisonOp::Eq, 3576909.7016),
+            ],
+            xstar: vec![
+                0.9644200910051128,
+                67109.0,
+                0.0,
+                1.0000000237487257,
+                67109.0,
+                0.0,
+                1.0000000474974513,
+                67109.0,
+                0.0,
+                1.0000000474974513,
+                67109.0,
+                0.0,
+                0.0,
+            ],
         });
     }
 

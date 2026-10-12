@@ -999,6 +999,327 @@ fn the_slack_basis_restart_starts_from_the_models_bounds_with_no_absorption_spen
     assert_eq!(values(&restarted), values(&fresh));
 }
 
+/// The vertex of `a_vertex_whose_exact_values_miss_a_bound_goes_on_from_its_refined_values`
+/// (`src/tests/magnitudes.rs`): its computed values meet every bound, and
+/// its exact ones put `x3` past its upper bound.
+fn vertex_whose_exact_values_miss_a_bound() -> Solver {
+    Solver::try_new(
+        &[0.0, -2.0, 0.5, -2.0],
+        &[67109.0, 0.0, 0.0, 0.0],
+        &[67109.0, 1.0, 1.0, 1.0],
+        &[
+            (
+                to_sparse(&[53.3, 0.0, 0.0016, 0.0]),
+                ComparisonOp::Eq,
+                3576909.7016,
+            ),
+            (
+                to_sparse(&[0.0, -0.0194, -824.0, -0.0011]),
+                ComparisonOp::Ge,
+                -824.0011,
+            ),
+            (to_sparse(&[0.0, 0.0155, 0.0, 0.0]), ComparisonOp::Eq, 0.0),
+        ],
+        &vec![VarDomain::Real; 4],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap()
+}
+
+/// The slack-basis restart starts with no bound held: its rounds go past the
+/// bounds a first attempt went past on refined values, and reach the
+/// optimum. Held, `x3`'s upper bound would keep the computed values of the
+/// vertex whose exact values miss it
+/// (`refined_values_missing_only_held_bounds_do_not_go_on`).
+#[test]
+fn the_slack_basis_restart_starts_with_no_bound_held() {
+    init();
+    let values = |sol: &Solver| sol.reported_values();
+    let mut first = vertex_whose_exact_values_miss_a_bound();
+    assert_eq!(first.reoptimize().unwrap(), StopReason::Finished);
+    assert_eq!(
+        first.held,
+        [(3, true)],
+        "fixture: the refined values go past x3's upper bound"
+    );
+    assert!(
+        (first.cur_obj_val + 1.5).abs() < 1e-8,
+        "{}",
+        first.cur_obj_val
+    );
+
+    let mut restarted = vertex_whose_exact_values_miss_a_bound();
+    restarted.held = first.held.clone();
+    assert_eq!(
+        restarted.phase_rounds_from_slack_basis().unwrap(),
+        Some(StopReason::Finished)
+    );
+    assert_eq!(values(&restarted), values(&first));
+}
+
+/// Refined values that miss only held bounds do not go on: with `x3`'s upper
+/// bound held, the vertex whose exact values miss it ends the rounds on its
+/// computed values, `0.083` worse than the optimum.
+#[test]
+fn refined_values_missing_only_held_bounds_do_not_go_on() {
+    init();
+    let mut sol = vertex_whose_exact_values_miss_a_bound();
+    sol.held.push((3, true));
+    assert_eq!(sol.phase_rounds().unwrap(), Some(StopReason::Finished));
+    assert!(
+        (sol.cur_obj_val + 1.4288401582615).abs() < 1e-9,
+        "{}",
+        sol.cur_obj_val
+    );
+    assert_eq!(sol.held, [(3, true)]);
+    assert!(sol.fallback.is_none());
+}
+
+/// An excursion on refined values that ends in an error returns to the
+/// answer it left, a state the checks accept and the phases go on from: the
+/// verification finds the rows held and the bounds met, the dual check the
+/// reduced costs, and a solve that verifies its values again goes on from
+/// the refined ones to the optimum.
+#[test]
+fn an_excursion_that_fails_returns_to_the_answer_it_left() {
+    init();
+    let mut sol = vertex_whose_exact_values_miss_a_bound();
+    assert_eq!(sol.phase_rounds().unwrap(), Some(StopReason::Finished));
+    let answer = sol
+        .fallback
+        .as_ref()
+        .expect("fixture: the refined values go on")
+        .objective;
+    assert!((answer + 1.4288401582615).abs() < 1e-9, "{answer}");
+    assert!((sol.cur_obj_val + 1.5).abs() < 1e-8, "{}", sol.cur_obj_val);
+
+    let failed = Err(Error::InternalError("the excursion failed".to_string()));
+    assert_eq!(
+        sol.keep_the_better_answer(failed).unwrap(),
+        Some(StopReason::Finished)
+    );
+    assert_eq!(sol.cur_obj_val, answer);
+    assert_eq!(sol.objective_of(&sol.reported_values()), answer);
+    sol.values_dirty = true;
+    assert_eq!(
+        sol.verify_primal().unwrap(),
+        Verdict::Checked { feasible: true }
+    );
+    sol.recalc_obj_coeffs_refined();
+    assert_eq!(sol.calc_dual_infeasibility().0, 0);
+    sol.values_dirty = true;
+    assert_eq!(sol.reoptimize().unwrap(), StopReason::Finished);
+    assert!((sol.cur_obj_val + 1.5).abs() < 1e-8, "{}", sol.cur_obj_val);
+}
+
+/// The vertex of [`vertex_whose_exact_values_miss_a_bound`] after an
+/// excursion on its refined values to the optimum, `-1.5`, and the objective
+/// of the answer it left, `-1.4288`.
+fn after_an_excursion() -> (Solver, f64) {
+    let mut sol = vertex_whose_exact_values_miss_a_bound();
+    assert_eq!(sol.phase_rounds().unwrap(), Some(StopReason::Finished));
+    let answer = sol
+        .fallback
+        .as_ref()
+        .expect("fixture: the refined values go on")
+        .objective;
+    assert!((sol.cur_obj_val + 1.5).abs() < 1e-8, "{}", sol.cur_obj_val);
+    (sol, answer)
+}
+
+/// An excursion on refined values that meets the deadline stops on the
+/// answer it left, still with `Limit`, and a later call ends there at once:
+/// no pivot, and no excursion again.
+#[test]
+fn an_excursion_that_meets_the_deadline_stops_on_the_answer_it_left() {
+    init();
+    let (mut sol, answer) = after_an_excursion();
+    assert_eq!(
+        sol.keep_the_better_answer(Ok(Some(StopReason::Limit)))
+            .unwrap(),
+        Some(StopReason::Limit)
+    );
+    assert_eq!(sol.cur_obj_val, answer);
+    let (values, iterations) = (sol.reported_values(), sol.lp_iterations);
+    assert_eq!(sol.reoptimize().unwrap(), StopReason::Finished);
+    assert_eq!(sol.reported_values(), values);
+    assert_eq!(sol.lp_iterations, iterations);
+    assert!(sol.held.is_empty());
+}
+
+/// An excursion that ends without an answer returns to the answer it left:
+/// through a vertex no factorization represents (`Ok(None)`), or with the
+/// phase rounds run out.
+#[test]
+fn an_excursion_without_an_answer_returns_to_the_answer_it_left() {
+    init();
+    let rounds_out = Error::InternalError(format!(
+        "simplex did not reach a verified optimum in {MAX_PHASE_ROUNDS} phase rounds"
+    ));
+    for outcome in [Ok(None), Err(rounds_out)] {
+        let (mut sol, answer) = after_an_excursion();
+        assert_eq!(
+            sol.keep_the_better_answer(outcome).unwrap(),
+            Some(StopReason::Finished)
+        );
+        assert_eq!(sol.cur_obj_val, answer);
+    }
+}
+
+/// A return to an answer whose basis a fresh factorization finds singular
+/// fails and changes nothing: the excursion's outcome stands. Planted: the
+/// answer's basis with `x1`'s column swapped for `x0`'s, which shares the
+/// zero third entry of `x2`'s and `x3`'s.
+#[test]
+fn a_return_to_a_basis_found_singular_leaves_the_excursions_outcome() {
+    init();
+    let (mut sol, _) = after_an_excursion();
+    let ended = (
+        sol.cur_obj_val,
+        sol.reported_values(),
+        sol.basic_vars.clone(),
+    );
+    let answer = sol.fallback.as_mut().unwrap();
+    let pos = answer
+        .basic_vars
+        .iter()
+        .position(|&var| var == 1)
+        .expect("fixture: x1 is basic at the answer");
+    answer.basic_vars[pos] = 0;
+    let failed = Err(Error::InternalError("the excursion failed".to_string()));
+    assert!(sol.keep_the_better_answer(failed).is_err());
+    assert_eq!(
+        (
+            sol.cur_obj_val,
+            sol.reported_values(),
+            sol.basic_vars.clone()
+        ),
+        ended
+    );
+    assert!(sol.fallback.is_none());
+}
+
+/// The engine of `problem` as written, without presolve.
+fn engine_of(problem: &Problem) -> Solver {
+    Solver::try_new(
+        &problem.obj_coeffs,
+        &problem.var_mins,
+        &problem.var_maxs,
+        &problem.constraints,
+        &problem.var_domains,
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap()
+}
+
+/// Refined values that gain the objective within the tolerances do not go
+/// on: the coupled model of
+/// `computed_values_within_their_tolerances_of_the_vertex_stay`
+/// (`src/tests/magnitudes.rs`), whose answer's refined values miss a bound
+/// and gain `5.8e-9`, `x6` being `5.5e-8` from its refined value, within its
+/// tolerance. No bound is held, and the answer is the computed values'.
+#[test]
+fn refined_values_that_gain_within_the_tolerances_do_not_go_on() {
+    init();
+    let mut problem = Problem::new(OptimizationDirection::Minimize);
+    let x: Vec<_> = [
+        (-3.0, 0.0, 1.0),
+        (0.0, 67109.0, 67109.0),
+        (-2.0, 0.0, 1.0),
+        (0.0, 0.0, 1.0),
+        (0.0, 67109.0, 67109.0),
+        (-2.0, 0.0, 1.0),
+        (0.1, 0.0, 1.0),
+        (0.0, 67109.0, 67109.0),
+        (-2.0, 0.0, 1.0),
+        (1.0, 0.0, 1.0),
+        (0.0, 67109.0, 67109.0),
+        (-1.0, 0.0, 1.0),
+        (0.0, 0.0, 1.0),
+    ]
+    .into_iter()
+    .map(|(cost, min, max)| problem.add_var(cost, (min, max)))
+    .collect();
+    let rows: [(&[(usize, f64)], ComparisonOp, f64); 10] = [
+        (
+            &[(5, -0.0194), (6, -412.0), (0, -0.0022)],
+            ComparisonOp::Le,
+            -412.0022,
+        ),
+        (&[(4, 53.3), (6, 0.0016)], ComparisonOp::Eq, 3576909.7016),
+        (&[(1, 53.3), (3, 0.0016)], ComparisonOp::Le, 3576909.7016),
+        (
+            &[(8, -0.0194), (9, -824.0), (0, -0.0022)],
+            ComparisonOp::Ge,
+            -824.0022,
+        ),
+        (
+            &[(10, 53.3), (12, 0.0016), (0, -0.5)],
+            ComparisonOp::Le,
+            3576909.2065999997,
+        ),
+        (
+            &[(2, -0.0194), (3, -412.0), (0, -0.0022)],
+            ComparisonOp::Le,
+            -412.0022,
+        ),
+        (
+            &[(7, 53.3), (9, 0.0016), (0, -1.0)],
+            ComparisonOp::Eq,
+            3576908.7016,
+        ),
+        (
+            &[(11, -0.0194), (12, -824.0), (0, -0.0011)],
+            ComparisonOp::Ge,
+            -824.0011,
+        ),
+        (&[(11, 0.0155)], ComparisonOp::Eq, 0.0),
+        (&[(5, 0.0155)], ComparisonOp::Eq, 0.0),
+    ];
+    for (terms, op, rhs) in rows {
+        let terms: Vec<_> = terms.iter().map(|&(j, a)| (x[j], a)).collect();
+        problem.add_constraint(terms, op, rhs);
+    }
+    let mut sol = engine_of(&problem);
+    assert_eq!(sol.reoptimize().unwrap(), StopReason::Finished);
+    assert!(sol.held.is_empty(), "{:?}", sol.held);
+    assert_eq!(sol.cur_obj_val, -6.895199995022267);
+    sol.values_dirty = true;
+    sol.verify_primal().unwrap();
+    assert!(
+        sol.undone.is_some(),
+        "fixture: the answer's refined values miss a bound"
+    );
+}
+
+/// Values one ulp apart are no evidence that the computed ones fall short of
+/// the vertex: rounding `x = 1e12`, with no bound and a cost of one, moves the
+/// objective by `1.2e-4`, far beyond its bound tolerance's `1e-7`, and the
+/// allowance covers it.
+#[test]
+fn values_an_ulp_apart_gain_nothing_beyond_the_allowance() {
+    init();
+    let mut problem = Problem::new(OptimizationDirection::Minimize);
+    let x = problem.add_var(1.0, (f64::NEG_INFINITY, f64::INFINITY));
+    let y = problem.add_var(0.0, (0.0, 1.0));
+    problem.add_constraint([(x, 1.0), (y, -1.0)], ComparisonOp::Eq, 1e12);
+    let mut sol = engine_of(&problem);
+    assert_eq!(sol.reoptimize().unwrap(), StopReason::Finished);
+    let VarState::Basic(pos) = sol.var_states[0] else {
+        panic!("fixture: x is basic");
+    };
+    assert_eq!(sol.basic_var_vals[pos], 1e12, "fixture");
+    let mut refined = sol.basic_var_vals.clone();
+    refined[pos] = refined[pos].next_down();
+    let (gain, allowance) = sol.refinement_gain(&refined);
+    assert!(
+        gain > 1e-4 && gain <= allowance,
+        "gain {gain:e}, allowance {allowance:e}"
+    );
+}
+
 /// A row presolve took over (a validation row) that a finished LP's answer
 /// misses is no error: the engine takes the row over and resumes, so the
 /// answer holds the model as written. Planted: `max x + y` over `[0, 2]^2`
