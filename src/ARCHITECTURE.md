@@ -400,7 +400,8 @@ cost of the visit: **is the solver already sitting at this node's parent's optim
   systematic failure.
 - `Ok(Limit)` → the deadline fired mid-solve → the node is pushed back **unsolved** and the
   search returns `Interrupted`. Nothing uses the coherent but non-optimal state as a solved
-  node: the next visit starts from its own bounds + basis data.
+  node: the next visit starts from its own bounds + basis data, and so repeats any excursion
+  of the verification the deadline cut short (§7.5).
 
 Inside the engine, `run_phases` alternates the dual phase (`restore_feasibility`) and the
 primal phase (`optimize`) until a state passes verification (§7.5): a phase's own exit test
@@ -959,9 +960,27 @@ where pivots updated them incrementally).
   away, solved through the factorization. It runs where the rows hold too, since a residual
   they accept can sit in any basic var and the basis can amplify it into the objective
   (`a_residual_the_rows_accept_is_refined_out_of_the_values`). It is undone where it turns
-  values the rows and bounds accept into ones they reject, as the exact values of an
-  ill-conditioned vertex can be: those keep their computed values, within the contract
-  (`a_vertex_whose_exact_values_miss_a_bound_keeps_its_computed_ones`, §7.9).
+  values the rows accept into ones they reject.
+- *The undo rule* (`refined_first`), where the refinement turns values the bounds accept into
+  ones that miss a bound, as the exact values of an ill-conditioned vertex can: the computed
+  values stay, within the contract, and once the dual check accepts the vertex they are
+  weighed against the refined ones. Where some bound the refined values miss is not held yet
+  and they lower the objective by more than the allowance, the phases go on from them
+  instead, at the cost of a phase round, and the bounds they miss are held for the rest of
+  the attempt (`held`, cleared with absorption's record on both attempts). The allowance
+  (`refinement_gain`) is `Σ_B |c_j| tol_j`, what basic vars each within its bound tolerance
+  of its refined value move the objective by, which the contract cannot tell apart, plus the
+  round-off of the objective's plain sums
+  (`computed_values_within_their_tolerances_of_the_vertex_stay`,
+  `a_vertex_whose_exact_values_miss_a_bound_goes_on_from_its_refined_values`). The answer
+  the first excursion starts from is kept (`fallback`): where the excursion ends worse than
+  it beyond the allowance, fails or meets the deadline, the attempt ends there
+  (`keep_the_better_answer`), at the deadline still with `Limit`, from where a later call on
+  the same LP ends at once. A node the search pushes back starts again from its own basis
+  (§5.3) and runs the excursion again, so where every visit's time slice is shorter than the
+  excursion, such a node is interrupted at each visit. Exact values the bounds reject can
+  lead far, as in models feasible only within the contract
+  (`an_excursion_on_refined_values_that_ends_worse_returns_to_the_answer`).
 - *Dual check*: the reduced costs recomputed on multipliers refined once
   (`refine_multipliers`: the residual `c_B - Bᵀy`, each entry summed in compensated
   arithmetic, solved through the factorization). A solve leaves the multipliers with the
@@ -975,7 +994,7 @@ where pivots updated them incrementally).
   `LU_STABLE_THRESHOLD = 0.5`, whose pivots bound the growth of the factors; a factorization
   that repairs the basis leaves another vertex, unverified, to the phases. When no
   factorization represents the vertex, the solve starts over once from the slack basis, with
-  the model's bounds and no absorption spent. Only then is the failure a loud
+  the model's bounds, no absorption spent and no bound held. Only then is the failure a loud
   `InternalError`.
 - *Report*: the objective is recomputed from the verified values, which are what is
   reported, so they pass the boundary's compensated check (§7.1).
@@ -1166,12 +1185,6 @@ it must give no wrong answer.
   columns differ by `2^-48`) and
   `an_infeasible_lp_of_nearly_dependent_rows_is_a_known_limitation` (a third row nearly a
   combination of the other two).
-- **An ill-conditioned vertex keeps its computed values** (in range). Where the refined
-  values would miss a bound the computed ones meet, the computed ones stay (§7.5), and the
-  basis can amplify their round-off into the objective: `Optimal` within the contract but
-  worse than the optimum, `-1.4288` against `-1.5`
-  (`a_vertex_whose_exact_values_miss_a_bound_is_kept_as_computed_and_is_a_known_limitation`,
-  row dynamism `7.5e5`).
 - **A point within the round-off of the room of a certificate of several rows** (in range
   too; no model known, so unpinned). Where the violated slack's row has a basic structural
   var, the proof combines rows, and its verdict on the slack and the engine's can disagree

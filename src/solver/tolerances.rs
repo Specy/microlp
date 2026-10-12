@@ -110,10 +110,12 @@ pub(crate) const PIVOT_AGREEMENT_TOL: f64 = 1e-7;
 /// Upper bound on the number of primal/dual phase alternations
 /// [`super::Solver::run_phases`] performs before giving up loudly. A round
 /// verifies the values before its primal phase, so a solve whose primal
-/// phase pivots takes two rounds, and a third is rare; each round after the
-/// first cuts the primal ratio test's tolerance ([`LOOP_HARRIS_REDUCTION`]);
-/// hitting this bound means the phases cannot
-/// agree on a verified state, which must not be reported as an optimum.
+/// phase pivots takes two rounds, and a third is rare, but for an excursion
+/// on refined values, which takes a round each (`Solver::refined_first`);
+/// each round after the first cuts the primal ratio test's tolerance
+/// ([`LOOP_HARRIS_REDUCTION`]). Hitting this bound means the phases cannot
+/// agree on a verified state, which must not be reported as an optimum; an
+/// excursion that hits it ends at the answer it started from.
 pub(crate) const MAX_PHASE_ROUNDS: usize = 8;
 
 /// The factor by which each round of [`super::Solver::run_phases`] after the
