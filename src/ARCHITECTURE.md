@@ -735,7 +735,9 @@ What an answer means:
 - **`Infeasible`**: a proof, summed from the model's data, that no point has every row and
   every continuous var within the room the engine can give it, the integer and fixed vars
   within their bounds (§7.3); never a row the simplex could not repair. A model feasible
-  only beyond that room, through the round-off sliver of its rows, is reported infeasible.
+  only beyond that room, through the round-off sliver of its rows (`(α − δ, τ]` for a slack
+  the proof grants its widening room, `(α − E, τ]` with `E ≤ δ` for the one it is about,
+  §7.3), is reported infeasible.
   For a MILP, every node is so proven or has crossing bounds: no integral point lies within
   the engine's room, up to that sliver and the proof's concession. A model with none is
   answered `Infeasible` (`a_model_feasible_only_off_its_integers_is_infeasible`) unless the
@@ -767,7 +769,10 @@ own evaluation can get wrong:
   two, at the row's magnitude at the current values; `δ = min((n + 2)·2^-53·m, τ/2)` for `n`
   terms (`slack_margin`) is the round-off of the engine's plain `f64` sum and of the
   boundary's compensated one. Where the cap binds (more than 43 terms at the round-off
-  floor, `plain_sum_resolves`), the engine sums the row in compensated arithmetic too. `α`
+  floor, `plain_sum_resolves`), the engine sums the row in compensated arithmetic too. So
+  it does where a plain sum puts the slack beyond its edge by at most `2δ` (`row_slack`):
+  there the exact slack can lie within `α`, where the proof, summed exactly, cannot prove
+  the row violated (§7.3). A plain acceptance stands, `δ` covering its round-off. `α`
   follows the values, refreshed whenever the rows are checked.
 - **Vars** (`structural_tol`): every structural var gets its whole bound contract, `f / s_j`
   in scaled units floored at the round-off of the bound; the reported value is the engine's
@@ -799,7 +804,7 @@ contract is not in the box.
 | Is a structural var within its bounds? | `structural_tol` (above) | |
 | Is a reduced cost zero? | `dual_tol`: `EPS` in the engine's units and in the user's (a slack's per unit of its row's activity divided by the row's largest coefficient), so that a cost a column factor shrinks still counts (`a_cost_tiny_beside_its_columns_coefficients_decides_the_optimum`), floored at the round-off of `\|c_j\| + Σ\|a_ij y_i\|`, refreshed with the multipliers | `EPS = 1e-10` |
 | Is a tableau entry a pivot? Do its two computations agree? | §7.7 | `dual_pivot_tolerance`, `primal_pivot_tolerance`, `PIVOT_GROWTH_TOL = 1e-9`, `PIVOT_AGREEMENT_TOL = 1e-7` |
-| Does a certificate prove infeasibility? | its gap beyond the room of its terms (§7.3) | `REFINEMENT_CONVERGED = 2^-53` |
+| Does a certificate prove infeasibility? | its gap beyond the room of its terms (§7.3) | `REFINEMENT_CONVERGED = 2^-53`, `COMPENSATED_ERROR = 16·2^-104` |
 | Is an LU pivot column singular? | its eligible part below `LU_SINGULAR_REL` of its largest transformed entry (§7.7) | `= ROUNDOFF_FLOOR` |
 
 ### 7.3 Infeasibility only from a proof
@@ -829,17 +834,37 @@ from drift dissolves):
   threshold would do: one at the round-off of the terms takes the data's `2^-50` for zero,
   and a lower one fails the proofs of infeasible models. What is left: a coefficient the
   data leave within that bound, some `1e-30` of its terms in a well-conditioned basis,
-  counts as zero and could prove a feasible model infeasible.
+  counts as zero and could prove a feasible model infeasible; and one within the round-off
+  of its sum of zero whose computed sign picks a finite bound where its exact sign picks an
+  infinite one counts at the finite bound, where the exact certificate is void.
 - *The room*: the gap must exceed what the engine can give the terms, each to the farthest
   value `f64` holds within its room (`band_edge`) times its coefficient: the leaving var its
-  tolerance (`α` for a slack, the bound contract for a structural var, none for an integer
-  var its bounds fix), every other term its widening room (a structural var's tolerance, a
-  slack's `α − δ`; none for a bound already widened, an integer var or a fixed structural
-  var), plus the round-off of the compensated sums. So a proof says that no point has every
-  term within the room the engine can reach, and a row it leaves open is the last resorts',
-  which reach that room: rows that agree only within their tolerances together are solved
+  tolerance (`α − E` for a slack, below; the bound contract for a structural var, none for
+  an integer var its bounds fix), every other term its widening room (a structural var's
+  tolerance, a slack's `α − δ`; none for a bound already widened, an integer var or a fixed
+  structural var), plus `A`, the round-off of the compensated sums (`compensated_error`:
+  `(T + 1)·max(1, (N + 2)/8)·16·2^-104` of their magnitude for `T` terms, the longest sum
+  of `N`, a bound whatever the count). The rooms are rounded up from their exact values and
+  the leaving var's is taken off the compensated gap, so rounding errs against the proof. So
+  a proof says that no point has every term within the room the engine can reach, and a row
+  it leaves open is the last resorts', which reach that room: rows that agree only within
+  their tolerances together are solved
   (`a_node_feasible_only_within_its_rows_tolerances_is_solved`). A model whose points all
   need more room is reported infeasible.
+- *The cut*: a leaving slack's room is `α − E`, with
+  `E = min(4u·min(|s|, |e|) + 4(n + 2)^2·u^2·m + 2A + u·|g|, δ)` (`leaving_slack_cut`,
+  `u = 2^-53`): a bound on the error of the compensated sum that found the slack at `s`,
+  beyond the edge `e` of its room, for a row of `n` terms at magnitude `m`
+  (`implied_slack_error`; `s` capped at `e`, beyond which the verdict is certain), the
+  allowance twice and the rounding of the gap `g`. Where the certificate is the slack's row
+  alone, as when no basic structural var lies in it, a row the engine finds violated is
+  then either proven infeasible or, some var's room closing its gap, reached by the
+  widening, whose target for the slack is `α − E`
+  (`a_node_point_within_the_round_off_of_its_rows_room_is_solved`,
+  `a_point_round_off_beyond_its_rows_room_is_proven_infeasible`). There the errors come to
+  at most `2u·m` and terms in `u^2`, within `δ`; the cap keeps the slack at least `α − δ`,
+  the room every other slack gets, where a certificate of several rows has an allowance
+  beyond its row's round-off.
 - *A failed proof* makes the row taboo (§7.8) until a rebuild.
 - *The last resorts*, when only taboo rows are left on fresh data and one failed its proof:
   1. Once per rebuild, the dual ratio test over the genuine entries of that row, refined
@@ -850,8 +875,10 @@ from drift dissolves):
      and the basis it leads to ill-conditioned.
   2. The widening (`certificate_repair`): the non-basic vars whose certificate coefficients
      are above round-off, sitting at their bound in the direction that helps, have that
-     bound widened by their widening room, largest reach first, until the leaving var
-     reaches its target, and move onto it; the side keeps no tolerance (a slack, only `δ`).
+     bound widened by their widening room, largest reach first, until the leaving var is
+     within its room of its target (a slack, `α − E`:
+     `the_repair_lands_a_slack_within_its_tolerance_less_the_proofs_cut`), and move onto
+     it; the side keeps no tolerance (a slack, only `δ`).
      The widened bounds stay in force for the rest of the solve, each side widened at most
      once, and the dual simplex goes on over them with the cycling detection restarted: the
      dual phase over the box the proof certifies, reached bound by bound
@@ -920,10 +947,13 @@ phase reports `Finished` only after `verify_primal` and exact reduced costs (rec
 where pivots updated them incrementally).
 
 - *Check* (`check_rows`): every basic slack is re-derived from its row at the current values
-  (plain, or compensated where `δ` is capped), so a row's violation lives in its slack,
-  where the dual simplex sees it; the slack tolerances are refreshed; and the basic values
-  must solve every row whose slack is non-basic within that slack's tolerance, on the side
-  the residual moves it (a widened side: `δ`).
+  (`row_slack`: plain, or compensated where `δ` is capped or the plain sum rejects the
+  slack within `2δ` of its edge, §7.2), so a row's violation lives in its slack, where the
+  dual simplex sees it; the slack tolerances are refreshed; and the basic values must solve
+  every row whose slack is non-basic within that slack's tolerance, on the side the residual
+  moves it (a widened side: `δ`). The starting vertex and an added row set their slacks by
+  the same evaluation: the starting vertex, every slack basic, counts as verified as it
+  stands, and the dual phase sees an added row's true violation from its first step.
 - *Refinement* (`refine`): one step, the residual of every row whose slack is non-basic
   summed in compensated arithmetic, which sees what a plain sum over large terms rounds
   away, solved through the factorization. It runs where the rows hold too, since a residual
@@ -1121,11 +1151,11 @@ never pivots on unverified values.
 
 ### 7.9 Known limitations
 
-Each is pinned by a test that passes while it stands and fails once a change fixes it: a
-`#[should_panic]` test named `..._is_a_known_limitation` in `src/tests/magnitudes.rs` (drop
-the attribute to keep the model as a regression test). The wide-coefficient
-properties split at the range: a draw within it must solve, a draw outside it must give no
-wrong answer.
+Each limitation a model is known for is pinned by a test that passes while it stands and
+fails once a change fixes it: a `#[should_panic]` test named `..._is_a_known_limitation` in
+`src/tests/magnitudes.rs` (drop the attribute to keep the model as a regression test). The
+wide-coefficient properties split at the range: a draw within it must solve, a draw outside
+it must give no wrong answer.
 
 - **Nearly dependent rows** (in range). An answer reached only through a basis the
   factorization finds singular, through a pivot on a genuine entry the refinement cannot
@@ -1142,10 +1172,13 @@ wrong answer.
   worse than the optimum, `-1.4288` against `-1.5`
   (`a_vertex_whose_exact_values_miss_a_bound_is_kept_as_computed_and_is_a_known_limitation`,
   row dynamism `7.5e5`).
-- **A point within the round-off of the proof's room** (outside the range) is neither proven
-  infeasible nor reached: the solve fails loudly, and in a MILP the node is not pruned
-  (`a_node_point_within_the_round_off_of_its_rows_room_is_a_known_limitation`, row dynamism
-  `1e10`).
+- **A point within the round-off of the room of a certificate of several rows** (in range
+  too; no model known, so unpinned). Where the violated slack's row has a basic structural
+  var, the proof combines rows, and its verdict on the slack and the engine's can disagree
+  by more than the cut covers (§7.3): a point there is neither proven infeasible nor
+  reached, and the solve fails loudly ("no var can repair row", from the slack basis too).
+  Where the certificate is the slack's row alone, none is left
+  (`a_node_point_within_the_round_off_of_its_rows_room_is_solved`).
 
 ---
 

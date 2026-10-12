@@ -2939,19 +2939,18 @@ mod regression_tests {
         );
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7.9): a node whose only point lies
-    /// within the round-off of its row's room fails loudly.
     /// `-1125 x0 - 1.125e-7 x1 = -5876999.999999887` with `x0` fixed at `5224`
-    /// holds `x1 = -1` and, `1e-11` inside the engine's room of the row (its
+    /// holds `x1 = -1` and, `1.02e-11` inside the engine's room of the row (its
     /// contract less the round-off margin), `x1 = -2`. The LP's vertex,
-    /// `x1 = -1.0017`, branches, and the node `x1 = -2` fixes both vars: the
-    /// plain sum of the row puts it `3.8e-10` beyond that room, no var can
-    /// move, and the proof, summed exactly, proves nothing. The row lies
-    /// outside the recommended range (row dynamism `1e10`).
+    /// `x1 = -1.0017`, branches, and the node `x1 = -2` fixes both vars. The
+    /// row's plain sum, whose round-off there is `3.8e-10`, put that point
+    /// `3.7e-10` beyond the room: no var could move, the proof, summed
+    /// exactly, proved nothing, and the solve failed loudly. Such a rejection
+    /// is summed again, compensated, which finds the point within the room.
+    /// The row lies outside the recommended range (row dynamism `1e10`).
     #[test]
-    #[should_panic(expected = "no var can repair row")]
-    fn a_node_point_within_the_round_off_of_its_rows_room_is_a_known_limitation() {
-        check(Model {
+    fn a_node_point_within_the_round_off_of_its_rows_room_is_solved() {
+        let model = Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![int(0.0, 5224, 5224), int(1.0, -2, -1)],
             rows: vec![row(
@@ -2959,8 +2958,187 @@ mod regression_tests {
                 ComparisonOp::Eq,
                 -5876999.999999887,
             )],
-            xstar: vec![5224.0, -1.0],
-        });
+            xstar: vec![5224.0, -2.0],
+        };
+        assert_solves_within_contract(&model);
+        assert_solves_within_contract_without_presolve(&model);
+    }
+
+    /// Nodes like the one above within the recommended range (row dynamism
+    /// `2e4` to `1e5`): `a0 x0 + a1 x1 = b` with `x0` fixed at an integer
+    /// between `4e8` and `2e9`, and `x1`'s better integer inside the row's
+    /// room by `8e-9` to `2.2e-7`, the plain sum putting it beyond by `6e-9`
+    /// to `8.5e-8`. Each solve failed loudly, presolve on and off.
+    #[test]
+    fn in_range_node_points_within_the_round_off_of_their_rows_room_are_solved() {
+        let cases: [(i32, f64, f64, i32, f64); 6] = [
+            (1711692785, 1.281, -5.415e-05, -5, 2192678457.585229),
+            (1993684016, -1.489, 7.377e-05, 3, -2968595499.8237224),
+            (469151876, -1.227, -1.451e-05, -5, -575649351.8519385),
+            (1904183514, 1.179, -5.23e-05, -4, 2245032363.0061665),
+            (436447346, -0.9354, 9.084e-06, 3, -408252847.448365),
+            (1489342251, -1.49, -4.678e-05, -1, -2219119953.9899955),
+        ];
+        for (k, a0, a1, x1, b) in cases {
+            let model = Model {
+                direction: OptimizationDirection::Minimize,
+                vars: vec![int(0.0, k, k), int(1.0, x1, x1 + 1)],
+                rows: vec![row(&[(0, a0), (1, a1)], ComparisonOp::Eq, b)],
+                xstar: vec![k as f64, x1 as f64],
+            };
+            assert!(
+                within_recommended_range(&model),
+                "fixture error: the model must lie within the recommended range"
+            );
+            assert_solves_within_contract(&model);
+            assert_solves_within_contract_without_presolve(&model);
+        }
+    }
+
+    /// The row above with `a1` an ulp or two steeper, over `x0` and `x1` fixed
+    /// at `5224` and `-2` as continuous vars, without presolve: the model's
+    /// one point has its exact slack `1.3e-23` to `6.6e-23` beyond the row's
+    /// room. The compensated row check finds it beyond, and the proof, summed
+    /// exactly, found no gap beyond the room: the solve failed loudly. The
+    /// proof withholds from the room of the slack the round-off within which
+    /// the two verdicts can disagree, and answers `Infeasible`, as for any
+    /// point needing more than the room (ARCHITECTURE §7.1).
+    #[test]
+    fn a_point_round_off_beyond_its_rows_room_is_proven_infeasible() {
+        for a1 in [
+            -1.1250510347794818e-7,
+            -1.1250510347794819e-7,
+            -1.125051034779482e-7,
+        ] {
+            let (problem, _) = Model {
+                direction: OptimizationDirection::Minimize,
+                vars: vec![real(0.0, 5224.0, 5224.0), real(1.0, -2.0, -2.0)],
+                rows: vec![row(
+                    &[(0, -1125.0), (1, a1)],
+                    ComparisonOp::Eq,
+                    -5876999.999999887,
+                )],
+                xstar: vec![5224.0, -2.0],
+            }
+            .build();
+            let options = SolveOptions {
+                presolve: false,
+                ..SolveOptions::default()
+            };
+            assert_eq!(
+                problem.solve_with(options).map(|_| ()),
+                Err(Error::Infeasible),
+                "a1 = {a1:e}"
+            );
+        }
+    }
+
+    /// `x0 + x1 = 348952339.66499335` over `x0 ∈ [0, 1e9]` and `x1 ∈ [0, 1]`
+    /// at cost one, solved, then edited: `x0` fixed at `348952339`, then `x1`
+    /// at `0.665`. That point meets the row `1.5e-8` inside the engine's room,
+    /// which the plain sum puts it `6.6e-9` beyond: no var could move, the
+    /// proof proved nothing, and the second edit failed loudly, presolve on
+    /// and off (an edit does not presolve). Within the recommended range (row
+    /// dynamism one).
+    #[test]
+    fn an_lp_edit_fixing_a_point_within_the_round_off_of_its_rows_room_solves() {
+        let model = |x0: (f64, f64), x1: (f64, f64)| Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![real(0.0, x0.0, x0.1), real(1.0, x1.0, x1.1)],
+            rows: vec![row(
+                &[(0, 1.0), (1, 1.0)],
+                ComparisonOp::Eq,
+                348952339.66499335,
+            )],
+            xstar: vec![348952339.0, 0.665],
+        };
+        let base = model((0.0, 1e9), (0.0, 1.0));
+        assert!(
+            within_recommended_range(&base) && xstar_is_feasible(&base),
+            "fixture error: x* must satisfy the model, which lies within the recommended range"
+        );
+        let (problem, vars) = base.build();
+        let fixed = model((348952339.0, 348952339.0), (0.665, 0.665));
+        for presolve in [true, false] {
+            let solution = problem
+                .solve_with(SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                })
+                .unwrap()
+                .into_solution()
+                .unwrap()
+                .fix_var(vars[0], 348952339.0)
+                .unwrap()
+                .into_solution()
+                .unwrap();
+            assert!(
+                infeasible_or_answer_within_contract(
+                    &fixed,
+                    solution.fix_var(vars[1], 0.665),
+                    &vars,
+                    "fix_var(x1, 0.665)",
+                )
+                .is_some(),
+                "presolve {presolve}: fix_var(x1, 0.665) returned Infeasible where x* lies \
+                 within the engine's room"
+            );
+        }
+    }
+
+    /// `x0 + x1 + x2 >= 348952339.66500664` with `x0` and `x1` fixed at
+    /// `348952339` and `0.665` and `x2 ∈ [0, 1e-5]` at cost `-1`, solved, then
+    /// `x2` fixed at `4.594137084480981e-8`. The row's plain sum accepts that
+    /// point, `3.5e-8` inside the row's room, its exact slack `2e-21` beyond:
+    /// a plain acceptance stands, the evaluation margin covering it, and the
+    /// edit answers the point, within the contract. Summed again,
+    /// compensated, the row would be found violated, and the proof would
+    /// answer `Infeasible`.
+    #[test]
+    fn an_lp_edit_fixing_a_point_its_rows_plain_sum_accepts_solves() {
+        let model = |x2: (f64, f64)| Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                real(0.0, 348952339.0, 348952339.0),
+                real(0.0, 0.665, 0.665),
+                real(-1.0, x2.0, x2.1),
+            ],
+            rows: vec![row(
+                &[(0, 1.0), (1, 1.0), (2, 1.0)],
+                ComparisonOp::Ge,
+                348952339.66500664,
+            )],
+            xstar: vec![348952339.0, 0.665, 1e-5],
+        };
+        let base = model((0.0, 1e-5));
+        assert!(
+            within_recommended_range(&base) && xstar_is_feasible(&base),
+            "fixture error: x* must satisfy the model, which lies within the recommended range"
+        );
+        let (problem, vars) = base.build();
+        let w = 4.594137084480981e-8;
+        let fixed = model((w, w));
+        for presolve in [true, false] {
+            let solution = problem
+                .solve_with(SolveOptions {
+                    presolve,
+                    ..SolveOptions::default()
+                })
+                .unwrap()
+                .into_solution()
+                .unwrap();
+            assert!(
+                infeasible_or_answer_within_contract(
+                    &fixed,
+                    solution.fix_var(vars[2], w),
+                    &vars,
+                    "fix_var(x2, w)",
+                )
+                .is_some(),
+                "presolve {presolve}: fix_var(x2, w) returned Infeasible where the row's plain \
+                 sum accepts the point"
+            );
+        }
     }
 
     /// `x0 + 1e-5 x2 = 262144.00001`, with `x0` fixed at `2^18`, holds exactly

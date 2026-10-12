@@ -26,7 +26,7 @@ mod tolerances;
 
 pub(crate) use basis::*;
 pub(crate) use proof::CDouble;
-use proof::{refinement_error, COMPENSATED_ERROR};
+use proof::{compensated_error, refinement_error};
 pub(crate) use scaling::*;
 pub(crate) use tolerances::*;
 
@@ -429,7 +429,7 @@ impl Solver {
                 prepared_rows.push(row);
             }
         }
-        let mut var_tols: Vec<BoundTols> = (0..num_vars)
+        let var_tols: Vec<BoundTols> = (0..num_vars)
             .map(|v| {
                 structural_tol(
                     col_scales[v],
@@ -485,9 +485,9 @@ impl Solver {
         let mut orig_rhs = vec![];
         let mut row_scales = vec![];
 
-        // Initially, all slack vars are basic.
+        // Initially, all slack vars are basic, their values and tolerances
+        // set from their rows once the solver holds them.
         let mut basic_vars = vec![];
-        let mut basic_var_vals = vec![];
         let mut basic_var_mins = vec![];
         let mut basic_var_maxs = vec![];
 
@@ -499,7 +499,7 @@ impl Solver {
             slack_var_max,
         } in prepared_rows
         {
-            constraint_coeffs.push(coeffs.clone());
+            constraint_coeffs.push(coeffs);
             orig_rhs.push(rhs);
             row_scales.push(row_scale);
 
@@ -512,19 +512,6 @@ impl Solver {
             let cur_slack_var = var_states.len();
             var_states.push(VarState::Basic(basic_vars.len()));
             basic_vars.push(cur_slack_var);
-
-            let mut lhs_val = 0.0;
-            let mut magnitude = rhs.abs();
-            for (var, &coeff) in coeffs.iter() {
-                lhs_val += coeff * nb_var_vals[var];
-                magnitude += (coeff * nb_var_vals[var]).abs();
-            }
-            basic_var_vals.push(rhs - lhs_val);
-            var_tols.push(BoundTols::uniform(slack_tol(
-                feasibility * row_scale,
-                magnitude,
-                coeffs.nnz(),
-            )));
         }
 
         let num_constraints = constraint_coeffs.len();
@@ -539,14 +526,6 @@ impl Solver {
             orig_constraints = orig_constraints.append_outer_csvec(coeffs.view());
         }
         let orig_constraints_csc = orig_constraints.to_csc();
-
-        let is_primal_feasible = basic_var_vals
-            .iter()
-            .zip(&basic_var_mins)
-            .zip(&basic_var_maxs)
-            .all(|((&val, &min), &max)| val >= min && val <= max);
-
-        let need_artificial_obj = !is_primal_feasible && !is_dual_feasible;
 
         let enable_dual_steepest_edge = enable_steepest_edge;
         let dual_edge_sq_norms = if enable_dual_steepest_edge {
@@ -564,38 +543,18 @@ impl Solver {
             vec![]
         };
 
-        // Phase-1 artificial objective: push every non-basic var towards the
-        // bound it starts at (cost +1 at a lower bound, -1 at an upper bound,
-        // 0 if free or fixed), so the slack basis is dual feasible for it.
-        let artificial_obj = need_artificial_obj.then(|| {
-            let mut costs = vec![0.0; num_total_vars];
-            for (&var, state) in nb_vars.iter().zip(&nb_var_states) {
-                costs[var] = if state.at_min && !state.at_max {
-                    1.0
-                } else if state.at_max && !state.at_min {
-                    -1.0
-                } else {
-                    0.0
-                };
-            }
-            costs
-        });
-        let costs = artificial_obj.as_deref().unwrap_or(&orig_obj_coeffs);
-
         let mut nb_var_obj_coeffs = vec![];
         let mut primal_edge_sq_norms = vec![];
         for &var in &nb_vars {
             //guaranteed to be a valid index
             let col = orig_constraints_csc.outer_view(var).unwrap();
 
-            nb_var_obj_coeffs.push(costs[var]);
+            nb_var_obj_coeffs.push(orig_obj_coeffs[var]);
 
             if enable_primal_steepest_edge {
                 primal_edge_sq_norms.push(col.squared_l2_norm() + 1.0);
             }
         }
-
-        let cur_obj_val = if need_artificial_obj { 0.0 } else { obj_val };
 
         let mut scratch = ScratchSpace::with_capacity(num_constraints);
         let (lu_factors, replaced) = lu_factorize(
@@ -637,7 +596,7 @@ impl Solver {
             orig_var_domains: var_domains.to_vec(),
             enable_primal_steepest_edge,
             enable_dual_steepest_edge,
-            artificial_obj,
+            artificial_obj: None,
             cost_perturbation: vec![0.0; num_total_vars],
             cost_shifts: vec![0.0; num_total_vars],
             costs_modified: false,
@@ -645,7 +604,11 @@ impl Solver {
             working_maxs: Vec::new(),
             bounds_modified: false,
             cycle_guard: CycleGuard::default(),
-            is_primal_feasible,
+            // Set below, with the slacks' values.
+            is_primal_feasible: false,
+            // The starting values are verified as they stand: each slack is
+            // its row as `check_rows` evaluates it (`row_slack`, below), and
+            // with every slack basic the refinement has no residual to remove.
             values_dirty: false,
             reduced_costs_dirty: false,
             pivots_since_drift_check: 0,
@@ -658,7 +621,7 @@ impl Solver {
                 rhs: ScatteredVec::empty(num_constraints),
             },
             basic_vars,
-            basic_var_vals,
+            basic_var_vals: Vec::with_capacity(num_constraints),
             basic_var_mins,
             basic_var_maxs,
             dual_edge_sq_norms,
@@ -671,13 +634,43 @@ impl Solver {
             absorbed: Vec::new(),
             unrepaired_row: None,
             widened: Vec::new(),
-            cur_obj_val,
+            cur_obj_val: obj_val,
             col_coeffs: SparseVec::new(),
             sq_norms_update_helper,
             inv_basis_row_coeffs: SparseVec::new(),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
             flip_rhs: ScatteredVec::empty(num_constraints),
         };
+        for r in 0..num_constraints {
+            let (value, tols) = res.row_slack(r);
+            res.basic_var_vals.push(value);
+            res.var_tols.push(tols);
+        }
+        res.is_primal_feasible = res
+            .basic_var_vals
+            .iter()
+            .zip(&res.basic_var_mins)
+            .zip(&res.basic_var_maxs)
+            .all(|((&val, &min), &max)| val >= min && val <= max);
+        if !res.is_primal_feasible && !is_dual_feasible {
+            // Phase-1 artificial objective: push every non-basic var towards
+            // the bound it starts at (cost +1 at a lower bound, -1 at an upper
+            // bound, 0 if free or fixed), so the slack basis is dual feasible
+            // for it.
+            let mut costs = vec![0.0; num_total_vars];
+            for (c, (&var, state)) in res.nb_vars.iter().zip(&res.nb_var_states).enumerate() {
+                costs[var] = if state.at_min && !state.at_max {
+                    1.0
+                } else if state.at_max && !state.at_min {
+                    -1.0
+                } else {
+                    0.0
+                };
+                res.nb_var_obj_coeffs[c] = costs[var];
+            }
+            res.artificial_obj = Some(costs);
+            res.cur_obj_val = 0.0;
+        }
         // The slack basis has zero multipliers: a reduced cost is the
         // objective coefficient.
         res.refresh_dual_tols(&vec![0.0; num_constraints]);
@@ -775,7 +768,7 @@ impl Solver {
     /// scaled values `x`, and the magnitude `|b_r| + Σ|a_rj x_j|` it was
     /// computed from, summed in plain `f64`: the engine's evaluation of a row
     /// where its round-off fits the margin the row's tolerance leaves out for
-    /// it ([`Self::check_rows`], [`slack_tol`]).
+    /// it ([`Self::row_slack`], [`slack_tol`]).
     fn row_activity(&self, r: usize, x: impl Fn(usize) -> f64) -> (f64, f64) {
         //guaranteed to be a valid index
         let row = self.orig_constraints.outer_view(r).unwrap();
@@ -789,6 +782,57 @@ impl Solver {
             }
         }
         (lhs, magnitude)
+    }
+
+    /// The slack `b_r - Σ a_rj x_j` row `r` implies at the current values,
+    /// and its tolerances there ([`Self::slack_tols`]): the plain sum of
+    /// [`Self::row_activity`] where its round-off fits the row's evaluation
+    /// margin ([`plain_sum_resolves`]), else compensated ([`implied_slack`]).
+    /// A plain sum that puts the slack beyond its edge by at most twice that
+    /// margin is summed again, compensated: there the exact slack can lie
+    /// within the room, where the infeasibility proof, summed exactly, cannot
+    /// prove the row violated ([`Self::leaving_slack_cut`]). A plain
+    /// acceptance stands, the margin covering it. The one evaluation every
+    /// slack set from its row takes (the row check, the starting vertex, an
+    /// added row).
+    fn row_slack(&self, r: usize) -> (f64, BoundTols) {
+        let (lhs, magnitude) = self.row_activity(r, |v| self.internal_value(v));
+        let (tol, terms) = (self.feasibility * self.row_scales[r], self.row_terms(r));
+        let tols = self.slack_tols(r, magnitude);
+        let compensated = || {
+            //guaranteed to be a valid index
+            let row = self.orig_constraints.outer_view(r).unwrap();
+            let terms = row
+                .iter()
+                .filter(|&(v, _)| v < self.num_vars)
+                .map(|(v, &coeff)| (coeff, self.internal_value(v)));
+            implied_slack(self.orig_rhs[r], terms).0
+        };
+        if !plain_sum_resolves(tol, magnitude, terms) {
+            return (compensated(), tols);
+        }
+        let plain = self.orig_rhs[r] - lhs;
+        let beyond = self.slack_excess(r, plain, tols);
+        if beyond > 0.0 && beyond <= 2.0 * slack_margin(tol, magnitude, terms) {
+            return (compensated(), tols);
+        }
+        (plain, tols)
+    }
+
+    /// How far the slack of row `r`, at `value`, lies beyond the edge the
+    /// engine holds it to with the tolerances `tols` (not positive within it):
+    /// a basic slack's bounds in the basis, a non-basic slack's residual
+    /// `value` less its own value, which [`Self::check_rows`] holds within
+    /// `tols` of zero.
+    fn slack_excess(&self, r: usize, value: f64, tols: BoundTols) -> f64 {
+        match self.var_states[self.num_vars + r] {
+            VarState::Basic(pos) => (self.basic_var_mins[pos] - tols.lo - value)
+                .max(value - (self.basic_var_maxs[pos] + tols.hi)),
+            VarState::NonBasic(col) => {
+                let residual = value - self.nb_var_vals[col];
+                (-tols.lo - residual).max(residual - tols.hi)
+            }
+        }
     }
 
     /// The number of structural nonzeros of row `r`, which the round-off of
@@ -1294,31 +1338,17 @@ impl Solver {
     }
 
     /// Bring the rows and the values into agreement and measure what is left.
-    /// Every basic slack is re-derived from its row, `s = b - Σ a_j x_j`,
-    /// through [`Self::row_activity`], or in compensated arithmetic where a
-    /// plain sum's round-off would not fit the row's evaluation margin
-    /// ([`plain_sum_resolves`]), so a row's violation lives in its slack,
-    /// where the dual simplex sees it; the slack tolerances are refreshed at
-    /// these values. Returns whether the residual `b - Σ a_j x_j - s` of every
-    /// row whose slack is non-basic (how far the basic structural values are
-    /// from solving it) lies within the slack's tolerance on the side it moves
-    /// the slack (on a widened side, the evaluation margin alone).
+    /// Every basic slack is re-derived from its row, `s = b - Σ a_j x_j`
+    /// ([`Self::row_slack`]), so a row's violation lives in its slack, where
+    /// the dual simplex sees it; the slack tolerances are refreshed at these
+    /// values. Returns whether the residual `b - Σ a_j x_j - s` of every row
+    /// whose slack is non-basic (how far the basic structural values are from
+    /// solving it) lies within the slack's tolerance on the side it moves the
+    /// slack (on a widened side, the evaluation margin alone).
     fn check_rows(&mut self) -> bool {
         let mut hold = true;
         for r in 0..self.num_constraints() {
-            let (lhs, magnitude) = self.row_activity(r, |v| self.internal_value(v));
-            let tol = self.feasibility * self.row_scales[r];
-            let implied = if plain_sum_resolves(tol, magnitude, self.row_terms(r)) {
-                self.orig_rhs[r] - lhs
-            } else {
-                //guaranteed to be a valid index
-                let row = self.orig_constraints.outer_view(r).unwrap();
-                let terms = row
-                    .iter()
-                    .filter(|&(v, _)| v < self.num_vars)
-                    .map(|(v, &coeff)| (coeff, self.internal_value(v)));
-                implied_slack(self.orig_rhs[r], terms).0
-            };
+            let (implied, tols) = self.row_slack(r);
             let slack = self.num_vars + r;
             let residual = match self.var_states[slack] {
                 VarState::Basic(row) => {
@@ -1327,7 +1357,6 @@ impl Solver {
                 }
                 VarState::NonBasic(col) => implied - self.nb_var_vals[col],
             };
-            let tols = self.slack_tols(r, magnitude);
             self.var_tols[slack] = tols;
             // A NaN residual holds nothing, and one is held to the tolerance
             // on the side it moves the slack.
@@ -2019,9 +2048,9 @@ impl Solver {
     /// unrepaired row's certificate leaves then lies where no step reaches:
     /// in an entry the refinement cannot settle of a var with no bound in its
     /// direction, in a coefficient below the round-off of its terms, within
-    /// the round-off of the room every term can give, or beyond the values
-    /// computed through the basis (see the known limitations in ARCHITECTURE
-    /// §7.9).
+    /// the round-off of the room every term of a certificate of several rows
+    /// can give ([`Self::leaving_slack_cut`]), or beyond the values computed
+    /// through the basis (see the known limitations in ARCHITECTURE §7.9).
     fn dual_phase(&mut self) -> Result<StopReason, Error> {
         let obj_str = if self.artificial_obj.is_some() {
             "artificial obj."
@@ -2407,20 +2436,6 @@ impl Solver {
         self.basic_vars.push(slack_var);
         self.basic_var_mins.push(slack_var_min);
         self.basic_var_maxs.push(slack_var_max);
-
-        let mut lhs_val = 0.0;
-        let mut magnitude = rhs.abs();
-        for (var, &coeff) in coeffs.iter() {
-            let term = coeff * self.internal_value(var);
-            lhs_val += term;
-            magnitude += term.abs();
-        }
-        self.basic_var_vals.push(rhs - lhs_val);
-        self.var_tols.push(BoundTols::uniform(slack_tol(
-            self.feasibility * row_scale,
-            magnitude,
-            coeffs.nnz(),
-        )));
         // The new slack's reduced cost is exactly zero until the multipliers
         // are next recomputed.
         self.dual_tols.push(dual_tol(0.0, slack_unit));
@@ -2442,6 +2457,12 @@ impl Solver {
         self.orig_constraints = new_orig_constraints;
         self.orig_constraints_csc = self.orig_constraints.to_csc();
 
+        // The new slack, basic: its row evaluated at the current values.
+        let new_row = self.num_constraints() - 1;
+        let (value, tols) = self.row_slack(new_row);
+        self.basic_var_vals.push(value);
+        self.var_tols.push(tols);
+
         if self.enable_dual_steepest_edge {
             // A placeholder, so that every row has its weight when the
             // factorization's repair resets some; the new row's is set below.
@@ -2453,7 +2474,6 @@ impl Solver {
             // The new row's contribution to the weights. The existing tableau
             // rows are unchanged unless the factorization repaired the basis;
             // then the weights are approximate, and they only steer pricing.
-            let new_row = self.num_constraints() - 1;
             self.calc_row_coeffs(new_row);
 
             if self.enable_primal_steepest_edge {
@@ -2576,6 +2596,7 @@ impl Solver {
         let mut magnitudes = vec![0.0; num_cols];
         let mut terms = vec![0u32; num_cols];
         for (r, &y) in refined.rho.iter().enumerate() {
+            let y = y.normalized();
             let y_value = y.value();
             let second = refined.second.get(r).copied().unwrap_or(0.0);
             if y_value == 0.0 && second == 0.0 {
@@ -2594,7 +2615,8 @@ impl Solver {
         let settled = !refined.second.is_empty();
         let genuine = (0..num_cols)
             .map(|idx| {
-                let sum_error = (f64::from(terms[idx]) + 1.0) * COMPENSATED_ERROR * magnitudes[idx];
+                let count = terms[idx] as usize;
+                let sum_error = compensated_error(count, count, magnitudes[idx]);
                 settled && entries[idx].value().abs() > moves[idx].value().abs() + sum_error
             })
             .collect();

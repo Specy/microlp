@@ -2,6 +2,10 @@
 
 #[cfg(test)]
 pub(crate) mod regression_tests {
+    use crate::tests::oracle::{
+        assert_solves_within_contract, assert_solves_within_contract_without_presolve,
+        within_recommended_range, Model, Row, Var,
+    };
     use crate::{ComparisonOp, OptimizationDirection, Problem};
 
     /// <https://github.com/Specy/microlp/issues/3>: a huge but *finite* variable
@@ -1036,5 +1040,83 @@ pub(crate) mod regression_tests {
                 "presolve {presolve}"
             );
         }
+    }
+
+    /// `x0 + x1 + ... + x300 >= 2^50 + 75`, `x0` fixed at `2^50` and the
+    /// other `x` at `0.12500001`, and with `with_y` a var `y ∈ [0, 100]` in
+    /// the row at cost one (`x*` puts it at `37.5`). The `x` leave the row
+    /// `37.5` short, beyond its contract of `22.5` (the round-off floor of its
+    /// magnitude) and the room their bound tolerances add. A plain sum in the
+    /// written order rounds each `0.12500001` it adds to `2^50` up to `0.25`,
+    /// the spacing of `f64` there, and finds the row held exactly.
+    fn long_row_short_of_its_contract(with_y: bool) -> Model {
+        let h = 2f64.powi(50);
+        let n = 300;
+        let fixed = |value: f64| Var {
+            obj: 0.0,
+            lo: value,
+            hi: value,
+            integer: false,
+        };
+        let mut vars = vec![fixed(h)];
+        vars.extend((0..n).map(|_| fixed(0.12500001)));
+        let mut xstar: Vec<f64> = vars.iter().map(|v| v.lo).collect();
+        if with_y {
+            vars.push(Var {
+                obj: 1.0,
+                lo: 0.0,
+                hi: 100.0,
+                integer: false,
+            });
+            xstar.push(37.5);
+        }
+        let row = Row {
+            terms: (0..vars.len()).map(|j| (j, 1.0)).collect(),
+            op: ComparisonOp::Ge,
+            rhs: h + 0.25 * n as f64,
+        };
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars,
+            rows: vec![row],
+            xstar,
+        };
+        assert!(
+            within_recommended_range(&model),
+            "fixture error: the model must lie within the recommended range"
+        );
+        model
+    }
+
+    /// The solver's constructor summed the row of
+    /// [`long_row_short_of_its_contract`] in plain `f64`, where the row check
+    /// sums a row that long in compensated arithmetic, and took the slack
+    /// basis for verified: the solve ended at once, and the answer check
+    /// failed loudly, the row missed by `37.5`. The model is `Infeasible`,
+    /// presolve on and off.
+    #[test]
+    fn a_long_row_is_judged_at_construction_as_the_row_check_judges_it() {
+        let (problem, _) = long_row_short_of_its_contract(false).build();
+        for presolve in [true, false] {
+            let result = problem.solve_with(crate::SolveOptions {
+                presolve,
+                ..crate::SolveOptions::default()
+            });
+            assert_eq!(
+                result.map(|_| "solved"),
+                Err(crate::Error::Infeasible),
+                "presolve {presolve}"
+            );
+        }
+    }
+
+    /// [`long_row_short_of_its_contract`] with `y` to make up the row's
+    /// shortfall: the starting vertex misses the row, and the solve repairs
+    /// it, presolve on and off.
+    #[test]
+    fn a_long_row_the_starting_vertex_misses_is_repaired() {
+        let model = long_row_short_of_its_contract(true);
+        assert_solves_within_contract(&model);
+        assert_solves_within_contract_without_presolve(&model);
     }
 }

@@ -262,6 +262,21 @@ pub(crate) fn implied_slack(rhs: f64, terms: impl Iterator<Item = (f64, f64)>) -
     (implied.value(), magnitude)
 }
 
+/// A bound on the error of [`implied_slack`] over `terms` products at
+/// `magnitude`, at a slack of magnitude `slack`: `4 u s + 4 (n + 2)^2 u^2 m`
+/// (`u = 2^-53`). Its last rounding errs by `u |s|`, and the `2n` low parts it
+/// sums in `f64`, two per product, by `(2n - 1)(n + 1) u^2 m` to first order
+/// (the `Dot2` bound of Ogita, Rump and Oishi 2005, for that count); the bound
+/// holds both at least twice over, which covers the higher-order terms and the
+/// round-off of `m` itself. The error grows with the slack, but slower, so a
+/// caller may take the slack at an edge it lies past
+/// (`Solver::leaving_slack_cut`). Products it rounds (a factor past
+/// [`SPLIT_LIMIT`]) aside.
+pub(crate) fn implied_slack_error(slack: f64, magnitude: f64, terms: usize) -> f64 {
+    let n = terms as f64 + 2.0;
+    4.0 * UNIT_ROUNDOFF * slack + 4.0 * n * n * UNIT_ROUNDOFF * UNIT_ROUNDOFF * magnitude
+}
+
 /// What a row says before any point is looked at: `Some(false)` when no
 /// point can satisfy it (a coefficient or right-hand side that is not a
 /// number, an infinite coefficient, an infinite right-hand side on the
@@ -312,7 +327,7 @@ pub(crate) fn excursion(value: f64, lo: f64, hi: f64) -> f64 {
 }
 
 /// The unit round-off of `f64`, `2^-53`.
-const UNIT_ROUNDOFF: f64 = f64::EPSILON / 2.0;
+pub(crate) const UNIT_ROUNDOFF: f64 = f64::EPSILON / 2.0;
 
 /// Tolerance within which a row counts as satisfied: its contract,
 /// [`row_tolerance`] of the absolute `tol` at the row's `magnitude`
