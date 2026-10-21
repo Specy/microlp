@@ -1767,6 +1767,32 @@ mod regression_tests {
         assert_infeasible(&problem, "relaxation 6e-4");
     }
 
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): with `e = 2^-52` and `p`, `t`,
+    /// `r` the exact dyadic values of the literals below, these rows are
+    /// feasible in exact arithmetic. Set `x = 1`, `d = t - p(1-e)`,
+    /// `j = d/e^2`, `k = p - (1+e)j`, and `z = r-j`. The first and third
+    /// rows then hold by substitution; the second uses
+    /// `(1-e)(1+e) = 1-e^2` and becomes `t + p(1-e) + d = 2t`.
+    /// The free vars have no bounds to violate, and doubling the literals
+    /// and forming `1 +/- e` are exact in f64. The coefficient concessions
+    /// can discard the genuine residual of these nearly dependent rows and
+    /// report this feasible zero-objective model `Infeasible`.
+    #[test]
+    #[should_panic(expected = "Err(Infeasible)")]
+    fn a_feasible_lp_with_a_tiny_cofactor_is_a_known_limitation() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_var(0.0, (0.0, 1.0));
+        let j = problem.add_var(0.0, (f64::NEG_INFINITY, f64::INFINITY));
+        let k = problem.add_var(0.0, (f64::NEG_INFINITY, f64::INFINITY));
+        let z = problem.add_var(0.0, (f64::NEG_INFINITY, f64::INFINITY));
+        let e = f64::EPSILON;
+        let (p, t, r) = (0.338, 0.262, 1.5819999999999999);
+        problem.add_constraint([(x, p), (j, 1.0 + e), (k, 1.0)], ComparisonOp::Eq, 2.0 * p);
+        problem.add_constraint([(x, t), (j, 1.0), (k, 1.0 - e)], ComparisonOp::Eq, 2.0 * t);
+        problem.add_constraint([(x, r), (j, 1.0), (z, 1.0)], ComparisonOp::Eq, 2.0 * r);
+        assert_eq!(assert_solved(&problem, "feasible cofactor model"), [0.0; 2]);
+    }
+
     /// A model whose exact optimum, `x*` at `x2 = 5000`, is reached only
     /// through a basis the factorization finds singular (`x2` is blocked by an
     /// entry some `1e-14` of its column) solves: the rows admit

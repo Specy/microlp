@@ -1042,6 +1042,168 @@ pub(crate) mod regression_tests {
         }
     }
 
+    /// A facility-location MILP: three sites opened by binaries through big-M
+    /// rows, an integer var fixed at 12 and two dense side rows, its proven
+    /// optimum 395. With presolve, a node's certificate combines two rows and
+    /// a third whose exact multiplier is zero, left by the refinement as
+    /// noise within its estimated error. That gave the non-basic `x11`,
+    /// unbounded above, a coefficient beyond the round-off of its one-term
+    /// sum, voiding every proof of the node. The solve failed loudly ("no var
+    /// can repair row", from the slack basis too). Within its error estimate
+    /// the multiplier counts as zero, and the node is proven infeasible.
+    #[test]
+    fn a_facility_milp_whose_node_proof_meets_a_multipliers_noise_solves() {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x0 = problem.add_integer_var(28.0, (0, 1));
+        let x1 = problem.add_integer_var(5.0, (0, 1));
+        let x2 = problem.add_integer_var(37.0, (0, 1));
+        let x3 = problem.add_var(7.0, (0.0, 40.0));
+        let x4 = problem.add_var(6.0, (0.0, 40.0));
+        let x5 = problem.add_var(5.0, (0.0, 40.0));
+        let x6 = problem.add_integer_var(8.0, (0, 40));
+        let x7 = problem.add_var(9.0, (0.0, f64::INFINITY));
+        let x8 = problem.add_var(8.0, (0.0, 40.0));
+        let x9 = problem.add_var(4.0, (0.0, f64::INFINITY));
+        let x10 = problem.add_integer_var(6.0, (12, 12));
+        let x11 = problem.add_var(8.0, (0.0, f64::INFINITY));
+        problem.add_constraint([(x3, 1.0), (x6, 1.0), (x9, 1.0)], ComparisonOp::Eq, 25.0);
+        problem.add_constraint([(x4, 1.0), (x7, 1.0), (x10, 1.0)], ComparisonOp::Eq, 15.0);
+        problem.add_constraint([(x5, 1.0), (x8, 1.0), (x11, 1.0)], ComparisonOp::Eq, 18.0);
+        problem.add_constraint(
+            [(x3, 1.0), (x4, 1.0), (x5, 1.0), (x0, -1000.0)],
+            ComparisonOp::Le,
+            0.0,
+        );
+        problem.add_constraint(
+            [(x6, 1.0), (x7, 1.0), (x8, 1.0), (x1, -10000.0)],
+            ComparisonOp::Le,
+            0.0,
+        );
+        problem.add_constraint([(x6, 1.0), (x1, -25.0)], ComparisonOp::Le, 0.0);
+        problem.add_constraint([(x7, 1.0), (x1, -15.0)], ComparisonOp::Le, 0.0);
+        problem.add_constraint([(x8, 1.0), (x1, -18.0)], ComparisonOp::Le, 0.0);
+        problem.add_constraint(
+            [(x9, 1.0), (x10, 1.0), (x11, 1.0), (x2, -5000.0)],
+            ComparisonOp::Le,
+            0.0,
+        );
+        problem.add_constraint(
+            [
+                (x0, -1.0),
+                (x2, -2.0),
+                (x3, 1.0),
+                (x4, -1.0),
+                (x6, -3.0),
+                (x10, 1.0),
+                (x11, -1.0),
+            ],
+            ComparisonOp::Eq,
+            -18.0,
+        );
+        problem.add_constraint(
+            [
+                (x0, 1.0),
+                (x1, -2.0),
+                (x2, 2.0),
+                (x3, 3.0),
+                (x4, -3.0),
+                (x6, -1.0),
+                (x7, -3.0),
+            ],
+            ComparisonOp::Le,
+            -16.5,
+        );
+        for presolve in [true, false] {
+            let options = crate::SolveOptions {
+                presolve,
+                ..crate::SolveOptions::default()
+            };
+            let objective = problem
+                .solve_with(options)
+                .unwrap_or_else(|e| {
+                    panic!("presolve {presolve}: a feasible MILP must solve: {e:?}")
+                })
+                .into_solution()
+                .unwrap_or_else(|i| panic!("presolve {presolve}: must finish, got {i:?}"))
+                .objective();
+            assert!(
+                (objective - 395.0).abs() < 1e-6,
+                "presolve {presolve}: objective {objective}, the proven optimum 395"
+            );
+        }
+    }
+
+    /// An infeasible LP reduced from a node-like LP of the fuzz set: with `x5`
+    /// fixed at `-6` and `x1 >= 6.81`, the second row needs `x9 >= 7.22`,
+    /// beyond its upper bound `7.11` (the rows must be relaxed by `0.43` to
+    /// admit a point). The proof of the basic `x1`'s row combines the second
+    /// row with three whose multipliers, zero for the exact multipliers, the
+    /// refinement leaves as noise within their error estimates. Their terms
+    /// gave a non-basic var with an infinite bound a coefficient far beyond
+    /// the round-off of its sum, which voided every proof: the solve failed
+    /// loudly ("no var can repair row", from the slack basis too), presolve
+    /// on and off. Within their error estimates the multipliers count as zero,
+    /// and the second row alone proves the model infeasible.
+    #[test]
+    fn an_lp_whose_proof_meets_multipliers_noise_is_proven_infeasible() {
+        let inf = f64::INFINITY;
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x0 = problem.add_var(-4.0, (-inf, inf));
+        let x1 = problem.add_var(-1.0, (6.806304608602744, inf));
+        let x2 = problem.add_var(6.58, (-11.505993738408385, 3.872839252966248));
+        let x3 = problem.add_var(5.0, (4.3368374636645655, 11.28552706260551));
+        let x4 = problem.add_var(2.0, (0.38879819010476036, 11.367911428145554));
+        let x5 = problem.add_var(6.0, (-6.0, -6.0));
+        let x6 = problem.add_var(-2.0, (-8.258941061706652, inf));
+        let x7 = problem.add_var(-1.35, (-9.460686926088817, -0.21420528771774006));
+        let x8 = problem.add_var(-9.95, (6.295856601844321, inf));
+        let x9 = problem.add_var(-5.66, (-3.4992901284970337, 7.109192961979099));
+        let x10 = problem.add_var(-2.47, (-inf, inf));
+        let x11 = problem.add_var(3.0, (2.0, 5.0));
+        problem.add_constraint(
+            [(x6, -6.47), (x10, -8.23)],
+            ComparisonOp::Le,
+            181.77374514389683,
+        );
+        problem.add_constraint(
+            [(x1, -0.09), (x5, 6.0), (x9, 4.0)],
+            ComparisonOp::Eq,
+            -7.742812100546735,
+        );
+        problem.add_constraint(
+            [(x0, -7.0), (x4, -2.5), (x7, -7.0), (x10, 4.89), (x11, 2.47)],
+            ComparisonOp::Eq,
+            90.60902210536591,
+        );
+        problem.add_constraint(
+            [(x1, -6.43), (x2, -8.24), (x4, 5.0)],
+            ComparisonOp::Le,
+            -33.21493975607508,
+        );
+        problem.add_constraint(
+            [(x3, 4.0), (x8, -8.0)],
+            ComparisonOp::Eq,
+            -19.507672166524216,
+        );
+        problem.add_constraint([(x0, -5.0), (x9, 1.0)], ComparisonOp::Ge, 68.57567901920862);
+        problem.add_constraint(
+            [(x0, -4.0), (x3, -5.02), (x9, -4.86)],
+            ComparisonOp::Ge,
+            -28.038374476146593,
+        );
+        for presolve in [true, false] {
+            let options = crate::SolveOptions {
+                presolve,
+                ..crate::SolveOptions::default()
+            };
+            assert_eq!(
+                problem.solve_with(options).map(|_| ()),
+                Err(crate::Error::Infeasible),
+                "presolve {presolve}"
+            );
+        }
+    }
+
     /// `x0 + x1 + ... + x300 >= 2^50 + 75`, `x0` fixed at `2^50` and the
     /// other `x` at `0.12500001`, and with `with_y` a var `y ∈ [0, 100]` in
     /// the row at cost one (`x*` puts it at `37.5`). The `x` leave the row

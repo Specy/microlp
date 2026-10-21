@@ -3243,6 +3243,120 @@ fn a_coefficient_on_an_infinite_bound_counts_as_zero_only_within_its_error() {
     }
 }
 
+/// `x0 + x1 + eps j >= 3` and `x2 + j (+ z) = 0`, `x0`, `x1`, `x2` in
+/// `[0, 1]`, `j` and `z` free, infeasible, at the basis `{j}` and the first
+/// row's slack, `3` above its bound, `z` non-basic where it is in the rows:
+/// the exact multipliers of the slack's row are `(1, -eps)`. Returns the
+/// solver and the slack's row.
+fn zeroed_multiplier_fixture(eps: f64, with_z: bool) -> (Solver, usize) {
+    let z = if with_z { 1.0 } else { 0.0 };
+    let mut sol = Solver::try_new(
+        &[0.0; 5],
+        &[0.0, 0.0, 0.0, f64::NEG_INFINITY, f64::NEG_INFINITY],
+        &[1.0, 1.0, 1.0, f64::INFINITY, f64::INFINITY],
+        &[
+            (to_sparse(&[1.0, 1.0, 0.0, eps, 0.0]), ComparisonOp::Ge, 3.0),
+            (to_sparse(&[0.0, 0.0, 1.0, 1.0, z]), ComparisonOp::Eq, 0.0),
+        ],
+        &vec![VarDomain::Real; 5],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let (j, s0) = (3, sol.num_vars);
+    sol.load_basis(&Basis(vec![
+        VarStatus::AtLower,
+        VarStatus::AtLower,
+        VarStatus::AtLower,
+        VarStatus::Basic,
+        VarStatus::Free,
+        VarStatus::Basic,
+        VarStatus::AtLower,
+    ]))
+    .unwrap();
+    let row = sol.basic_vars.iter().position(|&var| var == s0).unwrap();
+    assert!(
+        (sol.basic_var_vals[row] - 3.0).abs() < 1e-12
+            && matches!(sol.var_states[j], VarState::Basic(_)),
+        "fixture: j basic, the first row's slack 3 above its bound, {:?}",
+        sol.basic_var_vals
+    );
+    (sol, row)
+}
+
+/// A multiplier within its error estimate counts as zero, whatever its sign:
+/// what the refinement leaves of a multiplier that is zero gives the other
+/// vars of its row coefficients far beyond the round-off of their sums, and
+/// a non-basic var's, on an infinite bound, voids the proof. Planted, at
+/// [`zeroed_multiplier_fixture`] with no `eps` and `z` in the rows, whose
+/// exact multipliers are `(1, 0)`: `(1, -2^-136)`, which leaves the free
+/// non-basic `z` the coefficient `-2^-136`. With an error estimate of
+/// `2^-100`, or of `2^-136` (the second correction can move an exact first
+/// step's zero to the threshold), the second multiplier counts as zero,
+/// and the first row alone proves the model infeasible; with `2^-140`, zero
+/// or no estimate it counts, and `z` makes the range unbounded.
+#[test]
+fn a_multipliers_noise_does_not_void_a_proof() {
+    init();
+    let proof = |error: Option<f64>| {
+        let (sol, row) = zeroed_multiplier_fixture(0.0, true);
+        let refined = proof::RefinedRow {
+            rho: multipliers(&[1.0, -(2f64.powi(-136))]),
+            error: error.map(|e| vec![0.0, e]),
+            second: vec![0.0, error.unwrap_or(f64::INFINITY)],
+        };
+        sol.proof_of(&refined, row, false)
+    };
+    for error in [2f64.powi(-100), 2f64.powi(-136)] {
+        let proven = proof(Some(error));
+        assert!(proven.holds, "{error:e}: {proven:?}");
+        assert!((proven.gap - 1.0).abs() < 1e-14, "{error:e}: {proven:?}");
+        assert_eq!(
+            (proven.multipliers_zeroed, proven.zero_within_error),
+            (1, 0),
+            "{error:e}: {proven:?}"
+        );
+    }
+    for error in [Some(2f64.powi(-140)), Some(0.0), None] {
+        let unproven = proof(error);
+        assert!(!unproven.holds, "{error:?}: {unproven:?}");
+        assert_eq!(unproven.gap, f64::NEG_INFINITY, "{error:?}: {unproven:?}");
+    }
+}
+
+/// Taking a multiplier as zero moves the coefficient of a basic var in its
+/// row, and the concession allows its magnitude plus its error estimate
+/// for the distance from the exact multiplier. Planted, at
+/// [`zeroed_multiplier_fixture`] with `eps = 2^-3` and no `z`, its exact
+/// multipliers `(1, -2^-3)`: with an error estimate of `2^-2` the second counts
+/// as zero, which leaves the free basic `j` the first row's `2^-3`, within
+/// `2^-3 + 2^-2`, and the first row alone proves the model infeasible; with
+/// a zero estimate it counts and cancels `j`'s coefficient, and the proof
+/// concedes nothing.
+#[test]
+fn a_multiplier_taken_as_zero_concedes_what_it_moves() {
+    init();
+    let proof = |error: f64| {
+        let (sol, row) = zeroed_multiplier_fixture(2f64.powi(-3), false);
+        let refined = proof::RefinedRow {
+            rho: multipliers(&[1.0, -(2f64.powi(-3))]),
+            error: Some(vec![0.0, error]),
+            second: vec![0.0, error],
+        };
+        sol.proof_of(&refined, row, false)
+    };
+    for (error, zeroed) in [(2f64.powi(-2), 1), (0.0, 0)] {
+        let proven = proof(error);
+        assert!(proven.holds, "{error:e}: {proven:?}");
+        assert!((proven.gap - 1.0).abs() < 1e-14, "{error:e}: {proven:?}");
+        assert_eq!(
+            (proven.multipliers_zeroed, proven.zero_within_error),
+            (zeroed, zeroed),
+            "{error:e}: {proven:?}"
+        );
+    }
+}
+
 /// A basis repair drops, from a dependency, a var with both bounds finite
 /// where the factorization's own choice has an infinite bound, and keeps
 /// that choice where the alternative has one too. Loaded: the basis

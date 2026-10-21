@@ -856,26 +856,37 @@ from drift dissolves):
   finite bound counts however far it cancelled, since it can be the data's own (`1` and
   `−(1 + 2^-50)` leave `−2^-50`: `room_through_a_round_off_coefficient`). A row whose
   multiplier would need its slack's infinite bound is left out, and a number that is not
-  finite voids the proof.
+  finite voids the proof. A multiplier within its estimated error (its second correction,
+  where the refinement converged in two steps) counts as zero, whatever its sign:
+  refinement noise in a multiplier whose exact value is zero can give a non-basic var a
+  coefficient beyond the round-off of its sum, voiding the proof on an infinite bound
+  (`a_multipliers_noise_does_not_void_a_proof`,
+  `a_facility_milp_whose_node_proof_meets_a_multipliers_noise_solves`). Changing a multiplier
+  preserves the certificate identity; the basic-column concession for the change below is
+  estimated, not a verified forward-error enclosure.
 - *The concession*: on an infinite bound a coefficient voids the proof unless it lies
   within the round-off of its compensated sum or, a basic var's, within what the
   multipliers' error carries into it (their second refinement corrections, where the
   refinement converged to `REFINEMENT_CONVERGED` in two steps, carried through the var's
-  entries); then it counts as zero. A basic var's coefficient is zero for the exact
-  multipliers (`issue_48_switchable_dc_network_solves`). A non-basic var's is its tableau
-  entry, which the arithmetic cannot tell from a residual within that error, and counted as
-  zero there it proves feasible models infeasible
+  entries; in a row whose multiplier counts as zero, the multiplier plus its correction:
+  `a_multiplier_taken_as_zero_concedes_what_it_moves`); then it counts as zero. A basic
+  var's coefficient is zero for the exact multipliers
+  (`issue_48_switchable_dc_network_solves`). A non-basic var's is its tableau entry, which
+  the arithmetic cannot tell from a residual within that error, and counted as zero there it
+  proves feasible models infeasible
   (`an_unbounded_lp_of_nearly_dependent_rows_is_not_proven_infeasible`), so it gets the
   round-off alone (`a_non_basic_vars_residual_does_not_void_a_proof`). No fixed threshold
   would do: one at the round-off of the terms takes the data's `2^-50` for zero, and a lower
   one fails the proofs of infeasible models. A refinement that converges only after its
-  second step concedes the round-off alone, so refining longer never widens what a proof
-  concedes (`a_long_refinement_concedes_no_non_basic_coefficient`). What is left: a
-  coefficient the data leave within what is conceded counts as zero and could prove a
-  feasible model infeasible, a non-basic var's within the round-off of its sum, some `1e-30`
-  of its terms, or a basic var's whose column a row left out reaches; and one within the
-  round-off of its sum of zero whose computed sign picks a finite bound where its exact sign
-  picks an infinite one counts at the finite bound, where the exact certificate is void.
+  second step concedes the round-off alone, and counts every multiplier as it is, so
+  refining longer never widens what a proof concedes
+  (`a_long_refinement_concedes_no_non_basic_coefficient`). What is left: a coefficient the
+  data leave within what is conceded counts as zero and could prove a feasible model
+  infeasible, a non-basic var's within the round-off of its sum, some `1e-30` of its terms,
+  or a basic var's whose column a row left out or counted as zero reaches; and one within
+  the round-off of its sum of zero whose computed sign picks a finite bound where its exact
+  sign picks an infinite one counts at the finite bound, where the exact certificate is
+  void.
 - *The room*: the gap must exceed what the engine can give the terms, each to the farthest
   value `f64` holds within its room (`band_edge`) times its coefficient: the leaving var its
   tolerance (`α − E` for a slack, below; the bound contract for a structural var, none for
@@ -1246,10 +1257,20 @@ it must give no wrong answer.
   parallel over a var with one finite bound and a free one).
 - **A proof that needs a non-basic coefficient within the multipliers' error** (in range).
   A non-basic var's coefficient on an infinite bound counts as zero only within the
-  round-off of its sum (§7.3), so an infeasible model whose certificate leaves one beyond
-  that round-off, if within the error, is not proven, and the solve fails loudly ("no var
-  can repair row", from the slack basis too):
+  round-off of its sum (§7.3). A multiplier within its error counts as zero, which takes out
+  what the refinement leaves of the rows whose exact multipliers are zero, but an infeasible
+  model whose certificate leaves a coefficient beyond that round-off through multipliers
+  beyond their error, if within what that error carries into it, is not proven, and the
+  solve fails loudly ("no var can repair row", from the slack basis too):
   `a_proof_through_a_non_basic_coefficient_within_its_error_is_a_known_limitation`.
+- **A genuine coefficient within the proof's zero concession** (coefficients in range).
+  Nearly dependent rows can have an exactly feasible point only at very large variable
+  values. A genuine coefficient within the compensated-sum allowance, or a basic column's
+  estimated multiplier error after a row is dropped or zeroed, can count as zero and cause
+  `Infeasible` (§7.3). The second refinement correction estimates error; it is not a
+  verified componentwise enclosure. This is pinned by
+  `a_feasible_lp_with_a_tiny_cofactor_is_a_known_limitation`, whose exact feasible witness
+  is given algebraically in the test.
 - **A point within the round-off of the room of a certificate of several rows** (in range
   too; no model known, so unpinned). Where the violated slack's row has a basic structural
   var, the proof combines rows, and its verdict on the slack and the engine's can disagree
