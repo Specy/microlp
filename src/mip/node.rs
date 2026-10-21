@@ -12,9 +12,14 @@ pub(crate) struct Node {
     pub bound_changes: Vec<(usize, f64, f64)>,
     /// Optimal basis of the parent node (dual-feasible warm start after tightening).
     pub basis: Basis,
-    /// Parent's LP objective in internal (minimize) space — a valid lower bound
-    /// for this node, used for pruning before any LP work.
+    /// Parent's LP objective in internal (minimize) space: a lower bound on
+    /// the objective of this node's points up to the vertex freedom of the
+    /// LP (ARCHITECTURE §7.1), used for pruning before any LP work.
     pub lp_bound: f64,
+    /// `lp_bound` less the parent's dual slack (`MipState::lattice_bound`): a
+    /// lower bound on the objective of every point of this node that meets
+    /// its rows and bounds exactly, which the objective lattice rounds up.
+    pub lattice_bound: f64,
     pub depth: u32,
     /// Sequence number of the branching that created this node; used to detect
     /// "the solver is already at my parent's optimum" (warm dive).

@@ -103,18 +103,20 @@ fn interrupted_outcome_exposes_only_reason_stats_and_resume() {
 
 #[test]
 fn node_limit_interrupts_deterministically_and_resumes() {
-    let (p, _, _) = int_2var_problem();
+    let p = binary_knapsack();
     let mut options = SolveOptions::default();
     options.node_limit = Some(1);
     let mut outcome = p.solve_with(options).unwrap();
+    assert_eq!(outcome.termination_reason(), TerminationReason::NodeLimit);
     let mut resumes = 0;
     while !outcome.is_optimal() {
         resumes += 1;
         assert!(resumes < 10_000);
         outcome = outcome.resume().unwrap();
     }
+    assert!(resumes >= 1, "node_limit = 1 should interrupt the search");
     let sol = solution(outcome);
-    assert!((sol.objective() - 11.0).abs() < 1e-6);
+    assert!((sol.objective() - 21.0).abs() < 1e-6);
 }
 
 #[test]

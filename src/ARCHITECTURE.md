@@ -74,6 +74,7 @@ Three principles shape everything:
 | `src/mip/state.rs` | `MipState` (the complete, resumable search state) and `MipRun`. |
 | `src/mip/options.rs` | The public option and report types: `SolveOptions`, `ResumeOptions`, `Tolerances`, `Stats`, `SolutionStatus`, `TerminationReason`. |
 | `src/mip/node.rs` | `Node` (plain-data tree node) and `with_var_bounds` (a child's bound changes from its parent's). |
+| `src/mip/lattice.rs` | `ObjectiveLattice`: the values the objective takes at integral points where it lies on a lattice, and the integral bound pruning rounds a node's bound up to (§5.5). |
 | `src/mip/branching/` | Integrality checks and branch-variable selection (pseudocosts). |
 | `src/mip/params.rs` | Named, documented internal constants (see §7). |
 | `tests/suite/` | The problem-based correctness suite (see §9) — the safety net for all of this. |
@@ -339,6 +340,7 @@ and direction that created it.
 | `incumbent: Option<Incumbent>` | best integral solution: its values as computed + `objective = c·x` |
 | `node_seq`, `last_solved_id`, `diving` | warm-dive detection + node-selection mode |
 | `pseudocosts`, `stats`, `options`, `deadline`, `direction` | search intelligence and bookkeeping |
+| `objective_lattice` | the values the objective takes at integral points, where it lies on a lattice (§5.5) |
 | `base: Problem`, `fixed: BTreeMap<var, val>` | the CLEAN user problem + user-level fixes — the substrate for post-solve edits (§5.8) |
 
 `Solution` for a MILP holds `SolutionStatus`, `TerminationReason`, and this `MipState`
@@ -375,7 +377,7 @@ flowchart TD
     G -->|gap| GAP((Feasible / MipGap))
     G -->|deadline| I2((Interrupted<br/>frontier remains resumable))
     G -->|continue| P[pop_node: warm dive or best-bound jump]
-    P --> SB{stored bound reaches cutoff?}
+    P --> SB{stored bounds dominated?}
     SB -->|yes: free prune| O
     SB -->|no| NB{node LP budget exhausted?}
     NB -->|yes: requeue| I2
@@ -385,7 +387,7 @@ flowchart TD
     AB -->|valid| S[load basis if needed + solve_node_lp]
     S -->|Limit: requeue unsolved| NI[NodeVisit::Interrupted]
     S -->|Infeasible| NS[NodeVisit::Solved]
-    S -->|Solved| D[pseudocost + fresh cutoff + candidate/branch]
+    S -->|Solved| D[pseudocost + fresh bounds dominated? + candidate/branch]
     D --> NS
     NP --> O
     NS --> COUNT[increment solved-node budget] --> O
@@ -523,8 +525,38 @@ branching); a false acceptance would be a wrong answer.
   incumbent and global bound is still classified as an exact proof even when the open list
   contains dominated nodes.
 - **Pruning** uses `cutoff(incumbent) = incumbent − max(ε, ε·|incumbent|)` with
-  `ε = Tolerances::prune_epsilon` (default 1e-9), applied twice per node: against the stored
-  parent bound *before* any LP work, and against the fresh objective after.
+  `ε = Tolerances::prune_epsilon` (default 1e-9), applied twice per node (`dominated`):
+  against the stored parent bound *before* any LP work, and against the fresh objective
+  after.
+- **Objective lattice** (`ObjectiveLattice`): where every var with a nonzero cost is an
+  integer var or fixed in the bounds the search starts from (presolve's fixings and an
+  edit's included), the objective at a point whose integer vars are integral and whose fixed
+  vars are at their values is `offset + k·step`, `offset` the fixed vars' terms and `step`
+  the greatest common divisor of the other costs, exact over their `f64` values (`0.5` and
+  `1.5` give `0.5`). A node is then also pruned when its *integral bound* reaches the
+  cutoff: the least lattice value at or above its `lattice_bound`, less a margin.
+  `lattice_bound` is the LP bound less the vertex's dual slack (`Solver::dual_slack`), each
+  non-basic var's reduced cost on its wrong side, which the dual check accepts within its
+  tolerance, times the var's range: what a point meeting the rows and bounds exactly can
+  gain on the vertex, infinite where a range is. The margin covers the computed vertex
+  against the exact one: each cost var's cost times its tolerance, and the round-off of the
+  sums and of the rounding, at the most the cost terms add up to within their bounds (an
+  integer var's are `i32`); a step within the margin gives no lattice. A state rebuilt for
+  an edit or for unboundedness classification (zero objective) computes its own.
+  - *What holds*: no exactly integral point of a pruned node, every integer var at an
+    integer, every fixed var at its value, every row and bound met exactly, beats the
+    incumbent beyond `ε`, the claim of the cutoff alone (§7.1), up to the round-off of the
+    reduced costs themselves, which the dual slack does not count, and an answer whose
+    computed values the verification keeps while its refined values lower the objective by
+    more than the allowance (an excursion's fallback, a bound already held, §7.5).
+  - *What does not*: a point the contract accepts that is not exactly integral or exactly
+    feasible, an integer var within `int_tol` of its integer or a row met within its
+    tolerance, can lie up to a step below the bound, and its node is pruned even where it
+    beats the incumbent: the search keeps the integral points (§7.1). `int_tol` plays no
+    part in the rule, and an incumbent above its lattice value keeps every node that could
+    reach that value.
+  - The reported bound is not rounded: an answer can lie below its lattice value by its
+    integer vars' `int_tol`, and `Stats::best_bound` bounds every answer still to come.
 
 ### 5.6 Pseudocost branching (`src/mip/branching/`)
 
@@ -759,11 +791,12 @@ What an answer means:
   model as written. For a MILP, the incumbent meets the contract, and no integral point
   within the engine's room (fixed vars at their values), up to the round-off sliver, is
   better beyond the pruning epsilon (§5.5) and the vertex freedom above: every other node
-  was pruned by its bound or proven infeasible. The proof's concession and presolve's
-  round-off can hide a better integral point, as they can cause a wrong `Infeasible` (§7.3,
-  §7.4). The incumbent need not be integral, and can be better than every integral point:
-  under the big-M caveat of §5.4, a facility's binary at `1e-7` lets it serve all the
-  demand, at a cost of `20.00001` where the best integral point costs `110` (the model of
+  was pruned by its bound, or by its integral bound, which holds for the exactly integral
+  points (§5.5), or proven infeasible. The proof's concession and presolve's round-off can
+  hide a better integral point, as they can cause a wrong `Infeasible` (§7.3, §7.4). The
+  incumbent need not be integral, and can be better than every integral point: under the
+  big-M caveat of §5.4, a facility's binary at `1e-7` lets it serve all the demand, at a
+  cost of `20.00001` where the best integral point costs `110` (the model of
   `a_branch_that_fixes_a_big_m_binary_is_kept` at the default `int_tol`).
 - **`Infeasible`**: a proof, summed from the model's data, that no point has every row and
   every continuous var within the room the engine can give it, the integer and fixed vars

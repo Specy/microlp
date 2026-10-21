@@ -437,6 +437,100 @@ fn bounded_integer_models_match_exhaustive_enumeration() {
     }
 }
 
+/// The integer models with their costs times `step`, maximized when
+/// `maximize`, beside a continuous var fixed at `0.7` with a cost of `0.3`:
+/// the objective takes the values `0.21 + k * step` at the integral points.
+/// Returns the problem and the integer vars.
+fn build_lattice_problem(case: &Case, step: f64, maximize: bool) -> (Problem, Vec<Variable>) {
+    let direction = if maximize {
+        OptimizationDirection::Maximize
+    } else {
+        OptimizationDirection::Minimize
+    };
+    let mut problem = Problem::new(direction);
+    let vars: Vec<_> = (0..case.n)
+        .map(|v| {
+            problem.add_integer_var(
+                f64::from(case.objective[v]) * step,
+                (case.lo[v], case.hi[v]),
+            )
+        })
+        .collect();
+    problem.add_var(0.3, (0.7, 0.7));
+    for row in &case.rows {
+        problem.add_constraint(
+            (0..case.n).map(|v| (vars[v], f64::from(row.coeffs[v]) * row.scale)),
+            row.op,
+            f64::from(row.rhs) * row.scale,
+        );
+    }
+    (problem, vars)
+}
+
+/// The search rounds a node's bound up to the values the objective takes at
+/// integral points: with a step other than one, an offset from a fixed var
+/// and either direction, presolve on and off, the optimum is still the
+/// enumeration's.
+#[test]
+fn objectives_on_a_lattice_match_exhaustive_enumeration() {
+    const STEPS: [f64; 5] = [2.0, 0.5, 3.0, 0.25, 6.0];
+    for seed in 0..20_000u64 {
+        let case = generated_case(seed ^ 0x9e37_79b9_7f4a_7c15);
+        let maximize = seed % 2 == 1;
+        let step = STEPS[(seed / 2 % 5) as usize];
+        let presolve = seed % 3 != 0;
+        // The enumeration minimizes: a maximum is the minimum of the negation.
+        let sign = if maximize { -1 } else { 1 };
+        let mut minimized = case.clone();
+        for cost in &mut minimized.objective {
+            *cost *= sign;
+        }
+        let expected = brute_force(&minimized)
+            .map(|(objective, _)| step * (i64::from(sign) * objective) as f64 + 0.3 * 0.7);
+        let (problem, vars) = build_lattice_problem(&case, step, maximize);
+        let mut options = SolveOptions::default();
+        options.presolve = presolve;
+        let context = format!("seed {seed}, step {step}, maximize {maximize}, presolve {presolve}");
+        match (expected, problem.solve_with(options)) {
+            (None, Err(Error::Infeasible)) => {}
+            (None, other) => panic!("{context}: expected infeasible, got {other:?}; {case:?}"),
+            (Some(objective), Ok(outcome)) => {
+                let solution = expect_solution(outcome);
+                assert_eq!(
+                    solution.status(),
+                    SolutionStatus::Optimal,
+                    "{context}: {case:?}"
+                );
+                let costs: f64 = case.objective[..case.n]
+                    .iter()
+                    .map(|&c| f64::from(c).abs() * step)
+                    .sum();
+                assert!(
+                    (solution.objective() - objective).abs() < 1e-7 + int_tol() * costs,
+                    "{context}: objective {}, expected {objective}; {case:?}",
+                    solution.objective()
+                );
+                let mut values = [0; 4];
+                for (v, value) in values.iter_mut().enumerate().take(case.n) {
+                    let x = solution.var_value(vars[v]);
+                    assert!(
+                        (x - x.round()).abs() <= int_tol(),
+                        "{context}: x{v} = {x} is not integral within int_tol; {case:?}"
+                    );
+                    *value = x.round() as i32;
+                }
+                assert!(
+                    case.rows.iter().all(|row| row_holds(row, &values, case.n)),
+                    "{context}: solver returned infeasible values {values:?}; {case:?}"
+                );
+            }
+            (Some(expected), other) => {
+                panic!("{context}: expected {expected}, got {other:?}; {case:?}")
+            }
+        }
+    }
+}
+
 #[test]
 fn mixed_integer_models_match_integer_enumeration_and_analytic_lp() {
     for seed in 0..25_000 {

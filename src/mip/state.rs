@@ -3,6 +3,7 @@
 //! It owns the single [`Solver`] the whole search pivots on.
 
 use super::branching;
+use super::lattice::ObjectiveLattice;
 use super::node::Node;
 use super::options::{SolveOptions, Stats, TerminationReason};
 use crate::solver::{Deadline, Solver};
@@ -45,6 +46,10 @@ pub(crate) struct MipState {
     pub deadline: Deadline,
     /// Consumed by `fill_bound_stats` to report `best_bound`/`gap` in user space.
     pub direction: OptimizationDirection,
+    /// The values the objective takes at integral points of the model the
+    /// search starts from, where it lies on a lattice; pruning rounds a
+    /// node's lattice bound up to it (`super::dominated`).
+    pub objective_lattice: Option<ObjectiveLattice>,
     /// Learned per-variable branching degradation estimates, updated after each
     /// node LP solve and consulted by `branching::choose_branch_var`.
     pub pseudocosts: branching::PseudoCosts,
@@ -66,6 +71,7 @@ impl std::fmt::Debug for MipState {
             .field("has_incumbent", &self.incumbent.is_some())
             .field("stats", &self.stats)
             .field("diving", &self.diving)
+            .field("objective_lattice", &self.objective_lattice)
             .field(
                 "pseudocost_observations",
                 &self.pseudocosts.observation_count(),
@@ -76,6 +82,18 @@ impl std::fmt::Debug for MipState {
 }
 
 impl MipState {
+    /// The bound the objective lattice rounds up for a node whose LP bound
+    /// at the solver's current vertex is `bound`: `bound` less the vertex's
+    /// dual slack (`Solver::dual_slack`), or `bound` itself where the
+    /// objective lies on no lattice, which leaves it unused.
+    pub(crate) fn lattice_bound(&self, bound: f64) -> f64 {
+        if self.objective_lattice.is_some() {
+            bound - self.solver.dual_slack()
+        } else {
+            bound
+        }
+    }
+
     /// Objective of the solution exposed through the public value accessors.
     /// Unboundedness classification uses a zero-objective solver, so a working
     /// point without an incumbent is evaluated against the original model.

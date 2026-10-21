@@ -6,10 +6,12 @@
 //! This file builds a search from a [`Problem`], starts, resumes and re-edits
 //! it, and judges a candidate against the user's rows. [`options`] holds the
 //! public option and report types, [`state`] the resumable [`MipState`],
-//! [`search`] the node loop, and [`branching`], [`node`] and [`params`] the
+//! [`search`] the node loop, [`lattice`] the values the objective takes at
+//! integral points, and [`branching`], [`node`] and [`params`] the
 //! pseudocosts, tree nodes and constants.
 
 pub(crate) mod branching;
+mod lattice;
 pub(crate) mod node;
 mod options;
 pub(crate) mod params;
@@ -23,6 +25,7 @@ pub(crate) use state::{MipRun, MipState};
 
 use crate::solver::{deadline_after, Solver};
 use crate::{Error, OptimizationDirection, Problem, VarDomain, Variable};
+use lattice::ObjectiveLattice;
 use search::search_loop;
 use std::collections::BTreeMap;
 use web_time::Instant;
@@ -70,6 +73,13 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
         .zip(var_maxs)
         .map(|(&lo, &hi)| (lo, hi))
         .collect();
+    let objective_lattice = ObjectiveLattice::of(
+        &problem.obj_coeffs,
+        var_mins,
+        var_maxs,
+        &problem.var_domains,
+        options.tolerances.feasibility,
+    );
     // Incumbents are held to the rows as written, the ones presolve dropped
     // or rewrote included (the guard checks them through the solver).
     if let Some(presolved) = presolved {
@@ -90,6 +100,7 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
         options,
         deadline,
         direction: problem.direction,
+        objective_lattice,
         pseudocosts,
         base: problem.clone(),
         fixed: BTreeMap::new(),
@@ -312,6 +323,23 @@ pub(crate) fn fill_bound_stats(state: &mut MipState) {
 /// Prune threshold: a node whose lower bound is ≥ this cannot improve the incumbent.
 pub(crate) fn cutoff(incumbent_obj: f64, prune_epsilon: f64) -> f64 {
     incumbent_obj - f64::max(prune_epsilon, prune_epsilon * incumbent_obj.abs())
+}
+
+/// Whether a node whose LP bound is `bound` (internal space) cannot improve
+/// the incumbent: its bound reaches the cutoff, or, where the objective lies
+/// on a lattice, the integral bound of `lattice_bound` does, its bound less
+/// what the dual tolerance leaves a point to gain (`MipState::lattice_bound`),
+/// so that no exactly integral point of the node beats the incumbent by more
+/// than the pruning epsilon.
+pub(crate) fn dominated(state: &MipState, bound: f64, lattice_bound: f64) -> bool {
+    let Some(incumbent) = &state.incumbent else {
+        return false;
+    };
+    let cutoff = cutoff(incumbent.objective, state.options.tolerances.prune_epsilon);
+    bound >= cutoff
+        || state
+            .objective_lattice
+            .is_some_and(|lattice| lattice.integral_bound(lattice_bound) >= cutoff)
 }
 
 #[cfg(test)]

@@ -84,23 +84,25 @@ fn driver_exact_node_exhaustion_reports_infeasible_not_interrupted() {
 
 #[test]
 fn driver_node_limit_equal_to_exhaustion_count_reports_optimal() {
-    // int_2var_problem is proven optimal in exactly 2 B&B nodes (deterministic:
-    // the unlimited solve reports nodes_solved == 2; node_limit=1 -> Interrupted,
-    // node_limit=2 -> Optimal). Setting the node limit to that exact count must
-    // report Optimal, not Interrupted: when the tree empties on the same
-    // iteration the limit would fire, the empty-`open` check at the loop top
-    // wins and the finished proof is reported honestly.
+    // int_2var_problem is proven optimal in exactly 1 B&B node (deterministic:
+    // the unlimited solve reports nodes_solved == 1; node_limit=0 -> Interrupted,
+    // node_limit=1 -> Optimal): the first child finds the optimum 11, and the
+    // second, whose stored bound 10.6 cannot reach a better whole value, is
+    // pruned before any LP work. Setting the node limit to that exact count
+    // must report Optimal, not Interrupted: the free prune and then the
+    // empty-`open` check at the loop top come before the limit, and the
+    // finished proof is reported honestly.
     assert_eq!(
         run(&int_2var_problem(), SolveOptions::default())
             .unwrap()
             .state
             .stats
             .nodes_solved,
-        2,
+        1,
         "node count must stay deterministic; update the limit below if it changes"
     );
     let mut options = SolveOptions::default();
-    options.node_limit = Some(2);
+    options.node_limit = Some(1);
     let r = run(&int_2var_problem(), options).unwrap();
     assert_eq!(r.reason, TerminationReason::ProvenOptimal);
     assert!((incumbent_obj(&r.state) - 11.0).abs() < 1e-6);
@@ -110,7 +112,7 @@ fn driver_node_limit_equal_to_exhaustion_count_reports_optimal() {
 fn driver_node_limit_interrupts_and_resumes_to_same_optimum() {
     let mut options = SolveOptions::default();
     options.node_limit = Some(1);
-    let mut r = run(&int_2var_problem(), options).unwrap();
+    let mut r = run(&binary_knapsack(), options).unwrap();
     let mut guard = 0;
     while r.reason != TerminationReason::ProvenOptimal {
         guard += 1;
@@ -118,7 +120,7 @@ fn driver_node_limit_interrupts_and_resumes_to_same_optimum() {
         r.reason = resume_run(&mut r.state, ResumeOptions::default()).unwrap();
     }
     assert!(guard >= 1, "node_limit=1 should interrupt at least once");
-    assert!((incumbent_obj(&r.state) - 11.0).abs() < 1e-6);
+    assert!((incumbent_obj(&r.state) + 21.0).abs() < 1e-6);
 }
 
 #[test]
@@ -132,20 +134,40 @@ fn open_children_have_branch_metadata() {
     assert!(run.state.open.iter().all(|node| node.branch_var.is_some()));
 }
 
+/// `max cost x + cost y` s.t. `2x + 2y <= 7`, `x - y <= 0.5`, `x` and `y`
+/// integer over the `i32` range: the LP bound stays `3.5 cost` at every node
+/// along a face the integer bounds leave open, and the optimum is `3 cost`.
+fn deep_two_var_problem(cost: f64) -> Problem {
+    let mut p = Problem::new(OptimizationDirection::Maximize);
+    let x = p.add_integer_var(cost, (i32::MIN, i32::MAX));
+    let y = p.add_integer_var(cost, (i32::MIN, i32::MAX));
+    p.add_constraint(&[(x, 2.0), (y, 2.0)], ComparisonOp::Le, 7.0);
+    p.add_constraint(&[(x, 1.0), (y, -1.0)], ComparisonOp::Le, 0.5);
+    p
+}
+
+/// [`deep_two_var_problem`] at a cost of one with a continuous var in
+/// `[0, 1]` of cost `-1`, which keeps the objective off any lattice: the
+/// search finds the incumbent `3` within a few nodes and branches down the
+/// face until its budget runs out.
+fn deep_two_var_problem_off_any_lattice() -> Problem {
+    let mut p = deep_two_var_problem(1.0);
+    p.add_var(-1.0, (0.0, 1.0));
+    p
+}
+
 #[test]
 fn a_deep_search_stores_one_bound_change_per_var_in_each_node() {
     // The LP bound stays 3.5 against the incumbent 3 along a face the
-    // integer bounds leave open, so the search branches x and y again and
-    // again until its budget runs out.
-    let mut p = Problem::new(OptimizationDirection::Maximize);
-    let x = p.add_integer_var(1.0, (i32::MIN, i32::MAX));
-    let y = p.add_integer_var(1.0, (i32::MIN, i32::MAX));
-    p.add_constraint(&[(x, 2.0), (y, 2.0)], ComparisonOp::Le, 7.0);
-    p.add_constraint(&[(x, 1.0), (y, -1.0)], ComparisonOp::Le, 0.5);
+    // integer bounds leave open, and nothing prunes the face off any
+    // lattice: the search branches x and y again and again until its budget
+    // runs out.
+    let p = deep_two_var_problem_off_any_lattice();
     let mut options = SolveOptions::default();
     options.node_limit = Some(200);
     let run = run(&p, options).unwrap();
 
+    assert_eq!(run.state.objective_lattice, None);
     assert_eq!(
         run.reason,
         TerminationReason::NodeLimit,
@@ -170,6 +192,191 @@ fn a_deep_search_stores_one_bound_change_per_var_in_each_node() {
             "a node's entries should be in var order, one per var"
         );
     }
+}
+
+/// Solves `p` under a node limit, warm-started with `warm_start`, with
+/// presolve on and off as listed in `presolve`, expecting the search to prove
+/// the optimum `expected` (user space) within `max_nodes` nodes.
+fn assert_proves(
+    p: &Problem,
+    presolve: &[bool],
+    warm_start: Option<Vec<(Variable, f64)>>,
+    expected: f64,
+    max_nodes: u64,
+) {
+    for &presolve in presolve {
+        let options = SolveOptions {
+            presolve,
+            node_limit: Some(2000),
+            warm_start: warm_start.clone(),
+            ..SolveOptions::default()
+        };
+        let run = run(p, options).unwrap();
+        let objective = to_user_space(p.direction, incumbent_obj(&run.state));
+        let nodes = run.state.stats.nodes_solved;
+        assert_eq!(
+            run.reason,
+            TerminationReason::ProvenOptimal,
+            "presolve {presolve}: objective {objective} after {nodes} nodes"
+        );
+        assert!(
+            (objective - expected).abs() < 1e-6,
+            "presolve {presolve}: objective {objective}, expected {expected}"
+        );
+        assert!(
+            nodes <= max_nodes,
+            "presolve {presolve}: {nodes} nodes, expected at most {max_nodes}"
+        );
+    }
+}
+
+/// The deep model's objective takes whole values at its integral points, so
+/// a node whose bound is `3.5` cannot beat the incumbent `3`: the search
+/// proves it optimal instead of branching down the face.
+#[test]
+fn a_bound_short_of_the_next_whole_value_cannot_beat_the_incumbent() {
+    assert_proves(&deep_two_var_problem(1.0), &[true, false], None, 3.0, 5);
+}
+
+/// Costs of `-2` and `-4` put the objective's values at integral points on
+/// the even numbers, where the LP bound `-7` of every node along the face of
+/// `2x + 4y <= 7` cannot beat the incumbent `-6`, which a step of one would
+/// not tell; costs of `0.5` put them on the multiples of a half.
+#[test]
+fn the_lattice_step_is_the_greatest_common_divisor_of_the_costs() {
+    let mut p = Problem::new(OptimizationDirection::Minimize);
+    let x = p.add_integer_var(-2.0, (i32::MIN, i32::MAX));
+    let y = p.add_integer_var(-4.0, (i32::MIN, i32::MAX));
+    p.add_constraint(&[(x, 2.0), (y, 4.0)], ComparisonOp::Le, 7.0);
+    p.add_constraint(&[(x, 1.0), (y, -1.0)], ComparisonOp::Le, 0.5);
+    assert_proves(&p, &[true, false], None, -6.0, 5);
+
+    assert_proves(&deep_two_var_problem(0.5), &[true, false], None, 1.5, 5);
+}
+
+/// A continuous var fixed at `0.3` with a cost of `0.7` adds `0.21` to every
+/// point's objective: the lattice is offset by it.
+#[test]
+fn a_fixed_continuous_var_with_a_cost_offsets_the_lattice() {
+    let mut p = deep_two_var_problem(1.0);
+    p.add_var(0.7, (0.3, 0.3));
+    assert_proves(&p, &[true, false], None, 3.21, 5);
+}
+
+/// The lattice is the one of the bounds the search starts from: an integer
+/// var `z` in `[0, 3]` with a cost of `0.5` and the row `z >= 3`, which
+/// presolve turns into a fixing, adds `1.5` to the deep model's values, a
+/// whole step apart, where no node beats the incumbent `4.5`. Without
+/// presolve the values are a half apart, the LP bound `5` is one of them,
+/// and the search branches down the face until its budget runs out.
+#[test]
+fn a_var_presolve_fixes_joins_the_offset_of_the_lattice() {
+    let mut p = deep_two_var_problem(1.0);
+    let z = p.add_integer_var(0.5, (0, 3));
+    p.add_constraint(&[(z, 1.0)], ComparisonOp::Ge, 3.0);
+    let options = |presolve| SolveOptions {
+        presolve,
+        node_limit: Some(200),
+        ..SolveOptions::default()
+    };
+
+    let presolved = run(&p, options(true)).unwrap();
+    assert_eq!(presolved.reason, TerminationReason::ProvenOptimal);
+    assert!((incumbent_obj(&presolved.state) + 4.5).abs() < 1e-6);
+
+    let as_written = run(&p, options(false)).unwrap();
+    assert_eq!(as_written.reason, TerminationReason::NodeLimit);
+    assert!((incumbent_obj(&as_written.state) + 4.5).abs() < 1e-6);
+}
+
+/// Nodes whose LP vertices have reduced costs within their tolerance on their
+/// wrong side, over vars whose ranges span the `i32` range or `1e9`: an
+/// exactly feasible point of the node can lie a step below its LP objective,
+/// and rounding that objective up pruned the optimum. `min 3a - 3b - 2c`
+/// s.t. `-2a + 2b + c = -17` and a row of the same vars whose coefficients
+/// are `3` perturbed by `1e-11` to `2e-10` has its optimum `20` at
+/// `(0, -14, 11)`, and the search proved `21`; `max 2x - y` s.t.
+/// `-2x + (1 + 6e-11) y >= -2.99` has `3` at `(500000001, 999999999)`, and
+/// it proved `2`; `max -2x - 2y + 3z` s.t.
+/// `(1 + 4e-12) x - (2 + 8e-11) y + 3z <= -7.01` has `-7` at
+/// `(0, 1500000002, 999999999)`, and it proved `-8` with presolve.
+#[test]
+fn the_dual_tolerance_over_a_wide_range_does_not_prune_the_optimum() {
+    let mut p = Problem::new(OptimizationDirection::Minimize);
+    let a = p.add_integer_var(3.0, (0, 1_000_000_000));
+    let b = p.add_integer_var(-3.0, (i32::MIN, i32::MAX));
+    let c = p.add_integer_var(-2.0, (0, 1_000_000_000));
+    p.add_constraint(&[(a, -2.0), (b, 2.0), (c, 1.0)], ComparisonOp::Eq, -17.0);
+    p.add_constraint(
+        &[
+            (a, 3.0000000000240004),
+            (b, -3.00000000018),
+            (c, -3.000000000009),
+        ],
+        ComparisonOp::Ge,
+        8.99,
+    );
+    assert_proves(&p, &[true, false], None, 20.0, 20);
+
+    let mut p = Problem::new(OptimizationDirection::Maximize);
+    let x = p.add_integer_var(2.0, (i32::MIN, i32::MAX));
+    let y = p.add_integer_var(-1.0, (0, 1_000_000_000));
+    p.add_constraint(&[(x, -2.0), (y, 1.00000000006)], ComparisonOp::Ge, -2.99);
+    assert_proves(&p, &[true, false], None, 3.0, 20);
+
+    let mut p = Problem::new(OptimizationDirection::Maximize);
+    let x = p.add_integer_var(-2.0, (0, i32::MAX));
+    let y = p.add_integer_var(-2.0, (i32::MIN, i32::MAX));
+    let z = p.add_integer_var(3.0, (0, 1_000_000_000));
+    p.add_constraint(
+        &[(x, 1.000000000004), (y, -2.00000000008), (z, 3.0)],
+        ComparisonOp::Le,
+        -7.01,
+    );
+    assert_proves(&p, &[true], None, -7.0, 20);
+}
+
+/// `min x + 2^-1000 y` s.t. `x >= 20000000.5`, `x` in `[0, 1e8]` and `y` in
+/// `[0, 10]` integer, warm-started at `x = 3e7`: the costs' step, `2^-1000`,
+/// put the bound of every node more steps from the lattice's origin than
+/// `f64` holds, rounding it up gave infinity, and every node was pruned by
+/// the hint, proved optimal. A step within the margin gives no lattice.
+#[test]
+fn a_cost_tiny_beside_the_others_leaves_the_bounds_finite() {
+    let mut p = Problem::new(OptimizationDirection::Minimize);
+    let x = p.add_integer_var(1.0, (0, 100_000_000));
+    let y = p.add_integer_var(2f64.powi(-1000), (0, 10));
+    p.add_constraint(&[(x, 1.0)], ComparisonOp::Ge, 20000000.5);
+    let hint = vec![(x, 3e7), (y, 0.0)];
+    assert_proves(&p, &[true, false], Some(hint), 20000001.0, 5);
+}
+
+/// The lattice prunes a node only where none of its integral points would
+/// beat the incumbent by more than the pruning epsilon: with the incumbent
+/// `11 + 4e-7` above its lattice value (an integer var within `int_tol` of
+/// its integer, say), a node whose bound is below `11` could hold a point at
+/// `11`, which beats it; at `11 - 4e-7` it could not. A bound at the
+/// incumbent prunes whatever its integral bound.
+#[test]
+fn an_incumbent_off_its_lattice_value_prunes_only_what_cannot_beat_it() {
+    let mut state = build_state(&int_2var_problem(), SolveOptions::default()).unwrap();
+    assert!(state.objective_lattice.is_some());
+    let mut with_incumbent = |objective: f64| {
+        state.incumbent = Some(Incumbent {
+            values: vec![1.0, 2.0],
+            objective,
+        });
+        [9.5, 10.0, 10.5, 11.0, objective].map(|bound| dominated(&state, bound, bound))
+    };
+    assert_eq!(with_incumbent(11.0), [false, false, true, true, true]);
+    assert_eq!(
+        with_incumbent(11.0 - 4e-7),
+        [false, false, true, true, true]
+    );
+    assert_eq!(
+        with_incumbent(11.0 + 4e-7),
+        [false, false, false, false, true]
+    );
 }
 
 #[test]
@@ -237,9 +444,11 @@ fn mip_gap_stops_early_with_consistent_bound() {
 
 #[test]
 fn feasible_interrupt_reports_gap() {
+    // The deep model off any lattice finds its incumbent within a few nodes
+    // and never proves it.
     let mut options = SolveOptions::default();
     options.node_limit = Some(2);
-    let mut r = run(&binary_knapsack(), options).unwrap();
+    let mut r = run(&deep_two_var_problem_off_any_lattice(), options).unwrap();
     // Resume with node budget until an incumbent exists but the search isn't done.
     let mut guard = 0;
     while r.reason == TerminationReason::NodeLimit && r.state.incumbent.is_none() {
@@ -254,11 +463,10 @@ fn feasible_interrupt_reports_gap() {
         )
         .unwrap();
     }
-    if r.reason == TerminationReason::NodeLimit {
-        // Feasible-but-unproven: a gap must be reported.
-        assert!(r.state.stats.gap.unwrap() >= 0.0);
-        assert!(r.state.stats.best_bound.is_some());
-    }
+    // Feasible-but-unproven: a gap must be reported.
+    assert_eq!(r.reason, TerminationReason::NodeLimit);
+    assert!(r.state.stats.gap.unwrap() > 0.0);
+    assert!(r.state.stats.best_bound.is_some());
 }
 
 #[test]

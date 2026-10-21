@@ -1067,6 +1067,23 @@ impl Solver {
         })
     }
 
+    /// How far a point of the bounds in force that meets the rows exactly can
+    /// lower the objective below its value at the current vertex: each
+    /// non-basic var's reduced cost on its infeasible side, which the dual
+    /// check accepts within its tolerance, times the var's range, infinite
+    /// where the range is, and not a number where a reduced cost is not. The
+    /// round-off of the reduced costs themselves is not counted.
+    pub(crate) fn dual_slack(&self) -> f64 {
+        let mut slack = 0.0;
+        for (c, &var) in self.nb_vars.iter().enumerate() {
+            let wrong = self.nb_var_states[c].dual_infeasibility(self.nb_var_obj_coeffs[c]);
+            if wrong > 0.0 || wrong.is_nan() {
+                slack += wrong * (self.orig_var_maxs[var] - self.orig_var_mins[var]);
+            }
+        }
+        slack
+    }
+
     /// Objective value (internal minimize space) of an explicit structural-var
     /// value vector.
     pub(crate) fn objective_of(&self, values: &[f64]) -> f64 {

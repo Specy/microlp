@@ -1,7 +1,7 @@
 //! Post-solve edits on a MILP solution: `add_constraint`, `fix_var` and
 //! `unfix_var` re-solve against the untouched base problem.
 
-use super::common::{int_2var_problem, solution};
+use super::common::{binary_knapsack, int_2var_problem, solution};
 use crate::*;
 
 #[test]
@@ -56,6 +56,39 @@ fn milp_fix_and_unfix_var_roundtrip() {
     assert!((sol.objective() - 11.0).abs() < 1e-6);
 }
 
+/// `max x + y - w` s.t. `2x + 2y <= 7`, `x - y <= 0.5`, `x` and `y` integer
+/// over the `i32` range, `w` in `[0, 1]`: the LP bound stays `3.5` at every
+/// node along a face the integer bounds leave open. While `w` is free, its
+/// cost keeps the objective off any lattice and the search runs to its node
+/// limit; fixed, it offsets the lattice of whole values, where no node can
+/// beat the incumbent, and the search proves it optimal. Unfixed, the search
+/// runs to its limit again.
+#[test]
+fn milp_fixing_a_continuous_var_with_a_cost_puts_the_objective_on_a_lattice() {
+    let mut p = Problem::new(OptimizationDirection::Maximize);
+    let x = p.add_integer_var(1.0, (i32::MIN, i32::MAX));
+    let y = p.add_integer_var(1.0, (i32::MIN, i32::MAX));
+    let w = p.add_var(-1.0, (0.0, 1.0));
+    p.add_constraint(&[(x, 2.0), (y, 2.0)], ComparisonOp::Le, 7.0);
+    p.add_constraint(&[(x, 1.0), (y, -1.0)], ComparisonOp::Le, 0.5);
+    let mut options = SolveOptions::default();
+    options.node_limit = Some(200);
+
+    let sol = solution(p.solve_with(options).unwrap());
+    assert_eq!(sol.termination_reason(), TerminationReason::NodeLimit);
+    assert!((sol.objective() - 3.0).abs() < 1e-6);
+
+    let sol = solution(sol.fix_var(w, 0.25).unwrap());
+    assert_eq!(sol.termination_reason(), TerminationReason::ProvenOptimal);
+    assert!((sol.objective() - 2.75).abs() < 1e-6);
+
+    let (sol, was_fixed) = sol.unfix_var(w).unwrap();
+    let sol = solution(sol);
+    assert!(was_fixed);
+    assert_eq!(sol.termination_reason(), TerminationReason::NodeLimit);
+    assert!((sol.objective() - 3.0).abs() < 1e-6);
+}
+
 #[test]
 fn milp_fix_var_outside_bounds_is_infeasible_error() {
     let (p, a, _) = int_2var_problem();
@@ -79,25 +112,30 @@ fn milp_fix_var_non_finite_is_an_invalid_operation() {
 
 #[test]
 fn milp_edit_after_pause_completes_correctly() {
-    let (p, a, b) = int_2var_problem();
+    let p = binary_knapsack();
+    let (x, y) = (Variable(0), Variable(1));
     let mut options = SolveOptions::default();
     options.node_limit = Some(1); // pause almost immediately
     let mut outcome = p.solve_with(options).unwrap();
+    assert_eq!(outcome.termination_reason(), TerminationReason::NodeLimit);
     // Interrupted searches are deliberately not editable. Resume to a
     // validated solution before changing the original model.
     while outcome.solution().is_none() {
         outcome = outcome.resume().unwrap();
     }
     let sol = solution(outcome);
-    let edited = sol
-        .add_constraint(&[(a, 1.0), (b, 1.0)], ComparisonOp::Ge, 4.0)
+    // Taking both x and y (weights 5 and 7) leaves room for nothing else:
+    // the edited optimum is 8 + 11 = 19.
+    let mut edited = sol
+        .add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 2.0)
         .unwrap();
-    let sol = solution(if edited.is_optimal() {
-        edited
-    } else {
-        edited.resume().unwrap()
-    });
-    assert!((sol.objective() - 13.0).abs() < 1e-6);
+    let mut resumes = 0;
+    while !edited.is_optimal() {
+        resumes += 1;
+        assert!(resumes < 10_000);
+        edited = edited.resume().unwrap();
+    }
+    assert!((solution(edited).objective() - 19.0).abs() < 1e-6);
 }
 
 #[test]
