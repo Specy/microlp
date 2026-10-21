@@ -1164,7 +1164,7 @@ impl Solver {
                 .unwrap_or(0.0);
                 if new_val != cur {
                     // Shift the non-basic var to the nearest bound and propagate the
-                    // delta into basic values (same mechanism as fix_var's non-basic arm).
+                    // delta into basic values through its tableau column.
                     self.calc_col_coeffs(col);
                     let diff = new_val - cur;
                     for (r, coeff) in self.col_coeffs.iter() {

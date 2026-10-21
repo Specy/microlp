@@ -10,7 +10,7 @@ right answers, not merely the same answers as before.
 ## Running
 
 ```bash
-cargo test --release --test suite                          # default: easy + medium (~2 s)
+cargo test --release --test suite                          # default: easy + medium
 cargo test --release --test suite -- --hard                # + long-running MILPs (CI runs this)
 cargo test --release --test suite -- --xhard               # + 10-minute-budget instances
 cargo test --release --test suite -- --limit 25 --seed 42  # stable shuffled subset

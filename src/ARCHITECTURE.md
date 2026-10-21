@@ -1392,8 +1392,8 @@ Three rings, innermost first:
    custom cases: their runner must pass the supplied budget into every solve.
    **xhard** (`-- --xhard`) holds the MILPBench
    families beyond the solver's current ceiling, on 10-minute budgets with externally
-   certified (HiGHS) optima — those cases assert clean interrupts and bound sanity rather
-   than completion. File-based cases derive their tier from the folder their instance
+   certified results — those cases accept clean interrupts and validate returned
+   incumbents. File-based cases derive their tier from the folder their instance
    lives in (`tests/suite/data/<tier>/<source>/`), so moving a file re-tiers its cases.
    Both benchmark readers are thin adapters over external dev-dependency crates —
    `mps` for MPS files, `lp_parser_rs` for CPLEX-LP files — with the semantics layer
@@ -1420,11 +1420,10 @@ are `O(open)` linear scans — fine at current scales, a heap if profiling ever 
 Basis snapshots per node are `total_vars` bytes; basis *aging* (snapshot every k-th depth)
 is the standard next step if memory becomes a concern on deep trees.
 
-**Where the ceiling currently sits** (measured, MILPBench easy tier at 60s/instance):
-Capacitated Facility Location instances solve to proven optimality in seconds; the
-graph-structured families (MIS, MVC, Set Cover, Combinatorial Auctions, MIKS) at 20k–60k
-rows produce clean `Interrupted` — the machinery survives 160k-variable models without
-error, but proving optimality there needs the phase-4 items below.
+The `xhard` suite tier exercises large graph-structured MILPs that may exhaust their
+solve budget before proving optimality. It accepts clean interruptions and checks
+returned incumbents against the model and externally certified results. The extension
+points below describe ways to improve those searches.
 
 ---
 

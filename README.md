@@ -19,6 +19,8 @@ recommended to use it with the [rooc modeling language](https://github.com/specy
 
 The sections below show how to use microlp directly.
 
+microlp requires Rust 1.86 or later.
+
 ## Features
 
 * Pure Rust. Runs on WebAssembly.
@@ -63,7 +65,9 @@ coefficient and its bounds, and is represented by a `Variable` handle that you
 keep to reference it later. A handle belongs to the problem that created it:
 use it only with that problem and its solutions. Another problem does not
 detect a foreign handle; it refers to that problem's variable with the same
-index, or panics if there is none.
+index. If the index is absent, accessors and `Problem::add_constraint` panic;
+`Solution::add_constraint` and a solve's warm-start hints return
+`Error::InvalidOperation`.
 
 ```rust
 use microlp::{ComparisonOp, LinearExpr, OptimizationDirection, Problem};
@@ -139,6 +143,11 @@ constraint (in the order added) and the variable (its index) whose
 coefficients span the most, those of them outside the range. Changing the
 units of a variable or of a constraint usually brings a model back into
 range. Within the range, please report an `Error::InternalError` as a bug.
+
+Nearly dependent constraints can exceed floating-point resolution even within
+that coefficient range. In extreme cases, a model whose feasible points require
+very large variable values can be reported `Infeasible`. See the
+[known numerical limitations](src/ARCHITECTURE.md#79-known-limitations).
 
 When a solver decides to produce a solution it might be for different reasons:
 
@@ -366,7 +375,7 @@ Besides unit tests, the repository ships a correctness suite of 200+ LP/MILP
 problems with independently known answers:
 
 ```bash
-cargo test --release --test suite            # default set, a few seconds
+cargo test --release --test suite            # default: easy + medium
 cargo test --release --test suite -- --hard  # plus the long-running ones
 ```
 
@@ -374,7 +383,12 @@ See [tests/suite/README.md](tests/suite/README.md) for how it works, and
 [src/ARCHITECTURE.md](src/ARCHITECTURE.md) if you want to know how the solver
 itself works.
 
-There is also a harder tier called `xhard` which microlp currently cannot solve in reasonable time. (under 10 minutes) which you can run with. This tier is being used to compare with other solvers.
+The origin-feasible property test runs 50,000 cases by default. For a deeper
+run, use `HEGEL_TEST_CASES=500000 cargo test --release --lib origin`.
+
+The `xhard` tier gives larger instances a 10-minute budget. It accepts clean
+interruptions and checks returned incumbents against externally certified results:
+
 ```
 cargo test --release --test suite -- --xhard
 ```
@@ -382,10 +396,11 @@ cargo test --release --test suite -- --xhard
 ## Benchmarks
 
 [BENCHMARK.md](https://github.com/Specy/microlp/blob/master/BENCHMARK.md)
-compares microlp against other open-source solvers on the suite's benchmark
-instances, and tracks how close it gets on the instances it cannot yet solve
-within a time budget. Regenerate it from a clone of this repository (the
-crates.io package does not include the benchmark data) with:
+records a comparison of an earlier revision against other open-source solvers
+on the suite's benchmark instances. Its date and revision identify the code
+measured; it does not describe the current release. Regenerate it from a clone
+of this repository (the crates.io package does not include the benchmark data)
+with:
 
 ```bash
 cargo run -p microlp-benchmark --release

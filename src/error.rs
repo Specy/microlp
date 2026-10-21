@@ -1,7 +1,5 @@
 //! The single error type every fallible call in the public API returns.
 
-use sprs::errors::StructureError;
-
 /// An error returned while validating, solving, or editing a problem.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -18,8 +16,8 @@ pub enum Error {
     ///
     /// The message identifies the invalid field.
     InvalidOptions(String),
-    /// The input is invalid, and nothing was solved: a number of the problem
-    /// no solve can take (every objective coefficient, constraint
+    /// The input is invalid, and nothing was solved: a model number outside
+    /// its accepted range (every objective coefficient, constraint
     /// coefficient, bound and right-hand side must be finite, but a bound or a
     /// right-hand side may be infinite on the side it leaves open; see
     /// [`Problem::solve_with`](crate::Problem::solve_with)), a warm-start hint
@@ -42,12 +40,6 @@ pub enum Error {
     /// Within the range, please report it as a bug.
     InternalError(String),
 }
-impl From<StructureError> for Error {
-    fn from(err: StructureError) -> Self {
-        Error::InternalError(err.to_string())
-    }
-}
-
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let msg = match self {

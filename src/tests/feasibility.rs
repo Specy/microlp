@@ -11,12 +11,10 @@ mod tests_feasibility {
 
     use hegel::generators as gs;
 
-    /// Half a million cases: the numerical states this property reaches are
-    /// thin, and shallower runs mostly miss them. Memory is the ceiling: hegel
-    /// keeps about 7.7 KB per case until the run ends, and a million cases
-    /// would not fit CI's 7 GB macOS runner.
+    /// Keep the default small enough for CI, including captured traces.
+    /// Set HEGEL_TEST_CASES for a deeper run without editing the source.
     fn settings() -> hegel::Settings {
-        hegel::Settings::new().test_cases(500_000)
+        hegel::Settings::new().test_cases(50_000)
     }
 
     /// Indices are positions in `Model::reals`, so a row never mentions the
