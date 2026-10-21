@@ -106,6 +106,46 @@ impl CDouble {
         self.lo += c.lo * b;
     }
 
+    /// Add `v`, returning an upper bound on the arithmetic discarded from
+    /// the low part. The high part's two-sum is exact.
+    pub(super) fn add_with_error(&mut self, v: f64) -> f64 {
+        let (hi, carry) = Self::two_sum(v, self.hi);
+        let (lo, error) = Self::two_sum(self.lo, carry);
+        self.hi = hi;
+        self.lo = lo;
+        error.abs()
+    }
+
+    /// Add `c * b` with the same arithmetic as `add_scaled`, measuring each
+    /// discarded low-part addition and the low part's product.
+    pub(super) fn add_scaled_with_error(&mut self, c: CDouble, b: f64) -> f64 {
+        let (product, product_low) = Self::two_product(c.hi, b);
+        let mut error = self.add_with_error(product);
+        let (lo, discarded) = Self::two_sum(self.lo, product_low);
+        self.lo = lo;
+        error = add_up(error, discarded.abs());
+        let (low_product, low_error) = Self::two_product(c.lo, b);
+        let (lo, discarded) = Self::two_sum(self.lo, low_product);
+        self.lo = lo;
+        error = add_up(error, add_up(discarded.abs(), low_error.abs()));
+        // Below this magnitude an error-free product's trailing bits may
+        // underflow. Its discarded error cannot be measured reliably.
+        for part in [c.hi, c.lo] {
+            let product = part * b;
+            if !product.is_finite()
+                || (part != 0.0 && b != 0.0 && product.abs() < RESIDUAL_PRODUCT_MIN)
+            {
+                return f64::INFINITY;
+            }
+        }
+        error
+    }
+
+    /// The round-off discarded when converting the compensated value to f64.
+    pub(super) fn value_error(self) -> f64 {
+        Self::two_sum(self.hi, self.lo).1.abs()
+    }
+
     /// `-self`, exactly.
     fn neg(self) -> Self {
         Self {
@@ -151,7 +191,7 @@ impl From<f64> for CDouble {
 }
 
 /// `a + b`, rounded up: the nearest `f64` at or above the exact sum.
-fn add_up(a: f64, b: f64) -> f64 {
+pub(super) fn add_up(a: f64, b: f64) -> f64 {
     let (sum, error) = CDouble::two_sum(a, b);
     if error > 0.0 {
         sum.next_up()
@@ -164,6 +204,24 @@ fn add_up(a: f64, b: f64) -> f64 {
 fn mul_up(a: f64, b: f64) -> f64 {
     let (product, error) = CDouble::two_product(a, b);
     if error > 0.0 {
+        product.next_up()
+    } else {
+        product
+    }
+}
+
+// Below 2^-969 the trailing bit of a product of two 53-bit significands
+// can fall below the smallest subnormal, even when the product is normal.
+const RESIDUAL_PRODUCT_MIN: f64 = 2.0 * f64::MIN_POSITIVE / f64::EPSILON;
+
+/// Carry a nonnegative residual-error bound through an inverse-row entry,
+/// rounding upward even when the product's low part could underflow.
+pub(super) fn residual_error_product(a: f64, b: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() {
+        return f64::INFINITY;
+    }
+    let product = a * b;
+    if a > 0.0 && b > 0.0 {
         product.next_up()
     } else {
         product
@@ -224,10 +282,12 @@ const REFINEMENT_RATIO: f64 = 0.5;
 /// the primal ratio test (`Solver::refine_pivot_col`). Each entry gets its own
 /// correction, not the largest of all, which carried through the entries of a
 /// var whose rows have multipliers far below the rest would let its
-/// coefficient count as zero far above the error those multipliers carry. An
-/// entry whose error exceeds its correction only has too small a bound, which
-/// can fail a proof, or bound a step that an exact zero would not, but never
-/// make a proof or an unbounded ray.
+/// coefficient count as zero far above the error those multipliers carry. A
+/// correction measures the error down to the round-off of the residual it is
+/// solved from, and below that only round-off: an entry that is zero can end
+/// beyond its correction. Too small a bound fails a proof, never makes one,
+/// but a step it lets such an entry bound pivots on zero, so the primal ratio
+/// test adds that round-off (`Solver::refined_col_floors`).
 pub(super) fn refinement_error(x: &[CDouble], second: &[f64]) -> Option<Vec<f64>> {
     let x_norm = finite_max_norm(x.iter().map(|r| r.value()))?;
     let second_norm = finite_max_norm(second.iter().copied())?;
@@ -942,5 +1002,66 @@ impl Solver {
             self.basic_var_vals[row],
         );
         true
+    }
+}
+
+#[cfg(test)]
+mod roundoff_tests {
+    use super::{residual_error_product, CDouble};
+
+    #[test]
+    fn residual_roundoff_propagation_covers_underflow() {
+        let min = f64::from_bits(1);
+        assert_eq!(residual_error_product(min, 0.5), min);
+        assert!(residual_error_product(2f64.powi(-1000), 1.0) > 2f64.powi(-1000));
+        assert_eq!(residual_error_product(min, 0.0), 0.0);
+    }
+
+    #[test]
+    fn residual_roundoff_propagation_avoids_splitter_overflow() {
+        let a = 2f64.powi(1000) * (1.0 + f64::EPSILON);
+        let b = 2f64.powi(-1000) * (1.0 + f64::EPSILON);
+        assert_eq!(
+            residual_error_product(a, b),
+            (1.0 + 2.0 * f64::EPSILON).next_up()
+        );
+    }
+
+    #[test]
+    fn near_underflow_compensated_products_have_no_measured_bound() {
+        for a in [f64::from_bits(1), 2f64.powi(-1000)] {
+            let mut sum = CDouble::default();
+            assert_eq!(
+                sum.add_scaled_with_error(CDouble::from(a), 0.5),
+                f64::INFINITY
+            );
+        }
+    }
+
+    #[test]
+    fn an_exact_compensated_product_has_no_discarded_error() {
+        let mut sum = CDouble::default();
+        let error = sum.add_scaled_with_error(CDouble::from(1.0 + 2f64.powi(-52)), 1.0);
+        assert_eq!(error, 0.0);
+        assert_eq!(sum.value_error(), 0.0);
+    }
+
+    #[test]
+    fn a_discarded_low_part_addition_is_measured() {
+        let mut sum = CDouble {
+            hi: 1.0,
+            lo: 2f64.powi(-54),
+        };
+        assert_eq!(sum.add_with_error(2f64.powi(-108)), 2f64.powi(-108));
+    }
+
+    #[test]
+    fn a_discarded_low_part_product_is_measured() {
+        let mut sum = CDouble::default();
+        let c = CDouble {
+            hi: 1.0,
+            lo: 2f64.powi(-53) * (1.0 + 2f64.powi(-52)),
+        };
+        assert!(sum.add_scaled_with_error(c, 1.0 + 2f64.powi(-52)) >= 2f64.powi(-157));
     }
 }

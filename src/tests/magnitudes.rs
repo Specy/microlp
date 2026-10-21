@@ -1110,6 +1110,176 @@ mod regression_tests {
         assert_solves_within_contract_without_presolve(&model);
     }
 
+    /// The exact ray relation is y = -z and x = 2^-30 - 2^-52 z.
+    /// A genuine blocking entry below the residual's a priori round-off
+    /// allowance must still bound the step.
+    #[test]
+    fn a_tiny_exact_blocker_within_the_residual_allowance_still_bounds_the_step() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+        let x = problem.add_var(0.0, (0.0, f64::INFINITY));
+        let y = problem.add_var(0.0, (f64::NEG_INFINITY, f64::INFINITY));
+        let z = problem.add_var(1.0, (0.0, f64::INFINITY));
+        let a = 1.0 + 2f64.powi(-52);
+        let e = 2f64.powi(-45);
+        problem.add_constraint(
+            [(x, 1.0), (y, 1.0), (z, a)],
+            ComparisonOp::Eq,
+            2f64.powi(-30),
+        );
+        problem.add_constraint(
+            [(x, 1.0), (y, 1.0 + e), (z, a + e)],
+            ComparisonOp::Eq,
+            2f64.powi(-30),
+        );
+        for presolve in [true, false] {
+            let options = crate::SolveOptions {
+                presolve,
+                ..Default::default()
+            };
+            let outcome = problem.solve_with(options).unwrap();
+            let sol = outcome.solution().unwrap();
+            assert_eq!(sol.objective(), 2f64.powi(22));
+            assert_eq!(sol[z], 2f64.powi(22));
+        }
+    }
+
+    /// The redundant equality leaves an unresolved entry, but another
+    /// inequality supplies a genuine tiny blocker. On the equality line
+    /// `(-8, 2, 0) + t (5, 1, 6)` the inequality forces `t >= -1`.
+    #[test]
+    fn a_resolved_finite_blocker_can_bound_a_step_beside_an_unresolved_entry() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+        let free = (f64::NEG_INFINITY, f64::INFINITY);
+        let x0 = problem.add_var(-4.0, free);
+        let x1 = problem.add_var(-3.0, free);
+        let x2 = problem.add_var(1.0, free);
+        problem.add_constraint(
+            [(x0, 18.0), (x1, -18.0), (x2, -12.0)],
+            ComparisonOp::Eq,
+            -180.0,
+        );
+        problem.add_constraint([(x0, -1.0), (x1, 5.0)], ComparisonOp::Eq, 18.0);
+        problem.add_constraint([(x0, -5.0), (x1, 1.0), (x2, 4.0)], ComparisonOp::Eq, 42.0);
+        let delta = 2f64.powi(-30);
+        problem.add_constraint(
+            [(x0, 1.0), (x1, -(5.0 + delta))],
+            ComparisonOp::Le,
+            -18.0 - delta,
+        );
+        for presolve in [true, false] {
+            let options = crate::SolveOptions {
+                presolve,
+                ..Default::default()
+            };
+            let outcome = problem.solve_with(options).unwrap();
+            let sol = outcome.solution().unwrap();
+            assert!(
+                (sol.objective() - 43.0).abs() < 1e-5,
+                "{presolve}: {}",
+                sol.objective()
+            );
+        }
+    }
+
+    /// `max -4 x0 - 3 x1 + x2` s.t. `18 x0 - 18 x1 - 12 x2 = -180`,
+    /// `-x0 + 5 x1 = 18` and `-5 x0 + x1 + 4 x2 = 42`, all vars free, within
+    /// the recommended range: the first row is `-3` times the sum of the
+    /// others, and the rows leave the line `(-8, 2, 0) + t (5, 1, 6)`, along
+    /// which the objective is `26 - 17 t`, unbounded. At `(-8, 2, 0)`, with
+    /// `x0`, `x1` and the third row's slack basic, `x2` enters toward its
+    /// infinite bound through no entry above the pivot tolerance, and its
+    /// column is exactly zero in the slack's row. The refined column put that
+    /// zero at `-8.2e-33`, beyond its second correction of `2.1e-33` but
+    /// within the round-off of the refinement's residual: it bounded the
+    /// step, the pivot on it left the basis singular, and with every
+    /// non-basic var a fixed slack the solve returned `Optimal` at `26`,
+    /// presolve on and off. Unresolved, the entry does not pivot, and over
+    /// `2^52` units of `x2` it moves the slack, at zero, by far less than its
+    /// tolerance: a ray.
+    #[test]
+    fn a_ray_past_a_redundant_equality_does_not_pivot_on_round_off() {
+        assert_unbounded(
+            &redundant_equality_ray(1.0),
+            "ray past a redundant equality",
+        );
+    }
+
+    /// The model of
+    /// [`a_ray_past_a_redundant_equality_does_not_pivot_on_round_off`] with a
+    /// unit of `x2` `unit` times as large, a power of two: `x2`'s cost and
+    /// coefficients are multiplied by `unit`.
+    fn redundant_equality_ray(unit: f64) -> crate::Problem {
+        let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+        let free = (f64::NEG_INFINITY, f64::INFINITY);
+        let x0 = problem.add_var(-4.0, free);
+        let x1 = problem.add_var(-3.0, free);
+        let x2 = problem.add_var(unit, free);
+        problem.add_constraint(
+            [(x0, 18.0), (x1, -18.0), (x2, -12.0 * unit)],
+            ComparisonOp::Eq,
+            -180.0,
+        );
+        problem.add_constraint([(x0, -1.0), (x1, 5.0)], ComparisonOp::Eq, 18.0);
+        problem.add_constraint(
+            [(x0, -5.0), (x1, 1.0), (x2, 4.0 * unit)],
+            ComparisonOp::Eq,
+            42.0,
+        );
+        problem
+    }
+
+    /// [`redundant_equality_ray`] with a unit of `x2` `2^40` times as large,
+    /// outside the recommended range: the column scaling takes the factor
+    /// out, so the slack's unresolved entry is the same, but `2^52` units of
+    /// `x2` are `2^40` times as many in the engine's, over which that entry,
+    /// at its magnitude plus its error, could take the slack past its bound
+    /// by more than its tolerance. The ray cannot be told from a genuine
+    /// blocker there, and the solve fails loudly, presolve on and off.
+    #[test]
+    fn a_ray_past_an_unresolved_entry_beyond_its_tolerance_fails_loudly() {
+        let problem = redundant_equality_ray(2f64.powi(40));
+        for (got, presolve) in both_ways(&problem).into_iter().zip([true, false]) {
+            match got {
+                Err(Error::InternalError(message))
+                    if message.contains("unboundedness cannot be determined") => {}
+                other => panic!("presolve {presolve}: {other:?}"),
+            }
+        }
+    }
+
+    /// The MILP counterpart: `max -x0 + 3 x2 + 3 x3 + 3 x4`, `x1 >= 1`, `x2`
+    /// integer in `[-6, -1]`, the others free, s.t. `4 x0 - x1 <= 9`,
+    /// `2 x0 + x1 >= 11` and four equalities, the second `-3` times the first
+    /// less the third and the fourth, within the recommended range: the point
+    /// `(3, 6, -5, 0, 4)` and a ray of the relaxation, along which `x2` stays
+    /// put, make it unbounded. The root's primal step pivoted on the
+    /// redundant row's slack through an entry the refinement left within the
+    /// round-off of its residual, `3.1e-33` against a second correction of
+    /// zero, and the solve returned `Optimal` at `9.3e16`, presolve on and
+    /// off. Unresolved, the entry does not pivot, and is negligible up to
+    /// the magnitude taken for infinite: a ray.
+    #[test]
+    fn a_milp_with_a_ray_past_a_redundant_equality_does_not_pivot_on_round_off() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+        let free = (f64::NEG_INFINITY, f64::INFINITY);
+        let x0 = problem.add_var(-1.0, free);
+        let x1 = problem.add_var(0.0, (1.0, f64::INFINITY));
+        let x2 = problem.add_integer_var(3.0, (-6, -1));
+        let x3 = problem.add_var(3.0, free);
+        let x4 = problem.add_var(3.0, free);
+        problem.add_constraint([(x0, 4.0), (x1, -1.0)], ComparisonOp::Le, 9.0);
+        problem.add_constraint([(x0, -5.0), (x1, 4.0), (x4, -2.0)], ComparisonOp::Eq, 1.0);
+        problem.add_constraint(
+            [(x0, 15.0), (x1, -16.0), (x2, 5.0), (x3, -3.0), (x4, 6.0)],
+            ComparisonOp::Eq,
+            -52.0,
+        );
+        problem.add_constraint([(x1, 1.0), (x3, 3.0), (x4, 2.0)], ComparisonOp::Eq, 14.0);
+        problem.add_constraint([(x1, 3.0), (x2, -5.0), (x4, -2.0)], ComparisonOp::Eq, 35.0);
+        problem.add_constraint([(x0, 2.0), (x1, 1.0)], ComparisonOp::Ge, 11.0);
+        assert_unbounded(&problem, "MILP ray past a redundant equality");
+    }
+
     /// `min -1.7 x - 1.5 y` s.t. `8.36 x + 1.7 y >= 1.18` and
     /// `45.144 x + 9.179999999998072 y = 5.372`, `x, y >= 0`, within the
     /// recommended range, is infeasible: the second row is `5.4` times the
@@ -1791,6 +1961,249 @@ mod regression_tests {
         problem.add_constraint([(x, t), (j, 1.0), (k, 1.0 - e)], ComparisonOp::Eq, 2.0 * t);
         problem.add_constraint([(x, r), (j, 1.0), (z, 1.0)], ComparisonOp::Eq, 2.0 * r);
         assert_eq!(assert_solved(&problem, "feasible cofactor model"), [0.0; 2]);
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): `min -x9` over ten free vars
+    /// s.t. nine equalities and two inequalities within the recommended
+    /// range, nearly dependent (some coefficients `2^-26` off a multiple of
+    /// another row's), is unbounded. The primal ratio test's column is
+    /// blocked only by an entry within the round-off floor of its refinement,
+    /// which does not converge on that basis: no error is measured to bound
+    /// the entry by, so no ray is taken, and the solve fails loudly where it
+    /// should answer `Unbounded`, presolve on and off.
+    #[test]
+    #[should_panic(expected = "unboundedness cannot be determined")]
+    fn a_ray_past_an_unresolved_entry_of_an_unconverged_refinement_is_a_known_limitation() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let free = (f64::NEG_INFINITY, f64::INFINITY);
+        let x: Vec<_> = (0..10)
+            .map(|j| problem.add_var(if j == 9 { -1.0 } else { 0.0 }, free))
+            .collect();
+        problem.add_constraint(
+            [
+                (x[0], -6.0),
+                (x[1], -8.0),
+                (x[2], 12.0),
+                (x[3], -10.0),
+                (x[4], -1.0),
+                (x[5], -2.0),
+                (x[6], 16.0),
+                (x[7], -2.0),
+                (x[8], 10.0),
+                (x[9], -1.0),
+            ],
+            ComparisonOp::Eq,
+            268.0,
+        );
+        problem.add_constraint(
+            [(x[2], -1.0), (x[3], -3.999999985098839), (x[5], -4.0)],
+            ComparisonOp::Eq,
+            76.00000001490116,
+        );
+        problem.add_constraint([(x[1], -3.0), (x[9], 3.0)], ComparisonOp::Eq, 32.0);
+        problem.add_constraint(
+            [
+                (x[0], -3.0),
+                (x[1], 11.0),
+                (x[2], -1.0),
+                (x[3], 8.000000014901161),
+                (x[4], 6.0),
+                (x[5], -11.999999985098839),
+                (x[6], -12.0),
+                (x[7], -8.0),
+                (x[8], -4.0),
+                (x[9], -14.0),
+            ],
+            ComparisonOp::Eq,
+            99.99999995529652,
+        );
+        problem.add_constraint(
+            [
+                (x[0], -3.0),
+                (x[1], -4.0),
+                (x[3], 2.0),
+                (x[7], 5.0),
+                (x[8], 2.0),
+            ],
+            ComparisonOp::Eq,
+            -24.0,
+        );
+        problem.add_constraint(
+            [
+                (x[1], 6.0),
+                (x[2], 1.0),
+                (x[3], 6.0),
+                (x[4], 4.0),
+                (x[6], -4.0),
+                (x[7], -3.0),
+                (x[8], -6.0),
+                (x[9], -5.0),
+            ],
+            ComparisonOp::Eq,
+            -36.0,
+        );
+        problem.add_constraint(
+            [(x[3], -4.0), (x[5], -5.0), (x[6], 5.0), (x[7], -2.0)],
+            ComparisonOp::Le,
+            9.0,
+        );
+        problem.add_constraint(
+            [
+                (x[1], 15.0),
+                (x[2], 8.0),
+                (x[3], 25.999999970197678),
+                (x[4], 5.0),
+                (x[5], 17.999999970197678),
+                (x[6], -4.0),
+                (x[7], -8.0),
+                (x[8], -6.0),
+                (x[9], -14.0),
+            ],
+            ComparisonOp::Eq,
+            -415.99999991059303,
+        );
+        problem.add_constraint(
+            [(x[2], 3.0), (x[5], 4.0), (x[6], 4.0)],
+            ComparisonOp::Eq,
+            -32.0,
+        );
+        problem.add_constraint(
+            [(x[2], 3.0), (x[5], 3.999999985098839), (x[6], 4.0)],
+            ComparisonOp::Eq,
+            -31.999999940395355,
+        );
+        problem.add_constraint(
+            [(x[0], -5.0), (x[6], 4.0), (x[7], -4.0), (x[8], -4.0)],
+            ComparisonOp::Ge,
+            -44.0,
+        );
+        assert_unbounded(&problem, "nearly dependent equalities");
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): `min 4 x0 - x1 + 2^38 x2` s.t.
+    /// `-2 x1 - 2^-73 x2 + w = -2^-109` and three equalities over `x0`, `x1`
+    /// and `x2`, the third five times the first plus the second, `w >= 0`
+    /// and the other vars free, outside the recommended range, is bounded:
+    /// the equalities hold `x1` at zero, so `w >= 0` holds `x2` at `2^-36` or
+    /// more, and the optimum is `24`. The column of `x2` meets that blocker
+    /// only through entries its refinement leaves within their measured
+    /// correction, which count as zero where no entry is unresolved, and the
+    /// solve answers `Unbounded`, presolve on and off.
+    #[test]
+    #[should_panic(expected = "Unbounded")]
+    fn a_ray_past_an_entry_within_its_measured_correction_is_a_known_limitation() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let free = (f64::NEG_INFINITY, f64::INFINITY);
+        let x0 = problem.add_var(4.0, free);
+        let x1 = problem.add_var(-1.0, free);
+        let x2 = problem.add_var(2f64.powi(38), free);
+        let w = problem.add_var(0.0, (0.0, f64::INFINITY));
+        problem.add_constraint(
+            [(x1, -2.0), (x2, -(2f64.powi(-73))), (w, 1.0)],
+            ComparisonOp::Eq,
+            -(2f64.powi(-109)),
+        );
+        problem.add_constraint(
+            [(x0, -3.0), (x1, 1.0), (x2, -(2f64.powi(37)))],
+            ComparisonOp::Eq,
+            -17.0,
+        );
+        problem.add_constraint(
+            [(x0, -3.0), (x1, 3.0), (x2, -(2f64.powi(37)))],
+            ComparisonOp::Eq,
+            -17.0,
+        );
+        problem.add_constraint(
+            [(x0, -18.0), (x1, 8.0), (x2, -3.0 * 2f64.powi(38))],
+            ComparisonOp::Eq,
+            -102.0,
+        );
+        for objective in assert_solved(&problem, "a blocker within its measured correction") {
+            assert!((objective - 24.0).abs() <= 1e-6, "{objective}");
+        }
+    }
+
+    /// `min -3 x1 + 3 x3` s.t. six equalities of rank four within the
+    /// recommended range, `x1` in `[1, 7]`, `x5 <= 1` and the other vars free,
+    /// is unbounded. The primal phase meets the ray past an unresolved entry
+    /// with the last row's slack `4.4e-6` off its value, its working bound
+    /// shifted past it, beyond its tolerance: measured from there, the slack
+    /// would have no room left. The ray starts from the point the phase started
+    /// on, which the verification accepted, where the slack has its tolerance's
+    /// room: `Unbounded`, presolve on and off.
+    #[test]
+    fn an_unresolved_ray_starts_from_the_verified_point_the_phase_left() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let free = (f64::NEG_INFINITY, f64::INFINITY);
+        let x0 = problem.add_var(0.0, free);
+        let x1 = problem.add_var(-3.0, (1.0, 7.0));
+        let x2 = problem.add_var(0.0, free);
+        let x3 = problem.add_var(3.0, free);
+        let x4 = problem.add_var(0.0, free);
+        let x5 = problem.add_var(0.0, (f64::NEG_INFINITY, 1.0));
+        let x6 = problem.add_var(0.0, free);
+        problem.add_constraint(
+            [(x0, -4.0), (x1, 2.0), (x2, 3.0), (x4, -4.0)],
+            ComparisonOp::Eq,
+            -29.0,
+        );
+        problem.add_constraint(
+            [
+                (x0, -4.0),
+                (x1, -4.0),
+                (x2, 5.0),
+                (x3, -8.0),
+                (x4, 6.0),
+                (x5, 6.0),
+                (x6, -6.0),
+            ],
+            ComparisonOp::Eq,
+            -105.0,
+        );
+        problem.add_constraint(
+            [(x1, -6.0), (x3, 2.0), (x5, 6.0), (x6, 2.0)],
+            ComparisonOp::Eq,
+            -20.0,
+        );
+        problem.add_constraint(
+            [
+                (x0, -8.0),
+                (x1, 4.0),
+                (x2, 4.0),
+                (x3, 10.0),
+                (x4, -18.0),
+                (x6, 8.0),
+            ],
+            ComparisonOp::Eq,
+            -2.0,
+        );
+        problem.add_constraint(
+            [
+                (x0, -7.0),
+                (x1, -10.0),
+                (x2, 3.0),
+                (x3, 8.0),
+                (x4, -4.0),
+                (x5, 12.0),
+                (x6, 3.0),
+            ],
+            ComparisonOp::Eq,
+            -77.0,
+        );
+        problem.add_constraint(
+            [
+                (x0, -11.0),
+                (x1, -14.0),
+                (x2, 7.0),
+                (x3, 5.0),
+                (x4, -3.0),
+                (x5, 18.0),
+                (x6, 1.0),
+            ],
+            ComparisonOp::Eq,
+            -154.0,
+        );
+        assert_unbounded(&problem, "a ray from the verified start");
     }
 
     /// A model whose exact optimum, `x*` at `x2 = 5000`, is reached only

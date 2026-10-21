@@ -108,7 +108,11 @@ These normalizations happen at the boundary and hold everywhere inside:
   a var sits at it. The price: a bound of 2^52 or more meant as a bound is none (`max x` with
   `x ≤ 5e15` is `Unbounded`), even where small coefficients would let the rows resolve it.
   Both sides are pinned in `src/tests/regressions.rs`. A row's right-hand side is not cut
-  off: it is used as given, so the same `x ≤ 5e15` written as a row binds.
+  off: it is used as given, so the same `x ≤ 5e15` written as a row binds. The exception is
+  a blocker the refinement cannot resolve: the primal ratio test takes the threshold for the
+  end of a ray too, so an exactly bounded model whose only blocker is such an entry, binding
+  beyond the threshold, is answered `Unbounded` (§7.7). That horizon is `2^52` in the units
+  of the var that enters, so it depends on which var does.
 - **Invalid input is refused where it enters.** Every number must be finite, but a bound or a
   right-hand side may be infinite on the side it leaves open. `Problem::solve_with` refuses,
   with `InvalidOperation` and before presolve and the engine, the first number of the model
@@ -413,11 +417,12 @@ cost of the visit: **is the solver already sitting at this node's parent's optim
   where the error of the multipliers could make it zero, so a node could be pruned wrongly
   only if a coefficient the data leave lay within that error (some `1e-30` of its terms in
   well-conditioned bases) and, times its var's value, made room at every point of the node.
-- `Err(Unbounded)` → impossible for a bounded node → surfaced as `InternalError`.
 - Any other error, such as a row the dual simplex can neither repair nor prove infeasible
-  even after the engine's own start from the slack basis, → **retry once from the slack
-  basis** (all slacks basic), re-solving the node from scratch; a second failure
-  propagates. The retry is per-node-visit — it cannot mask a
+  even after the engine's own start from the slack basis, or `Err(Unbounded)`, which a node
+  reports only numerically (its relaxation is bounded where the root's is, and the
+  classification search has no objective to improve) → **retry once from the slack basis**
+  (all slacks basic), re-solving the node from scratch; a second failure propagates, an
+  `Unbounded` as an `InternalError`. The retry is per-node-visit — it cannot mask a
   systematic failure.
 - `Ok(Limit)` → the deadline fired mid-solve → the node is pushed back **unsolved** and the
   search returns `Interrupted`. Nothing uses the coherent but non-optimal state as a solved
@@ -773,12 +778,15 @@ What an answer means:
   (`a_model_feasible_only_off_its_integers_minimizing_its_binary_is_answered_either_way`).
   An edit that fixes a var at a value only such points meet leaves a model with none
   (`a_fix_at_a_value_only_points_off_their_integers_meet_is_answered_either_way`).
-- **`Unbounded`**: for an LP, an improving ray, priced on fresh data, from a column whose
-  blocking entries are zero within their error (§7.7); for a MILP, a ray of the root's
-  relaxation and a point the incumbent guard accepts (§5.4). A model with no integral point
-  within the engine's room whose relaxation is unbounded is answered `Unbounded` where the
-  search lands on a point the contract accepts, an integer var off its integer or a fixed
-  var off its value, else `Infeasible`, and which one comes can depend on presolve
+- **`Unbounded`**: for an LP, a point the verification accepted, which the primal phase
+  started on, and an improving ray, priced on fresh data, from a column whose blocking
+  entries are zero within their error, or unresolved but keep their vars within their
+  tolerances from that point up to the magnitude taken for infinite (§7.7); for a MILP, a
+  ray of the root's relaxation and a point the incumbent guard accepts (§5.4). A model with
+  no integral point within the engine's room whose relaxation is unbounded is answered
+  `Unbounded` where the search lands on a point the contract accepts, an integer var off its
+  integer or a fixed var off its value, else `Infeasible`, and which one comes can depend on
+  presolve
   (`an_unbounded_relaxation_feasible_only_off_its_integers_is_unbounded_or_infeasible`).
 - **`InternalError`**: the solve could not reach an answer it can verify, and says so; no
   answer that fails the check is returned. Within the recommended coefficient range (§7.7)
@@ -1119,24 +1127,49 @@ through: `dual_pivot_tolerance` `1e-9`, `3e-8`, `1e-6` and `primal_pivot_toleran
   refined multipliers, are not checked: a column computed through the factorization is no
   better. An entry at or below the tolerance neither bounds the step nor pivots, its basic
   var's bound shifted where the step leaves it outside (§7.8). A step nothing above the
-  tolerance bounds, toward an infinite bound, refines its column twice, and every entry
-  beyond the error measured for it bounds the step (every nonzero one where the refinement
-  did not converge): `Unbounded` comes only from a column whose blocking entries are zero
-  within their error, as `Infeasible` only from a certificate (`x + y <= 1` and
-  `x + (1 + 2^-48) y >= 1` block `x` through `2^-48`). It comes only on fresh data, too: a
-  ray found since the last rebuild is priced again after one, so that its reduced cost
-  comes from refined multipliers and its column through a fresh factorization, not an eta
-  file (`an_unbounded_verdict_is_taken_on_a_fresh_factorization`). The working bounds may
-  be perturbed or shifted then: a ray depends only on which bounds are infinite, which they
-  keep, and the phase started on values the verification accepted.
+  tolerance bounds, toward an infinite bound, refines its column twice. Entries beyond
+  their measured correction and residual-roundoff floor bound the step, however small.
+  A nonzero entry hidden by the added floor is unresolved: it never pivots, and a column
+  only such entries block is retried on a factorization renewed at a stronger threshold.
+  There the column is a ray where the refinement converged and every unresolved entry, at
+  its magnitude plus its error and of either sign, moves its basic var by no more than the
+  room the point the phase started on, which the verification accepted, leaves it to the
+  edge of the tolerance of each of its finite bounds in force (`band_edge`; a slack's value
+  and tolerance its row's at that point) over the entering var's step to the magnitude taken
+  for infinite: at most `2^52` of its user units (§2) plus its magnitude, the movement
+  rounded up and the room down (`unresolved_entries_leave_a_ray`). Every other nonzero entry
+  whose sign the refinement leaves open, of a var with a finite bound, is checked the same
+  way: one within its measured correction, which the step passes as zero, and one whose
+  computed sign moves its var toward an infinite bound, within its floor. The ray from that
+  point then keeps those vars within their tolerances all along, wherever the phase's steps
+  since left them; a phase started on values the verification did not accept takes no such
+  ray. Otherwise the solve fails loudly: a genuine blocker hidden in the floor could bind
+  within that range (`2^-52` per unit over `2^52` units moves its var by one, far past its
+  tolerance, while round-off near `1e-32` moves it by less than `1e-16`). An exact zero of
+  the refined column is not checked, nor is any entry of a column no unresolved entry blocks
+  (§7.9). The floor is the measured round-off of evaluating the compensated residual,
+  propagated through an approximate row of the basis inverse (`refined_col_floors`), plus
+  the column's final rounding. Exact residual arithmetic keeps a genuine tiny blocker, even
+  below a worst-case magnitude allowance. An unbounded verdict also requires fresh data: a
+  ray found since the last rebuild is priced again after one, so its reduced cost comes from
+  refined multipliers and its column through a fresh factorization, not an eta file
+  (`an_unbounded_verdict_is_taken_on_a_fresh_factorization`). The working bounds may be
+  perturbed or shifted then: a ray depends only on which bounds are infinite, which they
+  keep, and the phase started on values the verification accepted, from which an unresolved
+  entry's room is measured on the bounds in force.
 - *Genuine or round-off* is decided on refined values against the error the refinement
   measured, never on a size or on the plain computation, which can be off by any factor for
-  a genuine entry two nearly parallel rows leave (`1.2e-15` computed as `7.1e-15`): an entry
-  is genuine when the second refinement step moves it by less than its size (carried through
-  its column), where round-off moves by its own size. A genuine entry far below the
-  tolerance, from cancellation, nearly parallel rows or a chain of ratios, in range or not,
-  can be a row's only repair; the dual simplex takes one only as its first last resort
-  (§7.3).
+  a genuine entry two nearly parallel rows leave (`1.2e-15` computed as `7.1e-15`). The primal
+  column also measures the arithmetic discarded in its compensated residual and carries it
+  through approximate rows of the basis inverse. An entry inside that round-off floor has
+  an unresolved sign: it never pivots, and leaves a ray only where it is negligible up to
+  the magnitude taken for infinite (above). If no resolved entry blocks the ray, the
+  factorization is renewed at a stronger threshold; if it still cannot resolve the entry and
+  the entry is not negligible, the solve returns `InternalError`. The inverse rows are
+  computed in floating-point, so the floor is a numerical estimate rather than exact-zero
+  certification. A genuine entry far below the tolerance, from cancellation, nearly parallel
+  rows or a chain of ratios, in range or not, can be a row's only repair; the dual simplex
+  takes one only as its first last resort (§7.3).
 - *Agreement*: the pivot element computed through the row and through the column must agree
   to `PIVOT_AGREEMENT_TOL = 1e-7` relatively, signs included, a refined one against the
   other refined too. Else the factorization is renewed and the iteration redone, at a
@@ -1254,7 +1287,14 @@ it must give no wrong answer.
   change left leads to a singular basis"), for infeasible and feasible models alike:
   `an_infeasible_lp_whose_dependency_has_no_boxed_var_is_a_known_limitation` and
   `a_feasible_lp_whose_dependency_has_no_boxed_var_is_a_known_limitation` (rows nearly
-  parallel over a var with one finite bound and a free one).
+  parallel over a var with one finite bound and a free one). A primal column whose nonzero
+  blocking entry remains inside its residual-roundoff floor after refactorization, where the
+  refinement does not converge or the entry could take its basic var, from the point the
+  phase started on, past a bound by more than its tolerance before the entering var reaches
+  the magnitude taken for infinite, also fails loudly ("unboundedness cannot be
+  determined"), rather than pivoting on the entry or treating it as zero (§7.7):
+  `a_ray_past_an_unresolved_entry_of_an_unconverged_refinement_is_a_known_limitation`
+  (nearly dependent equalities over free vars, unbounded).
 - **A proof that needs a non-basic coefficient within the multipliers' error** (in range).
   A non-basic var's coefficient on an infinite bound counts as zero only within the
   round-off of its sum (§7.3). A multiplier within its error counts as zero, which takes out
@@ -1278,6 +1318,14 @@ it must give no wrong answer.
   reached, and the solve fails loudly ("no var can repair row", from the slack basis too).
   Where the certificate is the slack's row alone, none is left
   (`a_node_point_within_the_round_off_of_its_rows_room_is_solved`).
+- **A ray past an entry taken for zero** (outside the range). Where a primal step toward an
+  infinite bound meets no unresolved entry (§7.7), an entry of its refined column within its
+  measured correction counts as zero, and the sign of one beyond it is trusted without its
+  round-off floor; an entry the refined column holds at exactly zero is checked on neither
+  path. A genuine blocker hidden there, a coefficient far below the round-off of the others
+  in its column, can make an exactly bounded model `Unbounded`:
+  `a_ray_past_an_entry_within_its_measured_correction_is_a_known_limitation` (tiny genuine
+  coefficients beside huge ones).
 
 ---
 
@@ -1290,7 +1338,8 @@ it must give no wrong answer.
 | Root LP unbounded on a MILP | run a resumable zero-objective integer-feasibility search; any integer point proves `Unbounded`, exhaustion proves `Infeasible` |
 | Node LP infeasible | prune (correct: the engine returns `Infeasible` only on a proof, §7.3) |
 | A violated row no var can repair and whose certificate proves nothing, after the rebuild, the taboo and the last resorts | one solve from the slack basis, then `InternalError`, never `Infeasible`; on a node LP, the search's own slack-basis retry too |
-| Node LP unbounded | impossible when the node is bounded → `InternalError` |
+| Node LP unbounded | only numerical, the node's relaxation being bounded: the search's one slack-basis retry, then `InternalError` (§5.3) |
+| A primal column blocked only by entries unresolved within residual round-off, after renewed factorization | a ray, `Unbounded` on fresh data, where the refinement converged and no such entry, at its magnitude plus its error, takes its basic var, from the point the phase started on (which the verification accepted), past a bound by more than its tolerance before the entering var reaches magnitude `2^52` (§7.7); else `InternalError` ("unboundedness cannot be determined"); never a pivot on such an entry |
 | A basis the factorization finds singular (after a pivot on an entry tiny beside its column, or loaded) | repaired: the slack of a row no pivot took replaces each dependent column (a var with both bounds finite where the factorization's choice has an infinite bound and a second factorization allows, §7.8), and the solve goes on; within a phase the change back is taboo, unless the step whose refactorization found the basis singular moved its row (§3, §7.8) |
 | Basis bookkeeping found inconsistent when a singular basis is repaired (a var basic twice, or a slack's non-basic position held by another var) | panic: a bug, never repaired |
 | Integral candidate failing the guard with no integer variable to branch on | `InternalError`, never force-accepted. The engine verified the point on its own rows, and with nothing to branch on every integer variable is exactly integral (one its bounds fix the engine holds on its value), where a row presolve dropped or rewrote holds as written: the failure is a reduction that did not keep the point (§5.4) |
