@@ -192,7 +192,7 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
 }
 
 /// Outcome of solving one branch & bound node's LP relaxation.
-enum NodeLp {
+pub(super) enum NodeLp {
     /// The solver now holds this node's optimal basis and objective.
     Solved,
     /// The node's LP is infeasible under its current bounds. The engine
@@ -215,26 +215,23 @@ enum NodeLp {
 /// Solve the current node's LP relaxation. Bounds and (if needed) the warm basis
 /// are already loaded into the solver by the caller.
 ///
-/// Robustness valve: if the first `reoptimize` fails with an internal error class
-/// — anything that is neither [`Error::Infeasible`] nor [`Error::Unbounded`], e.g.
-/// a row the dual simplex can neither repair nor prove infeasible even after the
-/// engine's own start from the slack basis — fall back ONCE
-/// to the all-slack basis and re-solve the node from scratch, then take that
-/// retry's outcome as final. The retry cannot loop: it is attempted at most once
-/// and its own internal error is propagated rather than retried again. Only
-/// [`Error::Infeasible`] prunes the node (see [`NodeLp::Infeasible`]).
-fn solve_node_lp(state: &mut MipState) -> Result<NodeLp, Error> {
+/// Robustness valve: if the first `reoptimize` fails with anything but
+/// [`Error::Infeasible`] — an internal error, e.g. a row the dual simplex can
+/// neither repair nor prove infeasible even after the engine's own start from
+/// the slack basis, or an [`Error::Unbounded`], which a node of the search
+/// reports only numerically — fall back ONCE to the all-slack basis and
+/// re-solve the node from scratch, then take that retry's outcome as final.
+/// The retry cannot loop: it is attempted at most once, and its own error is
+/// propagated, an `Unbounded` as an internal error. Only [`Error::Infeasible`]
+/// prunes the node (see [`NodeLp::Infeasible`]).
+pub(super) fn solve_node_lp(state: &mut MipState) -> Result<NodeLp, Error> {
     state.solver.deadline = state.deadline;
     let err = match state.solver.reoptimize() {
         Ok(StopReason::Finished) => return Ok(NodeLp::Solved),
         Ok(StopReason::Limit) => return Ok(NodeLp::Limit),
         Err(Error::Infeasible) => return Ok(NodeLp::Infeasible),
-        Err(Error::Unbounded) => {
-            return Err(Error::InternalError(
-                "bounded B&B node reported unbounded".to_string(),
-            ))
-        }
-        // Any other error class: fall through to the one-shot slack retry.
+        // Any other outcome, `Unbounded` included: fall through to the
+        // one-shot slack retry.
         Err(e) => e,
     };
 

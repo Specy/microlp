@@ -19,7 +19,10 @@
 //! that bound is finite, however small the coefficient, and makes the range
 //! unbounded where it is infinite, with one concession for the error of the
 //! multipliers in a basic var's coefficient ([`Solver::proof_of`]), granted
-//! only to a refinement that converges in two steps.
+//! only to a refinement that converges in two steps. That refinement's
+//! multipliers within their estimated error are taken as zero. This preserves
+//! the certificate identity; the coefficient concessions retain the numerical
+//! limits described in [`Solver::proof_of`].
 //!
 //! The certificate proves infeasibility when its gap exceeds the room the
 //! engine can give its terms, plus the round-off allowance of the compensated
@@ -103,6 +106,46 @@ impl CDouble {
         self.lo += c.lo * b;
     }
 
+    /// Add `v`, returning an upper bound on the arithmetic discarded from
+    /// the low part. The high part's two-sum is exact.
+    pub(super) fn add_with_error(&mut self, v: f64) -> f64 {
+        let (hi, carry) = Self::two_sum(v, self.hi);
+        let (lo, error) = Self::two_sum(self.lo, carry);
+        self.hi = hi;
+        self.lo = lo;
+        error.abs()
+    }
+
+    /// Add `c * b` with the same arithmetic as `add_scaled`, measuring each
+    /// discarded low-part addition and the low part's product.
+    pub(super) fn add_scaled_with_error(&mut self, c: CDouble, b: f64) -> f64 {
+        let (product, product_low) = Self::two_product(c.hi, b);
+        let mut error = self.add_with_error(product);
+        let (lo, discarded) = Self::two_sum(self.lo, product_low);
+        self.lo = lo;
+        error = add_up(error, discarded.abs());
+        let (low_product, low_error) = Self::two_product(c.lo, b);
+        let (lo, discarded) = Self::two_sum(self.lo, low_product);
+        self.lo = lo;
+        error = add_up(error, add_up(discarded.abs(), low_error.abs()));
+        // Below this magnitude an error-free product's trailing bits may
+        // underflow. Its discarded error cannot be measured reliably.
+        for part in [c.hi, c.lo] {
+            let product = part * b;
+            if !product.is_finite()
+                || (part != 0.0 && b != 0.0 && product.abs() < RESIDUAL_PRODUCT_MIN)
+            {
+                return f64::INFINITY;
+            }
+        }
+        error
+    }
+
+    /// The round-off discarded when converting the compensated value to f64.
+    pub(super) fn value_error(self) -> f64 {
+        Self::two_sum(self.hi, self.lo).1.abs()
+    }
+
     /// `-self`, exactly.
     fn neg(self) -> Self {
         Self {
@@ -148,7 +191,7 @@ impl From<f64> for CDouble {
 }
 
 /// `a + b`, rounded up: the nearest `f64` at or above the exact sum.
-fn add_up(a: f64, b: f64) -> f64 {
+pub(super) fn add_up(a: f64, b: f64) -> f64 {
     let (sum, error) = CDouble::two_sum(a, b);
     if error > 0.0 {
         sum.next_up()
@@ -161,6 +204,24 @@ fn add_up(a: f64, b: f64) -> f64 {
 fn mul_up(a: f64, b: f64) -> f64 {
     let (product, error) = CDouble::two_product(a, b);
     if error > 0.0 {
+        product.next_up()
+    } else {
+        product
+    }
+}
+
+// Below 2^-969 the trailing bit of a product of two 53-bit significands
+// can fall below the smallest subnormal, even when the product is normal.
+const RESIDUAL_PRODUCT_MIN: f64 = 2.0 * f64::MIN_POSITIVE / f64::EPSILON;
+
+/// Carry a nonnegative residual-error bound through an inverse-row entry,
+/// rounding upward even when the product's low part could underflow.
+pub(super) fn residual_error_product(a: f64, b: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() {
+        return f64::INFINITY;
+    }
+    let product = a * b;
+    if a > 0.0 && b > 0.0 {
         product.next_up()
     } else {
         product
@@ -221,10 +282,12 @@ const REFINEMENT_RATIO: f64 = 0.5;
 /// the primal ratio test (`Solver::refine_pivot_col`). Each entry gets its own
 /// correction, not the largest of all, which carried through the entries of a
 /// var whose rows have multipliers far below the rest would let its
-/// coefficient count as zero far above the error those multipliers carry. An
-/// entry whose error exceeds its correction only has too small a bound, which
-/// can fail a proof, or bound a step that an exact zero would not, but never
-/// make a proof or an unbounded ray.
+/// coefficient count as zero far above the error those multipliers carry. A
+/// correction measures the error down to the round-off of the residual it is
+/// solved from, and below that only round-off: an entry that is zero can end
+/// beyond its correction. Too small a bound fails a proof, never makes one,
+/// but a step it lets such an entry bound pivots on zero, so the primal ratio
+/// test adds that round-off (`Solver::refined_col_floors`).
 pub(super) fn refinement_error(x: &[CDouble], second: &[f64]) -> Option<Vec<f64>> {
     let x_norm = finite_max_norm(x.iter().map(|r| r.value()))?;
     let second_norm = finite_max_norm(second.iter().copied())?;
@@ -265,6 +328,9 @@ pub(super) struct Proof {
     /// How many coefficients counted as zero within their error (the
     /// concession of [`Solver::proof_of`]).
     pub(super) zero_within_error: usize,
+    /// How many nonzero multipliers the certificate took as zero within their
+    /// error bound ([`Solver::proof_of`]).
+    pub(super) multipliers_zeroed: usize,
 }
 
 /// The row of the basis inverse the proof reads, refined, with a bound on
@@ -273,12 +339,13 @@ pub(super) struct Proof {
 pub(super) struct RefinedRow {
     /// Per row, its multiplier, compensated.
     pub(super) rho: Vec<CDouble>,
-    /// Per row, a bound on the error of its multiplier
-    /// ([`refinement_error`]); `None` where the refinement did not converge in
+    /// Per row, the estimated error of its multiplier
+    /// ([`refinement_error`]), within which the certificate takes the
+    /// multiplier as zero; `None` where the refinement did not converge in
     /// two steps, a later convergence included
-    /// ([`Solver::converged_basis_inverse_row`]), and then a coefficient
-    /// counts as zero only within the round-off of the certificate's own sums
-    /// ([`Solver::proof_of`]).
+    /// ([`Solver::converged_basis_inverse_row`]), and then every multiplier
+    /// counts as it is and a coefficient counts as zero only within the
+    /// round-off of the certificate's own sums ([`Solver::proof_of`]).
     pub(super) error: Option<Vec<f64>>,
     /// Per row, the second correction (the last, for
     /// [`Solver::converged_basis_inverse_row`]), taken off its multiplier;
@@ -298,18 +365,22 @@ struct Certificate {
     /// summed from (see [`Certificate::is_round_off`]), and how many terms.
     magnitudes: Vec<f64>,
     terms_of: Vec<u32>,
-    /// Per basic var, how far the error of the multipliers can carry its
-    /// coefficient, `Σ e_i |a_ij|` over the rows the certificate keeps (`e_i`
-    /// the bound of [`RefinedRow::error`]), zero for a non-basic var; `None`
-    /// where there is no bound.
+    /// Per basic var, the estimated distance of the certificate's multipliers
+    /// from the exact ones, carried through its entries:
+    /// `Σ e_i |a_ij|` over the rows the certificate keeps and
+    /// `Σ (|y_i| + e_i) |a_ij|` over those whose multiplier `y_i` it takes as
+    /// zero (`e_i` the estimate of [`RefinedRow::error`]), zero for a non-basic
+    /// var; `None` where there is no estimate.
     errors: Option<Vec<f64>>,
     beta: CDouble,
     /// The magnitude of every term summed so far, and their count, for the
     /// allowance for the error of the compensated sums.
     magnitude: f64,
     terms: usize,
-    /// How many rows the certificate combines.
+    /// How many rows the certificate combines, and how many nonzero
+    /// multipliers it took as zero.
     rows: usize,
+    zeroed: usize,
 }
 
 impl Certificate {
@@ -329,9 +400,10 @@ impl Certificate {
 
     /// How far from zero the coefficient of `var` can come out where it is
     /// zero for the exact multipliers: the round-off of its compensated sum
-    /// ([`compensated_error`]), plus, for a basic var, what the error of the
-    /// multipliers carries into it where that error has a bound. On an
-    /// infinite bound a coefficient within this counts as zero
+    /// ([`compensated_error`]), plus, for a basic var, what the estimated
+    /// distance of the certificate's multipliers from the exact ones carries
+    /// into it ([`Certificate::errors`]). On an infinite bound a coefficient
+    /// within this counts as zero
     /// ([`Solver::proof_of`]).
     fn error_of_zero(&self, var: usize) -> f64 {
         let multipliers_error = self.errors.as_ref().map_or(0.0, |errors| errors[var]);
@@ -455,7 +527,8 @@ impl Solver {
 
     /// The certificate of the multipliers of `refined` (one per row) for a
     /// leaving var that is to move up to its lower bound (`leaving_up`) or
-    /// down to its upper one (see [`Self::proof_of`]).
+    /// down to its upper one (see [`Self::proof_of`]), a multiplier within
+    /// its estimated error taken as zero.
     fn certificate(&self, refined: &RefinedRow, leaving_up: bool) -> Certificate {
         let total = self.num_total_vars();
         let mut cert = Certificate {
@@ -467,10 +540,32 @@ impl Solver {
             magnitude: 0.0,
             terms: 0,
             rows: 0,
+            zeroed: 0,
         };
         for (r, &rho) in refined.rho.iter().enumerate() {
             let y = if leaving_up { rho.neg() } else { rho }.normalized();
             let y_value = y.value();
+            let error = refined.error.as_ref().map(|error| error[r]);
+            //guaranteed to be a valid index
+            let entries = self.orig_constraints.outer_view(r).unwrap();
+            if let (Some(errors), Some(error)) = (&mut cert.errors, error) {
+                if y_value.abs() <= error {
+                    // Include the discarded multiplier in the estimated
+                    // distance from the exact one.
+                    let distance = y_value.abs() + error;
+                    if y_value != 0.0 {
+                        cert.zeroed += 1;
+                    }
+                    if distance > 0.0 {
+                        for (var, &a) in entries.iter() {
+                            if matches!(self.var_states[var], VarState::Basic(_)) {
+                                errors[var] += distance * a.abs();
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
             let slack = self.num_vars + r;
             let needs_infinite_side = if y_value > 0.0 {
                 self.orig_var_maxs[slack] == f64::INFINITY
@@ -484,9 +579,7 @@ impl Solver {
             cert.beta.add_scaled(y, self.orig_rhs[r]);
             cert.magnitude += (y_value * self.orig_rhs[r]).abs();
             cert.terms += 1;
-            let error = refined.error.as_ref().map(|error| error[r]);
-            //guaranteed to be a valid index
-            for (var, &a) in self.orig_constraints.outer_view(r).unwrap().iter() {
+            for (var, &a) in entries.iter() {
                 cert.coeffs[var].add_scaled(y, a);
                 cert.magnitudes[var] += (y_value * a).abs();
                 cert.terms_of[var] += 1;
@@ -507,9 +600,9 @@ impl Solver {
     /// [`REFINEMENT_RATIO`] of the one before (Demmel et al. 2006), the steps
     /// of [`Self::refine_basis_inverse_row`]; `None` where it does not
     /// converge. Its multipliers come with no bound on their error
-    /// ([`RefinedRow::error`]), so a proof concedes them nothing beyond the
-    /// round-off of each sum: refining longer never widens what a proof
-    /// concedes.
+    /// ([`RefinedRow::error`]), so a proof counts each as it is and concedes
+    /// them nothing beyond the round-off of each sum: refining longer never
+    /// widens what a proof concedes.
     fn converged_basis_inverse_row(&mut self, row: usize) -> Option<RefinedRow> {
         let mut rho = self.basis_inverse_row(row);
         let mut last = f64::INFINITY;
@@ -566,7 +659,13 @@ impl Solver {
     /// the certificate fails to hold exactly when its largest value over the
     /// box reaches `beta`. A multiplier whose row would need its slack's
     /// infinite bound is set to zero, which leaves a certificate of the other
-    /// rows.
+    /// rows. So is a multiplier within its estimated error ([`RefinedRow::error`]),
+    /// whatever its sign: refinement noise in a multiplier whose exact value
+    /// is zero can give a non-basic var a coefficient beyond the round-off of
+    /// its sum, voiding the proof on an infinite bound
+    /// (`a_multipliers_noise_does_not_void_a_proof`). Changing a multiplier
+    /// preserves the certificate identity; the basic-column concession for
+    /// the change below is estimated.
     ///
     /// Where its var's bound in the certificate's direction is finite, a
     /// coefficient counts as it is, however far below its terms it cancelled:
@@ -579,15 +678,16 @@ impl Solver {
     /// Where that bound is infinite, a coefficient makes the range unbounded
     /// and the proof void, however small it is, unless it lies within
     /// [`Certificate::error_of_zero`]: the round-off of its compensated sum,
-    /// plus, for a basic var, the refinement's bound on each multiplier's
-    /// error carried through the var's entries in the rows the certificate
-    /// keeps (where the refinement converged in two steps). Such a
-    /// coefficient counts as zero, the one concession. A basic var's
-    /// coefficient is zero for the exact multipliers, and the bound covers
-    /// what their error leaves of it. A non-basic var's is its tableau entry,
-    /// which the arithmetic cannot tell from a residual where it lies within
-    /// that bound, and counted as zero there it can prove a feasible model
-    /// infeasible
+    /// plus, for a basic var, the estimated distance of the certificate's
+    /// multipliers from the exact ones, carried through the var's entries
+    /// (where the refinement converged in two steps): each multiplier's error
+    /// estimate in the rows the certificate keeps, and its magnitude plus
+    /// that estimate in those it sets to zero. Such a coefficient counts as
+    /// zero, the one concession. A basic var's coefficient is zero for the
+    /// exact multipliers, and the estimate allows for the residual left by
+    /// their distance. A non-basic var's is its tableau entry, which the
+    /// arithmetic cannot tell from a residual within that estimate, and
+    /// counted as zero there it can prove a feasible model infeasible
     /// (`an_unbounded_lp_of_nearly_dependent_rows_is_not_proven_infeasible`),
     /// so it is conceded only the round-off of its sum. No fixed threshold
     /// tells a residual from a coefficient the data leave: where a row of
@@ -596,12 +696,13 @@ impl Solver {
     /// (`a_basic_vars_coefficient_in_a_row_left_out_voids_the_proof`). The
     /// concession can still prove a feasible model infeasible through a
     /// coefficient the data leave within it, which the arithmetic cannot
-    /// tell from zero: a basic var's whose column a left-out row reaches,
-    /// within the error bound, or any var's within the round-off of its sum,
-    /// and only where the var times it makes the room the gap lacks. So can a
-    /// coefficient within the round-off of its sum of zero whose computed sign
-    /// picks a finite bound where its exact sign picks an infinite one: it
-    /// counts at the finite bound, where the exact certificate is void.
+    /// tell from zero: a basic var's whose column a row left out or set to
+    /// zero reaches, within the estimated error, or any var's within the
+    /// round-off of its sum, and only where the var times it makes the room
+    /// the gap lacks. So can a coefficient within the round-off of its sum of
+    /// zero whose computed sign picks a finite bound where its exact sign
+    /// picks an infinite one: it counts at the finite bound, where the exact
+    /// certificate is void.
     ///
     /// A number of the certificate that is not finite (an overflow: a huge
     /// multiplier or coefficient, or Dekker's split of one beyond about
@@ -614,10 +715,11 @@ impl Solver {
         let proof = self.judge(&cert, row);
         debug!(
             "infeasibility proof for row {row} (basic var {}, {} rows combined, {} \
-             coefficients counted as zero within their error{}): gap {:e}, allowance {:e} \
-             (cut {:e}): {}",
+             multipliers and {} coefficients counted as zero within their error{}): gap {:e}, \
+             allowance {:e} (cut {:e}): {}",
             self.basic_vars[row],
             cert.rows,
+            proof.multipliers_zeroed,
             proof.zero_within_error,
             if cert.errors.is_some() {
                 ""
@@ -753,6 +855,7 @@ impl Solver {
             allowance,
             cut,
             zero_within_error,
+            multipliers_zeroed: cert.zeroed,
         }
     }
 
@@ -899,5 +1002,66 @@ impl Solver {
             self.basic_var_vals[row],
         );
         true
+    }
+}
+
+#[cfg(test)]
+mod roundoff_tests {
+    use super::{residual_error_product, CDouble};
+
+    #[test]
+    fn residual_roundoff_propagation_covers_underflow() {
+        let min = f64::from_bits(1);
+        assert_eq!(residual_error_product(min, 0.5), min);
+        assert!(residual_error_product(2f64.powi(-1000), 1.0) > 2f64.powi(-1000));
+        assert_eq!(residual_error_product(min, 0.0), 0.0);
+    }
+
+    #[test]
+    fn residual_roundoff_propagation_avoids_splitter_overflow() {
+        let a = 2f64.powi(1000) * (1.0 + f64::EPSILON);
+        let b = 2f64.powi(-1000) * (1.0 + f64::EPSILON);
+        assert_eq!(
+            residual_error_product(a, b),
+            (1.0 + 2.0 * f64::EPSILON).next_up()
+        );
+    }
+
+    #[test]
+    fn near_underflow_compensated_products_have_no_measured_bound() {
+        for a in [f64::from_bits(1), 2f64.powi(-1000)] {
+            let mut sum = CDouble::default();
+            assert_eq!(
+                sum.add_scaled_with_error(CDouble::from(a), 0.5),
+                f64::INFINITY
+            );
+        }
+    }
+
+    #[test]
+    fn an_exact_compensated_product_has_no_discarded_error() {
+        let mut sum = CDouble::default();
+        let error = sum.add_scaled_with_error(CDouble::from(1.0 + 2f64.powi(-52)), 1.0);
+        assert_eq!(error, 0.0);
+        assert_eq!(sum.value_error(), 0.0);
+    }
+
+    #[test]
+    fn a_discarded_low_part_addition_is_measured() {
+        let mut sum = CDouble {
+            hi: 1.0,
+            lo: 2f64.powi(-54),
+        };
+        assert_eq!(sum.add_with_error(2f64.powi(-108)), 2f64.powi(-108));
+    }
+
+    #[test]
+    fn a_discarded_low_part_product_is_measured() {
+        let mut sum = CDouble::default();
+        let c = CDouble {
+            hi: 1.0,
+            lo: 2f64.powi(-53) * (1.0 + 2f64.powi(-52)),
+        };
+        assert!(sum.add_scaled_with_error(c, 1.0 + 2f64.powi(-52)) >= 2f64.powi(-157));
     }
 }

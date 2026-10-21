@@ -2081,6 +2081,235 @@ fn dual_pivot_applies_the_column_element_to_the_eta_file() {
     assert_eq!(sol.dual_edge_sq_norms[row], rho_sq_norm / (a_col * a_col));
 }
 
+/// `min 4 x0 + 3 x1 - unit x2` s.t. `18 x0 - 18 x1 - 12 unit x2 = -180`,
+/// `-x0 + 5 x1 = 18` and `-5 x0 + x1 + 4 unit x2 = 42`, all vars free: the
+/// first row is `-3` times the sum of the others, and the rows leave a ray.
+/// `unit`, a power of two, is the size of a unit of `x2`; the column scaling
+/// takes it out exactly, so the engine computes the same columns whatever
+/// it is.
+fn redundant_equality_solver(unit: f64) -> Solver {
+    init();
+    Solver::try_new(
+        &[4.0, 3.0, -unit],
+        &[f64::NEG_INFINITY; 3],
+        &[f64::INFINITY; 3],
+        &[
+            (
+                to_sparse(&[18.0, -18.0, -12.0 * unit]),
+                ComparisonOp::Eq,
+                -180.0,
+            ),
+            (to_sparse(&[-1.0, 5.0, 0.0]), ComparisonOp::Eq, 18.0),
+            (to_sparse(&[-5.0, 1.0, 4.0 * unit]), ComparisonOp::Eq, 42.0),
+        ],
+        &vec![VarDomain::Real; 3],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap()
+}
+
+/// What [`redundant_equality_ray`] reports.
+struct RedundantEqualityRay {
+    choice: Result<PivotChoice, Error>,
+    /// The refined entry in the slack's row.
+    entry: f64,
+    /// `2^52` units of `x2`, at zero at the start, in the engine's units.
+    horizon: f64,
+    /// The slack's tolerance: all the room its value at the start, zero,
+    /// leaves it.
+    room: f64,
+}
+
+/// The primal ratio test of `x2` in [`redundant_equality_solver`] with
+/// `x0`, `x1` and the third row's slack basic, on a fresh factorization at
+/// the highest threshold, in a phase started on the vertex's values,
+/// verified if `verified`, where `x2`'s column is exactly zero in the slack's
+/// row: a ray.
+fn redundant_equality_ray(unit: f64, verified: bool) -> RedundantEqualityRay {
+    let mut sol = redundant_equality_solver(unit);
+    let basis = Basis(vec![
+        VarStatus::Basic,
+        VarStatus::Basic,
+        VarStatus::Free,
+        VarStatus::AtLower,
+        VarStatus::AtLower,
+        VarStatus::Basic,
+    ]);
+    sol.load_basis(&basis).unwrap();
+    if verified {
+        assert!(matches!(
+            sol.verify_primal(),
+            Ok(Verdict::Checked { feasible: true })
+        ));
+    }
+    sol.begin_primal_phase(true);
+    sol.lu_threshold = LU_STABLE_THRESHOLD;
+    let choice = sol.choose_pivot(nb_col(&sol, 2), 1.0);
+    let slack_row = match sol.var_states[5] {
+        VarState::Basic(row) => row,
+        VarState::NonBasic(_) => panic!("the third row's slack is basic"),
+    };
+    let ray = RedundantEqualityRay {
+        choice,
+        entry: sol.col_coeff_at(slack_row),
+        horizon: INFINITE_BOUND / sol.col_scales[2],
+        room: sol.var_tols[5].hi,
+    };
+    sol.end_primal_phase().unwrap();
+    ray
+}
+
+/// An entry of a refined pivot column within the round-off floor of its
+/// residual does not pivot: an exact zero comes out of the refinement at
+/// that floor, beyond a second correction there too, and a pivot on it
+/// leaves the basis singular. The column is a ray where no such entry, at
+/// its magnitude plus its error, takes its basic var past a bound by more
+/// than its tolerance before the entering var reaches the magnitude taken
+/// for infinite. In [`redundant_equality_ray`] with `x2` as written, the
+/// refinement leaves the slack's zero at `-8.2e-33`, beyond its second
+/// correction of `2.1e-33`, and the step pivoted on it; within its floor,
+/// the entry moves the slack, at zero, by at most `7.8e-16` over `2^52`
+/// units of `x2`, against the `1e-7` its tolerance leaves it.
+#[test]
+fn a_refined_entry_within_its_round_off_floor_leaves_a_ray_within_tolerance() {
+    let ray = redundant_equality_ray(1.0, true);
+    assert_ne!(
+        ray.entry, 0.0,
+        "fixture: the refinement leaves round-off in the slack's row"
+    );
+    assert!(
+        matches!(ray.choice, Ok(PivotChoice::Unbounded)),
+        "{:?}",
+        ray.choice
+    );
+}
+
+/// The ray of [`redundant_equality_ray`] with a unit of `x2` `2^40` times
+/// as large: the engine computes the same refined column, but `2^52` units
+/// of `x2` are now `2^40` times as many of the engine's, over which the
+/// slack's unresolved entry could move the slack by up to `8.5e-4`, far past
+/// the `1e-7` its tolerance leaves it. The ray cannot be told from a genuine
+/// blocker, and the solve fails loudly.
+#[test]
+fn an_unresolved_entry_beyond_its_tolerance_up_to_the_infinite_magnitude_is_no_ray() {
+    let as_written = redundant_equality_ray(1.0, true).entry;
+    let ray = redundant_equality_ray(2f64.powi(40), true);
+    assert_eq!(ray.entry, as_written, "fixture: the same refined column");
+    assert!(matches!(ray.choice, Err(Error::InternalError(ref message))
+        if message.contains("unresolved within residual round-off")));
+}
+
+/// An unresolved entry counts at its magnitude plus its error over the step:
+/// in [`redundant_equality_ray`] with a unit of `x2` `2^28` times as large,
+/// the slack's entry alone moves it by `4e-8` over `2^52` units of `x2`,
+/// within the `1e-7` its tolerance leaves it, but by `2.1e-7` with its error,
+/// beyond it, and the ratio test fails loudly.
+#[test]
+fn an_unresolved_entry_counts_at_its_magnitude_plus_its_error() {
+    let ray = redundant_equality_ray(2f64.powi(28), true);
+    assert!(
+        ray.entry.abs() * ray.horizon < 0.5 * ray.room,
+        "fixture: the entry alone fits the room"
+    );
+    assert!(matches!(ray.choice, Err(Error::InternalError(ref message))
+        if message.contains("unresolved within residual round-off")));
+}
+
+/// A ray past an unresolved entry starts from the point the phase started
+/// on, which the verification accepted: the ray of [`redundant_equality_ray`]
+/// in a phase started on values a basis load computed, unverified, has none,
+/// and the ratio test fails loudly. The solves start a primal phase only on
+/// verified values, so none meets this.
+#[test]
+fn an_unresolved_ray_needs_a_verified_start() {
+    let ray = redundant_equality_ray(1.0, false);
+    assert!(matches!(ray.choice, Err(Error::InternalError(ref message))
+        if message.contains("unresolved within residual round-off")));
+}
+
+/// The primal ratio test of `x2` in [`redundant_equality_solver`]'s rows and
+/// a fourth, the sum of the second and the third plus `coeff w`, `w >= 0`,
+/// with `x0`, `x1`, `w` and the third row's slack basic, in a phase started
+/// on the vertex's verified values. `w` stays zero wherever the other rows
+/// hold, so its entry in `x2`'s column is exactly zero, as the slack's is,
+/// and the ray stands.
+fn redundant_equality_ray_past_w(coeff: f64) -> Result<PivotChoice, Error> {
+    use VarStatus::{AtLower, Basic, Free};
+    init();
+    let mut sol = Solver::try_new(
+        &[4.0, 3.0, -1.0, 0.0],
+        &[f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY, 0.0],
+        &[f64::INFINITY; 4],
+        &[
+            (
+                to_sparse(&[18.0, -18.0, -12.0, 0.0]),
+                ComparisonOp::Eq,
+                -180.0,
+            ),
+            (to_sparse(&[-1.0, 5.0, 0.0, 0.0]), ComparisonOp::Eq, 18.0),
+            (to_sparse(&[-5.0, 1.0, 4.0, 0.0]), ComparisonOp::Eq, 42.0),
+            (to_sparse(&[-6.0, 6.0, 4.0, coeff]), ComparisonOp::Eq, 60.0),
+        ],
+        &vec![VarDomain::Real; 4],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let statuses = vec![Basic, Basic, Free, Basic, AtLower, AtLower, Basic, AtLower];
+    sol.load_basis(&Basis(statuses)).unwrap();
+    assert!(matches!(
+        sol.verify_primal(),
+        Ok(Verdict::Checked { feasible: true })
+    ));
+    sol.begin_primal_phase(true);
+    sol.lu_threshold = LU_STABLE_THRESHOLD;
+    let choice = sol.choose_pivot(nb_col(&sol, 2), 1.0);
+    let w_row = match sol.var_states[3] {
+        VarState::Basic(row) => row,
+        VarState::NonBasic(_) => panic!("w is basic"),
+    };
+    assert_ne!(
+        sol.col_coeff_at(w_row),
+        0.0,
+        "fixture: the refinement leaves round-off in w's row"
+    );
+    sol.end_primal_phase().unwrap();
+    choice
+}
+
+/// A ray past an unresolved entry covers every other entry of open sign: in
+/// [`redundant_equality_ray_past_w`] the refinement leaves `w`'s zero within
+/// its measured correction, where the step takes it for zero, and the
+/// slack's beyond it, unresolved, which fits its room alone. With `w`
+/// written at `2^-40`, its tolerance, `1e-7` of the user's units, is some
+/// `1e-19` of the engine's, and `w`'s entry, at its magnitude plus its
+/// error, could take it past its bound by far more over the step: no ray,
+/// and the ratio test fails loudly. Written at one, `w` has the room.
+#[test]
+fn a_ray_covers_an_entry_within_its_measured_correction() {
+    assert!(matches!(
+        redundant_equality_ray_past_w(1.0),
+        Ok(PivotChoice::Unbounded)
+    ));
+    assert!(matches!(
+        redundant_equality_ray_past_w(2f64.powi(-40)),
+        Err(Error::InternalError(ref message))
+            if message.contains("unresolved within residual round-off")
+    ));
+}
+
+/// A solve of [`redundant_equality_solver`] from the slack basis meets the
+/// unresolved entry, renews the factorization at the highest threshold,
+/// and takes the ray there: `Unbounded` on a fresh factorization.
+#[test]
+fn an_unresolved_ray_is_unbounded_on_a_renewed_factorization() {
+    let mut sol = redundant_equality_solver(1.0);
+    assert!(matches!(sol.initial_solve(), Err(Error::Unbounded)));
+    assert!(sol.factorization_is_fresh());
+    assert_eq!(sol.lu_threshold, LU_STABLE_THRESHOLD);
+}
+
 /// A genuine blocking entry of the primal ratio test's column bounds the
 /// step beside huge entries in rows that cannot block: `max x` is `x = 8`.
 /// Basis: the free `y1`, `y2` of the nearly dependent `y1 + y2 + x/8 = 0` and
@@ -3240,6 +3469,120 @@ fn a_coefficient_on_an_infinite_bound_counts_as_zero_only_within_its_error() {
             let proven = proof(with_w, 2f64.powi(-100), error);
             assert!(proven.holds, "w {with_w}, {error:?}: {proven:?}");
         }
+    }
+}
+
+/// `x0 + x1 + eps j >= 3` and `x2 + j (+ z) = 0`, `x0`, `x1`, `x2` in
+/// `[0, 1]`, `j` and `z` free, infeasible, at the basis `{j}` and the first
+/// row's slack, `3` above its bound, `z` non-basic where it is in the rows:
+/// the exact multipliers of the slack's row are `(1, -eps)`. Returns the
+/// solver and the slack's row.
+fn zeroed_multiplier_fixture(eps: f64, with_z: bool) -> (Solver, usize) {
+    let z = if with_z { 1.0 } else { 0.0 };
+    let mut sol = Solver::try_new(
+        &[0.0; 5],
+        &[0.0, 0.0, 0.0, f64::NEG_INFINITY, f64::NEG_INFINITY],
+        &[1.0, 1.0, 1.0, f64::INFINITY, f64::INFINITY],
+        &[
+            (to_sparse(&[1.0, 1.0, 0.0, eps, 0.0]), ComparisonOp::Ge, 3.0),
+            (to_sparse(&[0.0, 0.0, 1.0, 1.0, z]), ComparisonOp::Eq, 0.0),
+        ],
+        &vec![VarDomain::Real; 5],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let (j, s0) = (3, sol.num_vars);
+    sol.load_basis(&Basis(vec![
+        VarStatus::AtLower,
+        VarStatus::AtLower,
+        VarStatus::AtLower,
+        VarStatus::Basic,
+        VarStatus::Free,
+        VarStatus::Basic,
+        VarStatus::AtLower,
+    ]))
+    .unwrap();
+    let row = sol.basic_vars.iter().position(|&var| var == s0).unwrap();
+    assert!(
+        (sol.basic_var_vals[row] - 3.0).abs() < 1e-12
+            && matches!(sol.var_states[j], VarState::Basic(_)),
+        "fixture: j basic, the first row's slack 3 above its bound, {:?}",
+        sol.basic_var_vals
+    );
+    (sol, row)
+}
+
+/// A multiplier within its error estimate counts as zero, whatever its sign:
+/// what the refinement leaves of a multiplier that is zero gives the other
+/// vars of its row coefficients far beyond the round-off of their sums, and
+/// a non-basic var's, on an infinite bound, voids the proof. Planted, at
+/// [`zeroed_multiplier_fixture`] with no `eps` and `z` in the rows, whose
+/// exact multipliers are `(1, 0)`: `(1, -2^-136)`, which leaves the free
+/// non-basic `z` the coefficient `-2^-136`. With an error estimate of
+/// `2^-100`, or of `2^-136` (the second correction can move an exact first
+/// step's zero to the threshold), the second multiplier counts as zero,
+/// and the first row alone proves the model infeasible; with `2^-140`, zero
+/// or no estimate it counts, and `z` makes the range unbounded.
+#[test]
+fn a_multipliers_noise_does_not_void_a_proof() {
+    init();
+    let proof = |error: Option<f64>| {
+        let (sol, row) = zeroed_multiplier_fixture(0.0, true);
+        let refined = proof::RefinedRow {
+            rho: multipliers(&[1.0, -(2f64.powi(-136))]),
+            error: error.map(|e| vec![0.0, e]),
+            second: vec![0.0, error.unwrap_or(f64::INFINITY)],
+        };
+        sol.proof_of(&refined, row, false)
+    };
+    for error in [2f64.powi(-100), 2f64.powi(-136)] {
+        let proven = proof(Some(error));
+        assert!(proven.holds, "{error:e}: {proven:?}");
+        assert!((proven.gap - 1.0).abs() < 1e-14, "{error:e}: {proven:?}");
+        assert_eq!(
+            (proven.multipliers_zeroed, proven.zero_within_error),
+            (1, 0),
+            "{error:e}: {proven:?}"
+        );
+    }
+    for error in [Some(2f64.powi(-140)), Some(0.0), None] {
+        let unproven = proof(error);
+        assert!(!unproven.holds, "{error:?}: {unproven:?}");
+        assert_eq!(unproven.gap, f64::NEG_INFINITY, "{error:?}: {unproven:?}");
+    }
+}
+
+/// Taking a multiplier as zero moves the coefficient of a basic var in its
+/// row, and the concession allows its magnitude plus its error estimate
+/// for the distance from the exact multiplier. Planted, at
+/// [`zeroed_multiplier_fixture`] with `eps = 2^-3` and no `z`, its exact
+/// multipliers `(1, -2^-3)`: with an error estimate of `2^-2` the second counts
+/// as zero, which leaves the free basic `j` the first row's `2^-3`, within
+/// `2^-3 + 2^-2`, and the first row alone proves the model infeasible; with
+/// a zero estimate it counts and cancels `j`'s coefficient, and the proof
+/// concedes nothing.
+#[test]
+fn a_multiplier_taken_as_zero_concedes_what_it_moves() {
+    init();
+    let proof = |error: f64| {
+        let (sol, row) = zeroed_multiplier_fixture(2f64.powi(-3), false);
+        let refined = proof::RefinedRow {
+            rho: multipliers(&[1.0, -(2f64.powi(-3))]),
+            error: Some(vec![0.0, error]),
+            second: vec![0.0, error],
+        };
+        sol.proof_of(&refined, row, false)
+    };
+    for (error, zeroed) in [(2f64.powi(-2), 1), (0.0, 0)] {
+        let proven = proof(error);
+        assert!(proven.holds, "{error:e}: {proven:?}");
+        assert!((proven.gap - 1.0).abs() < 1e-14, "{error:e}: {proven:?}");
+        assert_eq!(
+            (proven.multipliers_zeroed, proven.zero_within_error),
+            (zeroed, zeroed),
+            "{error:e}: {proven:?}"
+        );
     }
 }
 

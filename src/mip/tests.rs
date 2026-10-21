@@ -1,4 +1,4 @@
-use super::search::{try_adopt_incumbent, try_warm_start};
+use super::search::{solve_node_lp, try_adopt_incumbent, try_warm_start};
 use super::state::Incumbent;
 use super::*;
 use crate::{ComparisonOp, OptimizationDirection, Problem, StopReason, Variable};
@@ -730,4 +730,36 @@ fn incumbent_feasible_decides_integrality_with_int_tol() {
         &tolerances,
         1e-6
     ));
+}
+
+/// A node LP the engine answers `Unbounded`, which the search's nodes do only
+/// numerically, is solved once more from the slack basis before it is
+/// reported, as an internal error. This LP, unbounded from every basis,
+/// stands in for a node whose ray one basis takes past an entry the
+/// refinement cannot resolve: the retry runs, then the error.
+#[test]
+fn an_unbounded_node_lp_is_solved_again_from_the_slack_basis() {
+    let mut problem = Problem::new(OptimizationDirection::Minimize);
+    let x = problem.add_var(-1.0, (0.0, f64::INFINITY));
+    let y = problem.add_var(-1.0, (0.0, f64::INFINITY));
+    problem.add_constraint([(x, 1.0), (y, -1.0)], ComparisonOp::Le, 1.0);
+    let options = SolveOptions {
+        presolve: false,
+        ..SolveOptions::default()
+    };
+    let once = {
+        let mut state = build_state(&problem, options.clone()).unwrap();
+        assert_eq!(state.solver.reoptimize(), Err(Error::Unbounded));
+        state.solver.lp_iterations
+    };
+    let mut state = build_state(&problem, options).unwrap();
+    assert!(matches!(
+        solve_node_lp(&mut state),
+        Err(Error::InternalError(ref message))
+            if message.contains("bounded B&B node reported unbounded")
+    ));
+    assert!(
+        state.solver.lp_iterations > once,
+        "the node LP is solved again"
+    );
 }

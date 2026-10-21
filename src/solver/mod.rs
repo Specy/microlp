@@ -78,6 +78,21 @@ fn bound_rank(min: f64, max: f64) -> u8 {
     }
 }
 
+/// Whether the basic var of a row where the entering var's column has
+/// `coeff` moves up as the entering var moves up (`entering_up`) or down:
+/// it changes by `-coeff` times the entering var's step.
+fn moves_up(entering_up: bool, coeff: f64) -> bool {
+    (entering_up && coeff < 0.0) || (!entering_up && coeff > 0.0)
+}
+
+/// A twice-refined pivot column and the arithmetic its refinement discarded.
+struct RefinedColumn {
+    errors: Option<Vec<f64>>,
+    values: Vec<CDouble>,
+    residual_roundoff: Vec<f64>,
+    value_roundoff: Vec<f64>,
+}
+
 /// A 64-bit hash of `x` (splitmix64's finalizer): the vertex hash of the
 /// cycling detection and the pseudo-random fractions of the perturbations.
 fn mix(x: u64) -> u64 {
@@ -218,6 +233,12 @@ pub(crate) struct Solver {
     /// Whether a primal phase has moved any bound, i.e. the simplex works
     /// with bounds other than the true ones.
     bounds_modified: bool,
+    /// The value of every var (scaled units, by var index) the running
+    /// primal phase started from, where the verification accepted them: the
+    /// point its rays start from ([`Self::unresolved_entries_leave_a_ray`]).
+    /// `None` outside a primal phase, and for one that started on values the
+    /// verification did not accept.
+    primal_start: Option<Vec<f64>>,
     /// The cycling detection of both simplex phases (see [`cycling`]).
     cycle_guard: CycleGuard,
 
@@ -678,6 +699,7 @@ impl Solver {
             working_mins: Vec::new(),
             working_maxs: Vec::new(),
             bounds_modified: false,
+            primal_start: None,
             cycle_guard: CycleGuard::default(),
             // Set below, with the slacks' values.
             is_primal_feasible: false,
@@ -3118,12 +3140,19 @@ impl Solver {
         // entry bounds the step and can be the pivot. A step that nothing
         // above the tolerance bounds, toward an infinite bound, would leave
         // such a var past its bound by an unbounded amount, which no shift
-        // makes good: the column is refined twice, and every entry beyond the
-        // error the refinement measured for it bounds the step, however small
-        // ([`Self::refine_pivot_col`]). So the column is an unbounded ray only
-        // where every blocking entry is zero within its measured error, as a
-        // row proves infeasibility only within its multipliers' measured
-        // error ([`Self::proof_of`]).
+        // makes good: the column is refined twice, and every entry beyond its
+        // error bounds the step, however small: the error the refinement
+        // measured for it, plus the round-off floor below which the
+        // refinement cannot tell it from zero ([`Self::refined_col_floors`]).
+        // No entry inside the residual-roundoff floor can justify a pivot,
+        // which could leave the basis singular: it may be a genuine blocker
+        // whose sign the arithmetic cannot tell. A column blocked only by such
+        // entries is retried on a stronger fresh factorization; there it is a
+        // ray where no entry of unresolved sign, blocking or not, can take its
+        // basic var from the point the phase started on past a bound by more
+        // than its tolerance before the entering var reaches the magnitude
+        // taken for infinite ([`Self::unresolved_entries_leave_a_ray`]), and
+        // the solve fails loudly otherwise.
         let pivot_tol = primal_pivot_tolerance(self.basis_solver.eta_matrices.len());
         let max_step = (entering_other_val - entering_cur_val).abs();
         let mut choice =
@@ -3132,10 +3161,78 @@ impl Solver {
             });
         let refined = choice.is_none() && entering_other_val.is_infinite();
         if refined {
-            let errors = self.refine_pivot_col(entering_c)?;
+            let mut column = self.refine_pivot_col(entering_c)?;
+            let converged = column.errors.is_some();
+            let mut errors = column
+                .errors
+                .take()
+                .unwrap_or_else(|| vec![0.0; self.num_constraints()]);
+            // The floor of an entry beyond its measured error that moves its
+            // basic var toward a finite bound: no other entry can bound the
+            // step.
+            let (rows, entries): (Vec<usize>, Vec<f64>) = self
+                .col_coeffs
+                .iter()
+                .filter(|&(r, &coeff)| {
+                    let bound = if moves_up(entering_diff_sign, coeff) {
+                        self.basic_var_maxs[r]
+                    } else {
+                        self.basic_var_mins[r]
+                    };
+                    coeff.abs() > errors[r] && bound.is_finite()
+                })
+                .map(|(r, &coeff)| (r, coeff))
+                .unzip();
+            let var = self.nb_vars[entering_c];
+            let floors = self.refined_col_floors(var, &rows, &column)?;
+            let mut unresolved = Vec::new();
+            for ((&r, entry), floor) in rows.iter().zip(entries).zip(floors) {
+                errors[r] = proof::add_up(errors[r], floor);
+                if entry.abs() <= errors[r] {
+                    unresolved.push((r, entry));
+                    debug!(
+                        "primal ratio test: entry {entry:e} of var {var} in row {r} is within the \
+                         round-off floor {floor:e} of the refined column; its sign is unresolved"
+                    );
+                }
+            }
             choice = self.primal_harris(entering_diff_sign, max_step, harris_scale, |r, coeff| {
-                coeff.abs() > errors.as_ref().map_or(0.0, |errors| errors[r])
+                coeff.abs() > errors[r]
             });
+            // A residual-roundoff allowance says an entry is unresolved, not
+            // that it is zero: it cannot justify a pivot on that entry, nor a
+            // ray unless it is negligible over the whole step. Retry on a
+            // stronger fresh factorization first; there, only a refinement
+            // that converged measured the error such a ray needs, and the ray
+            // covers every other entry whose sign is open too.
+            if choice.is_none() {
+                if let Some(&(row, _)) = unresolved.last() {
+                    if self.can_renew_factorization() {
+                        return Ok(PivotChoice::Inconsistent { row });
+                    }
+                    if converged {
+                        let mut open = unresolved.clone();
+                        open.extend(self.other_entries_of_open_sign(
+                            var,
+                            &column,
+                            &rows,
+                            &mut errors,
+                        )?);
+                        if self.unresolved_entries_leave_a_ray(entering_c, &open, &errors) {
+                            debug!(
+                                "primal ratio test: no entry of var {var}'s column of unresolved \
+                                 sign takes its basic var beyond its tolerance up to the infinite \
+                                 magnitude: a ray"
+                            );
+                            return Ok(PivotChoice::Unbounded);
+                        }
+                    }
+                    return Err(Error::InternalError(format!(
+                        "primal simplex: a nonzero blocking entry of var {var} in row {row} \
+                         is unresolved within residual round-off; unboundedness cannot be determined"
+                    )));
+                }
+            }
         }
 
         if let Some((row, mut leaving_new_val, pivot_coeff)) = choice {
@@ -3267,9 +3364,7 @@ impl Solver {
         harris_scale: f64,
         takes_part: impl Fn(usize, f64) -> bool,
     ) -> Option<(usize, f64, f64)> {
-        // leaving_diff = -entering_diff * coeff: whether the basic var of a
-        // row with this entry moves towards its max as the entering var moves.
-        let moves_up = |coeff: f64| (entering_up && coeff < 0.0) || (!entering_up && coeff > 0.0);
+        let moves_up = |coeff: f64| moves_up(entering_up, coeff);
         // How far the basic var of row `r` is from the (working) bound it
         // moves towards: negative when it already sits past that bound
         // (within its tolerance), infinite when that bound is.
@@ -3347,13 +3442,14 @@ impl Solver {
     /// basic columns, and adds the solution to the column, kept in doubled
     /// precision. The refined column replaces `col_coeffs`.
     ///
-    /// Returns the bound on each entry's error, its second correction, where
-    /// the refinement converged ([`refinement_error`]), and `None` where it
-    /// did not, when no entry can be told from zero but an exact zero. A
-    /// number of the refinement that is not finite is an `InternalError`: a
-    /// breakdown, which the ratio test would otherwise take for an unbounded
-    /// ray.
-    fn refine_pivot_col(&mut self, entering_c: usize) -> Result<Option<Vec<f64>>, Error> {
+    /// Returns the refined values, each entry's measured second-correction
+    /// error where the refinement converged ([`refinement_error`]), and the
+    /// arithmetic discarded in both steps. The ratio test carries that
+    /// round-off into the residual floor ([`Self::refined_col_floors`]), below
+    /// which no correction measures anything. A number of the refinement
+    /// that is not finite is an `InternalError`: a breakdown, which the ratio
+    /// test would otherwise take for an unbounded ray.
+    fn refine_pivot_col(&mut self, entering_c: usize) -> Result<RefinedColumn, Error> {
         let num_rows = self.num_constraints();
         let var = self.nb_vars[entering_c];
         let mut alpha = vec![CDouble::default(); num_rows];
@@ -3361,14 +3457,18 @@ impl Solver {
             alpha[r] = CDouble::from(coeff);
         }
         let mut second = Vec::new();
+        let mut residual_roundoff = vec![0.0; num_rows];
+        let mut value_roundoff = vec![0.0; num_rows];
         for _ in 0..2 {
-            let correction = self.pivot_col_correction(var, &alpha).ok_or_else(|| {
-                Error::InternalError(format!(
-                    "primal simplex: the refinement of the column of var {var} is not finite"
-                ))
-            })?;
-            for (a, &c) in alpha.iter_mut().zip(&correction) {
-                a.add(c);
+            let (correction, discarded) =
+                self.pivot_col_correction(var, &alpha).ok_or_else(|| {
+                    Error::InternalError(format!(
+                        "primal simplex: the refinement of the column of var {var} is not finite"
+                    ))
+                })?;
+            for (r, (a, &c)) in alpha.iter_mut().zip(&correction).enumerate() {
+                residual_roundoff[r] = proof::add_up(residual_roundoff[r], discarded[r]);
+                value_roundoff[r] = proof::add_up(value_roundoff[r], a.add_with_error(c));
             }
             second = correction;
         }
@@ -3385,7 +3485,21 @@ impl Solver {
             }
         }
         refined.to_sparse_vec(&mut self.col_coeffs);
-        Ok(refinement_error(&alpha, &second))
+        let (_, final_roundoff) = self.pivot_col_residual(var, &alpha);
+        for r in 0..num_rows {
+            residual_roundoff[r] = proof::add_up(residual_roundoff[r], final_roundoff[r]);
+            if !residual_roundoff[r].is_finite() || !value_roundoff[r].is_finite() {
+                return Err(Error::InternalError(format!(
+                    "primal simplex: the residual round-off of the column of var {var} is not finite"
+                )));
+            }
+        }
+        Ok(RefinedColumn {
+            errors: refinement_error(&alpha, &second),
+            values: alpha,
+            residual_roundoff,
+            value_roundoff,
+        })
     }
 
     /// The correction of one step of [`Self::refine_pivot_col`] for the
@@ -3394,21 +3508,14 @@ impl Solver {
     /// solve, exactly, by the power of two that puts its largest entry in
     /// `[1, 2)`; zero where the residual is, and `None` where it is not
     /// finite.
-    fn pivot_col_correction(&mut self, var: usize, alpha: &[CDouble]) -> Option<Vec<f64>> {
-        let num_rows = self.num_constraints();
-        let mut residual = vec![CDouble::default(); num_rows];
-        //guaranteed to be a valid index
-        for (r, &a) in self.orig_constraints_csc.outer_view(var).unwrap().iter() {
-            residual[r].add(a);
-        }
-        for (k, &basic) in self.basic_vars.iter().enumerate() {
-            if alpha[k].value() == 0.0 {
-                continue;
-            }
-            //guaranteed to be a valid index
-            for (r, &a) in self.orig_constraints_csc.outer_view(basic).unwrap().iter() {
-                residual[r].add_scaled(alpha[k], -a);
-            }
+    fn pivot_col_correction(
+        &mut self,
+        var: usize,
+        alpha: &[CDouble],
+    ) -> Option<(Vec<f64>, Vec<f64>)> {
+        let (residual, roundoff) = self.pivot_col_residual(var, alpha);
+        if roundoff.iter().any(|error| !error.is_finite()) {
+            return None;
         }
         let mut correction: Vec<f64> = residual.iter().map(|r| r.value()).collect();
         let norm = correction.iter().fold(0.0f64, |m, c| m.max(c.abs()));
@@ -3421,7 +3528,177 @@ impl Solver {
             self.basis_solver.solve_dense_with_etas(&mut correction);
             correction.iter_mut().for_each(|c| *c /= scale);
         }
-        Some(correction)
+        Some((correction, roundoff))
+    }
+
+    /// Evaluate the compensated residual with the same arithmetic used by
+    /// refinement, accounting for every discarded low-part operation and
+    /// its final conversion to f64.
+    fn pivot_col_residual(&self, var: usize, alpha: &[CDouble]) -> (Vec<CDouble>, Vec<f64>) {
+        let mut residual = vec![CDouble::default(); self.num_constraints()];
+        let mut roundoff = vec![0.0; self.num_constraints()];
+        for (i, &a) in self.orig_constraints_csc.outer_view(var).unwrap().iter() {
+            roundoff[i] = proof::add_up(roundoff[i], residual[i].add_with_error(a));
+        }
+        for (k, &basic) in self.basic_vars.iter().enumerate() {
+            if alpha[k].value() == 0.0 {
+                continue;
+            }
+            for (i, &a) in self.orig_constraints_csc.outer_view(basic).unwrap().iter() {
+                let e = residual[i].add_scaled_with_error(alpha[k], -a);
+                roundoff[i] = proof::add_up(roundoff[i], e);
+            }
+        }
+        for (r, error) in roundoff.iter_mut().enumerate() {
+            *error = proof::add_up(*error, residual[r].value_error());
+        }
+        (residual, roundoff)
+    }
+
+    /// The arithmetic discarded while evaluating the refined column's
+    /// residual, carried into each requested entry through an approximate
+    /// row of the basis inverse. Unlike a worst-case magnitude allowance,
+    /// this measures each low-part addition and product: exact arithmetic
+    /// has no discarded error even when a genuine entry is extremely small.
+    /// Residual round-off from both refinement steps, round-off of adding
+    /// their corrections, and the column's final rounding are included too.
+    ///
+    /// The inverse row comes from the floating-point factorization, so this
+    /// remains a numerical estimate. An entry inside this floor is unresolved:
+    /// it cannot be used to pivot, and leaves a ray only where it is
+    /// negligible over the step to the magnitude taken for infinite
+    /// ([`Self::unresolved_entries_leave_a_ray`]).
+    /// A floor that is not finite is a loud error.
+    fn refined_col_floors(
+        &mut self,
+        var: usize,
+        rows: &[usize],
+        column: &RefinedColumn,
+    ) -> Result<Vec<f64>, Error> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let roundoff = &column.residual_roundoff;
+        rows.iter()
+            .map(|&row| {
+                let floor: f64 = self
+                    .basis_solver
+                    .solve_transp(std::iter::once((row, &1.0)))
+                    .iter()
+                    .map(|(i, &rho)| proof::residual_error_product(rho.abs(), roundoff[i]))
+                    .fold(
+                        proof::add_up(column.value_roundoff[row], column.values[row].value_error()),
+                        proof::add_up,
+                    );
+                if floor.is_finite() {
+                    Ok(floor)
+                } else {
+                    Err(Error::InternalError(format!(
+                        "primal simplex: the round-off floor of the column of var {var} in row \
+                     {row} is not finite"
+                    )))
+                }
+            })
+            .collect()
+    }
+
+    /// The nonzero entries (row, value) of the refined column of `var` beside
+    /// the `floored` rows whose basic var has a finite bound and whose sign the
+    /// refinement leaves open: within their measured error and round-off floor
+    /// ([`Self::refined_col_floors`]), which `errors` gains. The primal ratio
+    /// test passes such an entry as zero, or as moving its var toward an
+    /// infinite bound, so a ray past unresolved entries covers it too.
+    fn other_entries_of_open_sign(
+        &mut self,
+        var: usize,
+        column: &RefinedColumn,
+        floored: &[usize],
+        errors: &mut [f64],
+    ) -> Result<Vec<(usize, f64)>, Error> {
+        let mut skip = vec![false; self.num_constraints()];
+        floored.iter().for_each(|&r| skip[r] = true);
+        let (rows, entries): (Vec<usize>, Vec<f64>) = self
+            .col_coeffs
+            .iter()
+            .filter(|&(r, _)| {
+                !skip[r]
+                    && (self.basic_var_mins[r].is_finite() || self.basic_var_maxs[r].is_finite())
+            })
+            .map(|(r, &coeff)| (r, coeff))
+            .unzip();
+        let floors = self.refined_col_floors(var, &rows, column)?;
+        let mut open = Vec::new();
+        for ((&r, entry), floor) in rows.iter().zip(entries).zip(floors) {
+            errors[r] = proof::add_up(errors[r], floor);
+            if entry.abs() <= errors[r] {
+                open.push((r, entry));
+            }
+        }
+        Ok(open)
+    }
+
+    /// Whether the refined column of `entering_c` is a ray within the
+    /// tolerances from the point the phase started on, which the verification
+    /// accepted ([`Self::primal_start`]; none without it), where its only
+    /// entries that could bound the step are the `open` ones (row, value),
+    /// whose sign the refinement leaves open, each within its error in `errors`
+    /// (of a refinement that converged). Whatever its sign, such an entry is at
+    /// most `|value| + error`, and the entering var moves at most `2^52` of its
+    /// user units plus its magnitude (at the start or now, the larger) before
+    /// it reaches the magnitude taken for infinite ([`INFINITE_BOUND`]): over
+    /// that step, the product rounded up, the entry must move its basic var by
+    /// no more than the room the start leaves it to the edge of the tolerance
+    /// of each finite bound in force ([`band_edge`]; a slack's value and
+    /// tolerance its row's at the start), rounded down, so that the var stays
+    /// within its tolerances all along.
+    fn unresolved_entries_leave_a_ray(
+        &self,
+        entering_c: usize,
+        open: &[(usize, f64)],
+        errors: &[f64],
+    ) -> bool {
+        let Some(start) = &self.primal_start else {
+            return false;
+        };
+        let var = self.nb_vars[entering_c];
+        // One user unit of the entering var in the engine's units.
+        let unit = if var < self.num_vars {
+            1.0 / self.col_scales[var]
+        } else {
+            self.row_scales[var - self.num_vars]
+        };
+        let entering_magnitude = self.nb_var_vals[entering_c].abs().max(start[var].abs());
+        let horizon = proof::add_up(INFINITE_BOUND * unit, entering_magnitude);
+        open.iter().all(|&(r, entry)| {
+            let basic = self.basic_vars[r];
+            let (val, tols) = if basic < self.num_vars {
+                (start[basic], self.var_tols[basic])
+            } else {
+                // A slack at the start is its row's, summed as the row check
+                // sums it, whether it was basic there or not.
+                let row = basic - self.num_vars;
+                //guaranteed to be a valid index
+                let terms = self.orig_constraints.outer_view(row).unwrap();
+                let (val, magnitude) = implied_slack(
+                    self.orig_rhs[row],
+                    terms
+                        .iter()
+                        .filter(|&(v, _)| v < self.num_vars)
+                        .map(|(v, &coeff)| (coeff, start[v])),
+                );
+                (val, self.slack_tols(row, magnitude))
+            };
+            let (min, max) = (self.orig_var_mins[basic], self.orig_var_maxs[basic]);
+            let mut room = f64::INFINITY;
+            if min.is_finite() {
+                room = room.min(-proof::add_up(band_edge(min, tols.lo, false), -val));
+            }
+            if max.is_finite() {
+                room = room.min(-proof::add_up(val, -band_edge(max, tols.hi, true)));
+            }
+            let drift = (proof::add_up(entry.abs(), errors[r]) * horizon).next_up();
+            room > 0.0 && drift <= room
+        })
     }
 
     /// The row to leave the basis: the violated row with the best dual

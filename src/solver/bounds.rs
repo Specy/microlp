@@ -66,14 +66,21 @@ impl Solver {
         }
     }
 
-    /// Start a primal phase: perturb the bounds ([`Self::perturb_bounds`])
-    /// unless the phase is a cleanup (`cleanup`, see `run_phases`) or starts
-    /// near optimal, shift the bound of every basic var outside its working
-    /// bounds ([`Self::correct_primal`]), and start the cycling detection. A
+    /// Start a primal phase: keep the values it starts from where the
+    /// verification accepted them ([`Self::primal_start`]), perturb the
+    /// bounds ([`Self::perturb_bounds`]) unless the phase is a cleanup
+    /// (`cleanup`, see `run_phases`) or starts near optimal, shift the bound
+    /// of every basic var outside its working bounds
+    /// ([`Self::correct_primal`]), and start the cycling detection. A
     /// perturbation whose optimum is a few pivots away costs more in the
     /// cleanup than it saves, hence the near-optimal test.
     pub(super) fn begin_primal_phase(&mut self, cleanup: bool) {
         debug_assert!(!self.bounds_modified, "a primal phase is already running");
+        self.primal_start = (!self.values_dirty && self.is_primal_feasible).then(|| {
+            (0..self.num_total_vars())
+                .map(|var| self.internal_value(var))
+                .collect()
+        });
         let mut num_dual_infeasible = 0usize;
         let mut max_dual_infeasibility = 0.0f64;
         for (c, (state, &d)) in self
@@ -257,6 +264,7 @@ impl Solver {
     /// dual phase would take the var off its bound again, round after round.
     pub(super) fn end_primal_phase(&mut self) -> Result<(), Error> {
         self.cycle_guard.stop();
+        self.primal_start = None;
         let mut moved = 0usize;
         for c in 0..self.nb_vars.len() {
             let var = self.nb_vars[c];

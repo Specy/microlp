@@ -25,8 +25,10 @@ pub(crate) enum PivotChoice {
     /// highest threshold the pivot is taken with the column's element; a
     /// basis it leaves singular is repaired at the next factorization.
     Inconsistent { row: usize },
-    /// No entry bounds the step toward the entering var's infinite bound: an
-    /// unbounded ray, if the reduced cost that priced the var is fresh.
+    /// No entry bounds the step toward the entering var's infinite bound, and
+    /// no entry the refinement cannot resolve takes its var past its
+    /// tolerances before the magnitude taken for infinite: an unbounded ray,
+    /// if the reduced cost that priced the var is fresh.
     Unbounded,
     /// The entering var's reduced cost, recomputed from its column, no longer
     /// improves the objective: the value that priced it had drifted. The

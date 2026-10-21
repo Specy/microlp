@@ -31,7 +31,9 @@ use super::tolerances::{slack_bounds, trivial_row_verdict, valid_rhs};
 /// (both pinned in `src/tests/regressions.rs`). The threshold is on the bound
 /// as given, not on `|a| B`, so a var whose rows could resolve a bound beyond
 /// it loses the bound all the same (`max x` s.t. `1e-8 x ≤ 1e9`, `x ≤ 1e16`
-/// gives `x = 1e17`).
+/// gives `x = 1e17`). It also ends the step over which an entry the primal
+/// ratio test cannot resolve must be negligible for a ray
+/// (`Solver::unresolved_entries_leave_a_ray`).
 pub(crate) const INFINITE_BOUND: f64 = 4_503_599_627_370_496.0; // 2^52
 
 /// Power-of-two row equilibration keeps the largest structural coefficient
