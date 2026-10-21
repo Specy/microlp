@@ -109,6 +109,23 @@ These normalizations happen at the boundary and hold everywhere inside:
   `x ≤ 5e15` is `Unbounded`), even where small coefficients would let the rows resolve it.
   Both sides are pinned in `src/tests/regressions.rs`. A row's right-hand side is not cut
   off: it is used as given, so the same `x ≤ 5e15` written as a row binds.
+- **Invalid input is refused where it enters.** Every number must be finite, but a bound or a
+  right-hand side may be infinite on the side it leaves open. `Problem::solve_with` refuses,
+  with `InvalidOperation` and before presolve and the engine, the first number of the model
+  that breaks this (`Problem::validate`): an objective or constraint coefficient that is NaN
+  or infinite, a NaN bound or right-hand side, a lower bound of `+∞`, an upper bound of `−∞`,
+  a right-hand side infinite on the side its row bounds (`−∞` on `≤`, `+∞` on `≥`, either on
+  `=`); then a warm-start hint that names a var outside the problem or gives a value that is
+  not finite (`Problem::validate_hint`). `Solution::add_constraint` refuses such a row
+  (`check_row`) and a malformed one, `Solution::fix_var` a value that is not finite. The
+  message names the value as given (`entry_bounds` leaves every refused bound as written).
+  So the input holds no NaN, and an infinite bound or right-hand side means no bound or no
+  constraint on that side. Arithmetic on magnitudes far outside the recommended range can
+  still overflow `f64`: that is caught where rows and bounds enter the engine (`prepare_row`,
+  `Solver::set_var_bounds`) and reported as `InternalError`, never as `Infeasible`, while
+  presolve gives back as written a row whose rewrite overflows (§7.4). The bounds at
+  presolve's entry and in `Solver::try_new` are valid by construction, which a debug
+  assertion checks.
 - **Every constraint row gets a slack variable.** A row `a·x ≤ b` becomes `a·x + s = b`
   with `s ∈ [0, +∞)`; `≥` gives `s ∈ (−∞, 0]`; `=` gives `s ∈ [0,0]`. So the `Solver`'s
   variable universe is `num_vars` *structural* variables followed by one slack per row
@@ -147,10 +164,12 @@ These normalizations happen at the boundary and hold everywhere inside:
 `prepare_row` is the single row-normalization contract used by both `Solver::try_new` and
 incremental `Solver::add_constraint`. It settles the rows whose data alone decide them
 (`trivial_row_verdict`, which presolve applies too: an empty row is held to the contract at
-activity zero, an infinite right-hand side is no constraint on the side the row leaves open
-and unsatisfiable on the side it constrains, and a NaN or an infinite coefficient makes a
-row no point satisfies), computes the power-of-two scale, scales coefficients and the
-right-hand side together, and derives slack bounds.
+activity zero, and an infinite right-hand side, which lies on the side the row leaves open,
+is no constraint), computes the power-of-two scale, scales coefficients and the
+right-hand side together, and derives slack bounds. A right-hand side that is NaN or
+infinite on the side the row bounds, or a coefficient its scaling makes infinite (a row
+added with columns scaled for the rows before it, a fixed var's term beside tiny ones), is
+an `InternalError`.
 The two callers still own their genuinely different work: initial matrix/basis construction
 versus extending a live matrix and repairing the current basis.
 
@@ -227,9 +246,10 @@ fell outside. Non-basic variable: move it to the new bound its state names (a va
 fixed goes to the bound at which its reduced cost is dual feasible, and one between its
 bounds stays where it is if they still hold it), and propagate the delta into the basic
 values through the variable's column (same mechanism as `fix_var`). Crossing bounds
-(`min > max`) or either bound being NaN returns `Err(Infeasible)` with state untouched.
-Infinite bounds remain valid. It does **not** run simplex — callers decide when to
-reoptimize.
+(`min > max`) return `Err(Infeasible)`, and a bound that is NaN or, in the engine's scaled
+units, a lower bound of `+∞` or an upper bound of `−∞` returns `Err(InternalError)`, both
+with state untouched. Infinite bounds on their open side remain valid. It does **not** run
+simplex — callers decide when to reoptimize.
 
 *Why this is the branching primitive:* tightening a bound leaves every reduced cost
 untouched, so the current basis stays **dual feasible** — re-solving is a short dual-simplex
@@ -427,7 +447,7 @@ bound tolerance, §7.2). Every solver-produced candidate enters `try_adopt_incum
 takes the values as the engine computed them (nothing is rounded) and applies one validation
 funnel:
 
-1. `candidate_variables_feasible` rejects malformed lengths, non-finite values, invalid
+1. `candidate_variables_feasible` rejects malformed lengths, non-finite values, crossed
    bounds, violations of the model's bounds (the root's: a warm-start hint fixes a variable
    up to `HINT_BOUNDS_SLACK` outside them, so the node's are not always within them), and
    integer variables off their integer by more than `int_tol`.
@@ -524,7 +544,9 @@ LP-complete the rest, and if the completion is integral, adopt it **through the 
 feasibility guard as every other incumbent** — hints get no shortcut. Then restore the root
 state (bounds back, root basis reloaded, everything recomputed, and re-solved, which only
 verifies it unless the load had to repair it) so the search starts from the true
-relaxation. Hints are advisory by design: unknown variables, out-of-range values,
+relaxation. A hint that names a variable outside the problem or gives a value that is not
+finite is invalid input, refused by `Problem::solve_with` (§2). Beyond that, hints are
+advisory by design: out-of-range values, values the engine's scaled units cannot hold,
 infeasible or fractional completions, and completions that fail with an engine error all
 just drop the hint with a debug log — a bad hint must never break a solve.
 Dropping one costs at most speed, since the search solves the whole model without it (a node
@@ -587,6 +609,8 @@ Timing is centralized without hiding the entry points' different policies:
   `time_limit`, `node_limit`, and `mip_gap` values; `None` means unlimited budgets or no gap
   target. Plain `resume()` instead passes back the options used by the immediately preceding
   solve or resume call.
+- Every deadline is the call's start plus its limit (`deadline_after`); a limit too long to
+  add to the clock, such as `Duration::MAX`, is no limit.
 
 MIP interruption points, in loop order, are: empty open list; when a positive gap target is
 active, exact incumbent/bound equality and then the gap target; deadline; then node budget.
@@ -651,9 +675,9 @@ let outcome = outcome.resume_with(ResumeOptions::default())?;
 Reading values: `var_value`/`iter`/indexing return the values as the engine computed them:
 the incumbent's for a MILP with an incumbent, the optimal live working values for a pure LP.
 An integer variable's value lies within `int_tol` of an integer, not necessarily on it, and a
-fixed one's on it (round it where an exact integer is needed, §5.4);
-`var_value_raw` is a deprecated alias of `var_value`. Interrupted outcomes expose no
-answer-value accessors.
+fixed one's on it (round it where an exact integer is needed, §5.4; `var_domain`, on the
+`Problem` and on the `Solution`, tells which variables are integer or boolean). Interrupted
+outcomes expose no answer-value accessors.
 
 ---
 
@@ -937,7 +961,9 @@ decision is made in user units against the engine's contract:
 - a big-M row rewritten by coefficient tightening admits no point beyond the row's contract
   and keeps every point of its budget whose rewritten binaries are exactly at one: its
   binding branch is relaxed by the contract the rewrites take out of it, and its bound
-  derived from the one as written in compensated arithmetic, rounded outward;
+  derived from the one as written in compensated arithmetic, rounded outward; where that
+  arithmetic overflows `f64`, the row is given back as written (`Work::hold_rewrites`), which
+  keeps every point, since a rewrite only tightens the relaxation;
 - a row whose vars are all fixed is judged as the boundary judges it once dropped: as
   written, by `row_violation`, against the full contract.
 
@@ -1238,7 +1264,8 @@ it must give no wrong answer.
 
 | Situation | Behavior |
 |---|---|
-| An objective coefficient is NaN or infinite | `InvalidOperation` from `solve_with`, before presolve and the engine (the value as the user gave it, with the var's index) |
+| A number of the model no solve can take (§2), a warm-start hint naming a var outside the problem or giving a value that is not finite, a row added to a solution that repeats a var or names one outside the problem, a `fix_var` value that is not finite | `InvalidOperation` from the call, before presolve and the engine (the value as the user gave it, with the var's index or the constraint's) |
+| A row or a bound whose magnitudes overflow `f64` in the engine's scaled units (a model far outside the recommended range) | `InternalError` where it enters the engine (`prepare_row`, `Solver::set_var_bounds`), never `Infeasible`; a presolve rewrite that overflows gives its row back as written (§7.4) |
 | Root LP unbounded on a MILP | run a resumable zero-objective integer-feasibility search; any integer point proves `Unbounded`, exhaustion proves `Infeasible` |
 | Node LP infeasible | prune (correct: the engine returns `Infeasible` only on a proof, §7.3) |
 | A violated row no var can repair and whose certificate proves nothing, after the rebuild, the taboo and the last resorts | one solve from the slack basis, then `InternalError`, never `Infeasible`; on a node LP, the search's own slack-basis retry too |
@@ -1258,7 +1285,7 @@ it must give no wrong answer.
 | Limit with no incumbent | `SolveOutcome::Interrupted`; only reason, stats, and resume are exposed |
 | Search exhausted, no incumbent | `Err(Infeasible)` |
 | Presolve finds the model infeasible | solve the model as written, without presolve (debug log): the engine or the search decides |
-| Warm-start hint invalid, out of range, infeasible, fractional, or limited, or its LP completion fails with an engine error | hint dropped (debug log), root bounds and basis restored, solve proceeds cold |
+| Warm-start hint out of range or beyond the engine's scaled units, infeasible, fractional, or limited, or its LP completion fails with an engine error | hint dropped (debug log), root bounds and basis restored, solve proceeds cold |
 | Error while restoring the root after a warm start | propagated: it belongs to the main search |
 | Edit makes the problem infeasible | `Err(Infeasible)` from the re-solve — on the *composed base problem*, never on leaf state |
 

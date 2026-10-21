@@ -7,7 +7,7 @@
 
 use crate::{ComparisonOp, CsVec, Error};
 
-use super::tolerances::{slack_bounds, trivial_row_verdict};
+use super::tolerances::{slack_bounds, trivial_row_verdict, valid_rhs};
 
 /// A variable bound at or beyond this magnitude on its side of infinity (a
 /// lower bound at or below `-INFINITE_BOUND`, an upper bound at or above it)
@@ -224,6 +224,14 @@ pub(crate) struct PreparedRow {
 /// storage. A row that every point satisfies (an empty row within the
 /// contract, an infinite right-hand side on the open side) is `None`; one
 /// that no point satisfies (see [`trivial_row_verdict`]) is `Infeasible`.
+///
+/// Every row enters the engine here, its coefficients scaled by their
+/// columns' factors. A right-hand side that is NaN or infinite on the side
+/// the row bounds, or a coefficient the scaling makes infinite, is an
+/// `InternalError`: the model's validation refuses the first, so only
+/// arithmetic on magnitudes far outside the recommended range makes either
+/// (a row added with columns scaled for the rows before it, a fixed var's
+/// term beside tiny ones).
 pub(crate) fn prepare_row(
     mut coeffs: CsVec,
     cmp_op: ComparisonOp,
@@ -231,6 +239,11 @@ pub(crate) fn prepare_row(
     feasibility: f64,
     is_fixed: impl Fn(usize) -> bool,
 ) -> Result<Option<PreparedRow>, Error> {
+    if !valid_rhs(cmp_op, rhs) {
+        return Err(Error::InternalError(format!(
+            "a {cmp_op:?} row reached the engine with the right-hand side {rhs}"
+        )));
+    }
     match trivial_row_verdict(&coeffs, cmp_op, rhs, feasibility) {
         Some(true) => return Ok(None),
         Some(false) => return Err(Error::Infeasible),
@@ -240,6 +253,11 @@ pub(crate) fn prepare_row(
     let row_scale = equilibration_scale(&coeffs, rhs, is_fixed);
     if row_scale != 1.0 {
         coeffs.map_inplace(|coeff| coeff * row_scale);
+    }
+    if let Some((var, coeff)) = coeffs.iter().find(|(_, coeff)| !coeff.is_finite()) {
+        return Err(Error::InternalError(format!(
+            "a row's coefficient of variable {var} is not finite once scaled: {coeff}"
+        )));
     }
     let (slack_var_min, slack_var_max) = slack_bounds(cmp_op);
     Ok(Some(PreparedRow {
@@ -262,7 +280,10 @@ pub(crate) fn prepare_row(
 /// written: its far bound does not lie beyond its near one, so it is the
 /// var's value or a contradiction, not a stand-in for infinity, and a var
 /// fixed out there stays fixed, an empty range out there stays infeasible. A
-/// NaN bound fails every comparison and stays NaN, for the solve to refuse.
+/// bound the solve refuses (a NaN one, a lower bound of `+∞`, an upper bound
+/// of `-∞`; `Problem::solve_with`) stays as written, so it is reported as
+/// given: only a lower bound is ever made `-∞`, an upper bound `+∞`, and a
+/// NaN fails every comparison.
 ///
 /// Applied once, where a var's bounds enter the crate (`Problem`'s
 /// `internal_add_var` stores them so), so that presolve, the engine and every

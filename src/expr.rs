@@ -46,7 +46,9 @@ impl LinearExpr {
     ///
     /// Terms may be added in any order, but each variable may appear only once.
     /// Passing an expression with repeated variables to
-    /// [`Problem::add_constraint`](crate::Problem::add_constraint) will panic.
+    /// [`Problem::add_constraint`](crate::Problem::add_constraint) will panic;
+    /// [`Solution::add_constraint`](crate::Solution::add_constraint) returns
+    /// [`Error::InvalidOperation`](crate::Error::InvalidOperation) for it.
     pub fn add(&mut self, var: Variable, coeff: f64) {
         self.vars.push(var.0);
         self.coeffs.push(coeff);

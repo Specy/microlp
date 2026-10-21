@@ -304,10 +304,13 @@ pub(crate) fn try_warm_start(
 
     for &(var, val) in hints {
         let v = var.idx();
-        if v >= state.solver.num_vars || !val.is_finite() {
-            ok = false;
-            break;
-        }
+        // The solve refuses a hint naming a var outside the problem or with a
+        // value that is not finite (`Problem::solve_with`), and an edit's hint
+        // is a validated incumbent.
+        debug_assert!(
+            v < state.solver.num_vars && val.is_finite(),
+            "a hint the solve's validation refuses reached the search"
+        );
         let val = if matches!(
             domains.get(v),
             Some(VarDomain::Integer | VarDomain::Boolean)
@@ -321,10 +324,12 @@ pub(crate) fn try_warm_start(
             ok = false;
             break;
         }
-        state
-            .solver
-            .set_var_bounds(v, val, val)
-            .expect("fixing to [val, val] cannot cross");
+        // A value the engine's scaled units cannot hold is no usable hint
+        // either.
+        if state.solver.set_var_bounds(v, val, val).is_err() {
+            ok = false;
+            break;
+        }
         applied.push(v);
     }
 
@@ -357,9 +362,7 @@ pub(crate) fn try_warm_start(
             }
         }
     } else {
-        debug!(
-            "warm-start hint invalid (unknown variable, non-finite value, or out of bounds); ignored"
-        );
+        debug!("warm-start hint out of bounds or beyond the engine's units; ignored");
     }
 
     // Restore the root state: bounds back, then the optimal root basis

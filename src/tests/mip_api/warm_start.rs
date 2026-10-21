@@ -1,5 +1,6 @@
-//! `SolveOptions::warm_start`: a usable hint is adopted, and every kind of
-//! unusable hint is ignored rather than trusted.
+//! `SolveOptions::warm_start`: a usable hint is adopted, every kind of
+//! unusable hint is ignored rather than trusted, and an invalid one (a value
+//! that is not finite, a variable outside the problem) is refused.
 
 use super::common::{int_2var_problem, solution};
 use crate::*;
@@ -35,30 +36,65 @@ fn warm_start_out_of_bounds_hint_is_ignored() {
     assert!((sol.objective() - 11.0).abs() < 1e-6);
 }
 
+/// A hint value that is NaN or infinite is invalid input, refused before
+/// anything is solved, on a MILP and on an LP alike.
 #[test]
-fn warm_start_non_finite_hint_is_ignored() {
+fn warm_start_non_finite_hint_is_an_invalid_operation() {
     for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        let (p, a, _) = int_2var_problem();
-        let mut options = SolveOptions::default();
-        options.warm_start = Some(vec![(a, invalid)]);
-        let sol = solution(p.solve_with(options).unwrap());
-        assert_eq!(sol.status(), SolutionStatus::Optimal);
-        assert!((sol.objective() - 11.0).abs() < 1e-6);
+        let (p, a, b) = int_2var_problem();
+        let mut lp = Problem::new(OptimizationDirection::Minimize);
+        let x = lp.add_var(1.0, (0.0, 10.0));
+        for (problem, hint) in [(p, vec![(a, 1.0), (b, invalid)]), (lp, vec![(x, invalid)])] {
+            let mut options = SolveOptions::default();
+            options.warm_start = Some(hint.clone());
+            let index = hint.last().unwrap().0.idx();
+            assert_eq!(
+                problem.solve_with(options).map(|_| "solved"),
+                Err(Error::InvalidOperation(format!(
+                    "invalid warm-start value {invalid} of variable {index}: expected a finite \
+                     value"
+                ))),
+                "{hint:?}"
+            );
+        }
     }
 }
 
 #[test]
-fn warm_start_nan_for_nonbasic_variable_is_ignored() {
+fn warm_start_nan_for_nonbasic_variable_is_an_invalid_operation() {
     let mut problem = Problem::new(OptimizationDirection::Minimize);
     let x = problem.add_integer_var(1.0, (0, 10));
     let mut options = SolveOptions::default();
     options.warm_start = Some(vec![(x, f64::NAN)]);
 
-    let solution = solution(problem.solve_with(options).unwrap());
+    assert_eq!(
+        problem.solve_with(options).map(|_| "solved"),
+        Err(Error::InvalidOperation(
+            "invalid warm-start value NaN of variable 0: expected a finite value".to_string()
+        )),
+    );
+}
 
-    assert_eq!(solution.status(), SolutionStatus::Optimal);
-    assert_eq!(solution.var_value(x), 0.0);
-    assert_eq!(solution.objective(), 0.0);
+/// A hint naming a variable of another problem, whose index this one does not
+/// have, is invalid input too: refused before anything is solved, the
+/// variable before its value.
+#[test]
+fn warm_start_variable_outside_the_problem_is_an_invalid_operation() {
+    let mut other = Problem::new(OptimizationDirection::Minimize);
+    let foreign: Vec<Variable> = (0..3).map(|_| other.add_var(1.0, (0.0, 1.0))).collect();
+    let (p, a, _) = int_2var_problem();
+    let mut lp = Problem::new(OptimizationDirection::Minimize);
+    lp.add_var(1.0, (0.0, 10.0));
+    for (problem, num_vars) in [(p, 2), (lp, 1)] {
+        let mut options = SolveOptions::default();
+        options.warm_start = Some(vec![(a, 1.0), (foreign[2], f64::NAN)]);
+        assert_eq!(
+            problem.solve_with(options).map(|_| "solved"),
+            Err(Error::InvalidOperation(format!(
+                "invalid warm-start hint: variable index 2 is out of range 0..{num_vars}"
+            ))),
+        );
+    }
 }
 
 #[test]

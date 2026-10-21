@@ -21,14 +21,14 @@ pub use options::{
 };
 pub(crate) use state::{MipRun, MipState};
 
-use crate::solver::Solver;
+use crate::solver::{deadline_after, Solver};
 use crate::{Error, OptimizationDirection, Problem, VarDomain, Variable};
 use search::search_loop;
 use std::collections::BTreeMap;
 use web_time::Instant;
 
 fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Error> {
-    let deadline = options.time_limit.map(|d| Instant::now() + d);
+    let deadline = deadline_after(Instant::now(), options.time_limit);
     // Presolve what the search solves; `state.base` stays the user's problem,
     // so post-solve edits keep composing against it. The presolved bounds
     // become the root bounds. Dual fixing can exclude a feasible point, so a
@@ -168,8 +168,6 @@ pub(crate) fn candidate_variables_feasible(
         // The contract on a bound: the same check as the engine's and the LP
         // path's.
         value.is_finite()
-            && !lo.is_nan()
-            && !hi.is_nan()
             && lo <= hi
             && !crate::solver::outside_bounds(value, lo, hi, feasibility)
             && (!matches!(domains[v], VarDomain::Integer | VarDomain::Boolean)
@@ -249,7 +247,7 @@ pub(crate) fn resume_run(
     options: ResumeOptions,
 ) -> Result<TerminationReason, Error> {
     options.validate()?;
-    state.deadline = options.time_limit.map(|d| Instant::now() + d);
+    state.deadline = deadline_after(Instant::now(), options.time_limit);
     state.options.time_limit = options.time_limit;
     state.options.node_limit = options.node_limit;
     state.options.mip_gap = options.mip_gap.unwrap_or(0.0);

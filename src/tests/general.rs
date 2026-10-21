@@ -94,14 +94,12 @@ mod tests_general {
     /// Rows whose data alone decide them get one verdict on every path (pure
     /// LP and MIP, presolve on and off, added to a solved LP): an empty row
     /// has activity zero and is held to the feasibility tolerance like any
-    /// row; an infinite right-hand side is no constraint on the side the row
-    /// leaves open and unsatisfiable on the side it constrains; a NaN
-    /// coefficient or right-hand side, or an infinite coefficient, makes the
-    /// row unsatisfiable.
+    /// row; an infinite right-hand side on the side the row leaves open is no
+    /// constraint (on the other side it is invalid input,
+    /// `invalid_constraint_numbers_are_an_invalid_operation`).
     #[test]
     fn rows_whose_data_decide_them_get_one_verdict_on_every_path() {
         init();
-        let nan = f64::NAN;
         let inf = f64::INFINITY;
         // (coefficient of x, or none for an empty row; sense; rhs; holds)
         let cases = [
@@ -113,12 +111,8 @@ mod tests_general {
             (None, ComparisonOp::Le, -1e-6, false),
             (Some(1.0), ComparisonOp::Le, inf, true),
             (Some(1.0), ComparisonOp::Ge, -inf, true),
-            (Some(1.0), ComparisonOp::Le, -inf, false),
-            (Some(1.0), ComparisonOp::Ge, inf, false),
-            (Some(1.0), ComparisonOp::Eq, inf, false),
-            (Some(1.0), ComparisonOp::Le, nan, false),
-            (Some(nan), ComparisonOp::Le, 1.0, false),
-            (Some(inf), ComparisonOp::Le, 1.0, false),
+            (None, ComparisonOp::Le, inf, true),
+            (None, ComparisonOp::Ge, -inf, true),
         ];
         for (coeff, op, rhs, holds) in cases {
             let expected = if holds {
@@ -162,27 +156,6 @@ mod tests_general {
                 got, expected,
                 "{coeff:?} x {op:?} {rhs}: added to a solved LP"
             );
-        }
-
-        // A NaN bound: `Infeasible` with presolve on and off.
-        for milp in [false, true] {
-            for presolve in [true, false] {
-                let mut problem = Problem::new(OptimizationDirection::Minimize);
-                let x = problem.add_var(1.0, (nan, 10.0));
-                if milp {
-                    problem.add_integer_var(1.0, (0, 0));
-                }
-                problem.add_constraint([(x, 1.0)], ComparisonOp::Eq, 3.0);
-                let got = problem.solve_with(SolveOptions {
-                    presolve,
-                    ..SolveOptions::default()
-                });
-                assert_eq!(
-                    got.map(|_| "solved"),
-                    Err(Error::Infeasible),
-                    "NaN bound: milp {milp}, presolve {presolve}"
-                );
-            }
         }
     }
 
@@ -229,6 +202,250 @@ mod tests_general {
                 }
             }
         }
+    }
+
+    /// Solves `problem` with presolve on and off, expecting
+    /// `InvalidOperation` with `message` both times.
+    fn assert_invalid(problem: &Problem, message: &str, label: &str) {
+        for presolve in [true, false] {
+            let got = problem.solve_with(SolveOptions {
+                presolve,
+                ..SolveOptions::default()
+            });
+            assert_eq!(
+                got.map(|_| "solved"),
+                Err(Error::InvalidOperation(message.to_string())),
+                "{label}, presolve {presolve}"
+            );
+        }
+    }
+
+    /// A NaN bound, a lower bound of `+inf` or an upper bound of `-inf` is
+    /// refused before the solve on every path, the message naming the bound
+    /// as given and its var: `(+inf, +inf)` and `(-inf, -inf)` too, which
+    /// `entry_bounds` keeps as a point, and a NaN beside a bound it makes
+    /// infinite. Solved, a NaN bound fails every comparison against it, and a
+    /// var fixed at an infinity has no value.
+    #[test]
+    fn invalid_bounds_are_an_invalid_operation() {
+        init();
+        let (nan, inf) = (f64::NAN, f64::INFINITY);
+        let lower = |min: f64| {
+            format!("invalid lower bound {min} of variable 1: expected a finite value or -inf")
+        };
+        let upper = |max: f64| {
+            format!("invalid upper bound {max} of variable 1: expected a finite value or inf")
+        };
+        let cases = [
+            ((nan, 10.0), lower(nan)),
+            ((nan, f64::MAX), lower(nan)),
+            ((nan, nan), lower(nan)),
+            ((0.0, nan), upper(nan)),
+            ((-f64::MAX, nan), upper(nan)),
+            ((inf, inf), lower(inf)),
+            ((inf, 5.0), lower(inf)),
+            ((-inf, -inf), upper(-inf)),
+            ((0.0, -inf), upper(-inf)),
+        ];
+        for ((min, max), message) in cases {
+            for direction in [
+                OptimizationDirection::Minimize,
+                OptimizationDirection::Maximize,
+            ] {
+                for milp in [false, true] {
+                    let mut problem = Problem::new(direction);
+                    let y = problem.add_var(1.0, (0.0, 5.0));
+                    let x = problem.add_var(1.0, (min, max));
+                    if milp {
+                        problem.add_integer_var(1.0, (0, 3));
+                    }
+                    problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 1.0);
+                    let label = format!("[{min}, {max}], {direction:?}, milp {milp}");
+                    assert_invalid(&problem, &message, &label);
+                }
+            }
+        }
+    }
+
+    /// A NaN or infinite constraint coefficient, a NaN right-hand side, or an
+    /// infinite one on the side its constraint bounds, is refused before the
+    /// solve on every path, and by an edit that adds such a constraint to an
+    /// LP or a MILP solution: the message names the value as given, its var
+    /// and its constraint, an added one numbered after the problem's.
+    #[test]
+    fn invalid_constraint_numbers_are_an_invalid_operation() {
+        init();
+        let (nan, inf) = (f64::NAN, f64::INFINITY);
+        let coefficient = |coeff: f64| {
+            format!(
+                "invalid coefficient {coeff} of variable 1 in constraint 1: expected a finite value"
+            )
+        };
+        let rhs = |rhs: f64, op: ComparisonOp| {
+            let expected = match op {
+                ComparisonOp::Le => "a finite value or inf",
+                ComparisonOp::Ge => "a finite value or -inf",
+                ComparisonOp::Eq => "a finite value",
+            };
+            format!("invalid right-hand side {rhs} of constraint 1 ({op:?}): expected {expected}")
+        };
+        let cases = [
+            (nan, ComparisonOp::Le, 1.0, coefficient(nan)),
+            (inf, ComparisonOp::Ge, 1.0, coefficient(inf)),
+            (-inf, ComparisonOp::Eq, 1.0, coefficient(-inf)),
+            (1.0, ComparisonOp::Le, nan, rhs(nan, ComparisonOp::Le)),
+            (1.0, ComparisonOp::Ge, nan, rhs(nan, ComparisonOp::Ge)),
+            (1.0, ComparisonOp::Eq, nan, rhs(nan, ComparisonOp::Eq)),
+            (1.0, ComparisonOp::Le, -inf, rhs(-inf, ComparisonOp::Le)),
+            (1.0, ComparisonOp::Ge, inf, rhs(inf, ComparisonOp::Ge)),
+            (1.0, ComparisonOp::Eq, inf, rhs(inf, ComparisonOp::Eq)),
+            (1.0, ComparisonOp::Eq, -inf, rhs(-inf, ComparisonOp::Eq)),
+        ];
+        for (coeff, op, b, message) in cases {
+            for milp in [false, true] {
+                let build = || {
+                    let mut problem = Problem::new(OptimizationDirection::Minimize);
+                    let y = problem.add_var(1.0, (0.0, 5.0));
+                    let x = problem.add_var(1.0, (0.0, 1.0));
+                    if milp {
+                        problem.add_integer_var(1.0, (0, 3));
+                    }
+                    problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 1.0);
+                    (problem, x, y)
+                };
+                let label = format!("{coeff} x {op:?} {b}, milp {milp}");
+                let (mut problem, x, y) = build();
+                problem.add_constraint([(y, 2.0), (x, coeff)], op, b);
+                assert_invalid(&problem, &message, &label);
+
+                let (problem, x, y) = build();
+                let edited = solution(problem.solve().unwrap()).add_constraint(
+                    [(y, 2.0), (x, coeff)],
+                    op,
+                    b,
+                );
+                assert_eq!(
+                    edited.map(|_| "solved"),
+                    Err(Error::InvalidOperation(message.clone())),
+                    "{label}, added to a solution"
+                );
+            }
+        }
+    }
+
+    /// The first invalid number is the one reported: variable by variable
+    /// (its objective coefficient, then its lower and upper bounds), then
+    /// constraint by constraint (its coefficients by variable index, then its
+    /// right-hand side).
+    #[test]
+    fn the_first_invalid_number_is_reported() {
+        let (nan, inf) = (f64::NAN, f64::INFINITY);
+        let assert_first = |problem: &Problem, start: &str| match problem.solve() {
+            Err(Error::InvalidOperation(message)) => {
+                assert!(message.starts_with(start), "{message}")
+            }
+            other => panic!(
+                "{start}: expected InvalidOperation, got {:?}",
+                other.map(|_| "solved")
+            ),
+        };
+
+        // A var's bounds before a later var's objective coefficient, and the
+        // vars before the constraints.
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x = problem.add_var(1.0, (0.0, 1.0));
+        problem.add_var(1.0, (nan, nan));
+        problem.add_var(inf, (0.0, 1.0));
+        problem.add_constraint([(x, nan)], ComparisonOp::Le, 1.0);
+        assert_first(&problem, "invalid lower bound NaN of variable 1");
+
+        // A var's objective coefficient before its bounds, as given.
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        problem.add_var(1.0, (0.0, 1.0));
+        problem.add_var(-inf, (nan, 1.0));
+        assert_first(&problem, "invalid objective coefficient -inf of variable 1");
+
+        // A constraint's coefficients by var index, before its right-hand side.
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_var(1.0, (0.0, 1.0));
+        let z = problem.add_var(1.0, (0.0, 1.0));
+        problem.add_constraint([(x, 1.0)], ComparisonOp::Le, 1.0);
+        problem.add_constraint([(z, nan), (x, inf)], ComparisonOp::Le, nan);
+        problem.add_constraint([(x, nan)], ComparisonOp::Le, 1.0);
+        assert_first(
+            &problem,
+            "invalid coefficient inf of variable 0 in constraint 1",
+        );
+
+        // An earlier constraint's right-hand side before a later one's
+        // coefficients.
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_var(1.0, (0.0, 1.0));
+        problem.add_constraint([(x, 1.0)], ComparisonOp::Ge, inf);
+        problem.add_constraint([(x, nan)], ComparisonOp::Le, 1.0);
+        assert_first(&problem, "invalid right-hand side inf of constraint 0 (Ge)");
+    }
+
+    /// A constraint added to a solution that repeats a var, or contains a
+    /// var index outside the problem, is invalid input, on an LP solution and
+    /// on a MILP one.
+    #[test]
+    fn a_malformed_added_constraint_is_an_invalid_operation() {
+        for milp in [false, true] {
+            let mut problem = Problem::new(OptimizationDirection::Minimize);
+            let x = problem.add_var(1.0, (0.0, 5.0));
+            if milp {
+                problem.add_integer_var(1.0, (0, 3));
+            }
+            problem.add_constraint([(x, 1.0)], ComparisonOp::Ge, 1.0);
+            let solved = solution(problem.solve().unwrap());
+
+            let repeated =
+                solved
+                    .clone()
+                    .add_constraint([(x, 1.0), (x, 2.0)], ComparisonOp::Le, 4.0);
+            assert_eq!(
+                repeated.map(|_| "solved"),
+                Err(Error::InvalidOperation(
+                    "invalid constraint 1: variable 0 appears more than once".to_string()
+                )),
+                "milp {milp}"
+            );
+
+            let num_vars = if milp { 2 } else { 1 };
+            let outside =
+                solved.add_constraint([(x, 1.0), (Variable(5), 1.0)], ComparisonOp::Le, 4.0);
+            assert_eq!(
+                outside.map(|_| "solved"),
+                Err(Error::InvalidOperation(format!(
+                    "invalid constraint 1: variable index 5 is out of range 0..{num_vars}"
+                ))),
+                "milp {milp}"
+            );
+        }
+    }
+
+    /// `Problem::add_constraint` panics on a repeated var, naming it.
+    #[test]
+    #[should_panic(expected = "invalid constraint 1: variable 0 appears more than once")]
+    fn problem_add_constraint_panics_on_a_repeated_variable() {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_var(1.0, (0.0, 5.0));
+        problem.add_constraint([(x, 1.0)], ComparisonOp::Ge, 1.0);
+        problem.add_constraint([(x, 1.0), (x, 2.0)], ComparisonOp::Le, 4.0);
+    }
+
+    /// `Problem::add_constraint` panics on a handle of another problem whose
+    /// index this problem does not have, naming it.
+    #[test]
+    #[should_panic(expected = "invalid constraint 0: variable index 1 is out of range 0..1")]
+    fn problem_add_constraint_panics_on_a_variable_outside_the_problem() {
+        let mut other = Problem::new(OptimizationDirection::Minimize);
+        other.add_var(1.0, (0.0, 5.0));
+        let foreign = other.add_var(1.0, (0.0, 5.0));
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        problem.add_var(1.0, (0.0, 5.0));
+        problem.add_constraint([(foreign, 1.0)], ComparisonOp::Le, 4.0);
     }
 
     /// A free var with a zero objective coefficient is optimal wherever it
@@ -488,15 +705,20 @@ mod tests_general {
         }
     }
 
+    /// A NaN or infinite `fix_var` value is invalid input, named in the
+    /// message with its var.
     #[test]
     fn fix_var_rejects_non_finite_values() {
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut problem = Problem::new(OptimizationDirection::Minimize);
+            let _y = problem.add_var(1.0, (0.0, 10.0));
             let x = problem.add_var(1.0, (0.0, 10.0));
             let solution = solution(problem.solve().unwrap());
-            assert!(
-                matches!(solution.fix_var(x, invalid), Err(Error::Infeasible)),
-                "non-finite fix {invalid} was not rejected"
+            assert_eq!(
+                solution.fix_var(x, invalid).map(|_| "solved"),
+                Err(Error::InvalidOperation(format!(
+                    "invalid fix_var value {invalid} of variable 1: expected a finite value"
+                ))),
             );
         }
     }

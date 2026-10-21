@@ -65,31 +65,11 @@ fn initialize() {
     assert_eq!(sol.cur_obj_val, 0.0);
 }
 
-#[test]
-fn try_new_rejects_nan_bound() {
-    init();
-    // A NaN bound used to slip past the `min > max` guard (every
-    // comparison against NaN is false, including this one), so it was
-    // accepted as an ordinary bound. Downstream, the simplex loop's own
-    // bound comparisons against that NaN never resolve either, so the
-    // solve hangs forever instead of reporting Infeasible up front (the
-    // same thing set_var_bounds already guards against for edits).
-    let res = Solver::try_new(
-        &[1.0],
-        &[f64::NAN],
-        &[10.0],
-        &[],
-        &[VarDomain::Real],
-        Default::default(),
-        crate::Tolerances::default().feasibility,
-    );
-    assert_eq!(res.unwrap_err(), Error::Infeasible);
-}
-
 /// `entry_bounds` judges each side of a range on its own: a bound at or
 /// beyond 2^52 on its side of infinity is infinite whatever the other bound
 /// (a var must not start on a far bound of `f64::MAX`), a bound on the other
-/// side is data, a point or an empty range is kept, and NaN stays NaN.
+/// side is data, a point or an empty range is kept, and a bound the solve
+/// refuses stays as written.
 #[test]
 fn entry_bounds_judges_each_side_on_its_own() {
     let t = INFINITE_BOUND;
@@ -121,9 +101,14 @@ fn entry_bounds_judges_each_side_on_its_own() {
     for ((min, max), want) in cases {
         assert_eq!(entry_bounds(min, max), want, "[{min:e}, {max:e}]");
     }
-    // A NaN bound stays NaN for the solve to refuse (`try_new_rejects_nan_bound`).
+    // A bound the solve refuses stays as written, so its message reports it
+    // as given (`invalid_bounds_are_an_invalid_operation`).
     assert!(entry_bounds(f64::NAN, f64::MAX).0.is_nan());
     assert!(entry_bounds(-f64::MAX, f64::NAN).1.is_nan());
+    assert_eq!(entry_bounds(inf, max), (inf, max));
+    assert_eq!(entry_bounds(-max, -inf), (-max, -inf));
+    assert_eq!(entry_bounds(inf, f64::NAN).0, inf);
+    assert_eq!(entry_bounds(f64::NAN, -inf).1, -inf);
 }
 
 /// Dense recalculations with pending etas must match a fresh factorization
@@ -462,21 +447,31 @@ fn set_var_bounds_crossing_is_infeasible_and_leaves_state_untouched() {
     assert!(float_eq(solver.cur_obj_val, obj_before));
 }
 
+/// Bounds the engine cannot take leave its state untouched: crossed ones are
+/// `Infeasible`; a NaN one, or one its column factor takes beyond `f64` (`x`
+/// scaled by `2^-997` for its row `1e300 x <= 1e301`, fixed at `1e300`), an
+/// `InternalError`.
 #[test]
-fn set_var_bounds_nan_is_infeasible_and_leaves_state_untouched() {
+fn refused_var_bounds_leave_the_solver_untouched() {
     let mut original = Solver::try_new(
         &[1.0],
         &[0.0],
         &[10.0],
-        &[],
+        &[(to_sparse(&[1e300]), ComparisonOp::Le, 1e301)],
         &[VarDomain::Real],
         None,
         crate::Tolerances::default().feasibility,
     )
     .unwrap();
     assert_eq!(original.initial_solve().unwrap(), StopReason::Finished);
+    assert_eq!(original.col_scales[0], 2f64.powi(-997), "fixture");
 
-    for (min, max) in [(f64::NAN, 10.0), (0.0, f64::NAN)] {
+    for (min, max, internal) in [
+        (f64::NAN, 10.0, true),
+        (0.0, f64::NAN, true),
+        (1e300, 1e300, true),
+        (6.0, 5.0, false),
+    ] {
         let mut solver = original.clone();
         let bounds_before = solver.get_var_bounds(0);
         let value_before = solver.get_value(0);
@@ -484,7 +479,15 @@ fn set_var_bounds_nan_is_infeasible_and_leaves_state_untouched() {
         let primal_before = solver.is_primal_feasible;
         let reduced_costs_before = solver.nb_var_obj_coeffs.clone();
 
-        assert_eq!(solver.set_var_bounds(0, min, max), Err(Error::Infeasible));
+        let result = solver.set_var_bounds(0, min, max);
+        if internal {
+            assert!(
+                matches!(&result, Err(Error::InternalError(_))),
+                "[{min}, {max}]: {result:?}"
+            );
+        } else {
+            assert_eq!(result, Err(Error::Infeasible), "[{min}, {max}]");
+        }
         assert_eq!(solver.get_var_bounds(0), bounds_before);
         assert_eq!(solver.get_value(0), value_before);
         assert_eq!(solver.cur_obj_val, objective_before);
@@ -1581,10 +1584,57 @@ fn a_plain_rejection_near_the_edge_is_summed_again_compensated() {
     assert_eq!(sol.calc_primal_infeasibility().0, 0);
 }
 
+/// Every row enters the engine through `prepare_row`, which refuses one it
+/// cannot hold with an `InternalError`: a right-hand side that is NaN or
+/// infinite on the side the row bounds, or a coefficient the scaling makes
+/// infinite (a fixed var's `1e300` beside an unfixed `1e-300`, whose row
+/// factor is `2^997`). An infinite right-hand side on the open side is no
+/// row at all.
+#[test]
+fn prepare_row_refuses_a_row_the_engine_cannot_hold() {
+    let feasibility = crate::Tolerances::default().feasibility;
+    let unfixed = |_: usize| false;
+    for (op, rhs) in [
+        (ComparisonOp::Le, f64::NAN),
+        (ComparisonOp::Le, f64::NEG_INFINITY),
+        (ComparisonOp::Ge, f64::INFINITY),
+        (ComparisonOp::Eq, f64::INFINITY),
+    ] {
+        let result = prepare_row(to_sparse(&[1.0]), op, rhs, feasibility, unfixed);
+        assert!(
+            matches!(&result, Err(Error::InternalError(m)) if m.contains("right-hand side")),
+            "{op:?} {rhs}: {:?}",
+            result.map(|row| row.is_some())
+        );
+    }
+    let result = prepare_row(
+        to_sparse(&[1e-300, 1e300]),
+        ComparisonOp::Le,
+        1.0,
+        feasibility,
+        |var| var == 1,
+    );
+    assert!(
+        matches!(&result, Err(Error::InternalError(m)) if m.contains("variable 1")),
+        "{:?}",
+        result.map(|row| row.is_some())
+    );
+    let result = prepare_row(
+        to_sparse(&[1.0]),
+        ComparisonOp::Le,
+        f64::INFINITY,
+        feasibility,
+        unfixed,
+    );
+    assert!(matches!(result, Ok(None)));
+}
+
 /// A row every point satisfies, as an infinite right-hand side on the side
 /// the row leaves open makes it, is violated nowhere: the boundary's check
 /// agrees with the verdict the row gets before any point is looked at, so
-/// an edit keeps an incumbent such a row cannot exclude.
+/// an edit keeps an incumbent such a row cannot exclude. On the side the row
+/// bounds, an infinite right-hand side is invalid input, refused before the
+/// solve (`invalid_constraint_numbers_are_an_invalid_operation`).
 #[test]
 fn a_row_with_an_infinite_right_hand_side_on_its_open_side_holds_everywhere() {
     let row = to_sparse(&[1.0, 2.0]);
@@ -1603,7 +1653,17 @@ fn a_row_with_an_infinite_right_hand_side_on_its_open_side_holds_everywhere() {
         ),
         None
     );
-    assert!(row_violation(&row, ComparisonOp::Ge, f64::INFINITY, |_| 1.0, feasibility).is_some());
+    assert!(valid_rhs(ComparisonOp::Le, f64::INFINITY));
+    assert!(valid_rhs(ComparisonOp::Ge, f64::NEG_INFINITY));
+    for (op, rhs) in [
+        (ComparisonOp::Le, f64::NEG_INFINITY),
+        (ComparisonOp::Ge, f64::INFINITY),
+        (ComparisonOp::Eq, f64::INFINITY),
+        (ComparisonOp::Eq, f64::NEG_INFINITY),
+        (ComparisonOp::Le, f64::NAN),
+    ] {
+        assert!(!valid_rhs(op, rhs), "{op:?} {rhs}");
+    }
 }
 
 /// The boundary rounds a product whose factor Dekker's split would overflow
@@ -2705,7 +2765,7 @@ fn proof_of_a_single_row(rhs: f64, y_max: f64, integer: bool) -> proof::Proof {
         &[0.0, 0.0],
         &[1.0, y_max],
         &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, rhs)],
-        &[domain.clone(), domain],
+        &[domain, domain],
         None,
         crate::Tolerances::default().feasibility,
     )
@@ -3337,7 +3397,7 @@ fn row_short_of_its_bounds_by_a_tolerance(integer: bool) -> Solver {
         &[0.0, 0.0],
         &[1.0, 1.0],
         &[(to_sparse(&[1.0, 1.0]), ComparisonOp::Ge, 2.0 + 1.8e-7)],
-        &[domain.clone(), domain],
+        &[domain, domain],
         None,
         crate::Tolerances::default().feasibility,
     )

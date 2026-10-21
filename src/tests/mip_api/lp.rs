@@ -1,5 +1,5 @@
-//! The pure-LP path through the same public API: solving, stats, and the
-//! time budget post-solve edits get.
+//! The pure-LP path through the same public API: solving, stats, variable
+//! domains, and the time budget post-solve edits get.
 
 use super::common::solution;
 use crate::*;
@@ -177,4 +177,43 @@ fn interrupted_lp_edit_resumes_to_the_edited_models_optimum() {
     for var in [x, y, z] {
         assert!((resumed.var_value(var) - fresh.var_value(var)).abs() < 1e-6);
     }
+}
+
+/// `Solution::var_domain` on an LP solution: every var is real, before and
+/// after each kind of edit.
+#[test]
+fn lp_solution_var_domain_is_real_across_edits() {
+    let mut p = Problem::new(OptimizationDirection::Maximize);
+    let x = p.add_var(1.0, (0.0, 4.0));
+    let y = p.add_var(2.0, (0.0, 3.0));
+    p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 5.0);
+    let check = |sol: &Solution| {
+        for var in [x, y] {
+            assert_eq!(sol.var_domain(var), VarDomain::Real);
+        }
+    };
+
+    let sol = solution(p.solve().unwrap());
+    check(&sol);
+    let sol = solution(
+        sol.add_constraint(&[(x, 1.0)], ComparisonOp::Le, 1.0)
+            .unwrap(),
+    );
+    check(&sol);
+    let sol = solution(sol.fix_var(y, 2.0).unwrap());
+    check(&sol);
+    let (outcome, was_fixed) = sol.unfix_var(y).unwrap();
+    assert!(was_fixed);
+    check(&solution(outcome));
+}
+
+/// `Solution::var_domain` panics on a var outside the problem, as
+/// `Solution::var_value` does.
+#[test]
+#[should_panic(expected = "assertion failed: var.0 < self.num_vars")]
+fn solution_var_domain_panics_on_a_variable_outside_the_problem() {
+    let mut p = Problem::new(OptimizationDirection::Minimize);
+    p.add_var(1.0, (0.0, 1.0));
+    let sol = solution(p.solve().unwrap());
+    sol.var_domain(Variable(1));
 }

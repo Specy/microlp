@@ -169,38 +169,17 @@ mod tests_presolve_api {
 
     /// Models presolve finds infeasible are solved as written, so the engine
     /// or the search decides, and one that is infeasible stays `Infeasible`:
-    /// crossed bounds, a NaN bound, a row with a NaN or an infinite
-    /// coefficient or right-hand side, rows that contradict each other, and
-    /// an integer var whose rows leave it no integer; as an LP and as a MILP
-    /// (an extra integer var), presolve on and off.
+    /// crossed bounds, a row beyond the bounds, rows that contradict each
+    /// other, and an integer var whose rows leave it no integer; as an LP and
+    /// as a MILP (an extra integer var), presolve on and off.
     #[test]
     fn infeasible_models_stay_infeasible_when_presolve_finds_them() {
         init();
         type Build = fn(&mut Problem);
-        let cases: [(&str, Build); 10] = [
+        let cases: [(&str, Build); 5] = [
             ("crossed bounds", |p| {
                 let x = p.add_var(1.0, (2.0, 1.0));
                 p.add_constraint(&[(x, 1.0)], ComparisonOp::Ge, 0.0);
-            }),
-            ("NaN bound", |p| {
-                let x = p.add_var(1.0, (f64::NAN, 1.0));
-                p.add_constraint(&[(x, 1.0)], ComparisonOp::Ge, 0.0);
-            }),
-            ("NaN coefficient", |p| {
-                let x = p.add_var(1.0, (0.0, 1.0));
-                p.add_constraint(&[(x, f64::NAN)], ComparisonOp::Le, 1.0);
-            }),
-            ("infinite coefficient", |p| {
-                let x = p.add_var(1.0, (0.0, 1.0));
-                p.add_constraint(&[(x, f64::INFINITY)], ComparisonOp::Le, 1.0);
-            }),
-            ("NaN right-hand side", |p| {
-                let x = p.add_var(1.0, (0.0, 1.0));
-                p.add_constraint(&[(x, 1.0)], ComparisonOp::Le, f64::NAN);
-            }),
-            ("infinite right-hand side", |p| {
-                let x = p.add_var(1.0, (0.0, 1.0));
-                p.add_constraint(&[(x, 1.0)], ComparisonOp::Ge, f64::INFINITY);
             }),
             ("a row beyond the bounds", |p| {
                 let x = p.add_var(1.0, (0.0, 5.0));

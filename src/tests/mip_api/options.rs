@@ -211,23 +211,6 @@ fn invalid_integrality_tolerances_are_rejected() {
     }
 }
 
-/// `tolerances.integrality_rounding` is deprecated and ignored: no value of it
-/// is invalid, `int_tol` deciding integrality everywhere.
-#[test]
-#[allow(deprecated)]
-fn a_deprecated_integrality_rounding_is_ignored() {
-    for value in [-1.0, f64::NAN, 0.5, f64::INFINITY] {
-        let mut options = SolveOptions::default();
-        options.tolerances.integrality_rounding = value;
-        let mut p = Problem::new(OptimizationDirection::Minimize);
-        p.add_integer_var(1.0, (0, 1));
-        assert!(
-            p.solve_with(options).is_ok(),
-            "integrality_rounding {value}"
-        );
-    }
-}
-
 #[test]
 fn invalid_gap_and_expert_tolerances_are_rejected() {
     fn assert_invalid(field: &str, options: SolveOptions) {
@@ -285,4 +268,85 @@ fn feasibility_tolerance_below_the_minimum_is_rejected() {
         let solution = solve(1e-10).unwrap().into_solution().unwrap();
         assert_eq!(solution.objective(), if integer { 4.0 } else { 4.5 });
     }
+}
+
+/// A time limit too long to add to the current time counts as no limit, from
+/// `set_time_limit`, `SolveOptions` and `ResumeOptions` alike: an LP and a
+/// MILP solve, resume and are edited under `Duration::MAX` as without one.
+#[test]
+fn a_time_limit_too_long_to_add_is_no_limit() {
+    for milp in [false, true] {
+        // max x + 2y, x + y <= 5.5, y <= 3: x = 2.5 for an LP, 2 for a MILP.
+        let mut p = Problem::new(OptimizationDirection::Maximize);
+        let x = if milp {
+            p.add_integer_var(1.0, (0, 10))
+        } else {
+            p.add_var(1.0, (0.0, 10.0))
+        };
+        let y = p.add_var(2.0, (0.0, 3.0));
+        p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 5.5);
+        let optimum = if milp { 8.0 } else { 8.5 };
+        let label = format!("milp {milp}");
+        let long = Some(Duration::MAX);
+
+        let mut limited = p.clone();
+        limited.set_time_limit(Duration::MAX);
+        let sol = solution(limited.solve().unwrap());
+        assert_eq!(sol.status(), SolutionStatus::Optimal, "{label}");
+        assert!((sol.objective() - optimum).abs() < 1e-6, "{label}");
+
+        let mut options = SolveOptions::default();
+        options.time_limit = long;
+        let sol = solution(p.solve_with(options).unwrap());
+        assert_eq!(sol.status(), SolutionStatus::Optimal, "{label}");
+        assert!((sol.objective() - optimum).abs() < 1e-6, "{label}");
+
+        // Resumed under it, and edited with it as the budget it keeps.
+        let mut options = SolveOptions::default();
+        options.time_limit = Some(Duration::ZERO);
+        let interrupted = p.solve_with(options).unwrap();
+        assert_eq!(
+            interrupted.termination_reason(),
+            TerminationReason::TimeLimit,
+            "{label}"
+        );
+        let resumed = interrupted
+            .resume_with(ResumeOptions {
+                time_limit: long,
+                ..ResumeOptions::default()
+            })
+            .unwrap();
+        let sol = solution(resumed);
+        assert_eq!(sol.status(), SolutionStatus::Optimal, "{label}");
+        assert!((sol.objective() - optimum).abs() < 1e-6, "{label}");
+        assert_eq!(sol.last_resume_options().time_limit, long, "{label}");
+        let edited = solution(
+            sol.add_constraint(&[(x, 1.0)], ComparisonOp::Le, 1.0)
+                .unwrap(),
+        );
+        assert_eq!(edited.status(), SolutionStatus::Optimal, "{label}");
+        assert!((edited.objective() - 7.0).abs() < 1e-6, "{label}");
+    }
+
+    // A plain resume reuses it: a MILP held at its root by a node limit.
+    let mut p = Problem::new(OptimizationDirection::Maximize);
+    let x = p.add_integer_var(1.0, (0, 10));
+    let y = p.add_var(2.0, (0.0, 3.0));
+    p.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 5.5);
+    let mut options = SolveOptions::default();
+    options.time_limit = Some(Duration::MAX);
+    options.node_limit = Some(0);
+    let held = p.solve_with(options).unwrap();
+    assert_eq!(held.termination_reason(), TerminationReason::NodeLimit);
+    let held = held.resume().unwrap();
+    assert_eq!(held.termination_reason(), TerminationReason::NodeLimit);
+    let sol = solution(
+        held.resume_with(ResumeOptions {
+            time_limit: Some(Duration::MAX),
+            ..ResumeOptions::default()
+        })
+        .unwrap(),
+    );
+    assert_eq!(sol.status(), SolutionStatus::Optimal);
+    assert!((sol.objective() - 8.0).abs() < 1e-6);
 }
