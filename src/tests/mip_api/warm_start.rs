@@ -2,7 +2,7 @@
 //! unusable hint is ignored rather than trusted, and an invalid one (a value
 //! that is not finite, a variable outside the problem) is refused.
 
-use super::common::{int_2var_problem, solution};
+use super::common::{binary_knapsack, int_2var_problem, solution};
 use crate::*;
 
 #[test]
@@ -121,15 +121,42 @@ fn warm_start_liveness_hint_seeds_incumbent_before_any_node() {
     assert!(cold.solution().is_none());
     assert_eq!(cold.termination_reason(), TerminationReason::NodeLimit);
 
+    // The objective takes whole values at integral points, and the root's
+    // bound 10.6 cannot beat the hint's 11: both children are pruned before
+    // any LP work, and the hint is proven optimal.
     let mut options = SolveOptions::default();
     options.node_limit = Some(0);
     options.warm_start = Some(vec![(a, 1.0), (b, 2.0)]);
     let hinted = solution(p.solve_with(options).unwrap());
-    assert_eq!(hinted.status(), SolutionStatus::Feasible);
-    assert_eq!(hinted.termination_reason(), TerminationReason::NodeLimit);
+    assert_eq!(hinted.status(), SolutionStatus::Optimal);
+    assert_eq!(
+        hinted.termination_reason(),
+        TerminationReason::ProvenOptimal
+    );
     assert!((hinted.objective() - 11.0).abs() < 1e-6);
     assert_eq!(hinted.var_value(a), 1.0);
     assert_eq!(hinted.var_value(b), 2.0);
+    assert_eq!(hinted.stats().nodes_solved, 0);
+}
+
+/// A hint the root cannot prove optimal seeds the incumbent of a search the
+/// node limit stops before any node: the knapsack's hint `x = y = 1` is worth
+/// `19`, and its root LP bound `22` leaves room for better.
+#[test]
+fn warm_start_hint_seeds_a_feasible_incumbent_before_any_node() {
+    let p = binary_knapsack();
+    let mut options = SolveOptions::default();
+    options.node_limit = Some(0);
+    options.warm_start = Some(vec![
+        (Variable(0), 1.0),
+        (Variable(1), 1.0),
+        (Variable(2), 0.0),
+        (Variable(3), 0.0),
+    ]);
+    let hinted = solution(p.solve_with(options).unwrap());
+    assert_eq!(hinted.status(), SolutionStatus::Feasible);
+    assert_eq!(hinted.termination_reason(), TerminationReason::NodeLimit);
+    assert!((hinted.objective() - 19.0).abs() < 1e-6);
     assert_eq!(hinted.stats().nodes_solved, 0);
 }
 

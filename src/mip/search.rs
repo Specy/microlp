@@ -1,11 +1,11 @@
 //! The search itself: visiting, branching, warm-starting and pruning nodes,
 //! and the loop that drives them until a termination reason is proven.
 
-use super::node::{effective_bounds, Node};
+use super::node::{with_var_bounds, Node};
 use super::params;
 use super::state::{Incumbent, MipState};
 use super::{
-    branching, candidate_variables_feasible, cutoff, global_bound_internal, relative_gap,
+    branching, candidate_variables_feasible, dominated, global_bound_internal, relative_gap,
     TerminationReason,
 };
 use crate::solver::check_deadline;
@@ -89,10 +89,13 @@ fn process_integral_candidate(
     }
 }
 
-/// Apply `node`'s bounds to the solver, diffing against what is currently applied.
-/// Returns false (node pruned, solver untouched) if the node's bounds cross.
+/// Apply `node`'s bounds to the solver: reset each var in `applied` that the
+/// node has no entry for to its root bounds, then set every entry of the
+/// node, also one already in force, which drops any widening a previous
+/// solve left on it (`Solver::set_var_bounds`). Returns false (node pruned,
+/// solver untouched) if the node's bounds cross.
 fn apply_node_bounds(state: &mut MipState, node: &Node) -> bool {
-    let target = effective_bounds(&node.bound_changes);
+    let target = &node.bound_changes;
     if target.iter().any(|&(_, lo, hi)| lo > hi) {
         return false;
     }
@@ -106,21 +109,22 @@ fn apply_node_bounds(state: &mut MipState, node: &Node) -> bool {
                 .expect("root bounds cannot cross");
         }
     }
-    // Apply the target bounds (validated above, cannot fail).
-    for &(v, lo, hi) in &target {
+    // Set every target bound, those in force too (validated above, cannot fail).
+    for &(v, lo, hi) in target {
         state
             .solver
             .set_var_bounds(v, lo, hi)
             .expect("validated bounds cannot cross");
     }
-    state.applied = target;
+    state.applied.clone_from(target);
     true
 }
 
 /// Branch on `var` at the solver's current (just solved) optimum: push the two
-/// children carrying the parent's basis and objective bound.
+/// children carrying the parent's basis, objective bound and lattice bound.
 fn branch(state: &mut MipState, parent: &Node, var: usize) {
     let z = state.solver.cur_obj_val;
+    let lattice_bound = state.lattice_bound(z);
     let val = state.solver.get_value(var);
     let (lo, hi) = state.solver.get_var_bounds(var);
     // The split point k (children: x ≤ k and x ≥ k + 1) must be
@@ -149,15 +153,11 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
     state.last_solved_id = Some(id);
     let basis = state.solver.snapshot_basis();
 
-    let mut down_changes = parent.bound_changes.clone();
-    down_changes.push((var, lo, floor));
-    let mut up_changes = parent.bound_changes.clone();
-    up_changes.push((var, floor + 1.0, hi));
-
     let down_node = Node {
-        bound_changes: down_changes,
+        bound_changes: with_var_bounds(&parent.bound_changes, var, lo, floor),
         basis: basis.clone(),
         lp_bound: z,
+        lattice_bound,
         depth: parent.depth + 1,
         parent_id: id,
         branch_var: Some(var),
@@ -165,9 +165,10 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
         branch_frac: f_down,
     };
     let up_node = Node {
-        bound_changes: up_changes,
+        bound_changes: with_var_bounds(&parent.bound_changes, var, floor + 1.0, hi),
         basis,
         lp_bound: z,
+        lattice_bound,
         depth: parent.depth + 1,
         parent_id: id,
         branch_var: Some(var),
@@ -416,6 +417,7 @@ fn initialize_root(
         bound_changes: Vec::new(),
         basis: state.solver.snapshot_basis(),
         lp_bound: state.solver.cur_obj_val,
+        lattice_bound: state.lattice_bound(state.solver.cur_obj_val),
         depth: 0,
         parent_id: 0,
         branch_var: None,
@@ -483,12 +485,11 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
             (objective - node.lp_bound).max(0.0) / node.branch_frac.max(params::BRANCH_FRAC_GUARD),
         );
     }
-    if let Some(incumbent) = &state.incumbent {
-        if objective >= cutoff(incumbent.objective, state.options.tolerances.prune_epsilon) {
-            state.last_solved_id = None;
-            state.diving = false;
-            return Ok(NodeVisit::Solved);
-        }
+    let lattice_bound = state.lattice_bound(objective);
+    if dominated(state, objective, lattice_bound) {
+        state.last_solved_id = None;
+        state.diving = false;
+        return Ok(NodeVisit::Solved);
     }
 
     let int_tol = state.options.int_tol;
@@ -566,11 +567,9 @@ pub(crate) fn search_loop(state: &mut MipState) -> Result<TerminationReason, Err
         };
 
         // Prune with the stored parent bound before any LP work.
-        if let Some(inc) = &state.incumbent {
-            if node.lp_bound >= cutoff(inc.objective, state.options.tolerances.prune_epsilon) {
-                state.diving = false;
-                continue;
-            }
+        if dominated(state, node.lp_bound, node.lattice_bound) {
+            state.diving = false;
+            continue;
         }
 
         // A node budget limits LP solves, not free bookkeeping. Pop and apply

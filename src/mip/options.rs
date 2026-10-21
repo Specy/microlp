@@ -214,7 +214,15 @@ pub struct Tolerances {
     /// better than `incumbent - max(prune_epsilon, prune_epsilon *
     /// |incumbent|)` is pruned. Guards against continuing to explore or
     /// retain nodes that could only ever match the incumbent to within
-    /// float noise.
+    /// float noise. Where every variable with a nonzero cost is an integer
+    /// variable or fixed, the objective takes values a whole number of
+    /// steps apart at the points whose integer variables are integral, and
+    /// a node is also pruned when its bound, lowered by what the tolerances
+    /// and round-off can put on it and then rounded up to the next such
+    /// value, is not strictly better: then none of its points whose integer
+    /// variables are integral and that meet every constraint and bound
+    /// exactly is. A point that relies on the tolerances can be pruned even
+    /// where it is better.
     ///
     /// Must be finite and non-negative. Default `1e-9`.
     pub prune_epsilon: f64,
