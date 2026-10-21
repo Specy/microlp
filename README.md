@@ -117,7 +117,13 @@ the solve returns an error:
 * `Error::InternalError`: a numerical failure the solver could not recover
   from. It returns this rather than an answer it could not verify.
 * `Error::InvalidOptions` for an invalid numeric option, and
-  `Error::InvalidOperation` for a NaN or infinite objective coefficient.
+  `Error::InvalidOperation` for invalid input, both checked before anything
+  is solved. Every number of the problem must be finite, but a bound or a
+  constraint's right-hand side may be infinite on the side it leaves open:
+  `f64::NEG_INFINITY` as a lower bound or on a `Ge` constraint,
+  `f64::INFINITY` as an upper bound or on a `Le` constraint, where it
+  constrains nothing. A warm-start hint must give finite values to variables
+  of the problem.
 
 An optimal solution is optimal at the point the solver ends at, within the
 tolerance, not over every point the tolerance admits: on an ill-conditioned
@@ -172,17 +178,25 @@ computed them, and the reported objective is computed from exactly the values
 you read. An integer or boolean variable's value lies within `int_tol` (default
 `1e-6`) of an integer, not necessarily on it: values like `0.9999999` are
 normal. One fixed at an integer (by its bounds, the search or an edit) lies on
-it. Use `.round()` where you need an exact integer, bearing in mind that
-rounded values need not meet the constraints: under a big-M constraint such as
-`x <= 1e7 * y`, a `y` of `1e-6` allows `x` up to 10, which `y` rounded to zero
-forbids. Keep big-M coefficients no larger than the model needs.
+it. Use `.round()` where you need an exact integer (`var_domain` tells which
+variables are integer or boolean), bearing in mind that rounded values need
+not meet the constraints: under a big-M constraint such as `x <= 1e7 * y`, a
+`y` of `1e-6` allows `x` up to 10, which `y` rounded to zero forbids. Keep
+big-M coefficients no larger than the model needs.
 
 ```rust
+use microlp::VarDomain;
+
 let value = solution.var_value(x);           // as computed
 let count = solution.var_value(y).round();   // an exact integer
 let same = solution[x];                      // indexing is equivalent to var_value()
 
 for (var, value) in &solution {
+    // Exact integers for the integer and boolean variables.
+    let value = match solution.var_domain(var) {
+        VarDomain::Integer | VarDomain::Boolean => value.round(),
+        VarDomain::Real => value,
+    };
     println!("{}: {}", var.idx(), value);
 }
 ```
@@ -218,6 +232,8 @@ while matches!(
 ```
 
 Time limits are checked periodically, so a solve can run slightly past its budget.
+A budget too long to add to the clock, such as `Duration::MAX`, counts as no
+limit.
 
 ## Solve options
 
@@ -243,15 +259,15 @@ let outcome = problem.solve_with(options)?;
   reason `MipGap`. The default `0.0` requires exact optimality.
 * `warm_start`: a starting assignment (it may cover only some variables).
   A good one gives the solver an immediate solution to improve on. It is
-  advisory: if it isn't usable it is ignored.
+  advisory: if it isn't usable it is ignored. A value that is NaN or infinite,
+  or a variable outside the problem, returns `Error::InvalidOperation`.
 * `int_tol`, `tolerances`: numeric tolerances. A value within `int_tol` of an
   integer counts as integral, for acceptance only (see `presolve` below), and
   integer values are reported within it (a fixed integer variable's on its
   integer); the feasibility tolerance is absolute, for every variable bound
   and constraint.
   Values must be finite and non-negative, the feasibility tolerance at least
-  `1e-10`, and `int_tol` below `0.5` (`tolerances.integrality_rounding` is
-  deprecated and ignored).
+  `1e-10`, and `int_tol` below `0.5`.
 * `presolve` (on by default): simplify the problem before the search. It never
   removes a variable or changes a real variable's bounds, and it keeps, up to
   round-off, every solution whose integer variables are exactly integral;

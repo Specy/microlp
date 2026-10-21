@@ -59,6 +59,12 @@ pub(crate) fn check_deadline(deadline: &Deadline) -> StopReason {
     StopReason::Finished
 }
 
+/// The deadline `limit` after `start`: none without a limit, nor for a limit
+/// too long to add to `start`, which no solve outlasts.
+pub(crate) fn deadline_after(start: Instant, limit: Option<Duration>) -> Deadline {
+    limit.and_then(|limit| start.checked_add(limit))
+}
+
 /// The rank by which a basis repair's second factorization takes the column
 /// of a var with these bounds ([`Solver::factorize_at`]): one with no finite
 /// bound first, then one finite bound, then two, a fixed var last (Bixby
@@ -458,7 +464,13 @@ impl Solver {
         assert_eq!(num_vars, var_mins.len());
         assert_eq!(num_vars, var_maxs.len());
         for v in 0..num_vars {
-            if var_mins[v].is_nan() || var_maxs[v].is_nan() || var_mins[v] > var_maxs[v] {
+            // Numbers, each infinite only on its open side: the bounds the
+            // model's validation takes (`Problem::solve_with`).
+            debug_assert!(
+                var_mins[v] < f64::INFINITY && var_maxs[v] > f64::NEG_INFINITY,
+                "bounds the model's validation refuses reached the engine"
+            );
+            if var_mins[v] > var_maxs[v] {
                 return Err(Error::Infeasible);
             }
         }
@@ -1067,21 +1079,35 @@ impl Solver {
     /// Change a variable's bounds (user units) in place. Records the new bounds
     /// and repairs the invariants that depend on them; does NOT run simplex —
     /// call [`Self::reoptimize`] afterwards. Returns `Err(Infeasible)` with
-    /// state untouched if either bound is NaN or `min > max`.
+    /// state untouched if `min > max`, and `Err(InternalError)` with state
+    /// untouched if a bound in the engine's units is NaN, a lower bound of
+    /// `+∞` or an upper bound of `-∞`: a NaN, or a value the column factor
+    /// takes beyond `f64`.
     pub(crate) fn set_var_bounds(&mut self, var: usize, min: f64, max: f64) -> Result<(), Error> {
-        if min.is_nan() || max.is_nan() || min > max {
+        if min > max {
             return Err(Error::Infeasible);
         }
         debug_assert!(
             !self.bounds_modified,
             "a bound changed during a primal phase"
         );
+        // Dividing by a power of two is exact, so the user's bound maps to
+        // exactly one internal bound, unless it leaves the range of `f64`.
+        let s = self.col_scale(var);
+        let (scaled_min, scaled_max) = (min / s, max / s);
+        if scaled_min.is_nan()
+            || scaled_max.is_nan()
+            || scaled_min == f64::INFINITY
+            || scaled_max == f64::NEG_INFINITY
+        {
+            return Err(Error::InternalError(format!(
+                "variable {var} cannot take the bounds [{min:e}, {max:e}] in the engine's \
+                 scaled units"
+            )));
+        }
+        let (min, max) = (scaled_min, scaled_max);
         // The new bounds are the model's, in force from here on.
         self.widened.retain(|w| w.var != var);
-        // Dividing by a power of two is exact, so the user's bound maps to
-        // exactly one internal bound.
-        let s = self.col_scale(var);
-        let (min, max) = (min / s, max / s);
         self.orig_var_mins[var] = min;
         self.orig_var_maxs[var] = max;
         if var < self.num_vars {
@@ -2078,8 +2104,8 @@ impl Solver {
         if outside_bounds(val, min, max, self.feasibility) {
             return Err(Error::Infeasible);
         }
-        self.fixed_var_bounds[var] = Some((min, max));
         self.set_var_bounds(var, val, val)?;
+        self.fixed_var_bounds[var] = Some((min, max));
         self.reoptimize()
     }
 

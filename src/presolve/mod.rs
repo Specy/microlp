@@ -83,6 +83,8 @@
 //!   the rewrites take out of it at the magnitude of the row's fixed terms,
 //!   fixed before the rewrites or after them (`Work::rewrite_room`), and its
 //!   bound is derived from the one as written (`Work::rewritten_bound`).
+//!   Where that arithmetic overflows `f64`, the row stays as written
+//!   (`Work::hold_rewrites`): a rewrite only tightens the relaxation.
 //! * A row whose vars are all fixed is judged exactly as the boundary judges
 //!   it once dropped ([`row_violation`], full contract): nothing the engine
 //!   does can move it, since a var fixed on entry never leaves its value.
@@ -151,9 +153,15 @@ pub(crate) fn presolve(
     let mut lo = var_mins.to_vec();
     let mut hi = var_maxs.to_vec();
 
-    // Crossed or NaN input bounds: same verdict Solver::try_new gives.
+    // Crossed input bounds: same verdict Solver::try_new gives. The bounds
+    // are numbers, each infinite only on its open side: the model's
+    // validation (`Problem::solve_with`) takes no others.
     for v in 0..num_vars {
-        if lo[v].is_nan() || hi[v].is_nan() || lo[v] > hi[v] {
+        debug_assert!(
+            lo[v] < f64::INFINITY && hi[v] > f64::NEG_INFINITY,
+            "bounds the model's validation refuses reached presolve"
+        );
+        if lo[v] > hi[v] {
             return Err(Error::Infeasible);
         }
     }
@@ -178,8 +186,9 @@ pub(crate) fn presolve(
     let mut dropped_on_input = 0usize;
     let mut rows: Vec<Row> = Vec::with_capacity(constraints.len());
     for (orig, (coeffs, op, rhs)) in constraints.iter().enumerate() {
-        // Rows whose data alone decide them (empty, non-finite): the verdict
-        // Solver::try_new gives them, under the same contract.
+        // Rows whose data alone decide them (empty, or an infinite
+        // right-hand side): the verdict Solver::try_new gives them, under the
+        // same contract.
         match trivial_row_verdict(coeffs, *op, *rhs, feasibility) {
             Some(true) => {
                 dropped_on_input += 1;
@@ -188,24 +197,7 @@ pub(crate) fn presolve(
             Some(false) => return Err(Error::Infeasible),
             None => {}
         }
-        let (lo, hi) = match op {
-            ComparisonOp::Le => (f64::NEG_INFINITY, *rhs),
-            ComparisonOp::Ge => (*rhs, f64::INFINITY),
-            ComparisonOp::Eq => (*rhs, *rhs),
-        };
-        rows.push(Row {
-            vars: coeffs.indices().to_vec(),
-            coeffs: coeffs.data().to_vec(),
-            lo,
-            hi,
-            fold_scale: 0.0,
-            shift: 0.0,
-            folded: Vec::new(),
-            alive: true,
-            orig: orig as u32,
-            coeffs_touched: false,
-            binding: None,
-        });
+        rows.push(Row::as_written(orig, coeffs, *op, *rhs));
     }
 
     // var -> rows adjacency (flat CSR). Rows only ever lose terms, so this
@@ -302,8 +294,14 @@ pub(crate) fn presolve(
         // the row keeps its magnitude, and the bound derived from the one as
         // written (`Work::rewritten_bound`). The rewrite holds for integer
         // points only, so the answer is also checked against the input row.
-        validation_rows.push(constraints[row.orig as usize].clone());
+        // A bound the arithmetic overflows leaves the row as written, which
+        // keeps every point the rewrites kept.
         let (op, rhs) = work.rewritten_bound(row);
+        if !rhs.is_finite() {
+            out.push(constraints[row.orig as usize].clone());
+            continue;
+        }
+        validation_rows.push(constraints[row.orig as usize].clone());
         let mut vars = row.vars.clone();
         let mut coeffs = row.coeffs.clone();
         for &(v, a) in &row.folded {

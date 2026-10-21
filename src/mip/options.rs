@@ -34,8 +34,9 @@ pub enum TerminationReason {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct SolveOptions {
-    /// Wall-clock budget for this call (`None` = unlimited). On expiry the search
-    /// stops and can be resumed.
+    /// Wall-clock budget for this call (`None` = unlimited, as is a budget too
+    /// long to add to the current time, such as [`Duration::MAX`]). On expiry
+    /// the search stops and can be resumed.
     pub time_limit: Option<Duration>,
     /// Maximum number of branch & bound nodes to solve in this call
     /// (`None` = unlimited). Deterministic alternative to `time_limit`; the
@@ -53,18 +54,21 @@ pub struct SolveOptions {
     /// solution reports an integer or boolean variable's value as the solver
     /// computed it, within this distance of an integer, not necessarily on it:
     /// values like `0.9999999` are normal (one fixed at an integer, by its
-    /// bounds, the search or an edit, lies on it). Use `.round()` where an
-    /// exact integer is needed, bearing in mind that the rounded values need
-    /// not meet the constraints: under `x <= 1e7 * y`, a `y` of `1e-6` allows
-    /// `x` up to 10, which `y` rounded to zero forbids. Keep a big-M
-    /// coefficient times this tolerance small against the quantities it
-    /// bounds. It also decides integrality in [`crate::Solution::fix_var`] and
-    /// in the check of an incumbent kept across an edit. Default `1e-6`. Must
-    /// be finite and in the half-open range `[0, 0.5)`.
+    /// bounds, the search or an edit, lies on it). Round it where an exact
+    /// integer is needed: [`crate::Solution::var_domain`] tells which
+    /// variables are integer or boolean, and its documentation why the
+    /// rounded values need not meet the constraints. Keep a big-M coefficient
+    /// times this tolerance small against the quantities it bounds. It also
+    /// decides integrality in [`crate::Solution::fix_var`] and in the check of
+    /// an incumbent kept across an edit. Default `1e-6`. Must be finite and
+    /// in the half-open range `[0, 0.5)`.
     pub int_tol: f64,
     /// Optional (partial) starting assignment used to seed the incumbent. The
     /// variables it leaves out are completed by an LP; a hint that is invalid or
-    /// infeasible, or whose completion is fractional or fails, is ignored.
+    /// infeasible for the model (a value outside its variable's bounds, or one
+    /// the constraints exclude), or whose completion is fractional or fails, is
+    /// ignored. A value that is NaN or infinite, or a variable outside the
+    /// problem, makes the solve return [`Error::InvalidOperation`] instead.
     /// Default `None`.
     pub warm_start: Option<Vec<(Variable, f64)>>,
     /// Enable presolve, which reduces the problem before the search starts
@@ -144,7 +148,8 @@ impl SolveOptions {
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct ResumeOptions {
-    /// New wall-clock budget (`None` = unlimited).
+    /// New wall-clock budget (`None` = unlimited, as is a budget too long to
+    /// add to the current time, such as [`Duration::MAX`]).
     pub time_limit: Option<Duration>,
     /// New branch-and-bound node budget (`None` = unlimited).
     pub node_limit: Option<u64>,
@@ -204,12 +209,6 @@ pub struct Tolerances {
     /// the recommended range of the crate documentation keep small. Must be
     /// finite and at least `1e-10`. Default `1e-7`.
     pub feasibility: f64,
-    /// Ignored: [`SolveOptions::int_tol`] decides integrality everywhere,
-    /// [`crate::Solution::fix_var`] and the check of an incumbent kept across
-    /// an edit included, so that `fix_var` accepts every value a solution
-    /// reports. Default `1e-5`.
-    #[deprecated(note = "ignored: SolveOptions::int_tol decides integrality everywhere")]
-    pub integrality_rounding: f64,
     /// Relative slack subtracted from the incumbent objective to form the
     /// branch & bound pruning cutoff: a node whose bound is not strictly
     /// better than `incumbent - max(prune_epsilon, prune_epsilon *
@@ -221,12 +220,10 @@ pub struct Tolerances {
     pub prune_epsilon: f64,
 }
 
-#[allow(deprecated)]
 impl Default for Tolerances {
     fn default() -> Self {
         Self {
             feasibility: 1e-7,
-            integrality_rounding: 1e-5,
             prune_epsilon: 1e-9,
         }
     }

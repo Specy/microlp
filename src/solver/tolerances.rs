@@ -279,35 +279,36 @@ pub(crate) fn implied_slack_error(slack: f64, magnitude: f64, terms: usize) -> f
     4.0 * UNIT_ROUNDOFF * slack + 4.0 * n * n * UNIT_ROUNDOFF * UNIT_ROUNDOFF * magnitude
 }
 
-/// What a row says before any point is looked at: `Some(false)` when no
-/// point can satisfy it (a coefficient or right-hand side that is not a
-/// number, an infinite coefficient, an infinite right-hand side on the
-/// side the row constrains, an empty row whose right-hand side the contract
-/// does not allow at activity zero), `Some(true)` when every point does (an
-/// infinite right-hand side on the side the row leaves open, an empty row
-/// within the contract), and `None` when its terms decide. An empty row is
-/// judged by the same comparison as every other row: its activity is
-/// exactly zero, and its magnitude is that of its right-hand side.
+/// Whether a row of sense `op` can take the right-hand side `rhs`: a finite
+/// one, or one infinite on the side the row leaves open (`+inf` on `≤`,
+/// `-inf` on `≥`), where `rhs - activity` lies within the slack range at
+/// every finite point.
+pub(crate) fn valid_rhs(op: ComparisonOp, rhs: f64) -> bool {
+    let (smin, smax) = slack_bounds(op);
+    rhs.is_finite() || rhs == smin || rhs == smax
+}
+
+/// What a row says before any point is looked at: `Some(true)` when every
+/// point satisfies it (an infinite right-hand side, which lies on the side
+/// the row leaves open, or an empty row within the contract), `Some(false)`
+/// when none does (an empty row whose right-hand side the contract does not
+/// allow at activity zero), and `None` when its terms decide. An empty row
+/// is judged by the same comparison as every other row: its activity is
+/// exactly zero, and its magnitude is that of its right-hand side. The
+/// right-hand side is one [`valid_rhs`] takes: the model's validation
+/// (`Problem::solve_with`) refuses any other, and [`super::prepare_row`] an
+/// engine row that holds one.
 pub(crate) fn trivial_row_verdict(
     coeffs: &CsVec,
     op: ComparisonOp,
     rhs: f64,
     feasibility: f64,
 ) -> Option<bool> {
-    if rhs.is_nan() || coeffs.data().iter().any(|c| !c.is_finite()) {
-        return Some(false);
-    }
-    let (smin, smax) = slack_bounds(op);
     if rhs.is_infinite() {
-        // `rhs - activity` is infinite for every finite point: inside the
-        // slack range only if that range is unbounded on rhs's side.
-        return Some(if rhs > 0.0 {
-            smax == f64::INFINITY
-        } else {
-            smin == f64::NEG_INFINITY
-        });
+        return Some(true);
     }
     if coeffs.indices().is_empty() {
+        let (smin, smax) = slack_bounds(op);
         return Some(!outside(
             rhs,
             smin,

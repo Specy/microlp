@@ -38,6 +38,11 @@ impl CoefficientRange {
         range
     }
 
+    /// How many rows have been measured: the index the next one gets.
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+
     /// Measure one more row, numbered after those measured so far. A
     /// coefficient that is zero or not finite has no magnitude to compare.
     pub(crate) fn add_row(&mut self, coeffs: &CsVec) {

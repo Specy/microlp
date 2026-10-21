@@ -61,7 +61,13 @@ the solve returns an error:
 * [`Error::InternalError`]: a numerical failure the solver could not recover
   from. It returns this rather than an answer it could not verify.
 * [`Error::InvalidOptions`] for an invalid explicit numeric option, and
-  [`Error::InvalidOperation`] for a NaN or infinite objective coefficient.
+  [`Error::InvalidOperation`] for invalid input, both checked before anything
+  is solved. Every number of the problem must be finite, but a bound or a
+  constraint's right-hand side may be infinite on the side it leaves open:
+  `f64::NEG_INFINITY` as a lower bound or on a [`ComparisonOp::Ge`]
+  constraint, `f64::INFINITY` as an upper bound or on a [`ComparisonOp::Le`]
+  constraint, where it constrains nothing. A warm-start hint must give finite
+  values to variables of the problem.
 
 An optimal solution is optimal at the point the solver ends at, within the
 tolerance, not over every point the tolerance admits: on an ill-conditioned
@@ -107,8 +113,9 @@ When a solve call returns successfully:
 [`Solution::var_value`] reports a value as the solver computed it. An integer
 or boolean variable's value lies within [`SolveOptions::int_tol`] of an
 integer, not necessarily on it: values like `0.9999999` are normal; one fixed
-at an integer lies on it. Round it where an exact integer is needed, bearing
-in mind that rounded values need not meet the constraints: under
+at an integer lies on it. Round it where an exact integer is needed
+([`Solution::var_domain`] tells which variables are integer or boolean),
+bearing in mind that rounded values need not meet the constraints: under
 `x <= 1e7 * y`, a `y` of `1e-6` allows `x` up to 10, which `y` rounded to zero
 forbids.
 

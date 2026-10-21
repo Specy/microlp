@@ -64,13 +64,15 @@ fn milp_fix_var_outside_bounds_is_infeasible_error() {
 }
 
 #[test]
-fn milp_fix_var_non_finite_is_infeasible_error() {
+fn milp_fix_var_non_finite_is_an_invalid_operation() {
     for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        let (p, a, _) = int_2var_problem();
+        let (p, _, b) = int_2var_problem();
         let sol = solution(p.solve().unwrap());
-        assert!(
-            matches!(sol.fix_var(a, invalid), Err(Error::Infeasible)),
-            "non-finite fix {invalid} was not rejected"
+        assert_eq!(
+            sol.fix_var(b, invalid).map(|_| "solved"),
+            Err(Error::InvalidOperation(format!(
+                "invalid fix_var value {invalid} of variable 1: expected a finite value"
+            ))),
         );
     }
 }

@@ -222,7 +222,23 @@ impl Work<'_> {
         }
         if row.folded.len() > folded {
             self.relax_binding(row);
+            self.hold_rewrites(row);
         }
+    }
+
+    /// Keep `row`'s rewrites only while their bound is a number: where the
+    /// arithmetic overflows `f64` and leaves it infinite or NaN, give the row
+    /// back as written, its fixed vars folded out. The rewrites only
+    /// tightened the row's relaxation, so the row as written keeps every point
+    /// they kept. Whether the row was given back.
+    fn hold_rewrites(&self, row: &mut Row) -> bool {
+        if row.binding.is_none() || row.lo.is_finite() || row.hi.is_finite() {
+            return false;
+        }
+        let (coeffs, op, rhs) = &self.constraints[row.orig as usize];
+        *row = Row::as_written(row.orig as usize, coeffs, *op, *rhs);
+        self.fold_fixed(row);
+        true
     }
 
     /// The magnitude of `row`'s fixed terms folded so far but `binaries'`.
@@ -651,10 +667,15 @@ impl Work<'_> {
     /// to half the round-off of the magnitude of the row's unfixed other
     /// terms, the bound itself being exact ([`Self::rewritten_bound`]). A term
     /// fixed after the rewrites widens the difference
-    /// ([`Self::relax_binding`]).
+    /// ([`Self::relax_binding`]). Where the magnitude as written overflows
+    /// `f64`, no relaxation holds the branch: the room is infinite, and the
+    /// row goes back as written ([`Self::hold_rewrites`]).
     fn rewrite_room(&self, written: f64, rewritten: f64, fixed: f64) -> f64 {
-        (row_tolerance(self.feas, written + fixed) - row_tolerance(self.feas, rewritten + fixed))
-            .max(0.0)
+        let written = written + fixed;
+        if !written.is_finite() {
+            return f64::INFINITY;
+        }
+        (row_tolerance(self.feas, written) - row_tolerance(self.feas, rewritten + fixed)).max(0.0)
     }
 
     /// Record in `row`'s binding branch the rewrite of its bound `b` into
@@ -886,15 +907,19 @@ impl Work<'_> {
                     }
                 }
                 if applied {
-                    self.stats.coeffs_tightened += 1;
                     changed = true;
-                    row.coeffs_touched = true;
                     // The row's data changed: reprocess it in the primal
                     // worklist (new redundancies/bounds may follow).
                     if !self.dirty[r] {
                         self.dirty[r] = true;
                         self.queue.push(r as u32);
                     }
+                    if self.hold_rewrites(row) {
+                        // Given back as written: `act` no longer describes it.
+                        break;
+                    }
+                    self.stats.coeffs_tightened += 1;
+                    row.coeffs_touched = true;
                 }
             }
         }

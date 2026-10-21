@@ -245,16 +245,11 @@ fn plunge_and_jump_selection_preserves_optima() {
 }
 
 #[test]
-#[allow(deprecated)]
 fn tolerances_default_matches_documented_values() {
     let t = Tolerances::default();
     assert_eq!(
         t.feasibility, 1e-7,
         "see Tolerances::feasibility's doc default"
-    );
-    assert_eq!(
-        t.integrality_rounding, 1e-5,
-        "see Tolerances::integrality_rounding's doc default"
     );
     assert_eq!(
         t.prune_epsilon, 1e-9,

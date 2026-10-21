@@ -1,4 +1,5 @@
-//! Solving a MILP: status, objective sign, and the limits that interrupt a solve.
+//! Solving a MILP: status, objective sign, variable domains, and the limits
+//! that interrupt a solve.
 
 use super::common::{binary_knapsack, int_2var_problem, solution};
 use crate::*;
@@ -127,4 +128,70 @@ fn positive_mip_gap_returns_a_feasible_solution_with_gap_reason() {
     assert_eq!(sol.status(), SolutionStatus::Feasible);
     assert_eq!(sol.termination_reason(), TerminationReason::MipGap);
     assert!(sol.gap().unwrap() <= 0.5 + 1e-9);
+}
+
+/// `Problem::var_domain` returns each var's domain as it was added.
+#[test]
+fn problem_var_domain_returns_each_variables_domain() {
+    let mut p = Problem::new(OptimizationDirection::Minimize);
+    let x = p.add_var(1.0, (0.0, 1.0));
+    let n = p.add_integer_var(1.0, (0, 3));
+    let b = p.add_binary_var(1.0);
+    assert_eq!(p.var_domain(x), VarDomain::Real);
+    assert_eq!(p.var_domain(n), VarDomain::Integer);
+    assert_eq!(p.var_domain(b), VarDomain::Boolean);
+}
+
+/// `Problem::var_domain` panics on a handle whose index the problem does not
+/// have, as `Solution::var_value` does.
+#[test]
+#[should_panic(expected = "assertion failed: var.0 <")]
+fn problem_var_domain_panics_on_a_variable_outside_the_problem() {
+    let mut other = Problem::new(OptimizationDirection::Minimize);
+    other.add_var(1.0, (0.0, 1.0));
+    let foreign = other.add_var(1.0, (0.0, 1.0));
+    let mut p = Problem::new(OptimizationDirection::Minimize);
+    p.add_var(1.0, (0.0, 1.0));
+    p.var_domain(foreign);
+}
+
+/// `Solution::var_domain` returns each var's domain on a MILP solution, the
+/// problem's, before and after each kind of edit; the values the search
+/// found round to integers on the integer and boolean vars.
+#[test]
+fn milp_solution_var_domain_returns_each_variables_domain_across_edits() {
+    let mut p = Problem::new(OptimizationDirection::Maximize);
+    let x = p.add_var(1.0, (0.0, 2.5));
+    let n = p.add_integer_var(2.0, (0, 10));
+    let b = p.add_binary_var(1.0);
+    p.add_constraint(&[(x, 1.0), (n, 1.0), (b, 1.0)], ComparisonOp::Le, 7.5);
+    let domains = [
+        (x, VarDomain::Real),
+        (n, VarDomain::Integer),
+        (b, VarDomain::Boolean),
+    ];
+    let int_tol = SolveOptions::default().int_tol;
+    let check = |sol: &Solution| {
+        for (var, domain) in domains {
+            assert_eq!(sol.var_domain(var), domain);
+            assert_eq!(sol.var_domain(var), p.var_domain(var));
+            if domain != VarDomain::Real {
+                let value = sol.var_value(var);
+                assert!((value - value.round()).abs() <= int_tol, "{value}");
+            }
+        }
+    };
+
+    let sol = solution(p.solve().unwrap());
+    check(&sol);
+    let sol = solution(
+        sol.add_constraint(&[(n, 1.0)], ComparisonOp::Le, 5.0)
+            .unwrap(),
+    );
+    check(&sol);
+    let sol = solution(sol.fix_var(b, 0.0).unwrap());
+    check(&sol);
+    let (outcome, was_fixed) = sol.unfix_var(b).unwrap();
+    assert!(was_fixed);
+    check(&solution(outcome));
 }

@@ -87,6 +87,29 @@ pub(crate) struct Binding {
 }
 
 impl Row {
+    /// Input row `orig`, `coeffs op rhs`, in the working form, nothing folded
+    /// or rewritten yet.
+    pub(crate) fn as_written(orig: usize, coeffs: &CsVec, op: ComparisonOp, rhs: f64) -> Self {
+        let (lo, hi) = match op {
+            ComparisonOp::Le => (f64::NEG_INFINITY, rhs),
+            ComparisonOp::Ge => (rhs, f64::INFINITY),
+            ComparisonOp::Eq => (rhs, rhs),
+        };
+        Row {
+            vars: coeffs.indices().to_vec(),
+            coeffs: coeffs.data().to_vec(),
+            lo,
+            hi,
+            fold_scale: 0.0,
+            shift: 0.0,
+            folded: Vec::new(),
+            alive: true,
+            orig: orig as u32,
+            coeffs_touched: false,
+            binding: None,
+        }
+    }
+
     /// The magnitude of row bound `b` (`lo` or `hi`) as the engine sees it:
     /// the right-hand side as written, fixed terms not substituted out, since
     /// the engine evaluates the row with those terms in it.

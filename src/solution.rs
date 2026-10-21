@@ -1,6 +1,7 @@
 //! [`Solution`]: a validated assignment, everything that can be read off it,
 //! and the post-solve edits that continue from it.
 
+use crate::problem::{check_row, row_of};
 use crate::range::CoefficientRange;
 use crate::solver::Solver;
 use crate::{
@@ -105,10 +106,9 @@ impl Solution {
     /// or boolean variable's value is within [`SolveOptions::int_tol`] of an
     /// integer, not necessarily on it: values like `0.9999999` are normal. One
     /// fixed at an integer (by its bounds, the search or an edit) lies on it.
-    /// Use `.round()` where an exact integer is needed, bearing in mind that
-    /// the rounded values need not meet the constraints: under
-    /// `x <= 1e7 * y`, a `y` of `1e-6` allows `x` up to 10, which `y` rounded
-    /// to zero forbids.
+    /// Round it where an exact integer is needed: [`Solution::var_domain`]
+    /// tells which variables are integer or boolean, and its documentation
+    /// why the rounded values need not meet the constraints.
     ///
     /// # Panics
     ///
@@ -127,15 +127,48 @@ impl Solution {
         }
     }
 
-    /// Returns a variable's value: the same as [`Solution::var_value`], which
-    /// no longer rounds.
+    /// Returns a variable's domain: whether it is real, integer or boolean.
+    ///
+    /// This is how to round the values of the integer and boolean variables
+    /// where exact integers are needed: [`Solution::var_value`] reports such a
+    /// value as the solver computed it, within [`SolveOptions::int_tol`] of an
+    /// integer, not necessarily on it. Bear in mind that the rounded values
+    /// need not meet the constraints: under `x <= 1e7 * y`, a `y` of `1e-6`
+    /// allows `x` up to 10, which `y` rounded to zero forbids.
     ///
     /// # Panics
     ///
     /// Panics if `var` is out of range for this problem.
-    #[deprecated(note = "values are reported as computed: use `Solution::var_value`")]
-    pub fn var_value_raw(&self, var: Variable) -> f64 {
-        self.var_value(var)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use microlp::{ComparisonOp, OptimizationDirection, Problem, VarDomain};
+    ///
+    /// let mut problem = Problem::new(OptimizationDirection::Maximize);
+    /// let x = problem.add_var(1.0, (0.0, 2.5));
+    /// let n = problem.add_integer_var(2.0, (0, 10));
+    /// problem.add_constraint(&[(x, 1.0), (n, 1.0)], ComparisonOp::Le, 7.5);
+    /// let solution = problem.solve().unwrap().into_solution().unwrap();
+    ///
+    /// // Exact integers for the integer and boolean variables, the others as
+    /// // computed.
+    /// let values: Vec<f64> = solution
+    ///     .iter()
+    ///     .map(|(var, value)| match solution.var_domain(var) {
+    ///         VarDomain::Integer | VarDomain::Boolean => value.round(),
+    ///         VarDomain::Real => value,
+    ///     })
+    ///     .collect();
+    /// assert_eq!(values[n.idx()], 7.0);
+    /// assert!((values[x.idx()] - 0.5).abs() < 1e-6);
+    /// ```
+    pub fn var_domain(&self, var: Variable) -> VarDomain {
+        assert!(var.0 < self.num_vars);
+        match &self.state {
+            SolveState::Lp(solver) => solver.orig_var_domains[var.0],
+            SolveState::Mip(state) => state.base.var_domains[var.0],
+        }
     }
 
     /// Returns the relative gap between this solution and the best proven bound.
@@ -194,19 +227,25 @@ impl Solution {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Infeasible`] when the solver proves the edited problem
-    /// infeasible (see [`Error::Infeasible`]). A malformed expression or a
-    /// failure while solving is returned as [`Error::InternalError`].
+    /// Returns [`Error::InvalidOperation`], before anything is solved, when
+    /// `expr` repeats a variable or contains a variable index outside the
+    /// problem, or when a coefficient or `rhs` is a number
+    /// [`Problem::solve_with`](crate::Problem::solve_with) refuses; the
+    /// message numbers the constraint after the problem's and those added
+    /// before it. Returns [`Error::Infeasible`] when the solver proves the
+    /// edited problem infeasible (see [`Error::Infeasible`]), and
+    /// [`Error::InternalError`] for a failure while solving.
     pub fn add_constraint(
         self,
         expr: impl Into<LinearExpr>,
         cmp_op: ComparisonOp,
         rhs: f64,
     ) -> Result<SolveOutcome, Error> {
-        let expr = expr.into();
-        let coefficients = CsVec::new_from_unsorted(self.num_vars, expr.vars, expr.coeffs)
-            .map_err(|error| Error::InternalError(error.2.to_string()))?;
         let mut range = self.state.coefficient_range();
+        let row = range.rows();
+        let coefficients =
+            row_of(expr.into(), self.num_vars, row).map_err(Error::InvalidOperation)?;
+        check_row(&coefficients, cmp_op, rhs, row)?;
         range.add_row(&coefficients);
         self.add_row(coefficients, cmp_op, rhs, range.clone())
             .map_err(|error| range.annotate(error))
@@ -260,10 +299,11 @@ impl Solution {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Infeasible`] if `val` is not finite, is outside the
-    /// variable's original bounds or is incompatible with its integer or
-    /// boolean domain, and when the solver proves the edited problem infeasible
-    /// (see [`Error::Infeasible`]). A `min <= -2^52` or `max >= 2^52` counts as
+    /// Returns [`Error::InvalidOperation`] if `val` is NaN or infinite. Returns
+    /// [`Error::Infeasible`] if `val` is outside the variable's original
+    /// bounds or is incompatible with its integer or boolean domain, and when
+    /// the solver proves the edited problem infeasible (see
+    /// [`Error::Infeasible`]). A `min <= -2^52` or `max >= 2^52` counts as
     /// infinite here too (see [`Problem::add_var`](crate::Problem::add_var)),
     /// and the bound and domain checks allow the solve's tolerances, so any
     /// value this solution reports is accepted (an integer variable's within
@@ -301,7 +341,10 @@ impl Solution {
         } = self;
         assert!(var.0 < num_vars);
         if !val.is_finite() {
-            return Err(Error::Infeasible);
+            return Err(Error::InvalidOperation(format!(
+                "invalid fix_var value {val} of variable {}: expected a finite value",
+                var.0
+            )));
         }
         match state {
             SolveState::Lp(mut solver) => {

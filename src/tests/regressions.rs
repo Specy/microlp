@@ -1119,4 +1119,98 @@ pub(crate) mod regression_tests {
         assert_solves_within_contract(&model);
         assert_solves_within_contract_without_presolve(&model);
     }
+
+    /// The row an edit adds to an LP is scaled by the column factors of the
+    /// rows before it: `x` scaled for `1e-200 x >= 1e-200` makes the
+    /// coefficient of the added `1e200 x <= 5e200` infinite (`y` beside it in
+    /// the second model, presolve on). The engine cannot hold the row: an
+    /// `InternalError`, where its arithmetic once answered `Infeasible` on
+    /// this feasible model.
+    #[test]
+    fn an_added_row_the_column_scales_overflow_is_an_internal_error() {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_var(1.0, (0.0, 10.0));
+        problem.add_constraint([(x, 1e-200)], ComparisonOp::Ge, 1e-200);
+        let options = crate::SolveOptions {
+            presolve: false,
+            ..crate::SolveOptions::default()
+        };
+        let solved = problem
+            .solve_with(options)
+            .unwrap()
+            .into_solution()
+            .unwrap();
+        let edited = solved.add_constraint([(x, 1e200)], ComparisonOp::Le, 5e200);
+        assert!(
+            matches!(&edited, Err(crate::Error::InternalError(m)) if m.contains("not finite once scaled")),
+            "{:?}",
+            edited.map(|_| "solved")
+        );
+
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x = problem.add_var(1.0, (0.0, 10.0));
+        let y = problem.add_var(1.0, (0.0, 10.0));
+        problem.add_constraint([(x, 1e-200), (y, 1e-200)], ComparisonOp::Le, 3e-200);
+        let solved = problem.solve().unwrap().into_solution().unwrap();
+        let edited = solved.add_constraint([(x, 1e200), (y, 1.0)], ComparisonOp::Le, 1e200);
+        assert!(
+            matches!(&edited, Err(crate::Error::InternalError(m)) if m.contains("not finite once scaled")),
+            "{:?}",
+            edited.map(|_| "solved")
+        );
+    }
+
+    /// Fixing `x` at `1e300` where its column factor is `2^-997`, for the row
+    /// `1e300 x <= 1e300`: the bound overflows the engine's units. An
+    /// `InternalError` that says so, where the engine once took the var as
+    /// fixed at infinity.
+    #[test]
+    fn a_fix_the_column_scale_overflows_is_an_internal_error() {
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x = problem.add_var(1.0, (0.0, f64::INFINITY));
+        problem.add_constraint([(x, 1e300)], ComparisonOp::Le, 1e300);
+        let solved = problem.solve().unwrap().into_solution().unwrap();
+        let fixed = solved.fix_var(x, 1e300);
+        assert!(
+            matches!(&fixed, Err(crate::Error::InternalError(m)) if m.contains("cannot take the bounds")),
+            "{:?}",
+            fixed.map(|_| "solved")
+        );
+    }
+
+    /// Coefficient tightening rewrites `y`'s big-M coefficient in
+    /// `5e307 y + a z3 <= 1e307`; the fixing of `z3` at `-2^31` folds a term
+    /// of `-1.3e308` into the row, whose magnitude then overflows `f64`, and
+    /// the rewrite's bound with it (it was emitted NaN). The row goes back as
+    /// written, and the model, feasible at `y = 1`, solves as with presolve
+    /// off.
+    #[test]
+    fn a_rewrite_whose_bound_overflows_keeps_the_row_as_written() {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let y = problem.add_binary_var(-1.0);
+        let z1 = problem.add_integer_var(0.0, (0, 5));
+        let z2 = problem.add_integer_var(0.0, (0, 5));
+        let z3 = problem.add_integer_var(0.0, (i32::MIN, 0));
+        let a = 1.3e308 / 2147483648.0;
+        problem.add_constraint([(y, 5e307), (z3, a)], ComparisonOp::Le, 1e307);
+        problem.add_constraint([(z2, 1.0), (z1, -1.0)], ComparisonOp::Ge, -1.0);
+        problem.add_constraint([(z3, 1.0), (z2, -1.0)], ComparisonOp::Ge, -2147483649.0);
+        for presolve in [true, false] {
+            let options = crate::SolveOptions {
+                presolve,
+                ..crate::SolveOptions::default()
+            };
+            let solution = problem
+                .solve_with(options)
+                .unwrap()
+                .into_solution()
+                .unwrap();
+            assert_eq!(
+                solution.status(),
+                crate::SolutionStatus::Optimal,
+                "presolve {presolve}"
+            );
+            assert_eq!(solution.objective(), -1.0, "presolve {presolve}");
+        }
+    }
 }
