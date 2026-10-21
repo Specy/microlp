@@ -1,7 +1,7 @@
 //! The search itself: visiting, branching, warm-starting and pruning nodes,
 //! and the loop that drives them until a termination reason is proven.
 
-use super::node::{effective_bounds, Node};
+use super::node::{with_var_bounds, Node};
 use super::params;
 use super::state::{Incumbent, MipState};
 use super::{
@@ -89,10 +89,13 @@ fn process_integral_candidate(
     }
 }
 
-/// Apply `node`'s bounds to the solver, diffing against what is currently applied.
-/// Returns false (node pruned, solver untouched) if the node's bounds cross.
+/// Apply `node`'s bounds to the solver: reset each var in `applied` that the
+/// node has no entry for to its root bounds, then set every entry of the
+/// node, also one already in force, which drops any widening a previous
+/// solve left on it (`Solver::set_var_bounds`). Returns false (node pruned,
+/// solver untouched) if the node's bounds cross.
 fn apply_node_bounds(state: &mut MipState, node: &Node) -> bool {
-    let target = effective_bounds(&node.bound_changes);
+    let target = &node.bound_changes;
     if target.iter().any(|&(_, lo, hi)| lo > hi) {
         return false;
     }
@@ -106,14 +109,14 @@ fn apply_node_bounds(state: &mut MipState, node: &Node) -> bool {
                 .expect("root bounds cannot cross");
         }
     }
-    // Apply the target bounds (validated above, cannot fail).
-    for &(v, lo, hi) in &target {
+    // Set every target bound, those in force too (validated above, cannot fail).
+    for &(v, lo, hi) in target {
         state
             .solver
             .set_var_bounds(v, lo, hi)
             .expect("validated bounds cannot cross");
     }
-    state.applied = target;
+    state.applied.clone_from(target);
     true
 }
 
@@ -149,13 +152,8 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
     state.last_solved_id = Some(id);
     let basis = state.solver.snapshot_basis();
 
-    let mut down_changes = parent.bound_changes.clone();
-    down_changes.push((var, lo, floor));
-    let mut up_changes = parent.bound_changes.clone();
-    up_changes.push((var, floor + 1.0, hi));
-
     let down_node = Node {
-        bound_changes: down_changes,
+        bound_changes: with_var_bounds(&parent.bound_changes, var, lo, floor),
         basis: basis.clone(),
         lp_bound: z,
         depth: parent.depth + 1,
@@ -165,7 +163,7 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
         branch_frac: f_down,
     };
     let up_node = Node {
-        bound_changes: up_changes,
+        bound_changes: with_var_bounds(&parent.bound_changes, var, floor + 1.0, hi),
         basis,
         lp_bound: z,
         depth: parent.depth + 1,

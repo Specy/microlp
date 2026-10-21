@@ -1,15 +1,14 @@
 //! Plain-data branch & bound tree nodes.
 
 use crate::solver::Basis;
-use std::collections::BTreeMap;
 
 /// One open node of the search tree. Contains no solver machinery — applying
 /// `bound_changes` on top of the root bounds plus loading `basis` fully
 /// reconstructs the node's starting state.
 #[derive(Clone, Debug)]
 pub(crate) struct Node {
-    /// Cumulative bound changes from the root, in creation order; for a var that
-    /// appears multiple times the LAST entry is its current bounds.
+    /// Bound changes from the root: one entry per branched var, its bounds
+    /// from the last branching on it, sorted by var index.
     pub bound_changes: Vec<(usize, f64, f64)>,
     /// Optimal basis of the parent node (dual-feasible warm start after tightening).
     pub basis: Basis,
@@ -29,14 +28,25 @@ pub(crate) struct Node {
     pub branch_frac: f64,
 }
 
-/// Collapse a bound-change list to one entry per var (later entries win),
-/// sorted by var index for deterministic application order.
-pub(crate) fn effective_bounds(changes: &[(usize, f64, f64)]) -> Vec<(usize, f64, f64)> {
-    let mut map: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
-    for &(v, lo, hi) in changes {
-        map.insert(v, (lo, hi));
+/// `changes` with `var`'s bounds set to `(lo, hi)`, replacing its entry or
+/// inserting one in var order: a child's bound changes from its parent's, so
+/// a node holds one entry per var however deep it lies. `changes` must be as
+/// a node stores them, sorted by var with one entry per var.
+pub(crate) fn with_var_bounds(
+    changes: &[(usize, f64, f64)],
+    var: usize,
+    lo: f64,
+    hi: f64,
+) -> Vec<(usize, f64, f64)> {
+    debug_assert!(
+        changes.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "bound changes out of var order or with a var twice"
+    );
+    let entry = (var, lo, hi);
+    match changes.binary_search_by_key(&var, |&(v, _, _)| v) {
+        Ok(i) => [&changes[..i], &[entry], &changes[i + 1..]].concat(),
+        Err(i) => [&changes[..i], &[entry], &changes[i..]].concat(),
     }
-    map.into_iter().map(|(v, (lo, hi))| (v, lo, hi)).collect()
 }
 
 #[cfg(test)]
@@ -44,12 +54,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn effective_bounds_later_entries_win() {
-        let changes = vec![(3, 0.0, 7.0), (1, 0.0, 1.0), (3, 2.0, 5.0)];
+    fn with_var_bounds_replaces_a_vars_entry_or_inserts_it_in_var_order() {
+        let changes = [(1, 0.0, 1.0), (3, 0.0, 7.0)];
         assert_eq!(
-            effective_bounds(&changes),
+            with_var_bounds(&changes, 3, 2.0, 5.0),
             vec![(1, 0.0, 1.0), (3, 2.0, 5.0)]
         );
-        assert_eq!(effective_bounds(&[]), vec![]);
+        assert_eq!(
+            with_var_bounds(&changes, 1, 1.0, 1.0),
+            vec![(1, 1.0, 1.0), (3, 0.0, 7.0)]
+        );
+        assert_eq!(
+            with_var_bounds(&changes, 0, -1.0, 0.0),
+            vec![(0, -1.0, 0.0), (1, 0.0, 1.0), (3, 0.0, 7.0)]
+        );
+        assert_eq!(
+            with_var_bounds(&changes, 2, 4.0, 4.0),
+            vec![(1, 0.0, 1.0), (2, 4.0, 4.0), (3, 0.0, 7.0)]
+        );
+        assert_eq!(
+            with_var_bounds(&changes, 5, 6.0, 9.0),
+            vec![(1, 0.0, 1.0), (3, 0.0, 7.0), (5, 6.0, 9.0)]
+        );
+        assert_eq!(with_var_bounds(&[], 4, 0.0, 1.0), vec![(4, 0.0, 1.0)]);
     }
 }

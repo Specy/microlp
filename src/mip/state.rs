@@ -23,7 +23,8 @@ pub(crate) struct MipState {
     pub solver: Solver,
     /// Original bounds of the structural vars (to reset when jumping between nodes).
     pub root_bounds: Vec<(f64, f64)>,
-    /// Bound changes currently applied to `solver` (collapsed, sorted by var).
+    /// Bound changes currently applied to `solver`, as a node stores them (one
+    /// entry per var, sorted by var).
     pub applied: Vec<(usize, f64, f64)>,
     pub open: Vec<Node>,
     /// Pop policy toggle for `pop_node`: `true` while the most recently processed

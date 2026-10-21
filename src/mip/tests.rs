@@ -133,6 +133,46 @@ fn open_children_have_branch_metadata() {
 }
 
 #[test]
+fn a_deep_search_stores_one_bound_change_per_var_in_each_node() {
+    // The LP bound stays 3.5 against the incumbent 3 along a face the
+    // integer bounds leave open, so the search branches x and y again and
+    // again until its budget runs out.
+    let mut p = Problem::new(OptimizationDirection::Maximize);
+    let x = p.add_integer_var(1.0, (i32::MIN, i32::MAX));
+    let y = p.add_integer_var(1.0, (i32::MIN, i32::MAX));
+    p.add_constraint(&[(x, 2.0), (y, 2.0)], ComparisonOp::Le, 7.0);
+    p.add_constraint(&[(x, 1.0), (y, -1.0)], ComparisonOp::Le, 0.5);
+    let mut options = SolveOptions::default();
+    options.node_limit = Some(200);
+    let run = run(&p, options).unwrap();
+
+    assert_eq!(
+        run.reason,
+        TerminationReason::NodeLimit,
+        "the search should stop at its node limit"
+    );
+    assert!(
+        (incumbent_obj(&run.state) + 3.0).abs() < 1e-6,
+        "the incumbent should be 3"
+    );
+    assert!(
+        run.state.open.iter().any(|node| node.depth >= 100),
+        "the search should branch each var again and again"
+    );
+    for node in &run.state.open {
+        let changes = &node.bound_changes;
+        assert!(
+            changes.len() <= 2,
+            "a node should hold at most one entry per var"
+        );
+        assert!(
+            changes.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "a node's entries should be in var order, one per var"
+        );
+    }
+}
+
+#[test]
 fn driver_zero_time_limit_interrupts_cleanly_then_resumes() {
     let mut options = SolveOptions::default();
     options.time_limit = Some(Duration::ZERO);

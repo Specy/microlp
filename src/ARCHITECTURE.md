@@ -73,7 +73,7 @@ Three principles shape everything:
 | `src/mip/search.rs` | The search itself: node visits, warm starts, branching, pruning, and the outer search loop. |
 | `src/mip/state.rs` | `MipState` (the complete, resumable search state) and `MipRun`. |
 | `src/mip/options.rs` | The public option and report types: `SolveOptions`, `ResumeOptions`, `Tolerances`, `Stats`, `SolutionStatus`, `TerminationReason`. |
-| `src/mip/node.rs` | `Node` (plain-data tree node) and `effective_bounds` (bound-change collapsing). |
+| `src/mip/node.rs` | `Node` (plain-data tree node) and `with_var_bounds` (a child's bound changes from its parent's). |
 | `src/mip/branching/` | Integrality checks and branch-variable selection (pseudocosts). |
 | `src/mip/params.rs` | Named, documented internal constants (see §7). |
 | `tests/suite/` | The problem-based correctness suite (see §9) — the safety net for all of this. |
@@ -310,7 +310,7 @@ not the answer; a MIP candidate that misses one is rejected (§5.4).
 ```rust
 // A tree node is PLAIN DATA — no solver machinery anywhere:
 Node {
-    bound_changes: Vec<(var, lo, hi)>, // cumulative from the root; later entries win
+    bound_changes: Vec<(var, lo, hi)>, // one entry per branched var, sorted by var
     basis: Basis,                      // the PARENT's optimal basis (warm start)
     lp_bound: f64,                     // parent's LP objective = valid lower bound here
     depth, parent_id,                  // parent_id detects warm dives (§5.2)
@@ -322,7 +322,8 @@ Node {
 Reconstructing any node's starting state = apply its `bound_changes` on top of the root
 bounds, load its `basis`, reoptimize. That is the whole trick: because nodes carry no live
 state, they are trivially storable, resumable, and cheap (a basis is `total_vars` bytes; a
-bound-change list is `depth` entries).
+bound-change list holds at most one entry per var however deep the node, since a child sets
+the entry of the var it branches on).
 
 The optional branch variable is a correctness distinction: the root has no creating branch
 and therefore must never record a pseudocost observation. Every child stores the variable
@@ -393,9 +394,10 @@ flowchart TD
 
 ### 5.2 Visiting a node: warm dives vs jumps
 
-When a node is popped, its target bounds are diffed against `applied`: variables no longer
-constrained are reset to root bounds, changed ones are set. Then one question decides the
-cost of the visit: **is the solver already sitting at this node's parent's optimum?**
+When a node is popped, its bounds replace `applied`: a var of `applied` the node has no entry
+for is reset to its root bounds, and every entry of the node is set, also one already in
+force, which drops any widening a previous solve left on it (§7.3). Then one question decides
+the cost of the visit: **is the solver already sitting at this node's parent's optimum?**
 
 - `last_solved_id == node.parent_id` → **warm dive**: the parent was the immediately
   previously solved node, its basis is live in the solver, and the child differs by exactly
@@ -1412,13 +1414,15 @@ If you change ANYTHING in the solver, the default suite tier is the first thing 
 per branch (matrix rebuild + LU refactorization + a new slack column at every node) and
 stores solver clones per tree node. This design's per-node cost is: one bound change + a short
 warm-started dual simplex (dive), or one basis refactorization (jump); per-node memory is a
-basis snapshot + a bound list. Pseudocost branching uses observed child degradation to
-shrink the tree while preserving the same node-state representation.
+basis snapshot + a bound list of at most one entry per var. Pseudocost branching uses
+observed child degradation to shrink the tree while preserving the same node-state
+representation.
 
 **Known, accepted costs:** the best-bound jump and the (only when `mip_gap > 0`) bound scan
 are `O(open)` linear scans — fine at current scales, a heap if profiling ever says otherwise.
-Basis snapshots per node are `total_vars` bytes; basis *aging* (snapshot every k-th depth)
-is the standard next step if memory becomes a concern on deep trees.
+Basis snapshots per node are `total_vars` bytes, and a dive leaves at most one open sibling
+per level, so its frontier grows linearly with its depth; basis *aging* (snapshot every k-th
+depth) is the standard next step if memory becomes a concern on deep trees.
 
 The `xhard` suite tier exercises large graph-structured MILPs that may exhaust their
 solve budget before proving optimality. It accepts clean interruptions and checks
@@ -1439,10 +1443,10 @@ dives a specific home:
   to round-off, every point within the engine's box with its integer vars exactly integral)
   and decide against the tolerance contract the way the existing ones do (§7.4).
 - **Node propagation.** Propagation belongs inside `visit_node`, after target bounds are
-  applied and before `solve_node_lp`. Deduced bounds must be stored on the `Node` so children
-  inherit them, and `state.applied` must mirror every partial tightening even when a
-  contradiction prunes the node. The activity arithmetic and its tolerance rules already
-  live in `src/presolve/`.
+  applied and before `solve_node_lp`. Deduced bounds must be stored on the `Node` (as the
+  var's one entry, `with_var_bounds`) so children inherit them, and `state.applied` must
+  mirror every partial tightening even when a contradiction prunes the node. The activity
+  arithmetic and its tolerance rules already live in `src/presolve/`.
 - **Reduced-cost fixing.** This belongs after a node LP solves and before candidate/branch
   inspection. Any bound change requires a reoptimization before integrality or branching
   reads the solver values.
