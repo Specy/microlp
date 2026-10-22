@@ -22,11 +22,11 @@ pub(crate) enum PivotChoice {
     /// column disagree (see [`super::PIVOT_AGREEMENT_TOL`]), and a fresh
     /// factorization, at a raised threshold, can still settle it: the
     /// factorization is renewed before choosing again. On a fresh one at the
-    /// highest threshold the pivot is taken with the column's element; a
-    /// basis it leaves singular is repaired at the next factorization.
+    /// highest threshold the ratio test judges the refined column instead
+    /// (`Solver::choose_pivot`).
     Inconsistent { row: usize },
     /// Only entries whose sign the refined column leaves unresolved within
-    /// their round-off floor, the last at `row`, block a step toward an
+    /// their error, the last at `row`, block a step toward an
     /// infinite bound, and a fresh factorization, at a raised threshold, can
     /// still resolve them: the factorization is renewed before choosing
     /// again. On a fresh one at the highest threshold they leave a ray or the

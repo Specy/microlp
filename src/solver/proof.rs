@@ -266,15 +266,16 @@ pub(super) fn compensated_error(terms: usize, longest: usize, magnitude: f64) ->
 const REFINEMENT_CONVERGED: f64 = f64::EPSILON / 2.0;
 
 /// The most steps of the refinement a failed proof goes on with
-/// ([`Solver::prove_infeasible`]), and the ratio of a correction to the one
+/// ([`Solver::prove_infeasible`]), as does the primal ratio test's column
+/// (`Solver::refine_pivot_col`), and the ratio of a correction to the one
 /// before beyond which it no longer converges (Demmel et al. 2006). A step
 /// multiplies the error by about the basis's condition times `2^-53`, so ten
 /// reach [`REFINEMENT_CONVERGED`] through a condition of some `1e14`.
-const REFINEMENT_MAX_STEPS: usize = 10;
-const REFINEMENT_RATIO: f64 = 0.5;
+pub(super) const REFINEMENT_MAX_STEPS: usize = 10;
+pub(super) const REFINEMENT_RATIO: f64 = 0.5;
 
-/// The estimated error of each entry of a solution refined twice, `x`: the
-/// magnitude of its entry of the refinement's `second` correction, where
+/// The estimated error of each entry of a refined solution, `x`: the
+/// magnitude of its entry of the refinement's last correction, `second`, where
 /// the refinement converged ([`REFINEMENT_CONVERGED`]); `None` where it did
 /// not, or where the solution or the correction is not finite. The solutions
 /// are the row of the basis inverse the proof reads, whose entries are the

@@ -1286,6 +1286,120 @@ mod regression_tests {
         assert_unbounded(&problem, "MILP ray past a redundant equality");
     }
 
+    /// `max 3 x0 - 2 x1 - 4 x2 - x3 - 4 x4 + 3 x5 + x6` s.t. five equalities
+    /// within the recommended range, `x0 <= 3`, `x2 >= -3`, `x3` in `[-1, 7]`,
+    /// `x4` in `[2, 6]`, `x6 <= -3`, `x1` and `x5` free, nearly dependent (the
+    /// first two rows differ by `2^-24` in `x3`'s coefficient and by `3 2^-24`
+    /// in the right-hand side): `(2, 9, 0, 3, 2, 24, -21)` is a point from
+    /// which `(0, 4, 0, 0, 0, 12, -9)` is a ray, gaining `19` per step:
+    /// unbounded. With `x6` entering toward its infinite bound, its
+    /// column had `-2^-29` in a row whose row computation gave exactly zero on
+    /// a fresh factorization at the highest threshold, above the pivot
+    /// tolerance: the pivot on the column's element left the basis singular,
+    /// and the solve returned `Optimal` at `14.8`, presolve on and off. Judged
+    /// on the refined column, the element is unresolved, and negligible up to
+    /// the magnitude taken for infinite: a ray.
+    #[test]
+    fn a_pivot_the_row_computes_as_zero_is_judged_on_the_refined_column() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+        let free = (f64::NEG_INFINITY, f64::INFINITY);
+        let e = 2f64.powi(-24);
+        let x0 = problem.add_var(3.0, (f64::NEG_INFINITY, 3.0));
+        let x1 = problem.add_var(-2.0, free);
+        let x2 = problem.add_var(-4.0, (-3.0, f64::INFINITY));
+        let x3 = problem.add_var(-1.0, (-1.0, 7.0));
+        let x4 = problem.add_var(-4.0, (2.0, 6.0));
+        let x5 = problem.add_var(3.0, free);
+        let x6 = problem.add_var(1.0, (f64::NEG_INFINITY, -3.0));
+        problem.add_constraint(
+            [(x0, -4.0), (x2, 1.0), (x3, -(2.0 + e)), (x4, 3.0)],
+            ComparisonOp::Eq,
+            -(8.0 + 3.0 * e),
+        );
+        problem.add_constraint(
+            [(x0, -4.0), (x2, 1.0), (x3, -2.0), (x4, 3.0)],
+            ComparisonOp::Eq,
+            -8.0,
+        );
+        problem.add_constraint(
+            [
+                (x0, -5.0),
+                (x1, -9.0),
+                (x3, -(1.0 - 2.0 * e)),
+                (x5, 9.0),
+                (x6, 8.0),
+            ],
+            ComparisonOp::Eq,
+            -(46.0 - 6.0 * e),
+        );
+        problem.add_constraint(
+            [(x0, 1.0), (x1, -3.0), (x3, 5.0), (x5, 1.0)],
+            ComparisonOp::Eq,
+            14.0,
+        );
+        problem.add_constraint(
+            [(x0, 3.0), (x1, 3.0), (x3, 3.0), (x5, -4.0), (x6, -4.0)],
+            ComparisonOp::Eq,
+            30.0,
+        );
+        assert_unbounded(&problem, "ray past a near twin of an equality");
+    }
+
+    /// `max -x0 - 2 x2` s.t. `x1 - 2 x2 + 3 x4 <= 2` and four equalities
+    /// within the recommended range, two of them combinations of the others
+    /// perturbed by `1e-5`, `x0` in `[-1, 4]`, `x1 >= -1`, `x2 <= 0`,
+    /// `x3 <= 0`, `x5 >= 0`, `x4` free: exactly unbounded, `x2` and `x3`
+    /// falling without end. With the first row's slack entering, the pivot
+    /// element of `x0`'s row came out at `-3.9231e-6` through both the row and
+    /// the column of a fresh factorization at the highest threshold, which
+    /// disagreed in the sixth digit, but it is zero: the basis the pivot on it
+    /// left is singular, which the factorization did not see, and the solve
+    /// returned `Optimal` at `3.02e11`, presolve on and off. Judged on the
+    /// refined column, the element is unresolved, and negligible up to the
+    /// magnitude taken for infinite: a ray.
+    #[test]
+    fn a_pivot_both_computations_put_at_a_zero_is_judged_on_the_refined_column() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+        let free = (f64::NEG_INFINITY, f64::INFINITY);
+        let x0 = problem.add_var(-1.0, (-1.0, 4.0));
+        let x1 = problem.add_var(0.0, (-1.0, f64::INFINITY));
+        let x2 = problem.add_var(-2.0, (f64::NEG_INFINITY, 0.0));
+        let x3 = problem.add_var(0.0, (f64::NEG_INFINITY, 0.0));
+        let x4 = problem.add_var(0.0, free);
+        let x5 = problem.add_var(0.0, (0.0, f64::INFINITY));
+        problem.add_constraint([(x1, 1.0), (x2, -2.0), (x4, 3.0)], ComparisonOp::Le, 2.0);
+        problem.add_constraint(
+            [
+                (x0, 2.00001),
+                (x1, -5.0),
+                (x2, -5.0),
+                (x3, 0.9999800000000001),
+                (x4, 4.99999),
+                (x5, 1e-5),
+            ],
+            ComparisonOp::Eq,
+            -14.99995,
+        );
+        problem.add_constraint(
+            [
+                (x1, -5.0),
+                (x2, -6.0),
+                (x3, 1.99998),
+                (x4, 4.99999),
+                (x5, 1e-5),
+            ],
+            ComparisonOp::Eq,
+            -13.99995,
+        );
+        problem.add_constraint([(x0, -2.0), (x2, -1.0), (x3, 1.0)], ComparisonOp::Eq, 1.0);
+        problem.add_constraint(
+            [(x1, -3.0), (x2, -2.0), (x3, 1.0), (x4, 1.0)],
+            ComparisonOp::Eq,
+            -8.0,
+        );
+        assert_unbounded(&problem, "ray past a pivot element that is zero");
+    }
+
     /// `min -1.7 x - 1.5 y` s.t. `8.36 x + 1.7 y >= 1.18` and
     /// `45.144 x + 9.179999999998072 y = 5.372`, `x, y >= 0`, within the
     /// recommended range, is infeasible: the second row is `5.4` times the
@@ -2229,17 +2343,17 @@ mod regression_tests {
         assert_eq!(assert_solved(&problem, "feasible cofactor model"), [0.0; 2]);
     }
 
-    /// KNOWN LIMITATION (ARCHITECTURE §7.9): `min -x9` over ten free vars
-    /// s.t. nine equalities and two inequalities within the recommended
-    /// range, nearly dependent (some coefficients `2^-26` off a multiple of
-    /// another row's), is unbounded. The primal ratio test's column is
-    /// blocked only by an entry within the round-off floor of its refinement,
-    /// which does not converge on that basis: no error is measured to bound
-    /// the entry by, so no ray is taken, and the solve fails loudly where it
-    /// should answer `Unbounded`, presolve on and off.
+    /// `min -x9` over ten free vars s.t. nine equalities and two
+    /// inequalities within the recommended range, nearly dependent (some
+    /// coefficients `2^-26` off a multiple of another row's), is unbounded.
+    /// The primal ratio test's column is blocked only by an entry within the
+    /// round-off floor of its refinement, which does not converge in two steps
+    /// on that basis: no error was measured to bound the entry by, so no ray
+    /// was taken, and the solve failed loudly, presolve on and off. Refined on
+    /// until it converges, the column bounds the entry, which keeps its var
+    /// within its tolerance up to the magnitude taken for infinite: a ray.
     #[test]
-    #[should_panic(expected = "unboundedness cannot be determined")]
-    fn a_ray_past_an_unresolved_entry_of_an_unconverged_refinement_is_a_known_limitation() {
+    fn a_ray_past_an_unresolved_entry_of_a_slowly_converging_refinement_is_taken() {
         let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
         let free = (f64::NEG_INFINITY, f64::INFINITY);
         let x: Vec<_> = (0..10)
@@ -2344,6 +2458,207 @@ mod regression_tests {
             -44.0,
         );
         assert_unbounded(&problem, "nearly dependent equalities");
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): `min x0 - x1 - 3 x2 - x3` s.t.
+    /// six equalities within the recommended range, `x0 >= 4`, `x1 >= -7`,
+    /// `x2` and `x3` free, is unbounded: two rows are twins but for `2^-33`
+    /// in `x1`'s coefficient and the right-hand side, the others combine them,
+    /// and `(5, -4, 3, 5)` is a point from which `(3, 0, 6, 4)` is a ray,
+    /// gaining `19` per step. The pivot element the plain computations of a
+    /// fresh factorization disagree on is unresolved on the refined column,
+    /// whose refinement converges, but at its magnitude plus its error it
+    /// could take `x1` past its bound by `1e-4` over the step to the
+    /// magnitude taken for infinite, beyond the `8e-7` of room its tolerance
+    /// leaves it: the solve fails loudly where it should answer `Unbounded`,
+    /// presolve on and off.
+    #[test]
+    #[should_panic(expected = "unboundedness cannot be determined")]
+    fn a_ray_past_an_unresolved_entry_beyond_its_room_is_a_known_limitation() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let free = (f64::NEG_INFINITY, f64::INFINITY);
+        let e = 2f64.powi(-33);
+        let x0 = problem.add_var(1.0, (4.0, f64::INFINITY));
+        let x1 = problem.add_var(-1.0, (-7.0, f64::INFINITY));
+        let x2 = problem.add_var(-3.0, free);
+        let x3 = problem.add_var(-1.0, free);
+        problem.add_constraint(
+            [(x0, -8.0), (x1, -(12.0 + 2.0 * e)), (x2, 6.0), (x3, -3.0)],
+            ComparisonOp::Eq,
+            11.0 + 8.0 * e,
+        );
+        problem.add_constraint(
+            [(x1, 4.0 + e), (x2, -2.0), (x3, 3.0)],
+            ComparisonOp::Eq,
+            -(7.0 + 4.0 * e),
+        );
+        problem.add_constraint([(x1, 4.0), (x2, -2.0), (x3, 3.0)], ComparisonOp::Eq, -7.0);
+        problem.add_constraint(
+            [(x0, -4.0), (x1, 4.0 + e), (x2, -2.0), (x3, 6.0)],
+            ComparisonOp::Eq,
+            -(12.0 + 4.0 * e),
+        );
+        problem.add_constraint(
+            [(x0, -4.0), (x1, 16.0 + 2.0 * e), (x2, -8.0), (x3, 15.0)],
+            ComparisonOp::Eq,
+            -(33.0 + 8.0 * e),
+        );
+        problem.add_constraint([(x0, -4.0), (x3, 3.0)], ComparisonOp::Eq, -5.0);
+        assert_unbounded(&problem, "ray past a twin of an equality");
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): `max 3 x0 - 2 x1 - 5 x2 + 2 x3`
+    /// s.t. four equalities within the recommended range, `x0 = 0.8`,
+    /// `x1 <= 2`, the others free: the third row is `1.1` times the second
+    /// plus `0.7` times the first and the fourth `0.3` times the second plus
+    /// `1.1` times the first in decimal, which `f64` rounds into rows `1e-17`
+    /// apart, and a ray near `(0, -1000, 77.2, -7.43, -604, 53.0)` gains
+    /// `1599` per step: unbounded. Two primal pivots on genuine entries of
+    /// `5.7e-17` and `-1.1e-17` leave the basis `{x1, x2, x3, x4}`, of
+    /// condition `2e18`, which the factorization does not flag; the dual
+    /// check, on multipliers some `1e17` times the costs, whose round-off
+    /// floor admits a reduced cost of `9e3`, accepts the vertex, where `x5`'s
+    /// is `-30`, and the solve answers `Optimal` at `-3.97`, presolve on and
+    /// off.
+    #[test]
+    #[should_panic(expected = "a solution")]
+    fn an_unbounded_lp_ending_at_a_numerically_singular_basis_is_a_known_limitation() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
+        let free = (f64::NEG_INFINITY, f64::INFINITY);
+        let x0 = problem.add_var(3.0, (0.8, 0.8));
+        let x1 = problem.add_var(-2.0, (f64::NEG_INFINITY, 2.0));
+        let x2 = problem.add_var(-5.0, free);
+        let x3 = problem.add_var(2.0, free);
+        let x4 = problem.add_var(0.0, free);
+        let x5 = problem.add_var(0.0, free);
+        problem.add_constraint(
+            [(x0, -0.9), (x1, 0.02), (x3, -2.69)],
+            ComparisonOp::Eq,
+            2.5079999999999996,
+        );
+        problem.add_constraint(
+            [
+                (x0, 2.63),
+                (x1, 1.0),
+                (x2, 1.52),
+                (x3, -1.89),
+                (x4, -1.7),
+                (x5, -2.98),
+            ],
+            ComparisonOp::Eq,
+            20.668,
+        );
+        problem.add_constraint(
+            [
+                (x0, 2.2630000000000003),
+                (x1, 1.114),
+                (x2, 1.6720000000000002),
+                (x3, -3.9619999999999997),
+                (x4, -1.87),
+                (x5, -3.278),
+            ],
+            ComparisonOp::Eq,
+            24.4904,
+        );
+        problem.add_constraint(
+            [
+                (x0, -0.20100000000000018),
+                (x1, 0.322),
+                (x2, 0.45599999999999996),
+                (x3, -3.526),
+                (x4, -0.51),
+                (x5, -0.894),
+            ],
+            ComparisonOp::Eq,
+            8.9592,
+        );
+        assert_unbounded(&problem, "decimal equalities rounded apart");
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): `min 2.2 x0 - 0.2 x1 + x2 -
+    /// 0.8 x3` s.t. two equalities and two inequalities within the
+    /// recommended range, `x0, x1 >= -2`, `x2 >= 0`, `x3 >= -4`, the first
+    /// and third rows nearly parallel to the second: a ray near
+    /// `(18.9, 17.8, 0, 1000)` loses `762` per step from a point near
+    /// `(18.4, 22.3, 0, 1000)`: unbounded. The phases end at the basis
+    /// `{x0, x1, x3}` and the first row's slack, of condition `1.6e18`, with
+    /// values near `4e16` whose rows hold within the round-off of their
+    /// terms, where `x2`'s reduced cost is `-26`, and the solve answers
+    /// `Optimal` at `-3.1e16`, presolve on and off.
+    #[test]
+    #[should_panic(expected = "a solution")]
+    fn an_unbounded_lp_of_nearly_parallel_rows_at_a_singular_basis_is_a_known_limitation() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let x0 = problem.add_var(2.2, (-2.0, f64::INFINITY));
+        let x1 = problem.add_var(-0.2, (-2.0, f64::INFINITY));
+        let x2 = problem.add_var(1.0, (0.0, f64::INFINITY));
+        let x3 = problem.add_var(-0.8, (-4.0, f64::INFINITY));
+        problem.add_constraint(
+            [
+                (x0, -26.07220000000364),
+                (x1, 44.83720000000001),
+                (x2, 7.556400000000001),
+                (x3, -0.30600000000000005),
+            ],
+            ComparisonOp::Le,
+            213.58940000000368,
+        );
+        problem.add_constraint(
+            [
+                (x0, 68.80770000000004),
+                (x1, 17.473799999999997),
+                (x2, 39.881),
+                (x3, -1.6150000000000002),
+            ],
+            ComparisonOp::Eq,
+            44.19849999999995,
+        );
+        problem.add_constraint(
+            [(x0, -6.875), (x1, -2.23), (x2, -4.198), (x3, 0.17)],
+            ComparisonOp::Ge,
+            -6.783,
+        );
+        problem.add_constraint([(x0, 8.738), (x1, -9.278)], ComparisonOp::Eq, -45.85);
+        assert_unbounded(&problem, "nearly parallel rows, values near 4e16");
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): `min -0.4 x0 - 0.2 x1 - 0.2 x2 -
+    /// 0.7 x3` s.t. three rows within the recommended range, `x0` free,
+    /// `x1, x2 >= -3`, `x3 >= -4`, is unbounded: the first row is `5.2` times
+    /// the second plus `5.2` times the third's terms but for `3.6e-12` in
+    /// `x1`'s coefficient, and a ray near `(-1, 0.00077, 0.354, 0.508)`
+    /// improves the objective by `0.026` per step from points near `1e12`.
+    /// The phases end at the basis `{x0, x1, x2}`, of condition `4e14`, whose
+    /// values and multipliers settle; its multipliers, near `7e11`, leave
+    /// `x3`'s reduced cost, `-0.052`, within the round-off floor of the terms
+    /// it cancels from (`1e-14` of `1.2e13`), so the dual check accepts the
+    /// vertex and the solve answers `Optimal` at `-7.86e10`, presolve on and
+    /// off.
+    #[test]
+    #[should_panic(expected = "a solution")]
+    fn an_improving_reduced_cost_within_the_round_off_floor_of_its_terms_is_a_known_limitation() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let x0 = problem.add_var(-0.4, (f64::NEG_INFINITY, f64::INFINITY));
+        let x1 = problem.add_var(-0.2, (-3.0, f64::INFINITY));
+        let x2 = problem.add_var(-0.2, (-3.0, f64::INFINITY));
+        let x3 = problem.add_var(-0.7, (-4.0, f64::INFINITY));
+        problem.add_constraint(
+            [
+                (x0, 40.5028),
+                (x1, -26.441999999996362),
+                (x2, 58.120400000000004),
+                (x3, 39.343199999999996),
+            ],
+            ComparisonOp::Le,
+            -221.30039999998908,
+        );
+        problem.add_constraint(
+            [(x0, 7.789), (x1, -5.085), (x2, 9.182), (x3, 8.956)],
+            ComparisonOp::Eq,
+            -47.352,
+        );
+        problem.add_constraint([(x2, 1.995), (x3, -1.39)], ComparisonOp::Ge, 4.675);
+        assert_unbounded(&problem, "a reduced cost within its round-off floor");
     }
 
     /// KNOWN LIMITATION (ARCHITECTURE §7.9): `min 4 x0 - x1 + 2^38 x2` s.t.

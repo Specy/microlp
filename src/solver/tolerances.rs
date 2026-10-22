@@ -76,7 +76,8 @@ pub(crate) fn dual_pivot_tolerance(updates: usize) -> f64 {
 /// (`Solver::correct_primal`). A step nothing above it bounds, toward an
 /// infinite bound, refines its column, whose entries beyond their measured
 /// error and the round-off floor of the refinement bound it
-/// (`Solver::refine_pivot_col`, `Solver::refined_col_floors`).
+/// (`Solver::judge_pivot_col`), as does a pivot whose two computations
+/// disagree on a fresh factorization at the highest threshold.
 pub(crate) fn primal_pivot_tolerance(updates: usize) -> f64 {
     if updates < 10 {
         1e-9

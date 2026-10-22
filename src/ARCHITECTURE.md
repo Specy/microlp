@@ -887,7 +887,7 @@ contract is not in the box.
 | Is a basic slack (row) within its bounds? | `slack_tol` (above) | `ROUNDOFF_FLOOR = 1e-14` |
 | Is a structural var within its bounds? | `structural_tol` (above) | |
 | Is a reduced cost zero? | `dual_tol`: `EPS` in the engine's units and in the user's (a slack's per unit of its row's activity divided by the row's largest coefficient), so that a cost a column factor shrinks still counts (`a_cost_tiny_beside_its_columns_coefficients_decides_the_optimum`), floored at the round-off of `\|c_j\| + Σ\|a_ij y_i\|`, refreshed with the multipliers | `EPS = 1e-10` |
-| Is a tableau entry a pivot? Do its two computations agree? | §7.7 | `dual_pivot_tolerance`, `primal_pivot_tolerance`, `PIVOT_GROWTH_TOL = 1e-9`, `PIVOT_AGREEMENT_TOL = 1e-7` |
+| Is a tableau entry a pivot? Do its two computations agree? | §7.7 | `dual_pivot_tolerance`, `primal_pivot_tolerance`, `PIVOT_GROWTH_TOL = 1e-9`, `PIVOT_AGREEMENT_TOL = 1e-7`, `REFINEMENT_MAX_STEPS = 10`, `REFINEMENT_RATIO = 1/2` (the primal column's refinement) |
 | Does a certificate prove infeasibility? | its gap beyond the room of its terms (§7.3) | `REFINEMENT_CONVERGED = 2^-53`, `REFINEMENT_MAX_STEPS = 10`, `REFINEMENT_RATIO = 1/2`, `COMPENSATED_ERROR = 16·2^-104` |
 | Is an LU pivot column singular? | its eligible part below `LU_SINGULAR_REL` of its largest transformed entry (§7.7) | `= ROUNDOFF_FLOOR` |
 
@@ -1177,8 +1177,10 @@ through: `dual_pivot_tolerance` `1e-9`, `3e-8`, `1e-6` and `primal_pivot_toleran
   refined multipliers, are not checked: a column computed through the factorization is no
   better. An entry at or below the tolerance neither bounds the step nor pivots, its basic
   var's bound shifted where the step leaves it outside (§7.8). A step nothing above the
-  tolerance bounds, toward an infinite bound, refines its column twice. Entries beyond
-  their measured correction and residual-roundoff floor bound the step, however small.
+  tolerance bounds, toward an infinite bound, refines its column: two steps, and more until
+  a correction converges, for up to `REFINEMENT_MAX_STEPS` while each correction is at most
+  half the one before, as the proof's row (§7.3). Entries beyond their measured correction
+  (the last) and residual-roundoff floor bound the step, however small.
   A nonzero entry hidden by the added floor is unresolved: it never pivots, and a column
   only such entries block is retried on a factorization renewed at a stronger threshold.
   There the column is a ray where the refinement converged and every unresolved entry, at
@@ -1225,10 +1227,22 @@ through: `dual_pivot_tolerance` `1e-9`, `3e-8`, `1e-6` and `primal_pivot_toleran
   other refined too. Else the factorization is renewed and the iteration redone, at a
   threshold raised fivefold up to `LU_STABLE_THRESHOLD = 0.5` for the rest of the solver's
   life (unless ten or more updates sat on the factorization, the likelier cause). On a fresh
-  factorization at the highest threshold the column's element is taken, in the dual simplex
-  only if it is nonzero, of the row's sign and, unless refined, above the tolerance, else an
-  `InternalError`. The column's element drives the step, the eta file and the steepest-edge
-  updates, the row's the reduced costs.
+  factorization at the highest threshold the dual simplex takes the column's element only if
+  it is nonzero, of the row's sign and, unless refined, above the tolerance, else an
+  `InternalError`. The primal simplex does not take the plain values there: two computations
+  through the same factors can agree on `-3.9e-6` to six digits for an element that is zero,
+  whose pivot leaves the basis singular where the factorization does not see it. The column
+  is refined and judged as above, the element unresolved unless the refinement resolves it,
+  and a refined element is checked against the refined row (`element_verdict`): taken where
+  the two agree, where the row has it genuine (beyond the move of its second step and the
+  round-off of its sum) and of the same sign, or, beside a column whose refinement converged,
+  where their errors overlap (a row refined twice can stay unconverged where the column
+  converges); an `InternalError` where the row has it genuine with the other sign; else
+  unresolved, its error the larger of what either computation leaves open. A judgment made
+  for a disputed element takes nothing unless the column's refinement converged: a row and a
+  column refined alike through the same factors are the same number in exact arithmetic, so
+  their agreement proves nothing. The column's element drives the step, the eta file and the
+  steepest-edge updates, the row's the reduced costs.
 - *The factorization*: threshold `LU_STABILITY_THRESHOLD = 0.1`, raised as above. A column
   whose eligible part is below `LU_SINGULAR_REL` of its largest transformed entry is
   dependent as far as `f64` can tell, and the basis is repaired with a slack (§3); an
@@ -1338,13 +1352,19 @@ draw within it must solve, a draw outside it must give no wrong answer.
   `an_infeasible_lp_whose_dependency_has_no_boxed_var_is_a_known_limitation` and
   `a_feasible_lp_whose_dependency_has_no_boxed_var_is_a_known_limitation` (rows nearly
   parallel over a var with one finite bound and a free one). A primal column whose nonzero
-  blocking entry remains inside its residual-roundoff floor after refactorization, where the
-  refinement does not converge or the entry could take its basic var, from the point the
+  blocking entry remains unresolved after refactorization, where the refinement does not
+  converge (a correction fails to halve the one before, or `REFINEMENT_MAX_STEPS` pass) or
+  the entry, at its magnitude plus its error, could take its basic var, from the point the
   phase started on, past a bound by more than its tolerance before the entering var reaches
-  the magnitude taken for infinite, also fails loudly ("unboundedness cannot be
-  determined"), rather than pivoting on the entry or treating it as zero (§7.7):
-  `a_ray_past_an_unresolved_entry_of_an_unconverged_refinement_is_a_known_limitation`
-  (nearly dependent equalities over free vars, unbounded).
+  the magnitude taken for infinite, also fails loudly ("unboundedness cannot be determined"),
+  rather than pivoting on the entry or treating it as zero (§7.7):
+  `a_ray_past_an_unresolved_entry_beyond_its_room_is_a_known_limitation` (an equality, its
+  near twin and combinations of them, unbounded), as does a pivot element its refined row and
+  refined column have with opposite signs ("through the refined row"; no model known in
+  range). Conversely, a step nothing above the tolerance bounds takes a refined element its
+  refined row agrees on even where the column's refinement did not converge, though the two
+  agree whatever the factors' error: an element of the wrong sign, or zero, can pivot there
+  (§7.7; seen only outside the range).
 - **Nearly dependent rows, other loud ends** (in range). The phases can keep undoing each
   other, each primal optimum leaving a bound violated once the model's bounds replace its
   working ones and each vertex the dual phase restores leaving reduced costs dual
@@ -1361,6 +1381,21 @@ draw within it must solve, a draw outside it must give no wrong answer.
   through the row and … through the column of a fresh factorization":
   `an_infeasible_lp_whose_pivot_row_and_column_disagree_is_a_known_limitation` (three
   nearly parallel rows, infeasible beyond the absolute tolerance).
+- **Optimal at a numerically singular basis** (in range). Nearly dependent rows (decimal
+  equalities `f64` rounds apart, near twins, nearly parallel rows) can leave the phases at a
+  basis singular to `f64`, through pivots on genuine entries far below the pivot tolerance,
+  which the factorization in force does not flag. Its multipliers, as large as the
+  singularity is small, raise the round-off floor of every reduced cost (§7.2) until the
+  dual check accepts the vertex, whose values the rows hold within the round-off of their
+  terms: the solve answers `Optimal` for an unbounded model, or ends a bounded one at a point
+  far from its optimum, presolve on and off:
+  `an_unbounded_lp_ending_at_a_numerically_singular_basis_is_a_known_limitation` (decimal
+  equalities) and
+  `an_unbounded_lp_of_nearly_parallel_rows_at_a_singular_basis_is_a_known_limitation`
+  (values near `4e16`). A basis whose solution settles can do the same where its
+  multipliers, some `1e11` times the costs, leave a genuine improving reduced cost within the
+  round-off floor of the terms it cancels from:
+  `an_improving_reduced_cost_within_the_round_off_floor_of_its_terms_is_a_known_limitation`.
 - **A proof that needs a non-basic coefficient within the multipliers' error** (in range).
   A non-basic var's coefficient on an infinite bound counts as zero only within the
   round-off of its sum (§7.3). A multiplier within its error counts as zero, which takes out
@@ -1418,6 +1453,7 @@ draw within it must solve, a draw outside it must give no wrong answer.
 | A violated row no var can repair and whose certificate proves nothing, after the rebuild, the taboo and the last resorts | one solve from the slack basis, then `InternalError`, never `Infeasible`; on a node LP, the search's own slack-basis retry too |
 | Node LP unbounded | only numerical, the node's relaxation being bounded: the search's one slack-basis retry, then `InternalError` (§5.3) |
 | A primal column blocked only by entries unresolved within residual round-off, after renewed factorization | a ray, `Unbounded` on fresh data, where the refinement converged and no such entry, at its magnitude plus its error, takes its basic var, from the point the phase started on (which the verification accepted), past a bound by more than its tolerance before the entering var reaches magnitude `2^52` (§7.7); else `InternalError` ("unboundedness cannot be determined"); never a pivot on such an entry |
+| A primal pivot element whose row and column computations disagree on a fresh factorization at the highest threshold | the column refined and judged (§7.7), never a pivot on the plain values: where the column's refinement converged, the element taken where the refined row agrees with it, has it genuine with the same sign, or overlaps it within their errors, `InternalError` ("through the refined row") where the row has it genuine with the other sign; else unresolved (the row above) |
 | A basis the factorization finds singular (after a pivot on an entry tiny beside its column, or loaded) | repaired: the slack of a row no pivot took replaces each dependent column (a var with both bounds finite where the factorization's choice has an infinite bound and a second factorization allows, §7.8), and the solve goes on; within a phase the change back is taboo, unless the step whose refactorization found the basis singular moved its row (§3, §7.8) |
 | Basis bookkeeping found inconsistent when a singular basis is repaired (a var basic twice, or a slack's non-basic position held by another var) | panic: a bug, never repaired |
 | A candidate's objective, or an LP answer's, that cannot be evaluated in `f64`, its terms (costs times values) or their sum overflowing | `InternalError` that says so, never an incumbent or an answer, even where the exact objective is representable (§7.9) |

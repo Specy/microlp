@@ -4631,9 +4631,10 @@ fn load_basis_recomputes_the_primal_edge_weights() {
 
 /// A pivot element whose row and column computations disagree renews the
 /// factorization at a raised threshold first; on a fresh one at the highest
-/// threshold it is taken with the column's element, and a basis it leaves
-/// singular would be repaired. Planted: `x`'s entry in `x <= 4` is `0.5` in
-/// the column data and `1` in the row data, and the primal phase pivots on
+/// threshold the column is judged refined, and an element the refined row
+/// has genuine and of the same sign is taken with the refined column's value.
+/// Planted: `x`'s entry in `x <= 4` is `0.5` in the column data and `1` in
+/// the row data, which the refinement keeps, and the primal phase pivots on
 /// it.
 #[test]
 fn a_primal_pivot_whose_computations_disagree_on_fresh_factors_is_taken() {
@@ -4667,6 +4668,91 @@ fn a_primal_pivot_whose_computations_disagree_on_fresh_factors_is_taken() {
     assert_eq!(sol.primal_phase(1.0).unwrap(), (StopReason::Finished, true));
     sol.end_primal_phase().unwrap();
     assert!(matches!(sol.var_states[0], VarState::Basic(_)));
+}
+
+/// On a fresh factorization at the highest threshold, a primal pivot whose
+/// row computation is zero, or of the other sign than its column
+/// computation, is not taken: the column is judged refined, and the refined
+/// row, which says the same, leaves the element unresolved (zero) or in
+/// dispute (the other sign). In `x <= 4` with `max x`, `x`'s entry is planted
+/// as `1` in the column data and `0`, or `-0.5`, in the row data. Toward
+/// `x`'s infinite bound, the unresolved element, at its size, takes the slack
+/// far past its bound over the step, so it leaves no ray, and the disputed
+/// one ends the solve; both fail loudly. With `x <= 10`, the unresolved
+/// element neither bounds the step nor pivots, and `x` moves to its other
+/// bound.
+#[test]
+fn a_primal_pivot_the_row_computes_as_zero_or_of_the_other_sign_is_not_taken() {
+    init();
+    for (planted, upper) in [(0.0, f64::INFINITY), (-0.5, f64::INFINITY), (0.0, 10.0)] {
+        let mut sol = Solver::try_new(
+            &[-1.0],
+            &[0.0],
+            &[upper],
+            &[(to_sparse(&[1.0]), ComparisonOp::Le, 4.0)],
+            &[VarDomain::Real],
+            None,
+            crate::Tolerances::default().feasibility,
+        )
+        .unwrap();
+        assert_eq!(sol.col_scales, [1.0], "fixture: no column scaling");
+        assert_eq!(sol.row_scales, [1.0], "fixture: no row scaling");
+        let basis = Basis(vec![VarStatus::AtLower, VarStatus::Basic]);
+        sol.load_basis(&basis).unwrap();
+        *sol.orig_constraints.get_mut(0, 0).unwrap() = planted;
+        sol.begin_primal_phase(true);
+        sol.lu_threshold = LU_STABLE_THRESHOLD;
+        let x = sol.price_primal().unwrap().unwrap();
+        let choice = sol.choose_pivot(x, 1.0);
+        sol.end_primal_phase().unwrap();
+        match (planted == 0.0, upper.is_finite(), &choice) {
+            (true, false, Err(Error::InternalError(msg)))
+                if msg.contains("unboundedness cannot be determined") => {}
+            (false, false, Err(Error::InternalError(msg)))
+                if msg.contains("through the refined row") => {}
+            (true, true, Ok(PivotChoice::Pivot(info)))
+                if info.elem.is_none() && info.entering_new_val == upper => {}
+            _ => panic!("planted {planted}, upper {upper}: {choice:?}"),
+        }
+    }
+}
+
+/// The verdict on a refined pivot element ([`element_verdict`]) in each of
+/// its branches, as (row, row error, column, column error, converged,
+/// disputed, verdict).
+#[test]
+fn element_verdicts_cover_every_branch() {
+    use ElementVerdict::{Refuse, Take, Unresolve};
+    let cases = [
+        // A judgment made for a disputed element takes nothing from a column
+        // whose refinement did not converge, agreement and sign included.
+        (1.0, 0.0, 1.0, 0.0, false, true, Unresolve),
+        (-0.5, 0.0, 1.0, 0.0, false, true, Unresolve),
+        // The refined row resolves it with the other sign.
+        (-0.5, 0.0, 1.0, 0.0, true, false, Refuse),
+        (-0.5, 0.0, 1.0, 0.0, true, true, Refuse),
+        // The two agree, though neither the row resolves it nor the column
+        // converged.
+        (1e-30, 1e-29, 1e-30, 0.0, false, false, Take),
+        // The refined row resolves it with the same sign.
+        (0.5, 0.1, 1.0, 0.0, false, false, Take),
+        (0.5, 0.1, 1.0, 0.0, true, true, Take),
+        // The row cannot tell it from zero, but their errors overlap beside a
+        // converged column; not beside an unconverged one.
+        (1e-46, 1e-44, 1.1e-46, 1e-50, true, false, Take),
+        (1e-46, 1e-44, 1.1e-46, 1e-50, false, false, Unresolve),
+        // Errors apart: the row exactly zero, the column one.
+        (0.0, 0.0, 1.0, 0.0, true, false, Unresolve),
+        (0.0, 0.0, 1.0, 0.0, true, true, Unresolve),
+    ];
+    for (row, row_error, col, col_error, converged, disputed, verdict) in cases {
+        assert_eq!(
+            element_verdict(row, row_error, col, col_error, converged, disputed),
+            verdict,
+            "row {row} within {row_error}, column {col} within {col_error}, converged \
+             {converged}, disputed {disputed}"
+        );
+    }
 }
 
 /// The dual simplex's counterpart: `x`'s entry in `x >= 1` is `0.5` in the
