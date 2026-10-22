@@ -1143,11 +1143,17 @@ mod regression_tests {
         }
     }
 
-    /// The redundant equality leaves an unresolved entry, but another
-    /// inequality supplies a genuine tiny blocker. On the equality line
-    /// `(-8, 2, 0) + t (5, 1, 6)` the inequality forces `t >= -1`.
+    /// `max -4 x0 - 3 x1 + x2` s.t. the redundant equalities of
+    /// [`a_ray_past_a_redundant_equality_does_not_pivot_on_round_off`] and
+    /// `x0 - (5 + 2^-30) x1 <= -18 - 2^-30`, all vars free, which on their
+    /// line `(-8, 2, 0) + t (5, 1, 6)` holds `t >= -1`: its entry in the
+    /// column of the step toward the ray, far below the pivot tolerance, is a
+    /// genuine blocker, and the optimum is `43`, presolve on and off. These
+    /// solves meet no entry of unresolved sign beside it;
+    /// `solver::tests::a_resolved_blocker_beside_an_unresolved_entry_is_the_pivot`
+    /// plants one.
     #[test]
-    fn a_resolved_finite_blocker_can_bound_a_step_beside_an_unresolved_entry() {
+    fn a_tiny_blocker_bounds_a_step_along_redundant_equalities() {
         let mut problem = crate::Problem::new(OptimizationDirection::Maximize);
         let free = (f64::NEG_INFINITY, f64::INFINITY);
         let x0 = problem.add_var(-4.0, free);
@@ -1357,14 +1363,39 @@ mod regression_tests {
         })
     }
 
-    /// Assert that `problem` is answered `Infeasible`, presolve on and off.
+    /// Assert that `problem` is answered `Infeasible`, presolve on and off,
+    /// reporting both answers where one is not.
     fn assert_infeasible(problem: &crate::Problem, what: &str) {
-        for (got, presolve) in both_ways(problem).into_iter().zip([true, false]) {
-            match got {
-                Err(Error::Infeasible) => {}
-                other => panic!("{what}, presolve {presolve}: {other:?}"),
-            }
+        let [on, off] = both_ways(problem);
+        if !matches!(on, Err(Error::Infeasible)) || !matches!(off, Err(Error::Infeasible)) {
+            panic!("{what}: presolve on {on:?}, off {off:?}");
         }
+    }
+
+    /// [`assert_solves_within_contract`] presolve on and off, both checked
+    /// before a failure is reported, with the other setting's.
+    fn assert_within_contract_both_ways(model: &Model) {
+        let failures: Vec<String> = [true, false]
+            .into_iter()
+            .filter_map(|presolve| {
+                let check = || {
+                    if presolve {
+                        assert_solves_within_contract(model)
+                    } else {
+                        assert_solves_within_contract_without_presolve(model)
+                    }
+                };
+                let payload =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).err()?;
+                let message = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                Some(format!("presolve {presolve}: {message}"))
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// Assert that `problem` is answered with a solution or `Unbounded`,
@@ -1935,6 +1966,241 @@ mod regression_tests {
             -9.41,
         );
         assert_infeasible(&problem, "relaxation 6e-4");
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): `min 0.8 x0 + 2.6 x1 + 0.1 x2`
+    /// s.t. three nearly parallel rows within the recommended range,
+    /// `x0 >= -1`, `x1 >= -3` and `x2` in `[-4, 15]`, is infeasible beyond
+    /// the absolute tolerance: the smallest relaxation of the rows that
+    /// admits a point is `1.9e-4`, and only the round-off floor of the rows
+    /// near `(5.8e8, 1.05e9, 15)` admits one, which is answered `Infeasible`
+    /// (ARCHITECTURE §7.1). No row's certificate proves it; the last resort of the dual phase moves
+    /// `x0` by some `4.7e9`, and the next pivot's element is `4.2e-7` through
+    /// the row and zero through the column of a fresh factorization at the
+    /// highest threshold, so the solve fails loudly where it should answer
+    /// `Infeasible`, presolve on and off.
+    #[test]
+    #[should_panic(expected = "0e0 through the column of a fresh factorization")]
+    fn an_infeasible_lp_whose_pivot_row_and_column_disagree_is_a_known_limitation() {
+        let mut problem = crate::Problem::new(OptimizationDirection::Minimize);
+        let x0 = problem.add_var(0.8, (-1.0, f64::INFINITY));
+        let x1 = problem.add_var(2.6, (-3.0, f64::INFINITY));
+        let x2 = problem.add_var(0.1, (-4.0, 15.0));
+        problem.add_constraint(
+            [
+                (x0, -43.071600000000004),
+                (x1, 23.760000000000005),
+                (x2, -9.592000000959203),
+            ],
+            ComparisonOp::Le,
+            -163.13540000383682,
+        );
+        problem.add_constraint(
+            [(x0, -61.6707), (x1, 34.020000003402004), (x2, -13.734)],
+            ComparisonOp::Ge,
+            -232.67879999319598,
+        );
+        problem.add_constraint(
+            [(x0, -9.789), (x1, 5.4), (x2, -2.18)],
+            ComparisonOp::Eq,
+            -37.076,
+        );
+        assert_infeasible(&problem, "relaxation 1.9e-4");
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9):
+    /// `min 4e6 x0 + 3e6 x4 - 5e6 x5 - 8e6 x6` over seven vars in
+    /// `[-1000, 1000]` s.t. two rows within the recommended range, nearly
+    /// parallel (each coefficient of the first within `2e-10` of the
+    /// second's, relatively), `>= -3656` and `<= -3656`: the optimum is
+    /// `-1.1108571e10`, at `x*`. Each primal optimum leaves a slack `2.5e-6`
+    /// past its bound once the model's bounds replace the working ones, and
+    /// each vertex the dual phase restores leaves reduced costs dual
+    /// infeasible, so the solve fails loudly where it should answer, presolve
+    /// on and off.
+    #[test]
+    #[should_panic(expected = "8 phase rounds")]
+    fn an_lp_whose_phases_undo_each_other_is_a_known_limitation() {
+        let var = |obj| real(obj, -1000.0, 1000.0);
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                var(4e6),
+                var(0.0),
+                var(0.0),
+                var(0.0),
+                var(3e6),
+                var(-5e6),
+                var(-8e6),
+            ],
+            rows: vec![
+                row(
+                    &[
+                        (0, 7.0000000007),
+                        (1, -8.9999999991),
+                        (2, 3.0000000006),
+                        (3, 1.0000000002),
+                        (4, 5.0000000005),
+                        (5, -7.0000000014),
+                        (6, -4.0000000004),
+                    ],
+                    ComparisonOp::Ge,
+                    -3656.0,
+                ),
+                row(
+                    &[
+                        (0, 7.0),
+                        (1, -9.0),
+                        (2, 3.0),
+                        (3, 1.0),
+                        (4, 5.0),
+                        (5, -7.0),
+                        (6, -4.0),
+                    ],
+                    ComparisonOp::Le,
+                    -3656.0,
+                ),
+            ],
+            xstar: vec![
+                -1000.0,
+                -321.77777777777777,
+                1000.0,
+                1000.0,
+                -1000.0,
+                -778.2857142857143,
+                1000.0,
+            ],
+        };
+        assert!(xstar_is_feasible(&model), "fixture: x* holds the rows");
+        assert_within_contract_both_ways(&model);
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): ten equalities over eight vars
+    /// within the recommended range, at zero cost, exactly dependent but for
+    /// the fourth's right-hand side, `1e-6` off (`-55.999999` for `-56`): no
+    /// point meets them exactly, but `x*` meets each within `8.9e-8`, inside
+    /// the tolerance. No row's certificate proves anything, the rows agreeing
+    /// within the room the engine can give them, and the dual phase runs out
+    /// of basis changes that do not return to visited vertices, so the solve
+    /// fails loudly where it should answer, presolve on and off.
+    #[test]
+    #[should_panic(expected = "dual simplex cycles")]
+    fn an_lp_of_equalities_agreeing_only_within_their_tolerances_is_a_known_limitation() {
+        let free = |obj| real(obj, f64::NEG_INFINITY, f64::INFINITY);
+        let model = Model {
+            direction: OptimizationDirection::Minimize,
+            vars: vec![
+                free(0.0),
+                free(0.0),
+                free(0.0),
+                free(0.0),
+                real(0.0, -1.0, f64::INFINITY),
+                real(0.0, -7.0, -6.0),
+                real(0.0, f64::NEG_INFINITY, -2.0),
+                real(0.0, f64::NEG_INFINITY, 6.0),
+            ],
+            rows: vec![
+                row(
+                    &[
+                        (0, 4.0),
+                        (1, -1.0),
+                        (3, 5.0),
+                        (5, 3.0),
+                        (6, -1.0),
+                        (7, -5.0),
+                    ],
+                    ComparisonOp::Eq,
+                    -25.0,
+                ),
+                row(
+                    &[
+                        (0, -5.0),
+                        (1, -3.0),
+                        (2, -2.0),
+                        (3, -5.0),
+                        (5, 3.0),
+                        (7, -3.0),
+                    ],
+                    ComparisonOp::Eq,
+                    -41.0,
+                ),
+                row(
+                    &[(0, -4.0), (1, -4.0), (4, -3.0), (5, -5.0), (7, -1.0)],
+                    ComparisonOp::Eq,
+                    9.0,
+                ),
+                row(
+                    &[
+                        (0, 3.0),
+                        (1, -7.0),
+                        (2, -13.0),
+                        (3, -10.0),
+                        (4, 12.0),
+                        (5, 17.0),
+                        (6, -8.0),
+                        (7, -12.0),
+                    ],
+                    ComparisonOp::Eq,
+                    -55.999999,
+                ),
+                row(&[(3, -2.0), (6, -2.0)], ComparisonOp::Eq, 4.0),
+                row(
+                    &[
+                        (0, 21.0),
+                        (1, -11.0),
+                        (2, -1.0),
+                        (3, 5.0),
+                        (4, -12.0),
+                        (5, 1.0),
+                        (6, 14.0),
+                        (7, -15.0),
+                    ],
+                    ComparisonOp::Eq,
+                    -19.0,
+                ),
+                row(
+                    &[(0, 4.0), (1, -3.0), (2, -2.0), (5, 2.0), (6, -2.0)],
+                    ComparisonOp::Eq,
+                    20.0,
+                ),
+                row(
+                    &[
+                        (0, -17.0),
+                        (1, -13.0),
+                        (2, -1.0),
+                        (3, -9.0),
+                        (4, -20.0),
+                        (5, -15.0),
+                        (6, 3.0),
+                        (7, -14.0),
+                    ],
+                    ComparisonOp::Eq,
+                    -48.0,
+                ),
+                row(
+                    &[(2, -4.0), (3, -1.0), (4, -4.0), (7, -3.0)],
+                    ComparisonOp::Eq,
+                    9.0,
+                ),
+                row(
+                    &[(0, 1.0), (2, -4.0), (3, -3.0), (5, -4.0)],
+                    ComparisonOp::Eq,
+                    52.0,
+                ),
+            ],
+            xstar: vec![
+                4.000000012774403,
+                -1.2943612927196516e-8,
+                -5.9999999893756035,
+                -1.9168361472627195e-8,
+                3.739222182419721e-8,
+                -6.000000015171468,
+                -2.0000000250655248,
+                4.999999971856553,
+            ],
+        };
+        assert!(xstar_is_feasible(&model), "fixture: x* holds the rows");
+        assert_within_contract_both_ways(&model);
     }
 
     /// KNOWN LIMITATION (ARCHITECTURE §7.9): with `e = 2^-52` and `p`, `t`,

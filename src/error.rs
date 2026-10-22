@@ -9,8 +9,16 @@ pub enum Error {
     /// variable whose bounds are equal at its value, meets the constraints and
     /// the other bounds within the feasibility tolerance (see
     /// [`Tolerances::feasibility`](crate::Tolerances::feasibility)).
+    ///
+    /// In extreme cases, a feasible model of nearly dependent constraints,
+    /// whose feasible points need very large variable values, is reported
+    /// infeasible: see the crate's [known limitations](crate#known-limitations).
     Infeasible,
     /// The objective can improve without a finite limit.
+    ///
+    /// Outside the recommended coefficient range, a bounded model can be
+    /// reported unbounded: see the crate's
+    /// [known limitations](crate#known-limitations).
     Unbounded,
     /// A solve or resume option is non-finite or outside its accepted range.
     ///
@@ -37,7 +45,8 @@ pub enum Error {
     /// When the model lies outside the recommended coefficient range (see the
     /// crate documentation), the message names the constraint and the
     /// variable whose coefficients span the most, those of them outside it.
-    /// Within the range, please report it as a bug.
+    /// Within the range, it is a bug or one of the crate's
+    /// [known limitations](crate#known-limitations): please report it.
     InternalError(String),
 }
 impl std::fmt::Display for Error {

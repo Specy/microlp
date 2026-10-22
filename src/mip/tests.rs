@@ -481,6 +481,11 @@ fn plunge_and_jump_selection_preserves_optima() {
     let mut options = SolveOptions::default();
     options.node_limit = Some(1);
     let mut r = run(&binary_knapsack(), options).unwrap();
+    assert_eq!(
+        r.reason,
+        TerminationReason::NodeLimit,
+        "fixture: the node limit interrupts the search"
+    );
     let mut guard = 0;
     while r.reason != TerminationReason::ProvenOptimal {
         guard += 1;

@@ -20,6 +20,11 @@ cargo test --release --test suite -- --parallel 8          # worker threads
 cargo test --release --test suite -- --help
 ```
 
+The test-only `highs` feature also cross-checks the MWIS warm-start cases
+against HiGHS: add `--features highs` to a command above, before any `--`
+(building it needs CMake, a C++ compiler and libclang). CI runs the hard tier
+with it on Linux.
+
 The runner prints one line per case and a final summary with pass/fail counts,
 then exits nonzero if anything failed (CI-friendly). Under a debug build only
 the `easy` tier runs by default (the heavier tiers are far too slow without

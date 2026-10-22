@@ -313,7 +313,10 @@ not the answer; a MIP candidate that misses one is rejected (§5.4).
 Node {
     bound_changes: Vec<(var, lo, hi)>, // one entry per branched var, sorted by var
     basis: Basis,                      // the PARENT's optimal basis (warm start)
-    lp_bound: f64,                     // parent's LP objective = valid lower bound here
+    lp_bound: f64,                     // parent's LP objective: a lower bound on this
+                                       // node's points up to the vertex freedom (§7.1)
+    lattice_bound: f64,                // lp_bound less the parent's dual slack: a lower
+                                       // bound on its exactly feasible points (§5.5)
     depth, parent_id,                  // parent_id detects warm dives (§5.2)
     branch_var: Option<usize>,         // None for the root, Some(var) for children
     branch_up, branch_frac             // metadata feeding pseudocost updates (§5.6)
@@ -322,9 +325,9 @@ Node {
 
 Reconstructing any node's starting state = apply its `bound_changes` on top of the root
 bounds, load its `basis`, reoptimize. That is the whole trick: because nodes carry no live
-state, they are trivially storable, resumable, and cheap (a basis is `total_vars` bytes; a
-bound-change list holds at most one entry per var however deep the node, since a child sets
-the entry of the var it branches on).
+state, they are trivially storable, resumable, and cheap (a basis is `num_total_vars`
+bytes; a bound-change list holds at most one entry per var however deep the node, since a
+child sets the entry of the var it branches on).
 
 The optional branch variable is a correctness distinction: the root has no creating branch
 and therefore must never record a pseudocost observation. Every child stores the variable
@@ -463,7 +466,10 @@ funnel:
 2. `Solver::first_violated_row` validates the vector against the rows, the ones presolve
    dropped or rewrote included, within the absolute `Tolerances::feasibility` (default
    `1e-7`) floored at each row's round-off (§7.1).
-3. `objective_of` must produce a finite objective before the incumbent can change.
+3. `objective_of` must produce a finite objective. A candidate whose objective cannot be
+   evaluated in `f64`, its terms (costs times values) overflowing, is an `InternalError` that
+   says so, since no branching changes it (§7.9); a warm-start completion whose objective
+   overflows drops its hint (§5.7).
 
 Post-edit warm-start filtering deliberately remains separate: `incumbent_feasible` checks
 the clean `Problem` plus its fix overlay in original user scale before a solver exists. Both
@@ -586,8 +592,9 @@ verifies it unless the load had to repair it) so the search starts from the true
 relaxation. A hint that names a variable outside the problem or gives a value that is not
 finite is invalid input, refused by `Problem::solve_with` (§2). Beyond that, hints are
 advisory by design: out-of-range values, values the engine's scaled units cannot hold,
-infeasible or fractional completions, and completions that fail with an engine error all
-just drop the hint with a debug log — a bad hint must never break a solve.
+infeasible or fractional completions, completions whose objective overflows `f64`, and
+completions that fail with an engine error all just drop the hint with a debug log — a bad
+hint must never break a solve.
 Dropping one costs at most speed, since the search solves the whole model without it (a node
 LP's error, after its retry, stays fatal: skipping a node could lose the optimum). Only the
 `Unbounded` verdict a completion can give during unboundedness classification (§5.4) is
@@ -1308,9 +1315,9 @@ never pivots on unverified values.
 
 Each limitation a model is known for is pinned by a test that passes while it stands and
 fails once a change fixes it: a `#[should_panic]` test named `..._is_a_known_limitation` in
-`src/tests/magnitudes.rs` (drop the attribute to keep the model as a regression test). The
-wide-coefficient properties split at the range: a draw within it must solve, a draw outside
-it must give no wrong answer.
+`src/tests/magnitudes.rs` (drop the attribute to keep the model as a regression test), or a
+test that expects the loud error. The wide-coefficient properties split at the range: a
+draw within it must solve, a draw outside it must give no wrong answer.
 
 - **Nearly dependent rows** (in range). A basis the factorization finds singular whose
   repair keeps a var with an infinite bound out (no var of the dependency has both bounds
@@ -1330,6 +1337,22 @@ it must give no wrong answer.
   determined"), rather than pivoting on the entry or treating it as zero (§7.7):
   `a_ray_past_an_unresolved_entry_of_an_unconverged_refinement_is_a_known_limitation`
   (nearly dependent equalities over free vars, unbounded).
+- **Nearly dependent rows, other loud ends** (in range). The phases can keep undoing each
+  other, each primal optimum leaving a bound violated once the model's bounds replace its
+  working ones and each vertex the dual phase restores leaving reduced costs dual
+  infeasible, until "simplex did not reach a verified optimum in 8 phase rounds"
+  (`MAX_PHASE_ROUNDS`): `an_lp_whose_phases_undo_each_other_is_a_known_limitation` (two
+  nearly parallel rows over boxed vars). The dual phase can run out of basis changes that
+  do not return to visited vertices where no certificate proves a violated row, "dual
+  simplex cycles: every basis change left returns to visited vertices":
+  `an_lp_of_equalities_agreeing_only_within_their_tolerances_is_a_known_limitation`
+  (exactly dependent equalities, one right-hand side off by less than the tolerances
+  absorb). A dual pivot can have an element the column of a fresh factorization at the
+  highest threshold gives as zero, of the other sign than the row's or, neither refined,
+  within the pivot tolerance, "dual simplex: the pivot element of var … in row … is …
+  through the row and … through the column of a fresh factorization":
+  `an_infeasible_lp_whose_pivot_row_and_column_disagree_is_a_known_limitation` (three
+  nearly parallel rows, infeasible beyond the absolute tolerance).
 - **A proof that needs a non-basic coefficient within the multipliers' error** (in range).
   A non-basic var's coefficient on an infinite bound counts as zero only within the
   round-off of its sum (§7.3). A multiplier within its error counts as zero, which takes out
@@ -1361,6 +1384,16 @@ it must give no wrong answer.
   in its column, can make an exactly bounded model `Unbounded`:
   `a_ray_past_an_entry_within_its_measured_correction_is_a_known_limitation` (tiny genuine
   coefficients beside huge ones).
+- **An objective whose terms overflow `f64`** (in range too: the range bounds the
+  constraint coefficients, not the costs). Where costs times values overflow `f64`, the
+  objective of a point cannot be evaluated, even where its exact value is representable:
+  `max 1e300 x + 1e300 y` over integers in the `i32` range reaches
+  `(-2147483644, 2147483647)`, whose objective is `3e300` but whose terms are some `2e309`.
+  A candidate of the search or an LP answer there is an `InternalError` that says so, never
+  an answer whose objective is not a number:
+  `an_integral_point_whose_objective_overflows_is_an_internal_error` and
+  `an_lp_answer_whose_objective_overflows_is_an_internal_error` (`src/tests/regressions.rs`),
+  which expect the error.
 
 ---
 
@@ -1377,6 +1410,7 @@ it must give no wrong answer.
 | A primal column blocked only by entries unresolved within residual round-off, after renewed factorization | a ray, `Unbounded` on fresh data, where the refinement converged and no such entry, at its magnitude plus its error, takes its basic var, from the point the phase started on (which the verification accepted), past a bound by more than its tolerance before the entering var reaches magnitude `2^52` (§7.7); else `InternalError` ("unboundedness cannot be determined"); never a pivot on such an entry |
 | A basis the factorization finds singular (after a pivot on an entry tiny beside its column, or loaded) | repaired: the slack of a row no pivot took replaces each dependent column (a var with both bounds finite where the factorization's choice has an infinite bound and a second factorization allows, §7.8), and the solve goes on; within a phase the change back is taboo, unless the step whose refactorization found the basis singular moved its row (§3, §7.8) |
 | Basis bookkeeping found inconsistent when a singular basis is repaired (a var basic twice, or a slack's non-basic position held by another var) | panic: a bug, never repaired |
+| A candidate's objective, or an LP answer's, that cannot be evaluated in `f64`, its terms (costs times values) overflowing | `InternalError` that says so, never an incumbent or an answer, even where the exact objective is representable (§7.9) |
 | Integral candidate failing the guard with no integer variable to branch on | `InternalError`, never force-accepted. The engine verified the point on its own rows, and with nothing to branch on every integer variable is exactly integral (one its bounds fix the engine holds on its value), where a row presolve dropped or rewrote holds as written: the failure is a reduction that did not keep the point (§5.4) |
 | Verified state unreachable (`MAX_PHASE_ROUNDS` alternations, or a vertex whose values miss its rows through every factorization of the verification's ladder, again after the solve starts over from the slack basis) | `InternalError`, never an unverified optimum |
 | Any `InternalError` of a model outside the recommended coefficient range | its message names the constraint and the variable whose coefficients span the most, those of them outside the range (§7.7) |
@@ -1390,7 +1424,7 @@ it must give no wrong answer.
 | Limit with no incumbent | `SolveOutcome::Interrupted`; only reason, stats, and resume are exposed |
 | Search exhausted, no incumbent | `Err(Infeasible)` |
 | Presolve finds the model infeasible | solve the model as written, without presolve (debug log): the engine or the search decides |
-| Warm-start hint out of range or beyond the engine's scaled units, infeasible, fractional, or limited, or its LP completion fails with an engine error | hint dropped (debug log), root bounds and basis restored, solve proceeds cold |
+| Warm-start hint out of range or beyond the engine's scaled units, infeasible, fractional, or limited, or its LP completion's objective overflows `f64` or the completion fails with an engine error | hint dropped (debug log), root bounds and basis restored, solve proceeds cold |
 | Error while restoring the root after a warm start | propagated: it belongs to the main search |
 | Edit makes the problem infeasible | `Err(Infeasible)` from the re-solve — on the *composed base problem*, never on leaf state |
 
@@ -1416,14 +1450,15 @@ Three rings, innermost first:
    status semantics, panics, sign handling, edit composition, warm starts, sliced resumes
    equal unlimited solves value-for-value.
 3. **The correctness suite** (`tests/suite`, `cargo test --release --test suite`) — a
-   problem-based harness (parallel runner, ≤ 8 cores) where every answer is independently
-   known: netlib/MIPLIB published optima, constructed instances, DP/brute-force oracles,
-   plus a shadow model that re-validates every claimed solution (feasibility, integrality,
-   objective consistency, and solver-soundness checks like "a feasible incumbent must never
-   beat the proven optimum"). Cases are tiered **easy / medium / hard / xhard**; a tier
-   flag is a cumulative upper limit (`-- --hard` runs easy + medium + hard). Easy + medium
-   is the default run; CI runs the full hard tier with each case's supplied solve budget
-   clamped to five minutes (`-- --hard --max-case-seconds 300`). This is cooperative for
+   problem-based harness (`--parallel N` worker threads, one by default) where every
+   answer is independently known: netlib/MIPLIB published optima, constructed instances,
+   DP/brute-force oracles, plus a shadow model that re-validates every claimed solution
+   (feasibility, integrality, objective consistency, and solver-soundness checks like "a
+   feasible incumbent must never beat the proven optimum"). Cases are tiered **easy /
+   medium / hard / xhard**; a tier flag is a cumulative upper limit (`-- --hard` runs
+   easy + medium + hard). Easy + medium is the default run; CI runs the full hard tier
+   with each case's supplied solve budget clamped to five minutes
+   (`-- --hard --max-case-seconds 300`). This is cooperative for
    custom cases: their runner must pass the supplied budget into every solve.
    **xhard** (`-- --xhard`) holds the MILPBench
    families beyond the solver's current ceiling, on 10-minute budgets with externally
@@ -1453,9 +1488,9 @@ representation.
 
 **Known, accepted costs:** the best-bound jump and the (only when `mip_gap > 0`) bound scan
 are `O(open)` linear scans — fine at current scales, a heap if profiling ever says otherwise.
-Basis snapshots per node are `total_vars` bytes, and a dive leaves at most one open sibling
-per level, so its frontier grows linearly with its depth; basis *aging* (snapshot every k-th
-depth) is the standard next step if memory becomes a concern on deep trees.
+Basis snapshots per node are `num_total_vars` bytes, and a dive leaves at most one open
+sibling per level, so its frontier grows linearly with its depth; basis *aging* (snapshot
+every k-th depth) is the standard next step if memory becomes a concern on deep trees.
 
 The `xhard` suite tier exercises large graph-structured MILPs that may exhaust their
 solve budget before proving optimality. It accepts clean interruptions and checks

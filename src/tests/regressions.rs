@@ -1031,6 +1031,8 @@ pub(crate) mod regression_tests {
             (0, 1, 413000.0, 1.15),
         ];
         let demand = [0.537, 0.835, 0.245, 1.07, 1.09, 0.823, 0.775, 0.73];
+        // A generator's capacity, not 1/pi.
+        #[allow(clippy::approx_constant)]
         let gen_max = [0.683, 1.18, 0.38, 1.2, 0.827, 0.318, 1.3, 0.602];
         let gen_cost = [6.7, 8.07, 2.61, 8.44, 4.5, 5.87, 8.26, 4.92];
         for presolve in [true, false] {
@@ -1373,6 +1375,70 @@ pub(crate) mod regression_tests {
                 "presolve {presolve}"
             );
             assert_eq!(solution.objective(), -1.0, "presolve {presolve}");
+        }
+    }
+
+    /// `max 1e300 x + 1e300 y` s.t. `2x + 2y <= 7` and `x - y <= 0.5`, `x`
+    /// and `y` integers over the `i32` range. The search's integral point
+    /// `(-2147483644, 2147483647)` has the objective `3e300`, but its terms,
+    /// some `2e309`, overflow `f64`, and their sum is not a number. An
+    /// `InternalError` that says so, where the guard's rejection of the point
+    /// read as a failed validation with nothing to branch on.
+    #[test]
+    fn an_integral_point_whose_objective_overflows_is_an_internal_error() {
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x = problem.add_integer_var(1e300, (i32::MIN, i32::MAX));
+        let y = problem.add_integer_var(1e300, (i32::MIN, i32::MAX));
+        problem.add_constraint([(x, 2.0), (y, 2.0)], ComparisonOp::Le, 7.0);
+        problem.add_constraint([(x, 1.0), (y, -1.0)], ComparisonOp::Le, 0.5);
+        for presolve in [true, false] {
+            let options = crate::SolveOptions {
+                presolve,
+                ..crate::SolveOptions::default()
+            };
+            let got = problem.solve_with(options);
+            assert!(
+                matches!(&got, Err(crate::Error::InternalError(m))
+                    if m.contains("the objective of an integral solution cannot be evaluated")),
+                "presolve {presolve}: {:?}",
+                got.map(|_| "solved")
+            );
+        }
+    }
+
+    /// The LP of
+    /// [`an_integral_point_whose_objective_overflows_is_an_internal_error`]
+    /// over reals ends at `(-2147483643.5, 2147483647)`, whose objective is
+    /// `3.5e300` but whose terms overflow `f64`, their sum not a number; the
+    /// optimum of `max 1e308 x + 1e308 y` s.t. `x + y <= 15` over `[0, 10]`,
+    /// `1.5e309`, lies beyond `f64`. Each answer is an `InternalError` that
+    /// says so, where it was `Optimal` with the objective NaN or inf.
+    #[test]
+    fn an_lp_answer_whose_objective_overflows_is_an_internal_error() {
+        let mut open_face = Problem::new(OptimizationDirection::Maximize);
+        let i32_range = (i32::MIN as f64, i32::MAX as f64);
+        let x = open_face.add_var(1e300, i32_range);
+        let y = open_face.add_var(1e300, i32_range);
+        open_face.add_constraint([(x, 2.0), (y, 2.0)], ComparisonOp::Le, 7.0);
+        open_face.add_constraint([(x, 1.0), (y, -1.0)], ComparisonOp::Le, 0.5);
+        let mut beyond = Problem::new(OptimizationDirection::Maximize);
+        let x = beyond.add_var(1e308, (0.0, 10.0));
+        let y = beyond.add_var(1e308, (0.0, 10.0));
+        beyond.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 15.0);
+        for problem in [open_face, beyond] {
+            for presolve in [true, false] {
+                let options = crate::SolveOptions {
+                    presolve,
+                    ..crate::SolveOptions::default()
+                };
+                let got = problem.solve_with(options);
+                assert!(
+                    matches!(&got, Err(crate::Error::InternalError(m))
+                        if m.contains("the objective of the LP solution cannot be evaluated")),
+                    "presolve {presolve}: {:?}",
+                    got.map(|_| "solved")
+                );
+            }
         }
     }
 }

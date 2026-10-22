@@ -260,9 +260,9 @@ pub(super) fn compensated_error(terms: usize, longest: usize, magnitude: f64) ->
 
 /// The test of a converged refinement: a correction of at most `2^-53` of the
 /// solution in the max norm. Only a refinement whose second correction passes
-/// it bounds the error of its solution ([`refinement_error`]): a solve that
-/// leaves more is too inaccurate to measure its own error, and a bound it gave
-/// could make a coefficient or an entry of the model's own count as zero.
+/// it estimates the error of its solution ([`refinement_error`]): a solve that
+/// leaves more is too inaccurate to measure its own error, and an estimate it
+/// gave could make a coefficient or an entry of the model's own count as zero.
 const REFINEMENT_CONVERGED: f64 = f64::EPSILON / 2.0;
 
 /// The most steps of the refinement a failed proof goes on with
@@ -273,8 +273,8 @@ const REFINEMENT_CONVERGED: f64 = f64::EPSILON / 2.0;
 const REFINEMENT_MAX_STEPS: usize = 10;
 const REFINEMENT_RATIO: f64 = 0.5;
 
-/// The bound on the error of each entry of a solution refined twice, `x`:
-/// the magnitude of its entry of the refinement's `second` correction, where
+/// The estimated error of each entry of a solution refined twice, `x`: the
+/// magnitude of its entry of the refinement's `second` correction, where
 /// the refinement converged ([`REFINEMENT_CONVERGED`]); `None` where it did
 /// not, or where the solution or the correction is not finite. The solutions
 /// are the row of the basis inverse the proof reads, whose entries are the
@@ -285,9 +285,9 @@ const REFINEMENT_RATIO: f64 = 0.5;
 /// coefficient count as zero far above the error those multipliers carry. A
 /// correction measures the error down to the round-off of the residual it is
 /// solved from, and below that only round-off: an entry that is zero can end
-/// beyond its correction. Too small a bound fails a proof, never makes one,
-/// but a step it lets such an entry bound pivots on zero, so the primal ratio
-/// test adds that round-off (`Solver::refined_col_floors`).
+/// beyond its correction. Too small an estimate fails a proof, never makes
+/// one, but a step it lets such an entry bound pivots on zero, so the primal
+/// ratio test adds that round-off (`Solver::refined_col_floors`).
 pub(super) fn refinement_error(x: &[CDouble], second: &[f64]) -> Option<Vec<f64>> {
     let x_norm = finite_max_norm(x.iter().map(|r| r.value()))?;
     let second_norm = finite_max_norm(second.iter().copied())?;
@@ -329,11 +329,11 @@ pub(super) struct Proof {
     /// concession of [`Solver::proof_of`]).
     pub(super) zero_within_error: usize,
     /// How many nonzero multipliers the certificate took as zero within their
-    /// error bound ([`Solver::proof_of`]).
+    /// estimated error ([`Solver::proof_of`]).
     pub(super) multipliers_zeroed: usize,
 }
 
-/// The row of the basis inverse the proof reads, refined, with a bound on
+/// The row of the basis inverse the proof reads, refined, with an estimate of
 /// the error each of its multipliers keeps
 /// ([`Solver::refined_basis_inverse_row`]).
 pub(super) struct RefinedRow {
@@ -435,7 +435,7 @@ impl Solver {
     }
 
     /// `rho`, the row of the basis inverse for `row` as solved for, refined
-    /// twice, with a bound on the error each multiplier keeps.
+    /// twice, with an estimate of the error each multiplier keeps.
     ///
     /// Each step solves for the residual `B^T rho - e_row`, summed in
     /// compensated arithmetic over the basic columns, and takes the solution

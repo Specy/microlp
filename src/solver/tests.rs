@@ -2121,12 +2121,10 @@ struct RedundantEqualityRay {
     room: f64,
 }
 
-/// The primal ratio test of `x2` in [`redundant_equality_solver`] with
-/// `x0`, `x1` and the third row's slack basic, on a fresh factorization at
-/// the highest threshold, in a phase started on the vertex's values,
-/// verified if `verified`, where `x2`'s column is exactly zero in the slack's
-/// row: a ray.
-fn redundant_equality_ray(unit: f64, verified: bool) -> RedundantEqualityRay {
+/// [`redundant_equality_solver`] with `x0`, `x1` and the third row's slack
+/// basic, in a primal phase started on the vertex's values, verified if
+/// `verified`: `x2`'s column is exactly zero in the slack's row.
+fn redundant_equality_phase(unit: f64, verified: bool) -> Solver {
     let mut sol = redundant_equality_solver(unit);
     let basis = Basis(vec![
         VarStatus::Basic,
@@ -2144,6 +2142,13 @@ fn redundant_equality_ray(unit: f64, verified: bool) -> RedundantEqualityRay {
         ));
     }
     sol.begin_primal_phase(true);
+    sol
+}
+
+/// The primal ratio test of `x2` in [`redundant_equality_phase`], on a fresh
+/// factorization at the highest threshold: a ray.
+fn redundant_equality_ray(unit: f64, verified: bool) -> RedundantEqualityRay {
+    let mut sol = redundant_equality_phase(unit, verified);
     sol.lu_threshold = LU_STABLE_THRESHOLD;
     let choice = sol.choose_pivot(nb_col(&sol, 2), 1.0);
     let slack_row = match sol.var_states[5] {
@@ -2231,10 +2236,11 @@ fn an_unresolved_ray_needs_a_verified_start() {
 /// The primal ratio test of `x2` in [`redundant_equality_solver`]'s rows and
 /// a fourth, the sum of the second and the third plus `coeff w`, `w >= 0`,
 /// with `x0`, `x1`, `w` and the third row's slack basic, in a phase started
-/// on the vertex's verified values. `w` stays zero wherever the other rows
+/// on the vertex's verified values, but for `w` on the lower edge of its
+/// tolerance band if `w_on_band_edge`. `w` stays zero wherever the other rows
 /// hold, so its entry in `x2`'s column is exactly zero, as the slack's is,
 /// and the ray stands.
-fn redundant_equality_ray_past_w(coeff: f64) -> Result<PivotChoice, Error> {
+fn redundant_equality_ray_past_w(coeff: f64, w_on_band_edge: bool) -> Result<PivotChoice, Error> {
     use VarStatus::{AtLower, Basic, Free};
     init();
     let mut sol = Solver::try_new(
@@ -2263,6 +2269,10 @@ fn redundant_equality_ray_past_w(coeff: f64) -> Result<PivotChoice, Error> {
         Ok(Verdict::Checked { feasible: true })
     ));
     sol.begin_primal_phase(true);
+    if w_on_band_edge {
+        let edge = band_edge(sol.orig_var_mins[3], sol.var_tols[3].lo, false);
+        sol.primal_start.as_mut().expect("a verified start")[3] = edge;
+    }
     sol.lu_threshold = LU_STABLE_THRESHOLD;
     let choice = sol.choose_pivot(nb_col(&sol, 2), 1.0);
     let w_row = match sol.var_states[3] {
@@ -2289,11 +2299,126 @@ fn redundant_equality_ray_past_w(coeff: f64) -> Result<PivotChoice, Error> {
 #[test]
 fn a_ray_covers_an_entry_within_its_measured_correction() {
     assert!(matches!(
-        redundant_equality_ray_past_w(1.0),
+        redundant_equality_ray_past_w(1.0, false),
         Ok(PivotChoice::Unbounded)
     ));
     assert!(matches!(
-        redundant_equality_ray_past_w(2f64.powi(-40)),
+        redundant_equality_ray_past_w(2f64.powi(-40), false),
+        Err(Error::InternalError(ref message))
+            if message.contains("unresolved within residual round-off")
+    ));
+}
+
+/// A column blocked only by entries of unresolved sign renews the
+/// factorization at a raised threshold before anything else: the ratio test
+/// of [`redundant_equality_phase`] on a factorization whose threshold can
+/// still rise names the slack's row.
+#[test]
+fn a_column_blocked_only_by_unresolved_entries_renews_the_factorization() {
+    let mut sol = redundant_equality_phase(1.0, true);
+    assert!(
+        sol.lu_threshold < LU_STABLE_THRESHOLD,
+        "fixture: the threshold can rise"
+    );
+    let choice = sol.choose_pivot(nb_col(&sol, 2), 1.0);
+    let slack_row = match sol.var_states[5] {
+        VarState::Basic(row) => row,
+        VarState::NonBasic(_) => panic!("the third row's slack is basic"),
+    };
+    assert!(
+        matches!(choice, Ok(PivotChoice::Unresolved { row }) if row == slack_row),
+        "{choice:?}"
+    );
+    sol.end_primal_phase().unwrap();
+}
+
+/// The primal ratio test of `x2` in [`redundant_equality_solver`]'s rows and
+/// a fourth, `x0 - (5 + 2^-30) x1 <= -18 - 2^-30`, which holds `x1 >= 1` on
+/// the line `(-8, 2, 0) + t (5, 1, 6)` the others leave, with `x0`, `x1` and
+/// the slacks of the third and fourth rows basic, on a fresh factorization
+/// at the highest threshold, in a phase started on the vertex's verified
+/// values; and the rows of the two slacks. `x2`'s column is exactly zero in
+/// the third row's slack, and `2^-30 / 6` in magnitude per unit of `x2` in
+/// the fourth's, below the pivot tolerance.
+fn tiny_blocker_beside_a_redundant_equality() -> (Result<PivotChoice, Error>, Solver, [usize; 2]) {
+    use VarStatus::{AtLower, Basic, Free};
+    init();
+    let delta = 2f64.powi(-30);
+    let mut sol = Solver::try_new(
+        &[4.0, 3.0, -1.0],
+        &[f64::NEG_INFINITY; 3],
+        &[f64::INFINITY; 3],
+        &[
+            (to_sparse(&[18.0, -18.0, -12.0]), ComparisonOp::Eq, -180.0),
+            (to_sparse(&[-1.0, 5.0, 0.0]), ComparisonOp::Eq, 18.0),
+            (to_sparse(&[-5.0, 1.0, 4.0]), ComparisonOp::Eq, 42.0),
+            (
+                to_sparse(&[1.0, -(5.0 + delta), 0.0]),
+                ComparisonOp::Le,
+                -18.0 - delta,
+            ),
+        ],
+        &[VarDomain::Real; 3],
+        None,
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    let statuses = vec![Basic, Basic, Free, AtLower, AtLower, Basic, Basic];
+    sol.load_basis(&Basis(statuses)).unwrap();
+    assert!(matches!(
+        sol.verify_primal(),
+        Ok(Verdict::Checked { feasible: true })
+    ));
+    sol.begin_primal_phase(true);
+    sol.lu_threshold = LU_STABLE_THRESHOLD;
+    let choice = sol.choose_pivot(nb_col(&sol, 2), 1.0);
+    let rows = [5, 6].map(|slack| match sol.var_states[slack] {
+        VarState::Basic(row) => row,
+        VarState::NonBasic(_) => panic!("var {slack} is basic"),
+    });
+    (choice, sol, rows)
+}
+
+/// A resolved blocker bounds the step beside an entry of unresolved sign: in
+/// [`tiny_blocker_beside_a_redundant_equality`] no entry above the pivot
+/// tolerance bounds the step, the refinement leaves the third row's zero
+/// unresolved within its round-off floor, and the fourth row's genuine
+/// entry, beyond its floor, is the pivot. The unresolved entry neither
+/// pivots nor keeps the step from its blocker.
+#[test]
+fn a_resolved_blocker_beside_an_unresolved_entry_is_the_pivot() {
+    let (choice, mut sol, [redundant, blocker]) = tiny_blocker_beside_a_redundant_equality();
+    let pivot_tol = primal_pivot_tolerance(0);
+    let blocking = sol.col_coeff_at(blocker);
+    assert!(
+        blocking != 0.0 && blocking.abs() <= pivot_tol,
+        "fixture: the blocker's entry {blocking:e} is below the pivot tolerance"
+    );
+    assert!(
+        sol.col_coeff_at(redundant) != 0.0 && sol.col_coeff_at(redundant).abs() < 1e-20,
+        "fixture: the refinement leaves round-off in the redundant row"
+    );
+    let Ok(PivotChoice::Pivot(info)) = choice else {
+        panic!("{choice:?}");
+    };
+    assert_eq!(info.elem.as_ref().map(|elem| elem.row), Some(blocker));
+    sol.end_primal_phase().unwrap();
+}
+
+/// A var the start leaves no room leaves no ray: in
+/// [`redundant_equality_ray_past_w`] with `w` written at one, the ray covers
+/// `w`'s entry of open sign and stands from `w` at zero, but from `w` on the
+/// lower edge of its tolerance band, which the verification accepts, any
+/// movement of open sign could take `w` past it, and the ratio test fails
+/// loudly.
+#[test]
+fn an_entry_of_open_sign_whose_var_starts_on_its_band_edge_is_no_ray() {
+    assert!(matches!(
+        redundant_equality_ray_past_w(1.0, false),
+        Ok(PivotChoice::Unbounded)
+    ));
+    assert!(matches!(
+        redundant_equality_ray_past_w(1.0, true),
         Err(Error::InternalError(ref message))
             if message.contains("unresolved within residual round-off")
     ));
