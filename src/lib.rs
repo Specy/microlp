@@ -82,7 +82,8 @@ can then fail with [`Error::InternalError`], whose message names the
 constraint (in the order added) and the variable (its index) whose
 coefficients span the most, those of them outside the range. Changing the
 units of a variable or of a constraint usually brings a model back into
-range. Within the range, please report an [`Error::InternalError`] as a bug.
+range. Within the range, an [`Error::InternalError`] is a bug or one of the
+[known limitations](#known-limitations): please report it.
 
 [`SolveOptions::presolve`], on by default, simplifies the problem before the
 search. It never removes a variable or changes a real variable's bounds, and
@@ -119,10 +120,24 @@ bearing in mind that rounded values need not meet the constraints: under
 `x <= 1e7 * y`, a `y` of `1e-6` allows `x` up to 10, which `y` rounded to zero
 forbids.
 
+# Known limitations
+
+The solver computes in floating point. Nearly dependent constraints can exceed
+its resolution even within the recommended coefficient range: a solve can then
+fail with [`Error::InternalError`], and in extreme cases a feasible model whose
+feasible points need very large variable values is reported
+[`Error::Infeasible`]. Outside the range, a bounded model can also be reported
+[`Error::Unbounded`]. An objective whose terms (costs times values) overflow
+`f64` cannot be evaluated: a solve that meets one fails with
+[`Error::InternalError`], even where the exact objective is representable. The
+known cases are listed in the
+[architecture notes](https://github.com/Specy/microlp/blob/v0.7.0/src/ARCHITECTURE.md#79-known-limitations).
+
 # Time limits, resuming, and editing
 
 [`Problem::set_time_limit`] sets a time budget. [`SolveOutcome::resume`] uses
-the per-call options from the immediately preceding solve or resume call.
+the per-call options from the immediately preceding solve, resume, or
+post-solve edit call.
 [`SolveOutcome::resume_with`] instead uses only the supplied [`ResumeOptions`]:
 every field replaces the previous setting, and values are not merged.
 
@@ -130,8 +145,6 @@ A [`Solution`] can be edited and re-solved. [`Solution::add_constraint`] adds a
 constraint, [`Solution::fix_var`] pins a variable to a value, and
 [`Solution::unfix_var`] releases a previous fix. Each edit consumes the
 solution and returns a new [`SolveOutcome`] for the edited problem.
-
-
 */
 
 #![deny(missing_debug_implementations, missing_docs)]

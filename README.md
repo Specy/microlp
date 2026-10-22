@@ -19,6 +19,11 @@ recommended to use it with the [rooc modeling language](https://github.com/specy
 
 The sections below show how to use microlp directly.
 
+microlp requires Rust 1.86 or later. The latest releases of its `sprs`
+dependency need Rust 1.88, so on Rust 1.86 and 1.87 resolve dependencies with
+the MSRV-aware resolver (`resolver = "3"`, the default of edition 2024), or
+run `cargo update -p sprs --precise 0.11.4`.
+
 ## Features
 
 * Pure Rust. Runs on WebAssembly.
@@ -63,7 +68,9 @@ coefficient and its bounds, and is represented by a `Variable` handle that you
 keep to reference it later. A handle belongs to the problem that created it:
 use it only with that problem and its solutions. Another problem does not
 detect a foreign handle; it refers to that problem's variable with the same
-index, or panics if there is none.
+index. If the index is absent, accessors and `Problem::add_constraint` panic;
+`Solution::add_constraint` and a solve's warm-start hints return
+`Error::InvalidOperation`.
 
 ```rust
 use microlp::{ComparisonOp, LinearExpr, OptimizationDirection, Problem};
@@ -138,7 +145,17 @@ solve can then fail with `Error::InternalError`, whose message names the
 constraint (in the order added) and the variable (its index) whose
 coefficients span the most, those of them outside the range. Changing the
 units of a variable or of a constraint usually brings a model back into
-range. Within the range, please report an `Error::InternalError` as a bug.
+range. Within the range, an `Error::InternalError` is a bug or one of the
+known limitations below: please report it.
+
+Nearly dependent constraints can exceed floating-point resolution even within
+that coefficient range: a solve can then fail with `Error::InternalError`, and
+in extreme cases a feasible model whose feasible points require very large
+variable values is reported `Infeasible`. Outside the range, a bounded model
+can also be reported `Unbounded`. An objective whose terms (costs times
+values) overflow `f64` cannot be evaluated: a solve that meets one fails with
+`Error::InternalError`, even where the exact objective is representable. See
+the [known numerical limitations](src/ARCHITECTURE.md#79-known-limitations).
 
 When a solver decides to produce a solution it might be for different reasons:
 
@@ -192,9 +209,10 @@ let count = solution.var_value(y).round();   // an exact integer
 let same = solution[x];                      // indexing is equivalent to var_value()
 
 for (var, value) in &solution {
-    // Exact integers for the integer and boolean variables.
+    // Exact integers for the integer and boolean variables (`+ 0.0` turns
+    // the `-0` that rounds a value just below zero into `0`).
     let value = match solution.var_domain(var) {
-        VarDomain::Integer | VarDomain::Boolean => value.round(),
+        VarDomain::Integer | VarDomain::Boolean => value.round() + 0.0,
         VarDomain::Real => value,
     };
     println!("{}: {}", var.idx(), value);
@@ -209,7 +227,7 @@ iterations, elapsed time, the best proven bound and the current gap.
 Set a time budget with `set_time_limit`. When it runs out, the outcome
 contains either a feasible incumbent or an interrupted search. `resume()`
 continues the same search with the per-call options used by the immediately
-preceding solve or resume.
+preceding solve, resume or edit.
 
 Use `resume_with` to resume with different settings.
 
@@ -259,8 +277,9 @@ let outcome = problem.solve_with(options)?;
   reason `MipGap`. The default `0.0` requires exact optimality.
 * `warm_start`: a starting assignment (it may cover only some variables).
   A good one gives the solver an immediate solution to improve on. It is
-  advisory: if it isn't usable it is ignored. A value that is NaN or infinite,
-  or a variable outside the problem, returns `Error::InvalidOperation`.
+  advisory: if it isn't usable it is ignored, and a problem with only real
+  variables does not use it. A value that is NaN or infinite, or a variable
+  outside the problem, returns `Error::InvalidOperation`.
 * `int_tol`, `tolerances`: numeric tolerances. A value within `int_tol` of an
   integer counts as integral, for acceptance only (see `presolve` below), and
   integer values are reported within it (a fixed integer variable's on its
@@ -351,7 +370,9 @@ fn main() -> Result<(), Error> {
         .into_solution()
         .expect("resume_until_answer guarantees a solution");
     for (i, &unit) in units.iter().enumerate() {
-        println!("product {}: {} units", i, solution.var_value(unit));
+        // Rounded: an integer variable's value is reported as computed.
+        let count = solution.var_value(unit).round() + 0.0;
+        println!("product {}: {} units", i, count);
     }
     Ok(())
 }
@@ -366,7 +387,7 @@ Besides unit tests, the repository ships a correctness suite of 200+ LP/MILP
 problems with independently known answers:
 
 ```bash
-cargo test --release --test suite            # default set, a few seconds
+cargo test --release --test suite            # default: easy + medium
 cargo test --release --test suite -- --hard  # plus the long-running ones
 ```
 
@@ -374,7 +395,13 @@ See [tests/suite/README.md](tests/suite/README.md) for how it works, and
 [src/ARCHITECTURE.md](src/ARCHITECTURE.md) if you want to know how the solver
 itself works.
 
-There is also a harder tier called `xhard` which microlp currently cannot solve in reasonable time. (under 10 minutes) which you can run with. This tier is being used to compare with other solvers.
+The origin-feasible property test runs 50,000 cases by default. For a deeper
+run, use `HEGEL_TEST_CASES=500000 cargo test --release --lib origin`, which
+takes about a minute and some 4 GB of memory.
+
+The `xhard` tier gives larger instances a 10-minute budget. It accepts clean
+interruptions and checks returned incumbents against externally certified results:
+
 ```
 cargo test --release --test suite -- --xhard
 ```
@@ -382,10 +409,11 @@ cargo test --release --test suite -- --xhard
 ## Benchmarks
 
 [BENCHMARK.md](https://github.com/Specy/microlp/blob/master/BENCHMARK.md)
-compares microlp against other open-source solvers on the suite's benchmark
-instances, and tracks how close it gets on the instances it cannot yet solve
-within a time budget. Regenerate it from a clone of this repository (the
-crates.io package does not include the benchmark data) with:
+records a comparison of an earlier revision against other open-source solvers
+on the suite's benchmark instances. Its date and revision identify the code
+measured; it does not describe the current release. Regenerate it from a clone
+of this repository (the crates.io package does not include the benchmark data)
+with:
 
 ```bash
 cargo run -p microlp-benchmark --release

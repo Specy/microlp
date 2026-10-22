@@ -19,7 +19,10 @@ use crate::{Error, StopReason, VarDomain};
 /// since a warm-start hint fixes a var up to `params::HINT_BOUNDS_SLACK`
 /// outside them, and the var may sit its whole tolerance beyond that.
 /// `Ok(false)` means the point fails the check and the caller must branch. A
-/// valid candidate completes unboundedness classification.
+/// valid candidate completes unboundedness classification. A candidate whose
+/// objective cannot be evaluated in `f64`, its terms (costs times values)
+/// overflowing, is an `InternalError`: no bound or incumbent compares with
+/// it, and no branching changes it.
 pub(crate) fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
     let values = state.solver.reported_values();
     let solver = &state.solver;
@@ -38,8 +41,11 @@ pub(crate) fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
     }
     let objective = solver.objective_of(&values);
     if !objective.is_finite() {
-        debug!("integral-within-tol solution rejected: objective is non-finite");
-        return Ok(false);
+        return Err(Error::InternalError(
+            "the objective of an integral solution cannot be evaluated in f64: its terms \
+             (costs times values) overflow"
+                .to_string(),
+        ));
     }
     let better = match &state.incumbent {
         Some(inc) => objective < inc.objective,
@@ -344,7 +350,12 @@ pub(crate) fn try_warm_start(
                         Ok(false) => {
                             debug!("warm-start hint rejected by feasibility guard; ignored");
                         }
-                        Err(error) => verdict = Some(error),
+                        Err(Error::Unbounded) => verdict = Some(Error::Unbounded),
+                        // A completion whose objective cannot be evaluated is
+                        // no usable hint either.
+                        Err(error) => {
+                            debug!("warm-start hint rejected ({error}); ignored");
+                        }
                     }
                 } else {
                     debug!("warm-start hint LP-completed fractionally; ignored");

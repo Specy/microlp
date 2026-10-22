@@ -25,6 +25,13 @@ pub(crate) enum PivotChoice {
     /// highest threshold the pivot is taken with the column's element; a
     /// basis it leaves singular is repaired at the next factorization.
     Inconsistent { row: usize },
+    /// Only entries whose sign the refined column leaves unresolved within
+    /// their round-off floor, the last at `row`, block a step toward an
+    /// infinite bound, and a fresh factorization, at a raised threshold, can
+    /// still resolve them: the factorization is renewed before choosing
+    /// again. On a fresh one at the highest threshold they leave a ray or the
+    /// ratio test fails loudly.
+    Unresolved { row: usize },
     /// No entry bounds the step toward the entering var's infinite bound, and
     /// no entry the refinement cannot resolve takes its var past its
     /// tolerances before the magnitude taken for infinite: an unbounded ray,

@@ -23,8 +23,8 @@ use super::tolerances::{slack_bounds, trivial_row_verdict, valid_rhs};
 /// var at a bound `B` with a coefficient `a` it is held to about
 /// `1e-14 |a| B` only, and with `|a|` near one, from 2^52 on the spacing of
 /// `f64` is one or more, so no fraction of the row's data survives. A huge
-/// bound that stands for infinity, as `f64::MAX`, `f32::MAX` and `i64::MAX`
-/// do in issue #3, would then change the answer as soon as a var sits at it;
+/// bound written for a missing one, as `f64::MAX`, `f32::MAX` or `i64::MAX`
+/// commonly is, would then change the answer as soon as a var sits at it;
 /// bounds from about `1e15` up to the threshold still can. The price: a bound
 /// of 2^52 or more that is meant as a bound is none here, so `max x` with
 /// `x ≤ 5e15` is `Unbounded`, and a solution can lie beyond such a bound

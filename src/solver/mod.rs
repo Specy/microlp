@@ -93,6 +93,14 @@ struct RefinedColumn {
     value_roundoff: Vec<f64>,
 }
 
+/// The `InternalError` of a refinement of the pivot column of `var`, in the
+/// `phase` simplex, that computes a number that is not finite.
+fn refinement_breakdown(phase: &str, var: usize) -> Error {
+    Error::InternalError(format!(
+        "{phase} simplex: the refinement of the column of var {var} is not finite"
+    ))
+}
+
 /// A 64-bit hash of `x` (splitmix64's finalizer): the vertex hash of the
 /// cycling detection and the pseudo-random fractions of the perturbations.
 fn mix(x: u64) -> u64 {
@@ -1181,7 +1189,7 @@ impl Solver {
                 .unwrap_or(0.0);
                 if new_val != cur {
                     // Shift the non-basic var to the nearest bound and propagate the
-                    // delta into basic values (same mechanism as fix_var's non-basic arm).
+                    // delta into basic values through its tableau column.
                     self.calc_col_coeffs(col);
                     let diff = new_val - cur;
                     for (r, coeff) in self.col_coeffs.iter() {
@@ -2341,6 +2349,15 @@ impl Solver {
                     self.rebuild_primal()?;
                     refreshed_since_step = true;
                 }
+                PivotChoice::Unresolved { row } => {
+                    debug!(
+                        "optimize iter {iter}: only entries of unresolved sign block the step, \
+                         the last in row {row}; rebuilding"
+                    );
+                    self.raise_lu_threshold();
+                    self.rebuild_primal()?;
+                    refreshed_since_step = true;
+                }
                 PivotChoice::Unbounded => {
                     if refreshed_since_step {
                         return Err(Error::Unbounded);
@@ -2667,7 +2684,7 @@ impl Solver {
             // the next factorization.
             self.calc_col_coeffs(col);
             if step.refined {
-                self.refine_pivot_col(col)?;
+                self.refine_dual_pivot_col(col)?;
             }
             let a_col = self.col_coeff_at(row);
             if !Self::pivots_agree(a_row, a_col) {
@@ -3225,7 +3242,7 @@ impl Solver {
             if choice.is_none() {
                 if let Some(&(row, _)) = unresolved.last() {
                     if self.can_renew_factorization() {
-                        return Ok(PivotChoice::Inconsistent { row });
+                        return Ok(PivotChoice::Unresolved { row });
                     }
                     if converged {
                         let mut open = unresolved.clone();
@@ -3452,11 +3469,10 @@ impl Solver {
 
     /// The pivot column of `entering_c` refined twice, for a primal step that
     /// nothing above the pivot tolerance bounds, toward an infinite bound
-    /// (see [`Self::choose_pivot`]), or a pivot read off a refined row (see
-    /// [`Self::dual_phase`]), the way the proof refines its row of the basis
-    /// inverse ([`Self::refine_basis_inverse_row`]): each step solves for the
-    /// residual `a_q - B alpha`, summed in compensated arithmetic over the
-    /// basic columns, and adds the solution to the column, kept in doubled
+    /// (see [`Self::choose_pivot`]), the way the proof refines its row of the
+    /// basis inverse ([`Self::refine_basis_inverse_row`]): each step solves
+    /// for the residual `a_q - B alpha`, summed in compensated arithmetic over
+    /// the basic columns, and adds the solution to the column, kept in doubled
     /// precision. The refined column replaces `col_coeffs`.
     ///
     /// Returns the refined values, each entry's measured second-correction
@@ -3469,40 +3485,22 @@ impl Solver {
     fn refine_pivot_col(&mut self, entering_c: usize) -> Result<RefinedColumn, Error> {
         let num_rows = self.num_constraints();
         let var = self.nb_vars[entering_c];
-        let mut alpha = vec![CDouble::default(); num_rows];
-        for (r, &coeff) in self.col_coeffs.iter() {
-            alpha[r] = CDouble::from(coeff);
-        }
+        let mut alpha = self.compensated_col_coeffs();
         let mut second = Vec::new();
         let mut residual_roundoff = vec![0.0; num_rows];
         let mut value_roundoff = vec![0.0; num_rows];
         for _ in 0..2 {
-            let (correction, discarded) =
-                self.pivot_col_correction(var, &alpha).ok_or_else(|| {
-                    Error::InternalError(format!(
-                        "primal simplex: the refinement of the column of var {var} is not finite"
-                    ))
-                })?;
+            let (correction, discarded) = self
+                .pivot_col_correction(var, &alpha, true)
+                .ok_or_else(|| refinement_breakdown("primal", var))?;
             for (r, (a, &c)) in alpha.iter_mut().zip(&correction).enumerate() {
                 residual_roundoff[r] = proof::add_up(residual_roundoff[r], discarded[r]);
                 value_roundoff[r] = proof::add_up(value_roundoff[r], a.add_with_error(c));
             }
             second = correction;
         }
-        let mut refined = ScatteredVec::empty(num_rows);
-        for (r, a) in alpha.iter().enumerate() {
-            let value = a.value();
-            if !value.is_finite() {
-                return Err(Error::InternalError(format!(
-                    "primal simplex: the refinement of the column of var {var} is not finite"
-                )));
-            }
-            if value != 0.0 {
-                *refined.get_mut(r) = value;
-            }
-        }
-        refined.to_sparse_vec(&mut self.col_coeffs);
-        let (_, final_roundoff) = self.pivot_col_residual(var, &alpha);
+        self.set_refined_col(var, &alpha, "primal")?;
+        let (_, final_roundoff) = self.pivot_col_residual(var, &alpha, true);
         for r in 0..num_rows {
             residual_roundoff[r] = proof::add_up(residual_roundoff[r], final_roundoff[r]);
             if !residual_roundoff[r].is_finite() || !value_roundoff[r].is_finite() {
@@ -3519,18 +3517,66 @@ impl Solver {
         })
     }
 
-    /// The correction of one step of [`Self::refine_pivot_col`] for the
-    /// column of `var`: `B^-1 (a_q - B alpha)`, the residual summed in
-    /// compensated arithmetic over the basic columns and scaled for the
-    /// solve, exactly, by the power of two that puts its largest entry in
-    /// `[1, 2)`; zero where the residual is, and `None` where it is not
-    /// finite.
+    /// The pivot column of `entering_c` refined twice as
+    /// [`Self::refine_pivot_col`] refines it, for a pivot read off a refined
+    /// row (see [`Self::dual_phase`]), which reads only the refined values:
+    /// what the arithmetic discards is not measured. A number of the
+    /// refinement that is not finite is an `InternalError`.
+    fn refine_dual_pivot_col(&mut self, entering_c: usize) -> Result<(), Error> {
+        let var = self.nb_vars[entering_c];
+        let mut alpha = self.compensated_col_coeffs();
+        for _ in 0..2 {
+            let (correction, _) = self
+                .pivot_col_correction(var, &alpha, false)
+                .ok_or_else(|| refinement_breakdown("dual", var))?;
+            for (a, &c) in alpha.iter_mut().zip(&correction) {
+                a.add(c);
+            }
+        }
+        self.set_refined_col(var, &alpha, "dual")
+    }
+
+    /// `col_coeffs`, dense and compensated, for a refinement to go into.
+    fn compensated_col_coeffs(&self) -> Vec<CDouble> {
+        let mut alpha = vec![CDouble::default(); self.num_constraints()];
+        for (r, &coeff) in self.col_coeffs.iter() {
+            alpha[r] = CDouble::from(coeff);
+        }
+        alpha
+    }
+
+    /// Replace `col_coeffs` by `alpha`, the refined column of `var`, rounded
+    /// to `f64`; an entry that is not finite is an `InternalError` of the
+    /// `phase` simplex.
+    fn set_refined_col(&mut self, var: usize, alpha: &[CDouble], phase: &str) -> Result<(), Error> {
+        let mut refined = ScatteredVec::empty(alpha.len());
+        for (r, a) in alpha.iter().enumerate() {
+            let value = a.value();
+            if !value.is_finite() {
+                return Err(refinement_breakdown(phase, var));
+            }
+            if value != 0.0 {
+                *refined.get_mut(r) = value;
+            }
+        }
+        refined.to_sparse_vec(&mut self.col_coeffs);
+        Ok(())
+    }
+
+    /// The correction of one step of a refinement of the column of `var`
+    /// ([`Self::refine_pivot_col`]): `B^-1 (a_q - B alpha)`, the residual
+    /// summed in compensated arithmetic over the basic columns and scaled for
+    /// the solve, exactly, by the power of two that puts its largest entry in
+    /// `[1, 2)`; zero where the residual is. With it, where `measure`, the
+    /// arithmetic the residual discarded ([`Self::pivot_col_residual`]).
+    /// `None` where the residual, or what it discarded, is not finite.
     fn pivot_col_correction(
         &mut self,
         var: usize,
         alpha: &[CDouble],
+        measure: bool,
     ) -> Option<(Vec<f64>, Vec<f64>)> {
-        let (residual, roundoff) = self.pivot_col_residual(var, alpha);
+        let (residual, roundoff) = self.pivot_col_residual(var, alpha, measure);
         if roundoff.iter().any(|error| !error.is_finite()) {
             return None;
         }
@@ -3548,22 +3594,40 @@ impl Solver {
         Some((correction, roundoff))
     }
 
-    /// Evaluate the compensated residual with the same arithmetic used by
-    /// refinement, accounting for every discarded low-part operation and
-    /// its final conversion to f64.
-    fn pivot_col_residual(&self, var: usize, alpha: &[CDouble]) -> (Vec<CDouble>, Vec<f64>) {
-        let mut residual = vec![CDouble::default(); self.num_constraints()];
-        let mut roundoff = vec![0.0; self.num_constraints()];
+    /// The residual `a_q - B alpha` of the column of `var`, summed in
+    /// compensated arithmetic over the basic columns, and where `measure`,
+    /// per row an upper bound on the arithmetic the sum discarded, each
+    /// low-part addition and product and its conversion to `f64` (empty
+    /// otherwise). Measured or not, the residual is the same.
+    fn pivot_col_residual(
+        &self,
+        var: usize,
+        alpha: &[CDouble],
+        measure: bool,
+    ) -> (Vec<CDouble>, Vec<f64>) {
+        let num_rows = self.num_constraints();
+        let mut residual = vec![CDouble::default(); num_rows];
+        let mut roundoff = vec![0.0; if measure { num_rows } else { 0 }];
+        //guaranteed to be a valid index
         for (i, &a) in self.orig_constraints_csc.outer_view(var).unwrap().iter() {
-            roundoff[i] = proof::add_up(roundoff[i], residual[i].add_with_error(a));
+            if measure {
+                roundoff[i] = proof::add_up(roundoff[i], residual[i].add_with_error(a));
+            } else {
+                residual[i].add(a);
+            }
         }
         for (k, &basic) in self.basic_vars.iter().enumerate() {
             if alpha[k].value() == 0.0 {
                 continue;
             }
+            //guaranteed to be a valid index
             for (i, &a) in self.orig_constraints_csc.outer_view(basic).unwrap().iter() {
-                let e = residual[i].add_scaled_with_error(alpha[k], -a);
-                roundoff[i] = proof::add_up(roundoff[i], e);
+                if measure {
+                    let error = residual[i].add_scaled_with_error(alpha[k], -a);
+                    roundoff[i] = proof::add_up(roundoff[i], error);
+                } else {
+                    residual[i].add_scaled(alpha[k], -a);
+                }
             }
         }
         for (r, error) in roundoff.iter_mut().enumerate() {
@@ -3572,13 +3636,13 @@ impl Solver {
         (residual, roundoff)
     }
 
-    /// The arithmetic discarded while evaluating the refined column's
-    /// residual, carried into each requested entry through an approximate
-    /// row of the basis inverse. Unlike a worst-case magnitude allowance,
-    /// this measures each low-part addition and product: exact arithmetic
-    /// has no discarded error even when a genuine entry is extremely small.
-    /// Residual round-off from both refinement steps, round-off of adding
-    /// their corrections, and the column's final rounding are included too.
+    /// The round-off floor of the requested entries of the refined column:
+    /// the arithmetic discarded while evaluating its residuals, in both
+    /// refinement steps and after them, carried into each entry through an
+    /// approximate row of the basis inverse, plus the round-off of adding the
+    /// corrections and of rounding the entry to `f64`. Each low-part addition
+    /// and product counts what it discards, so arithmetic that is exact adds
+    /// nothing to the floor, however small a genuine entry is.
     ///
     /// The inverse row comes from the floating-point factorization, so this
     /// remains a numerical estimate. An entry inside this floor is unresolved:
@@ -3612,7 +3676,7 @@ impl Solver {
                 } else {
                     Err(Error::InternalError(format!(
                         "primal simplex: the round-off floor of the column of var {var} in row \
-                     {row} is not finite"
+                         {row} is not finite"
                     )))
                 }
             })

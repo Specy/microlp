@@ -588,6 +588,11 @@ mod tests_presolve_api {
                 ..SolveOptions::default()
             })
             .unwrap();
+        assert_eq!(
+            outcome.termination_reason(),
+            TerminationReason::NodeLimit,
+            "fixture: the node limit interrupts the search"
+        );
         let mut guard = 0;
         while !outcome.is_optimal() {
             guard += 1;

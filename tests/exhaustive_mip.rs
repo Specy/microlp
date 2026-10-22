@@ -378,6 +378,8 @@ fn assert_solution(
 
 #[test]
 fn bounded_integer_models_match_exhaustive_enumeration() {
+    // How many of the searches sliced by the node limit were interrupted.
+    let mut resumed_searches = 0;
     for seed in 0..50_000 {
         let case = generated_case(seed);
         let expected = brute_force(&case);
@@ -410,6 +412,9 @@ fn bounded_integer_models_match_exhaustive_enumeration() {
                     let mut resumed = problem.solve_with(options).unwrap_or_else(|error| {
                         panic!("seed {seed}: node-limited solve failed: {error}; {case:?}")
                     });
+                    if !resumed.is_optimal() {
+                        resumed_searches += 1;
+                    }
                     for _ in 0..10_000 {
                         if resumed.is_optimal() {
                             break;
@@ -435,6 +440,12 @@ fn bounded_integer_models_match_exhaustive_enumeration() {
             }
         }
     }
+    // Most searches end within the first node; enough others must resume for
+    // the comparison above to test resumes.
+    assert!(
+        resumed_searches >= 20,
+        "only {resumed_searches} sliced searches were interrupted"
+    );
 }
 
 /// The integer models with their costs times `step`, maximized when

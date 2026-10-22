@@ -1,7 +1,5 @@
 //! The single error type every fallible call in the public API returns.
 
-use sprs::errors::StructureError;
-
 /// An error returned while validating, solving, or editing a problem.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -11,15 +9,23 @@ pub enum Error {
     /// variable whose bounds are equal at its value, meets the constraints and
     /// the other bounds within the feasibility tolerance (see
     /// [`Tolerances::feasibility`](crate::Tolerances::feasibility)).
+    ///
+    /// In extreme cases, a feasible model of nearly dependent constraints,
+    /// whose feasible points need very large variable values, is reported
+    /// infeasible: see the crate's [known limitations](crate#known-limitations).
     Infeasible,
     /// The objective can improve without a finite limit.
+    ///
+    /// Outside the recommended coefficient range, a bounded model can be
+    /// reported unbounded: see the crate's
+    /// [known limitations](crate#known-limitations).
     Unbounded,
     /// A solve or resume option is non-finite or outside its accepted range.
     ///
     /// The message identifies the invalid field.
     InvalidOptions(String),
-    /// The input is invalid, and nothing was solved: a number of the problem
-    /// no solve can take (every objective coefficient, constraint
+    /// The input is invalid, and nothing was solved: a model number outside
+    /// its accepted range (every objective coefficient, constraint
     /// coefficient, bound and right-hand side must be finite, but a bound or a
     /// right-hand side may be infinite on the side it leaves open; see
     /// [`Problem::solve_with`](crate::Problem::solve_with)), a warm-start hint
@@ -39,15 +45,10 @@ pub enum Error {
     /// When the model lies outside the recommended coefficient range (see the
     /// crate documentation), the message names the constraint and the
     /// variable whose coefficients span the most, those of them outside it.
-    /// Within the range, please report it as a bug.
+    /// Within the range, it is a bug or one of the crate's
+    /// [known limitations](crate#known-limitations): please report it.
     InternalError(String),
 }
-impl From<StructureError> for Error {
-    fn from(err: StructureError) -> Self {
-        Error::InternalError(err.to_string())
-    }
-}
-
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let msg = match self {

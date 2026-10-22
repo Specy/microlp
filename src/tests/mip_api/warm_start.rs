@@ -36,6 +36,58 @@ fn warm_start_out_of_bounds_hint_is_ignored() {
     assert!((sol.objective() - 11.0).abs() < 1e-6);
 }
 
+/// A hint the engine's scaled units cannot hold is ignored too: in
+/// `max x + n` s.t. `1e300 x <= 1e300`, `x >= 0` and `n` an integer in
+/// `[0, 3]`, `x`'s column factor is `2^-997`, so its hint `1e300`, within its
+/// bounds, overflows the engine's units, and the solve proceeds without it to
+/// the optimum `4`.
+#[test]
+fn warm_start_hint_beyond_the_engines_units_is_ignored() {
+    let mut p = Problem::new(OptimizationDirection::Maximize);
+    let x = p.add_var(1.0, (0.0, f64::INFINITY));
+    p.add_integer_var(1.0, (0, 3));
+    p.add_constraint([(x, 1e300)], ComparisonOp::Le, 1e300);
+    for presolve in [true, false] {
+        let options = SolveOptions {
+            presolve,
+            warm_start: Some(vec![(x, 1e300)]),
+            ..SolveOptions::default()
+        };
+        let sol = solution(p.solve_with(options).unwrap());
+        assert_eq!(sol.status(), SolutionStatus::Optimal, "presolve {presolve}");
+        assert!((sol.objective() - 4.0).abs() < 1e-9, "presolve {presolve}");
+    }
+}
+
+/// A hint whose completion's objective overflows `f64` is ignored too: in
+/// `max 1e300 x + 1e300 y` s.t. `2x + 2y <= 7`, `x - y <= 0.5` and `y <= 10`
+/// over integers in the `i32` range, the hint `x = -2e9` completes to
+/// `y = 10`, where the term of `x` overflows, and the solve proceeds without
+/// it to the optimum `3e300`.
+#[test]
+fn warm_start_hint_whose_completion_overflows_is_ignored() {
+    let mut p = Problem::new(OptimizationDirection::Maximize);
+    let x = p.add_integer_var(1e300, (i32::MIN, i32::MAX));
+    let y = p.add_integer_var(1e300, (i32::MIN, i32::MAX));
+    p.add_constraint([(x, 2.0), (y, 2.0)], ComparisonOp::Le, 7.0);
+    p.add_constraint([(x, 1.0), (y, -1.0)], ComparisonOp::Le, 0.5);
+    p.add_constraint([(y, 1.0)], ComparisonOp::Le, 10.0);
+    for presolve in [true, false] {
+        let options = SolveOptions {
+            presolve,
+            warm_start: Some(vec![(x, -2e9)]),
+            ..SolveOptions::default()
+        };
+        let sol = solution(p.solve_with(options).unwrap());
+        assert_eq!(sol.status(), SolutionStatus::Optimal, "presolve {presolve}");
+        assert!(
+            (sol.objective() - 3e300).abs() <= 1e-9 * 3e300,
+            "presolve {presolve}: {}",
+            sol.objective()
+        );
+    }
+}
+
 /// A hint value that is NaN or infinite is invalid input, refused before
 /// anything is solved, on a MILP and on an LP alike.
 #[test]
@@ -58,21 +110,6 @@ fn warm_start_non_finite_hint_is_an_invalid_operation() {
             );
         }
     }
-}
-
-#[test]
-fn warm_start_nan_for_nonbasic_variable_is_an_invalid_operation() {
-    let mut problem = Problem::new(OptimizationDirection::Minimize);
-    let x = problem.add_integer_var(1.0, (0, 10));
-    let mut options = SolveOptions::default();
-    options.warm_start = Some(vec![(x, f64::NAN)]);
-
-    assert_eq!(
-        problem.solve_with(options).map(|_| "solved"),
-        Err(Error::InvalidOperation(
-            "invalid warm-start value NaN of variable 0: expected a finite value".to_string()
-        )),
-    );
 }
 
 /// A hint naming a variable of another problem, whose index this one does not

@@ -1,5 +1,8 @@
 # microlp benchmark
 
+This report measures the revision recorded below. It predates 0.7.0 and does
+not describe its performance. Regenerate it to compare the current release.
+
 microlp measured against other open-source solvers on the 35 LP/MILP instances vendored for the [correctness suite](tests/suite/README.md) (netlib LPs, MIPLIB 3 and MILPBench MILPs). Regenerate with:
 
 ```bash

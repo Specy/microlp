@@ -63,13 +63,15 @@ pub struct SolveOptions {
     /// an incumbent kept across an edit. Default `1e-6`. Must be finite and
     /// in the half-open range `[0, 0.5)`.
     pub int_tol: f64,
-    /// Optional (partial) starting assignment used to seed the incumbent. The
-    /// variables it leaves out are completed by an LP; a hint that is invalid or
-    /// infeasible for the model (a value outside its variable's bounds, or one
-    /// the constraints exclude), or whose completion is fractional or fails, is
-    /// ignored. A value that is NaN or infinite, or a variable outside the
-    /// problem, makes the solve return [`Error::InvalidOperation`] instead.
-    /// Default `None`.
+    /// Optional (partial) starting assignment used to seed the incumbent of a
+    /// problem with integer or boolean variables. The variables it leaves out
+    /// are completed by an LP; a hint that is invalid or infeasible for the
+    /// model (a value outside its variable's bounds, or one the constraints
+    /// exclude), or whose completion is fractional or fails, is ignored. A
+    /// value that is NaN or infinite, or a variable outside the problem, makes
+    /// the solve return [`Error::InvalidOperation`] instead. A problem with
+    /// only real variables validates the hint the same way but does not use
+    /// it. Default `None`.
     pub warm_start: Option<Vec<(Variable, f64)>>,
     /// Enable presolve, which reduces the problem before the search starts
     /// (dropping redundant rows and, for integer variables, tightening bounds,
@@ -237,7 +239,8 @@ impl Default for Tolerances {
     }
 }
 
-/// Statistics of a solve, available via [`crate::Solution::stats`].
+/// Statistics of a solve, available via [`crate::Solution::stats`],
+/// [`crate::SolveOutcome::stats`] and [`crate::InterruptedSolve::stats`].
 #[derive(Clone, Copy, Debug, Default)]
 #[non_exhaustive]
 pub struct Stats {

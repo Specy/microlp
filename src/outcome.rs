@@ -44,7 +44,9 @@ impl SolveOutcome {
     /// rows summed in compensated arithmetic). The engine holds its rows and
     /// bounds to that contract less the round-off of its own evaluation, so a
     /// failure here is an internal contradiction, returned as
-    /// [`Error::InternalError`].
+    /// [`Error::InternalError`], as is an objective of those values that
+    /// cannot be evaluated in `f64`, its terms (costs times values)
+    /// overflowing.
     pub(crate) fn from_lp_stop(
         direction: OptimizationDirection,
         num_vars: usize,
@@ -77,6 +79,13 @@ impl SolveOutcome {
                          satisfies, empty or with an infinite right-hand side on their open \
                          side, and numbers the rows presolve took out last)"
                     )));
+                }
+                if !lp_objective.is_finite() {
+                    return Err(Error::InternalError(
+                        "the objective of the LP solution cannot be evaluated in f64: its \
+                         terms (costs times values) overflow"
+                            .to_string(),
+                    ));
                 }
                 Ok(Self::Solution(Solution {
                     direction,

@@ -721,6 +721,44 @@ fn a_rewritten_row_whose_bound_its_rewrites_keep_is_emitted_with_its_bound_as_wr
 }
 
 #[test]
+fn a_rewrite_whose_binding_branch_overflows_gives_its_row_back_at_once() {
+    // 7.5e307 x1 + 3e307 x2 + 1e300 z <= 5e307 over binaries x1 and x2 at cost
+    // -1 and an integer z in [-4e7, 0] at cost 1. Tightening shrinks x1's
+    // coefficient, dual fixing puts z at -4e7, folding a term of -4e307 into
+    // the row, and then shrinking x2's coefficient too would take the
+    // magnitude of the binding branch, the bound, both coefficients as written
+    // and the fixed term, past `f64`: no relaxation holds the branch, so the
+    // row goes back as written at that rewrite, its activity no longer the
+    // one the pass computed, and is emitted as written.
+    let cons = vec![(
+        csvec(3, &[(0, 7.5e307), (1, 3e307), (2, 1e300)]),
+        ComparisonOp::Le,
+        5e307,
+    )];
+    let pre = presolve(
+        &[-1.0, -1.0, 1.0],
+        &[0.0, 0.0, -4e7],
+        &[1.0, 1.0, 0.0],
+        &cons,
+        &[VarDomain::Boolean, VarDomain::Boolean, VarDomain::Integer],
+        Mode::Mip,
+        1e-7,
+        1e-6,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        (pre.var_mins[2], pre.var_maxs[2]),
+        (-4e7, -4e7),
+        "z is fixed"
+    );
+    assert!(pre.stats.coeffs_tightened > 0, "fixture: x1 is rewritten");
+    assert_eq!(pre.constraints.len(), 1);
+    assert!(same_row(&pre.constraints[0], &cons[0]));
+    assert!(pre.validation_rows.is_empty());
+}
+
+#[test]
 fn lp_mode_never_rounds_or_dual_fixes() {
     // Same shape as the dual-fixing test but Mode::Lp: bounds must come
     // out exactly as they went in.
