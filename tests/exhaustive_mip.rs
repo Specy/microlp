@@ -1,6 +1,6 @@
 use microlp::{
-    ComparisonOp, Error, OptimizationDirection, Problem, SolutionStatus, SolveOptions,
-    SolveOutcome, Variable,
+    ComparisonOp, Error, OptimizationDirection, Problem, ResumeOptions, SolutionStatus,
+    SolveOptions, SolveOutcome, Variable,
 };
 
 fn expect_solution(outcome: SolveOutcome) -> microlp::Solution {
@@ -407,13 +407,22 @@ fn bounded_integer_models_match_exhaustive_enumeration() {
                 }
 
                 if seed % 25 == 0 {
+                    // The root alone, then one node a call: every search the
+                    // root does not end resumes, the first time with new
+                    // options, then with those, and must end on the point of
+                    // the search solved at once.
                     let mut options = SolveOptions::default();
-                    options.node_limit = Some(1);
+                    options.node_limit = Some(0);
                     let mut resumed = problem.solve_with(options).unwrap_or_else(|error| {
                         panic!("seed {seed}: node-limited solve failed: {error}; {case:?}")
                     });
                     if !resumed.is_optimal() {
                         resumed_searches += 1;
+                        let mut one_node = ResumeOptions::default();
+                        one_node.node_limit = Some(1);
+                        resumed = resumed.resume_with(one_node).unwrap_or_else(|error| {
+                            panic!("seed {seed}: resume failed: {error}; {case:?}")
+                        });
                     }
                     for _ in 0..10_000 {
                         if resumed.is_optimal() {
@@ -440,8 +449,8 @@ fn bounded_integer_models_match_exhaustive_enumeration() {
             }
         }
     }
-    // Most searches end within the first node; enough others must resume for
-    // the comparison above to test resumes.
+    // Most searches end at their root; enough others must resume for the
+    // comparison above to test resumes.
     assert!(
         resumed_searches >= 20,
         "only {resumed_searches} sliced searches were interrupted"

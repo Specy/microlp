@@ -45,8 +45,8 @@ impl SolveOutcome {
     /// bounds to that contract less the round-off of its own evaluation, so a
     /// failure here is an internal contradiction, returned as
     /// [`Error::InternalError`], as is an objective of those values that
-    /// cannot be evaluated in `f64`, its terms (costs times values)
-    /// overflowing.
+    /// cannot be evaluated in `f64`, its terms (costs times values) or their
+    /// sum overflowing.
     pub(crate) fn from_lp_stop(
         direction: OptimizationDirection,
         num_vars: usize,
@@ -83,7 +83,7 @@ impl SolveOutcome {
                 if !lp_objective.is_finite() {
                     return Err(Error::InternalError(
                         "the objective of the LP solution cannot be evaluated in f64: its \
-                         terms (costs times values) overflow"
+                         terms (costs times values) or their sum overflow"
                             .to_string(),
                     ));
                 }

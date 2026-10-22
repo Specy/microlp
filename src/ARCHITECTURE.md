@@ -467,9 +467,9 @@ funnel:
    dropped or rewrote included, within the absolute `Tolerances::feasibility` (default
    `1e-7`) floored at each row's round-off (§7.1).
 3. `objective_of` must produce a finite objective. A candidate whose objective cannot be
-   evaluated in `f64`, its terms (costs times values) overflowing, is an `InternalError` that
-   says so, since no branching changes it (§7.9); a warm-start completion whose objective
-   overflows drops its hint (§5.7).
+   evaluated in `f64`, its terms (costs times values) or their sum overflowing, is an
+   `InternalError` that says so, since no branching changes it (§7.9); a warm-start completion
+   whose objective overflows drops its hint (§5.7).
 
 Post-edit warm-start filtering deliberately remains separate: `incumbent_feasible` checks
 the clean `Problem` plus its fix overlay in original user scale before a solver exists. Both
@@ -662,7 +662,15 @@ MIP interruption points, in loop order, are: empty open list; when a positive ga
 active, exact incumbent/bound equality and then the gap target; deadline; then node budget.
 Checking proof conditions first prevents a completed proof from being mislabeled as interrupted
 or merely gap-satisfied. `node_limit` is per search call, so every `resume` receives a fresh node
-budget; the retained frontier still supplies continuity between calls.
+budget; the retained frontier still supplies continuity between calls. An interruption puts
+the node it popped back where the pop took it (`put_back`), the dive as it was, so a resume
+pops that node first. The node limit stops before a node's LP, the solver where the last
+node left it, so a search it slices pops every node an uninterrupted search would and ends
+on its point, with the same nodes and LP iterations
+(`a_search_sliced_by_the_node_limit_takes_the_nodes_of_an_unlimited_one`). A deadline that
+cuts a node's LP short has that LP solved again from the node's stored basis, which can end
+at another vertex than the uninterrupted solve: from that node on, the resumed search can
+pop other nodes.
 
 `SolveOutcome` makes answer safety structural:
 
@@ -1384,13 +1392,15 @@ draw within it must solve, a draw outside it must give no wrong answer.
   in its column, can make an exactly bounded model `Unbounded`:
   `a_ray_past_an_entry_within_its_measured_correction_is_a_known_limitation` (tiny genuine
   coefficients beside huge ones).
-- **An objective whose terms overflow `f64`** (in range too: the range bounds the
-  constraint coefficients, not the costs). Where costs times values overflow `f64`, the
-  objective of a point cannot be evaluated, even where its exact value is representable:
-  `max 1e300 x + 1e300 y` over integers in the `i32` range reaches
-  `(-2147483644, 2147483647)`, whose objective is `3e300` but whose terms are some `2e309`.
+- **An objective whose terms or their sum overflow `f64`** (in range too: the range bounds
+  the constraint coefficients, not the costs). Where costs times values, or their sum,
+  overflow `f64`, the objective of a point cannot be evaluated, even where its exact value is
+  representable: `max 1e300 x + 1e300 y` over integers in the `i32` range reaches
+  `(-2147483644, 2147483647)`, whose objective is `3e300` but whose terms are some `2e309`,
+  and three binaries costing `1e308` each reach `(1, 1, 1)`, whose terms are finite and whose
+  sum is not.
   A candidate of the search or an LP answer there is an `InternalError` that says so, never
-  an answer whose objective is not a number:
+  an answer whose objective is not finite:
   `an_integral_point_whose_objective_overflows_is_an_internal_error` and
   `an_lp_answer_whose_objective_overflows_is_an_internal_error` (`src/tests/regressions.rs`),
   which expect the error.
@@ -1410,7 +1420,7 @@ draw within it must solve, a draw outside it must give no wrong answer.
 | A primal column blocked only by entries unresolved within residual round-off, after renewed factorization | a ray, `Unbounded` on fresh data, where the refinement converged and no such entry, at its magnitude plus its error, takes its basic var, from the point the phase started on (which the verification accepted), past a bound by more than its tolerance before the entering var reaches magnitude `2^52` (§7.7); else `InternalError` ("unboundedness cannot be determined"); never a pivot on such an entry |
 | A basis the factorization finds singular (after a pivot on an entry tiny beside its column, or loaded) | repaired: the slack of a row no pivot took replaces each dependent column (a var with both bounds finite where the factorization's choice has an infinite bound and a second factorization allows, §7.8), and the solve goes on; within a phase the change back is taboo, unless the step whose refactorization found the basis singular moved its row (§3, §7.8) |
 | Basis bookkeeping found inconsistent when a singular basis is repaired (a var basic twice, or a slack's non-basic position held by another var) | panic: a bug, never repaired |
-| A candidate's objective, or an LP answer's, that cannot be evaluated in `f64`, its terms (costs times values) overflowing | `InternalError` that says so, never an incumbent or an answer, even where the exact objective is representable (§7.9) |
+| A candidate's objective, or an LP answer's, that cannot be evaluated in `f64`, its terms (costs times values) or their sum overflowing | `InternalError` that says so, never an incumbent or an answer, even where the exact objective is representable (§7.9) |
 | Integral candidate failing the guard with no integer variable to branch on | `InternalError`, never force-accepted. The engine verified the point on its own rows, and with nothing to branch on every integer variable is exactly integral (one its bounds fix the engine holds on its value), where a row presolve dropped or rewrote holds as written: the failure is a reduction that did not keep the point (§5.4) |
 | Verified state unreachable (`MAX_PHASE_ROUNDS` alternations, or a vertex whose values miss its rows through every factorization of the verification's ladder, again after the solve starts over from the slack basis) | `InternalError`, never an unverified optimum |
 | Any `InternalError` of a model outside the recommended coefficient range | its message names the constraint and the variable whose coefficients span the most, those of them outside the range (§7.7) |
@@ -1420,7 +1430,7 @@ draw within it must solve, a draw outside it must give no wrong answer.
 | Phase-1 stall (“no entering column”) | rebuild (fresh LU + recomputed values and reduced costs, dual infeasibilities corrected) and retry once per stall; declare `Infeasible` only if the row, on fresh data, proves it (§7.3) |
 | Simplex cycling: after a rebuild, every basis change left (a violated row's in the dual simplex, an entering var's in the primal) is taboo (it keeps leading to visited vertices, or to a basis the factorization found singular) | `InternalError`, never a hang, naming a singular basis when a change leads to one; on a node LP, the one slack-basis retry |
 | Simplex stalled: the objective of a phase has not improved in `STALL_ITERATIONS` iterations | `InternalError`, never a hang |
-| Deadline mid-LP | requeue the node unsolved; return `Interrupted` |
+| Deadline mid-LP | requeue the node unsolved, where it was in the open list; return `Interrupted` |
 | Limit with no incumbent | `SolveOutcome::Interrupted`; only reason, stats, and resume are exposed |
 | Search exhausted, no incumbent | `Err(Infeasible)` |
 | Presolve finds the model infeasible | solve the model as written, without presolve (debug log): the engine or the search decides |
