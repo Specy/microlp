@@ -124,9 +124,11 @@ forbids.
 
 The solver computes in floating point. Nearly dependent constraints can exceed
 its resolution even within the recommended coefficient range: a solve can then
-fail with [`Error::InternalError`], and in extreme cases a feasible model whose
+fail with [`Error::InternalError`]; in extreme cases a feasible model whose
 feasible points need very large variable values is reported
-[`Error::Infeasible`]. Outside the range, a bounded model can also be reported
+[`Error::Infeasible`], and a solve whose last basis is singular to `f64` reports
+a solution for an unbounded model, or one far from the optimum of a bounded
+model. Outside the range, a bounded model can also be reported
 [`Error::Unbounded`]. An objective whose terms (costs times values) or their
 sum overflow `f64` cannot be evaluated: a solve that meets one fails with
 [`Error::InternalError`], even where the exact objective is representable. The

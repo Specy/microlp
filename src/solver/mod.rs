@@ -85,12 +85,85 @@ fn moves_up(entering_up: bool, coeff: f64) -> bool {
     (entering_up && coeff < 0.0) || (!entering_up && coeff > 0.0)
 }
 
-/// A twice-refined pivot column and the arithmetic its refinement discarded.
+/// A refined pivot column and the arithmetic its refinement discarded.
 struct RefinedColumn {
     errors: Option<Vec<f64>>,
     values: Vec<CDouble>,
     residual_roundoff: Vec<f64>,
     value_roundoff: Vec<f64>,
+}
+
+/// A refined pivot column as the primal ratio test judges it
+/// ([`Solver::judge_pivot_col`]).
+struct ColumnJudgment {
+    column: RefinedColumn,
+    /// Whether the refinement converged: only then did it measure the error a
+    /// ray past an unresolved entry needs.
+    converged: bool,
+    /// Whether it was made for a pivot element the plain computations
+    /// disagreed on ([`element_verdict`]).
+    disputed: bool,
+    /// Per row, the error within which its entry is unresolved.
+    errors: Vec<f64>,
+    /// The rows whose error includes their round-off floor.
+    floored: Vec<usize>,
+    /// The entries (row, value) within their error.
+    unresolved: Vec<(usize, f64)>,
+}
+
+impl ColumnJudgment {
+    /// Take the entry `entry` of `row` as unresolved: its error grows to its
+    /// size at least, and to `row_bound`, the most the refined row leaves it.
+    fn unresolve(&mut self, row: usize, entry: f64, row_bound: f64) {
+        self.errors[row] = self.errors[row].max(row_bound).max(entry.abs());
+        self.unresolved.push((row, entry));
+    }
+}
+
+/// What the primal ratio test makes of a refined pivot element
+/// ([`element_verdict`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElementVerdict {
+    /// Pivot on it, with the column's value.
+    Take,
+    /// It neither bounds the step nor pivots.
+    Unresolve,
+    /// The refined row has it with the other sign: a loud error.
+    Refuse,
+}
+
+/// The verdict on a pivot element the refined column computes as `col`,
+/// within `col_error`, and the refined row as `row`, within `row_error`.
+///
+/// Taken where the two agree, where the row resolves it with the same sign,
+/// or, beside a column whose refinement `converged`, where their errors
+/// overlap: a row refined twice can stay unconverged where the column
+/// converges. Refused where the row resolves it with the other sign, and
+/// unresolved otherwise. A judgment made for a `disputed` element takes
+/// nothing unless the column's refinement converged: a row and a column
+/// refined alike through the same factors are the same number in exact
+/// arithmetic, so their agreement proves nothing.
+fn element_verdict(
+    row: f64,
+    row_error: f64,
+    col: f64,
+    col_error: f64,
+    converged: bool,
+    disputed: bool,
+) -> ElementVerdict {
+    if disputed && !converged {
+        return ElementVerdict::Unresolve;
+    }
+    let row_resolves = row.abs() > row_error;
+    if row_resolves && (row > 0.0) != (col > 0.0) {
+        return ElementVerdict::Refuse;
+    }
+    let overlap = (row - col).abs() <= proof::add_up(col_error, row_error);
+    if Solver::pivots_agree(row, col) || row_resolves || (converged && overlap) {
+        ElementVerdict::Take
+    } else {
+        ElementVerdict::Unresolve
+    }
 }
 
 /// The `InternalError` of a refinement of the pivot column of `var`, in the
@@ -2216,7 +2289,9 @@ impl Solver {
     /// bound of every basic var the step left outside its bounds beyond its
     /// tolerance ([`Self::correct_primal`]). Where the two computations of the
     /// pivot element disagree, the factorization is renewed, at a raised
-    /// threshold ([`Self::raise_lu_threshold`]), and the iteration redone.
+    /// threshold ([`Self::raise_lu_threshold`]), and the iteration redone; at
+    /// the highest threshold the ratio test settles the element on the refined
+    /// column instead.
     /// Where the reduced costs were updated since their last recompute, the
     /// entering var's is first recomputed from its column: a var it shows no
     /// longer improving does not enter, and a value on the other side of
@@ -3007,18 +3082,19 @@ impl Solver {
     /// `inv_basis_row_coeffs`, so that the ratio test, the pivot's
     /// reduced-cost update and the steepest-edge updates all use it.
     ///
-    /// Returns, per non-basic column, whether its entry is genuine: the
-    /// refinement has settled it, its second step moving it by less than its
-    /// size, beyond the round-off of the compensated sum. The second
-    /// correction carried through the column's entries is that move, with the
-    /// cancellation the multipliers themselves have in that column: through
-    /// an ill-conditioned basis the multipliers' corrections are large, but
-    /// along the column's own direction they cancel as the multipliers do. An
-    /// entry that is zero but for the error of computing it moves by its own
-    /// size and is not genuine, however it came out; one the data leave,
-    /// however small and however inexactly the plain row computed it, is. A
-    /// refinement that is not finite settles nothing.
-    fn refine_pivot_row(&mut self, row: usize) -> Vec<bool> {
+    /// Returns, per non-basic column, the error of its entry: how far the
+    /// second step moved it, plus the round-off of the compensated sum. An
+    /// entry beyond its error is genuine: the refinement has settled it. The
+    /// second correction carried through the column's entries is that move,
+    /// with the cancellation the multipliers themselves have in that column:
+    /// through an ill-conditioned basis the multipliers' corrections are
+    /// large, but along the column's own direction they cancel as the
+    /// multipliers do. An entry that is zero but for the error of computing it
+    /// moves by its own size and is not genuine, however it came out; one the
+    /// data leave, however small and however inexactly the plain row computed
+    /// it, is. A refinement that is not finite settles nothing: every error is
+    /// infinite.
+    fn refine_pivot_row(&mut self, row: usize) -> Vec<f64> {
         let refined = self.refined_basis_inverse_row(row);
         let num_cols = self.nb_vars.len();
         let mut entries = vec![CDouble::default(); num_cols];
@@ -3045,11 +3121,15 @@ impl Solver {
             }
         }
         let settled = !refined.second.is_empty();
-        let genuine = (0..num_cols)
+        let errors = (0..num_cols)
             .map(|idx| {
                 let count = terms[idx] as usize;
                 let sum_error = compensated_error(count, count, magnitudes[idx]);
-                settled && entries[idx].value().abs() > moves[idx].value().abs() + sum_error
+                if settled {
+                    moves[idx].value().abs() + sum_error
+                } else {
+                    f64::INFINITY
+                }
             })
             .collect();
         self.row_coeffs.clear_and_resize(self.nb_vars.len());
@@ -3067,7 +3147,7 @@ impl Solver {
             }
         }
         rho.to_sparse_vec(&mut self.inv_basis_row_coeffs);
-        genuine
+        errors
     }
 
     /// The primal simplex's pricing: the non-basic column of the dual
@@ -3174,127 +3254,121 @@ impl Solver {
         // entry bounds the step and can be the pivot. A step that nothing
         // above the tolerance bounds, toward an infinite bound, would leave
         // such a var past its bound by an unbounded amount, which no shift
-        // makes good: the column is refined twice, and every entry beyond its
-        // error bounds the step, however small: the error the refinement
-        // measured for it, plus the round-off floor below which the
-        // refinement cannot tell it from zero ([`Self::refined_col_floors`]).
-        // No entry inside the residual-roundoff floor can justify a pivot,
-        // which could leave the basis singular: it may be a genuine blocker
-        // whose sign the arithmetic cannot tell. A column blocked only by such
-        // entries is retried on a stronger fresh factorization; there it is a
-        // ray where no entry of unresolved sign, blocking or not, can take its
-        // basic var from the point the phase started on past a bound by more
-        // than its tolerance before the entering var reaches the magnitude
-        // taken for infinite ([`Self::unresolved_entries_leave_a_ray`]), and
-        // the solve fails loudly otherwise.
+        // makes good: the column is refined and judged
+        // ([`Self::judge_pivot_col`]), and every entry beyond its error bounds
+        // the step, however small. No entry within its error can justify a
+        // pivot, which could leave the basis singular: it may be a genuine
+        // blocker whose sign the arithmetic cannot tell. A column toward an
+        // infinite bound blocked only by such entries is retried on a stronger
+        // fresh factorization; there it is a ray where no entry of unresolved
+        // sign, blocking or not, can take its basic var from the point the
+        // phase started on past a bound by more than its tolerance before the
+        // entering var reaches the magnitude taken for infinite
+        // ([`Self::unresolved_entries_leave_a_ray`]), and the solve fails
+        // loudly otherwise.
+        let var = self.nb_vars[entering_c];
         let pivot_tol = primal_pivot_tolerance(self.basis_solver.eta_matrices.len());
         let max_step = (entering_other_val - entering_cur_val).abs();
+        let toward_infinite = entering_other_val.is_infinite();
         let mut choice =
             self.primal_harris(entering_diff_sign, max_step, harris_scale, |_, coeff| {
                 coeff.abs() > pivot_tol
             });
-        let refined = choice.is_none() && entering_other_val.is_infinite();
-        if refined {
-            let mut column = self.refine_pivot_col(entering_c)?;
-            let converged = column.errors.is_some();
-            let mut errors = column
-                .errors
-                .take()
-                .unwrap_or_else(|| vec![0.0; self.num_constraints()]);
-            // The floor of an entry beyond its measured error that moves its
-            // basic var toward a finite bound: no other entry can bound the
-            // step.
-            let (rows, entries): (Vec<usize>, Vec<f64>) = self
-                .col_coeffs
-                .iter()
-                .filter(|&(r, &coeff)| {
-                    let bound = if moves_up(entering_diff_sign, coeff) {
-                        self.basic_var_maxs[r]
-                    } else {
-                        self.basic_var_mins[r]
-                    };
-                    coeff.abs() > errors[r] && bound.is_finite()
-                })
-                .map(|(r, &coeff)| (r, coeff))
-                .unzip();
-            let var = self.nb_vars[entering_c];
-            let floors = self.refined_col_floors(var, &rows, &column)?;
-            let mut unresolved = Vec::new();
-            for ((&r, entry), floor) in rows.iter().zip(entries).zip(floors) {
-                errors[r] = proof::add_up(errors[r], floor);
-                if entry.abs() <= errors[r] {
-                    unresolved.push((r, entry));
-                    debug!(
-                        "primal ratio test: entry {entry:e} of var {var} in row {r} is within the \
-                         round-off floor {floor:e} of the refined column; its sign is unresolved"
-                    );
-                }
+        let mut judgment = None;
+        if choice.is_none() && toward_infinite {
+            let judged = self.judge_pivot_col(entering_c, entering_diff_sign, None)?;
+            choice = self.judged_harris(
+                &judged,
+                entering_diff_sign,
+                max_step,
+                harris_scale,
+                toward_infinite,
+            );
+            judgment = Some(judged);
+        }
+
+        // The pivot element is checked through the row as in the dual phase
+        // (see `dual_phase`), a refined one through the refined row, like
+        // with like ([`element_verdict`]); a disagreement renews the
+        // factorization (`PivotChoice::Inconsistent`). On a fresh one at the
+        // highest threshold the plain values cannot settle the element, whose
+        // pivot leaves the basis singular if it is zero: the column is judged
+        // refined instead, the element unresolved unless the refinement
+        // resolves it. The column's value drives the step, the row's the
+        // reduced costs.
+        while let Some((row, _, pivot_coeff)) = choice {
+            self.calc_row_coeffs(row);
+            let row_errors = judgment.is_some().then(|| self.refine_pivot_row(row));
+            let a_row = *self.row_coeffs.get(entering_c);
+            let agree = Self::pivots_agree(a_row, pivot_coeff);
+            if !agree && self.can_renew_factorization() {
+                return Ok(PivotChoice::Inconsistent { row });
             }
-            choice = self.primal_harris(entering_diff_sign, max_step, harris_scale, |r, coeff| {
-                coeff.abs() > errors[r]
-            });
-            // A residual-roundoff allowance says an entry is unresolved, not
-            // that it is zero: it cannot justify a pivot on that entry, nor a
-            // ray unless it is negligible over the whole step. Retry on a
-            // stronger fresh factorization first; there, only a refinement
-            // that converged measured the error such a ray needs, and the ray
-            // covers every other entry whose sign is open too.
-            if choice.is_none() {
-                if let Some(&(row, _)) = unresolved.last() {
-                    if self.can_renew_factorization() {
-                        return Ok(PivotChoice::Unresolved { row });
+            let (Some(judged), Some(row_errors)) = (judgment.as_mut(), &row_errors) else {
+                if agree {
+                    break;
+                }
+                debug!(
+                    "primal ratio test: pivot row/column disagreement ({a_row:e} vs \
+                     {pivot_coeff:e}) in row {row} on a fresh factorization; judging the \
+                     refined column"
+                );
+                let judged = self.judge_pivot_col(entering_c, entering_diff_sign, Some(row))?;
+                choice = self.judged_harris(
+                    &judged,
+                    entering_diff_sign,
+                    max_step,
+                    harris_scale,
+                    toward_infinite,
+                );
+                judgment = Some(judged);
+                continue;
+            };
+            let row_error = row_errors[entering_c];
+            let verdict = element_verdict(
+                a_row,
+                row_error,
+                pivot_coeff,
+                judged.errors[row],
+                judged.converged,
+                judged.disputed,
+            );
+            match verdict {
+                ElementVerdict::Take => {
+                    if !agree {
+                        debug!(
+                            "primal ratio test: pivot row/column disagreement ({a_row:e} vs \
+                             {pivot_coeff:e}) on a fresh factorization; pivoting"
+                        );
                     }
-                    if converged {
-                        let mut open = unresolved.clone();
-                        open.extend(self.other_entries_of_open_sign(
-                            var,
-                            &column,
-                            &rows,
-                            &mut errors,
-                        )?);
-                        if self.unresolved_entries_leave_a_ray(entering_c, &open, &errors) {
-                            debug!(
-                                "primal ratio test: no entry of var {var}'s column of unresolved \
-                                 sign takes its basic var beyond its tolerance up to the infinite \
-                                 magnitude: a ray"
-                            );
-                            return Ok(PivotChoice::Unbounded);
-                        }
-                    }
+                    break;
+                }
+                ElementVerdict::Refuse => {
                     return Err(Error::InternalError(format!(
-                        "primal simplex: a nonzero blocking entry of var {var} in row {row} \
-                         is unresolved within residual round-off; unboundedness cannot be determined"
+                        "primal simplex: the pivot element of var {var} in row {row} is \
+                         {a_row:e} through the refined row and {pivot_coeff:e} through the \
+                         refined column of a fresh factorization"
                     )));
+                }
+                ElementVerdict::Unresolve => {
+                    debug!(
+                        "primal ratio test: the pivot element {pivot_coeff:e} of var {var} in \
+                         row {row}, {a_row:e} within {row_error:e} through the refined row, is \
+                         unresolved"
+                    );
+                    judged.unresolve(row, pivot_coeff, proof::add_up(a_row.abs(), row_error));
+                    choice = self.judged_harris(
+                        judged,
+                        entering_diff_sign,
+                        max_step,
+                        harris_scale,
+                        toward_infinite,
+                    );
                 }
             }
         }
 
         if let Some((row, mut leaving_new_val, pivot_coeff)) = choice {
-            self.calc_row_coeffs(row);
-            if refined {
-                // A pivot read off the refined column is checked against the
-                // refined row: like with like.
-                self.refine_pivot_row(row);
-            }
-
-            // The pivot-element cross-check of the dual phase (see
-            // `dual_phase`): the column gave `pivot_coeff`, the row must agree,
-            // or the factorization is renewed (`PivotChoice::Inconsistent`). On a
-            // fresh one at the highest threshold the column's element is taken:
-            // it chose the row and sets the step, size and direction, while the
-            // row's feeds the reduced costs, which the phase exit recomputes,
-            // and the edge weights, which are floored and checked.
-            let a_row = *self.row_coeffs.get(entering_c);
-            if !Self::pivots_agree(a_row, pivot_coeff) {
-                if self.can_renew_factorization() {
-                    return Ok(PivotChoice::Inconsistent { row });
-                }
-                debug!(
-                    "primal ratio test: pivot row/column disagreement ({a_row:e} vs \
-                     {pivot_coeff:e}) on a fresh factorization; pivoting"
-                );
-            }
-
             // The step takes the leaving var exactly onto its working bound,
             // and a var fixed in the model onto its value, whatever the phase
             // did to its working bounds: an equality's slack then holds its
@@ -3324,7 +3398,7 @@ impl Solver {
             };
             let entering_new_val = entering_cur_val + entering_diff;
 
-            Ok(PivotChoice::Pivot(PivotInfo {
+            return Ok(PivotChoice::Pivot(PivotInfo {
                 col: entering_c,
                 entering_new_val,
                 entering_diff,
@@ -3334,19 +3408,141 @@ impl Solver {
                     dual_step_coeff: pivot_coeff,
                     leaving_new_val,
                 }),
-            }))
-        } else {
-            if entering_other_val.is_infinite() {
-                return Ok(PivotChoice::Unbounded);
-            }
-
-            Ok(PivotChoice::Pivot(PivotInfo {
+            }));
+        }
+        // Nothing resolved bounds a step toward a finite bound: the entering
+        // var moves to it, and a basic var an unresolved entry moves past its
+        // bound has that bound shifted, as for an entry at or below the
+        // tolerance.
+        if !toward_infinite {
+            return Ok(PivotChoice::Pivot(PivotInfo {
                 col: entering_c,
                 entering_new_val: entering_other_val,
                 entering_diff: entering_other_val - entering_cur_val,
                 elem: None,
-            }))
+            }));
         }
+
+        // An entry within its error is unresolved, not zero: it cannot justify
+        // a pivot on that entry, nor a ray unless it is negligible over the
+        // whole step. Retry on a stronger fresh factorization first; there,
+        // only a refinement that converged measured the error such a ray
+        // needs, and the ray covers every other entry whose sign is open too.
+        if let Some(mut judged) = judgment {
+            if let Some(&(row, _)) = judged.unresolved.last() {
+                if self.can_renew_factorization() {
+                    return Ok(PivotChoice::Unresolved { row });
+                }
+                if judged.converged {
+                    let mut open = judged.unresolved.clone();
+                    open.extend(self.other_entries_of_open_sign(
+                        var,
+                        &judged.column,
+                        &judged.floored,
+                        &mut judged.errors,
+                    )?);
+                    if self.unresolved_entries_leave_a_ray(entering_c, &open, &judged.errors) {
+                        debug!(
+                            "primal ratio test: no entry of var {var}'s column of unresolved \
+                             sign takes its basic var beyond its tolerance up to the infinite \
+                             magnitude: a ray"
+                        );
+                        return Ok(PivotChoice::Unbounded);
+                    }
+                }
+                return Err(Error::InternalError(format!(
+                    "primal simplex: a nonzero blocking entry of var {var} in row {row} \
+                     is unresolved within residual round-off; unboundedness cannot be determined"
+                )));
+            }
+        }
+        Ok(PivotChoice::Unbounded)
+    }
+
+    /// The pivot column of `entering_c` refined until a correction converges
+    /// ([`Self::refine_pivot_col`]) and judged for an entering var that moves
+    /// up (`entering_up`) or down: per row, the error within which its entry
+    /// is unresolved, the error the refinement measured for it plus, for an
+    /// entry beyond that which moves its basic var toward a finite bound, the
+    /// round-off floor below which the refinement cannot tell it from zero
+    /// ([`Self::refined_col_floors`]); and the entries within it. The entry of
+    /// the `disputed` row, whose plain computations disagreed, gets its floor
+    /// whatever its size and sign, zero included: it is unresolved unless the
+    /// refinement resolves it.
+    fn judge_pivot_col(
+        &mut self,
+        entering_c: usize,
+        entering_up: bool,
+        disputed: Option<usize>,
+    ) -> Result<ColumnJudgment, Error> {
+        let mut column = self.refine_pivot_col(entering_c)?;
+        let converged = column.errors.is_some();
+        let mut errors = column
+            .errors
+            .take()
+            .unwrap_or_else(|| vec![0.0; self.num_constraints()]);
+        // The floors of the entries beyond their measured error that move
+        // their basic var toward a finite bound, the only ones that can bound
+        // the step, and of the disputed entry.
+        let (mut floored, mut entries): (Vec<usize>, Vec<f64>) = self
+            .col_coeffs
+            .iter()
+            .filter(|&(r, &coeff)| {
+                let bound = if moves_up(entering_up, coeff) {
+                    self.basic_var_maxs[r]
+                } else {
+                    self.basic_var_mins[r]
+                };
+                Some(r) == disputed || (coeff.abs() > errors[r] && bound.is_finite())
+            })
+            .map(|(r, &coeff)| (r, coeff))
+            .unzip();
+        if let Some(row) = disputed {
+            if !floored.contains(&row) {
+                floored.push(row);
+                entries.push(0.0);
+            }
+        }
+        let var = self.nb_vars[entering_c];
+        let floors = self.refined_col_floors(var, &floored, &column)?;
+        let mut unresolved = Vec::new();
+        for ((&r, entry), floor) in floored.iter().zip(entries).zip(floors) {
+            errors[r] = proof::add_up(errors[r], floor);
+            if entry.abs() <= errors[r] {
+                unresolved.push((r, entry));
+                debug!(
+                    "primal ratio test: entry {entry:e} of var {var} in row {r} is within the \
+                     round-off floor {floor:e} of the refined column; its sign is unresolved"
+                );
+            }
+        }
+        Ok(ColumnJudgment {
+            column,
+            converged,
+            disputed: disputed.is_some(),
+            errors,
+            floored,
+            unresolved,
+        })
+    }
+
+    /// The primal ratio test ([`Self::primal_harris`]) over the entries of the
+    /// refined column `judged` beyond their error, for an entering var that
+    /// moves up (`entering_up`) or down by at most `max_step`; unless the step
+    /// is `toward_infinite`, only those above the pivot tolerance, as on the
+    /// plain column.
+    fn judged_harris(
+        &self,
+        judged: &ColumnJudgment,
+        entering_up: bool,
+        max_step: f64,
+        harris_scale: f64,
+        toward_infinite: bool,
+    ) -> Option<(usize, f64, f64)> {
+        let pivot_tol = primal_pivot_tolerance(self.basis_solver.eta_matrices.len());
+        self.primal_harris(entering_up, max_step, harris_scale, |r, coeff| {
+            coeff.abs() > judged.errors[r] && (toward_infinite || coeff.abs() > pivot_tol)
+        })
     }
 
     /// Check the reduced cost that priced the entering var at `col`, updated
@@ -3467,17 +3663,20 @@ impl Solver {
         choice
     }
 
-    /// The pivot column of `entering_c` refined twice, for a primal step that
-    /// nothing above the pivot tolerance bounds, toward an infinite bound
-    /// (see [`Self::choose_pivot`]), the way the proof refines its row of the
+    /// The pivot column of `entering_c` refined for the primal ratio test
+    /// ([`Self::judge_pivot_col`]), the way the proof refines its row of the
     /// basis inverse ([`Self::refine_basis_inverse_row`]): each step solves
     /// for the residual `a_q - B alpha`, summed in compensated arithmetic over
     /// the basic columns, and adds the solution to the column, kept in doubled
-    /// precision. The refined column replaces `col_coeffs`.
+    /// precision. The refined column replaces `col_coeffs`. Two steps, and
+    /// more until a correction converges, for up to `REFINEMENT_MAX_STEPS`
+    /// steps while each is at most `REFINEMENT_RATIO` of the one before, as
+    /// the proof refines a row two steps leave unconverged
+    /// ([`Self::converged_basis_inverse_row`]).
     ///
-    /// Returns the refined values, each entry's measured second-correction
-    /// error where the refinement converged ([`refinement_error`]), and the
-    /// arithmetic discarded in both steps. The ratio test carries that
+    /// Returns the refined values, each entry's measured error, its last
+    /// correction, where the refinement converged ([`refinement_error`]), and
+    /// the arithmetic discarded in every step. The ratio test carries that
     /// round-off into the residual floor ([`Self::refined_col_floors`]), below
     /// which no correction measures anything. A number of the refinement
     /// that is not finite is an `InternalError`: a breakdown, which the ratio
@@ -3489,7 +3688,8 @@ impl Solver {
         let mut second = Vec::new();
         let mut residual_roundoff = vec![0.0; num_rows];
         let mut value_roundoff = vec![0.0; num_rows];
-        for _ in 0..2 {
+        let mut last = f64::INFINITY;
+        for step in 0..proof::REFINEMENT_MAX_STEPS {
             let (correction, discarded) = self
                 .pivot_col_correction(var, &alpha, true)
                 .ok_or_else(|| refinement_breakdown("primal", var))?;
@@ -3497,7 +3697,15 @@ impl Solver {
                 residual_roundoff[r] = proof::add_up(residual_roundoff[r], discarded[r]);
                 value_roundoff[r] = proof::add_up(value_roundoff[r], a.add_with_error(c));
             }
+            let size = correction.iter().fold(0.0f64, |m, c| m.max(c.abs()));
             second = correction;
+            if step >= 1
+                && (refinement_error(&alpha, &second).is_some()
+                    || size > proof::REFINEMENT_RATIO * last)
+            {
+                break;
+            }
+            last = size;
         }
         self.set_refined_col(var, &alpha, "primal")?;
         let (_, final_roundoff) = self.pivot_col_residual(var, &alpha, true);
@@ -3517,9 +3725,9 @@ impl Solver {
         })
     }
 
-    /// The pivot column of `entering_c` refined twice as
-    /// [`Self::refine_pivot_col`] refines it, for a pivot read off a refined
-    /// row (see [`Self::dual_phase`]), which reads only the refined values:
+    /// The pivot column of `entering_c` refined twice, by the steps of
+    /// [`Self::refine_pivot_col`], for a pivot read off a refined row (see
+    /// [`Self::dual_phase`]), which reads only the refined values:
     /// what the arithmetic discards is not measured. A number of the
     /// refinement that is not finite is an `InternalError`.
     fn refine_dual_pivot_col(&mut self, entering_c: usize) -> Result<(), Error> {
@@ -3637,8 +3845,8 @@ impl Solver {
     }
 
     /// The round-off floor of the requested entries of the refined column:
-    /// the arithmetic discarded while evaluating its residuals, in both
-    /// refinement steps and after them, carried into each entry through an
+    /// the arithmetic discarded while evaluating its residuals, in every
+    /// refinement step and after them, carried into each entry through an
     /// approximate row of the basis inverse, plus the round-off of adding the
     /// corrections and of rounding the entry to `f64`. Each low-part addition
     /// and product counts what it discards, so arithmetic that is exact adds
@@ -3966,13 +4174,17 @@ impl Solver {
         row: usize,
         leaving_new_val: f64,
     ) -> Result<DualRatioTest, Error> {
-        let genuine = self.refine_pivot_row(row);
+        let errors = self.refine_pivot_row(row);
+        let genuine = |c: usize, coeff: f64| coeff.abs() > errors[c];
         debug!(
             "dual ratio test for row {row}: no pivot above the tolerance and no proof; the {} \
              genuine entries of the refined row take part",
-            genuine.iter().filter(|&&g| g).count()
+            self.row_coeffs
+                .iter()
+                .filter(|&(c, &coeff)| genuine(c, coeff))
+                .count()
         );
-        let mut test = self.dual_ratio_pass(row, leaving_new_val, |c, _| genuine[c])?;
+        let mut test = self.dual_ratio_pass(row, leaving_new_val, genuine)?;
         if let DualRatioTest::Step(step) = &mut test {
             step.refined = true;
         }
