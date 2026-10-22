@@ -1,4 +1,5 @@
-use super::search::{solve_node_lp, try_adopt_incumbent, try_warm_start};
+use super::node::Node;
+use super::search::{pop_node, put_back, solve_node_lp, try_adopt_incumbent, try_warm_start};
 use super::state::Incumbent;
 use super::*;
 use crate::{ComparisonOp, OptimizationDirection, Problem, StopReason, Variable};
@@ -467,6 +468,102 @@ fn feasible_interrupt_reports_gap() {
     assert_eq!(r.reason, TerminationReason::NodeLimit);
     assert!(r.state.stats.gap.unwrap() > 0.0);
     assert!(r.state.stats.best_bound.is_some());
+}
+
+/// [`put_back`] undoes [`pop_node`] to the order of the open list: in a dive
+/// the pop takes the last node, on a jump the first of the best bounds, whose
+/// place `swap_remove` gives to the last.
+#[test]
+fn a_node_put_back_leaves_the_open_list_as_before_its_pop() {
+    let mut state = build_state(&binary_knapsack(), SolveOptions::default()).unwrap();
+    let basis = state.solver.snapshot_basis();
+    for (depth, lp_bound) in [3.0, 1.0, 2.0, 1.0, 5.0].into_iter().enumerate() {
+        state.open.push(Node {
+            bound_changes: Vec::new(),
+            basis: basis.clone(),
+            lp_bound,
+            lattice_bound: lp_bound,
+            depth: depth as u32,
+            parent_id: 0,
+            branch_var: None,
+            branch_up: false,
+            branch_frac: 1.0,
+        });
+    }
+    let order = |state: &MipState| state.open.iter().map(|n| n.depth).collect::<Vec<_>>();
+    let before = order(&state);
+    for (diving, popped) in [(true, 4), (false, 1)] {
+        state.diving = diving;
+        let (node, at) = pop_node(&mut state).unwrap();
+        assert_eq!((at, node.depth), (popped, popped as u32));
+        put_back(&mut state, node, at);
+        assert_eq!(order(&state), before);
+    }
+}
+
+/// `min -x0 - 6 x1 - x2 + 8 x3` s.t. `2e6 x0 + 2e6 x1 + 1e6 x2 + 6e6 x3 <=
+/// 7e6` and `6 x0 - 2 x1 + 4 x2 + 6 x3 <= -4` over integers in `[-3, 1]`,
+/// `[-3, 2]`, `[-1, 2]` and `[1, 2]`: the root branches into two children of
+/// the same bound, and the optimum `-3` is reached at more than one point.
+fn tied_children_problem() -> Problem {
+    let mut p = Problem::new(OptimizationDirection::Minimize);
+    let x0 = p.add_integer_var(-1.0, (-3, 1));
+    let x1 = p.add_integer_var(-6.0, (-3, 2));
+    let x2 = p.add_integer_var(-1.0, (-1, 2));
+    let x3 = p.add_integer_var(8.0, (1, 2));
+    p.add_constraint(
+        [(x0, 2e6), (x1, 2e6), (x2, 1e6), (x3, 6e6)],
+        ComparisonOp::Le,
+        7e6,
+    );
+    p.add_constraint(
+        [(x0, 6.0), (x1, -2.0), (x2, 4.0), (x3, 6.0)],
+        ComparisonOp::Le,
+        -4.0,
+    );
+    p
+}
+
+/// A search the node limit slices takes the nodes of an uninterrupted one:
+/// an interruption puts the node it popped back where it was, the dive as it
+/// was. Sliced into its root alone and then one node a call, the knapsack's
+/// search, which jumps between dives, and [`tied_children_problem`]'s end on
+/// the point of the search solved at once, with its nodes and LP iterations.
+/// The second ended on its other optimum when the interrupted node went to
+/// the end of the open list and the dive stopped.
+#[test]
+fn a_search_sliced_by_the_node_limit_takes_the_nodes_of_an_unlimited_one() {
+    for problem in [binary_knapsack(), tied_children_problem()] {
+        let whole = run(&problem, SolveOptions::default()).unwrap();
+        assert_eq!(whole.reason, TerminationReason::ProvenOptimal);
+        let root_alone = SolveOptions {
+            node_limit: Some(0),
+            ..SolveOptions::default()
+        };
+        let mut sliced = run(&problem, root_alone).unwrap();
+        let mut calls = 1;
+        while sliced.reason != TerminationReason::ProvenOptimal {
+            assert_eq!(sliced.reason, TerminationReason::NodeLimit);
+            calls += 1;
+            assert!(calls < 10_000, "resume loop did not terminate");
+            let one_node = ResumeOptions {
+                node_limit: Some(1),
+                ..ResumeOptions::default()
+            };
+            sliced.reason = resume_run(&mut sliced.state, one_node).unwrap();
+        }
+        assert!(calls >= 2, "fixture: the node limit interrupts the search");
+        let values = |run: &MipRun| run.state.incumbent.as_ref().unwrap().values.clone();
+        assert_eq!(values(&sliced), values(&whole));
+        assert_eq!(
+            sliced.state.stats.nodes_solved,
+            whole.state.stats.nodes_solved
+        );
+        assert_eq!(
+            sliced.state.stats.lp_iterations,
+            whole.state.stats.lp_iterations
+        );
+    }
 }
 
 #[test]

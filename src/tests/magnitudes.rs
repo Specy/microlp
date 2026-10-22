@@ -1974,11 +1974,11 @@ mod regression_tests {
     /// the absolute tolerance: the smallest relaxation of the rows that
     /// admits a point is `1.9e-4`, and only the round-off floor of the rows
     /// near `(5.8e8, 1.05e9, 15)` admits one, which is answered `Infeasible`
-    /// (ARCHITECTURE §7.1). No row's certificate proves it; the last resort of the dual phase moves
-    /// `x0` by some `4.7e9`, and the next pivot's element is `4.2e-7` through
-    /// the row and zero through the column of a fresh factorization at the
-    /// highest threshold, so the solve fails loudly where it should answer
-    /// `Infeasible`, presolve on and off.
+    /// (ARCHITECTURE §7.1). No row's certificate proves it; the last resort
+    /// of the dual phase moves `x0` by some `4.7e9`, and the next pivot's
+    /// element is `4.2e-7` through the row and zero through the column of a
+    /// fresh factorization at the highest threshold, so the solve fails
+    /// loudly where it should answer `Infeasible`, presolve on and off.
     #[test]
     #[should_panic(expected = "0e0 through the column of a fresh factorization")]
     fn an_infeasible_lp_whose_pivot_row_and_column_disagree_is_a_known_limitation() {

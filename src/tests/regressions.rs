@@ -1383,15 +1383,21 @@ pub(crate) mod regression_tests {
     /// `(-2147483644, 2147483647)` has the objective `3e300`, but its terms,
     /// some `2e309`, overflow `f64`, and their sum is not a number. An
     /// `InternalError` that says so, where the guard's rejection of the point
-    /// read as a failed validation with nothing to branch on.
+    /// read as a failed validation with nothing to branch on. Three binaries
+    /// costing `1e308` each reach `(1, 1, 1)`, whose terms are finite and
+    /// whose sum is not.
     #[test]
     fn an_integral_point_whose_objective_overflows_is_an_internal_error() {
-        let mut problem = Problem::new(OptimizationDirection::Maximize);
-        let x = problem.add_integer_var(1e300, (i32::MIN, i32::MAX));
-        let y = problem.add_integer_var(1e300, (i32::MIN, i32::MAX));
-        problem.add_constraint([(x, 2.0), (y, 2.0)], ComparisonOp::Le, 7.0);
-        problem.add_constraint([(x, 1.0), (y, -1.0)], ComparisonOp::Le, 0.5);
-        for presolve in [true, false] {
+        let mut terms = Problem::new(OptimizationDirection::Maximize);
+        let x = terms.add_integer_var(1e300, (i32::MIN, i32::MAX));
+        let y = terms.add_integer_var(1e300, (i32::MIN, i32::MAX));
+        terms.add_constraint([(x, 2.0), (y, 2.0)], ComparisonOp::Le, 7.0);
+        terms.add_constraint([(x, 1.0), (y, -1.0)], ComparisonOp::Le, 0.5);
+        let mut sum = Problem::new(OptimizationDirection::Maximize);
+        let b: Vec<_> = (0..3).map(|_| sum.add_binary_var(1e308)).collect();
+        sum.add_constraint([(b[0], 1.0), (b[1], 1.0)], ComparisonOp::Le, 2.0);
+        sum.add_constraint([(b[1], 1.0), (b[2], 1.0)], ComparisonOp::Le, 2.0);
+        for (problem, presolve) in [(&terms, true), (&terms, false), (&sum, true), (&sum, false)] {
             let options = crate::SolveOptions {
                 presolve,
                 ..crate::SolveOptions::default()
@@ -1399,7 +1405,8 @@ pub(crate) mod regression_tests {
             let got = problem.solve_with(options);
             assert!(
                 matches!(&got, Err(crate::Error::InternalError(m))
-                    if m.contains("the objective of an integral solution cannot be evaluated")),
+                    if m.contains("the objective of an integral solution cannot be evaluated \
+                        in f64: its terms (costs times values) or their sum overflow")),
                 "presolve {presolve}: {:?}",
                 got.map(|_| "solved")
             );
@@ -1411,8 +1418,10 @@ pub(crate) mod regression_tests {
     /// over reals ends at `(-2147483643.5, 2147483647)`, whose objective is
     /// `3.5e300` but whose terms overflow `f64`, their sum not a number; the
     /// optimum of `max 1e308 x + 1e308 y` s.t. `x + y <= 15` over `[0, 10]`,
-    /// `1.5e309`, lies beyond `f64`. Each answer is an `InternalError` that
-    /// says so, where it was `Optimal` with the objective NaN or inf.
+    /// `1.5e309`, lies beyond `f64`; and `max 1e308 (x + y + z)` over
+    /// `[0, 1]` ends at `(1, 1, 1)`, whose terms are finite and whose sum is
+    /// not. Each answer is an `InternalError` that says so, where it was
+    /// `Optimal` with the objective NaN or inf.
     #[test]
     fn an_lp_answer_whose_objective_overflows_is_an_internal_error() {
         let mut open_face = Problem::new(OptimizationDirection::Maximize);
@@ -1425,7 +1434,14 @@ pub(crate) mod regression_tests {
         let x = beyond.add_var(1e308, (0.0, 10.0));
         let y = beyond.add_var(1e308, (0.0, 10.0));
         beyond.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 15.0);
-        for problem in [open_face, beyond] {
+        let mut sum = Problem::new(OptimizationDirection::Maximize);
+        let v: Vec<_> = (0..3).map(|_| sum.add_var(1e308, (0.0, 1.0))).collect();
+        sum.add_constraint(
+            [(v[0], 1.0), (v[1], 1.0), (v[2], 1.0)],
+            ComparisonOp::Le,
+            3.0,
+        );
+        for problem in [open_face, beyond, sum] {
             for presolve in [true, false] {
                 let options = crate::SolveOptions {
                     presolve,
@@ -1434,7 +1450,8 @@ pub(crate) mod regression_tests {
                 let got = problem.solve_with(options);
                 assert!(
                     matches!(&got, Err(crate::Error::InternalError(m))
-                        if m.contains("the objective of the LP solution cannot be evaluated")),
+                        if m.contains("the objective of the LP solution cannot be evaluated \
+                            in f64: its terms (costs times values) or their sum overflow")),
                     "presolve {presolve}: {:?}",
                     got.map(|_| "solved")
                 );

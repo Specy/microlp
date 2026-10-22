@@ -20,9 +20,9 @@ use crate::{Error, StopReason, VarDomain};
 /// outside them, and the var may sit its whole tolerance beyond that.
 /// `Ok(false)` means the point fails the check and the caller must branch. A
 /// valid candidate completes unboundedness classification. A candidate whose
-/// objective cannot be evaluated in `f64`, its terms (costs times values)
-/// overflowing, is an `InternalError`: no bound or incumbent compares with
-/// it, and no branching changes it.
+/// objective cannot be evaluated in `f64`, its terms (costs times values) or
+/// their sum overflowing, is an `InternalError`: no bound or incumbent
+/// compares with it, and no branching changes it.
 pub(crate) fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
     let values = state.solver.reported_values();
     let solver = &state.solver;
@@ -43,7 +43,7 @@ pub(crate) fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
     if !objective.is_finite() {
         return Err(Error::InternalError(
             "the objective of an integral solution cannot be evaluated in f64: its terms \
-             (costs times values) overflow"
+             (costs times values) or their sum overflow"
                 .to_string(),
         ));
     }
@@ -264,12 +264,14 @@ pub(super) fn solve_node_lp(state: &mut MipState) -> Result<NodeLp, Error> {
 /// when a dive dies out, jump to the open node with the best (lowest) bound. Ties
 /// in `lp_bound` resolve to the first (lowest-index) such node in `open` — the
 /// scan uses strict `<`, so `best` only moves for a strictly smaller bound.
-fn pop_node(state: &mut MipState) -> Option<Node> {
+/// Returns the node and the index it held, which `swap_remove` refills with the
+/// last node ([`put_back`] undoes the pop).
+pub(super) fn pop_node(state: &mut MipState) -> Option<(Node, usize)> {
     if state.open.is_empty() {
         return None;
     }
-    if state.diving {
-        state.open.pop()
+    let at = if state.diving {
+        state.open.len() - 1
     } else {
         let mut best = 0;
         for (i, n) in state.open.iter().enumerate() {
@@ -277,8 +279,18 @@ fn pop_node(state: &mut MipState) -> Option<Node> {
                 best = i;
             }
         }
-        Some(state.open.swap_remove(best))
-    }
+        best
+    };
+    Some((state.open.swap_remove(at), at))
+}
+
+/// Undo [`pop_node`] of `node` from index `at`: `open` as it was before the
+/// pop, so that with `diving` as it was too, a resumed search pops the nodes
+/// an uninterrupted one would.
+pub(super) fn put_back(state: &mut MipState, node: Node, at: usize) {
+    state.open.push(node);
+    let last = state.open.len() - 1;
+    state.open.swap(at, last);
 }
 
 /// Evaluate a warm-start hint: fix hinted vars, LP-complete the rest, and if the
@@ -572,8 +584,8 @@ pub(crate) fn search_loop(state: &mut MipState) -> Result<TerminationReason, Err
         if check_deadline(&state.deadline) == StopReason::Limit {
             return Ok(TerminationReason::TimeLimit);
         }
-        let node = match pop_node(state) {
-            Some(n) => n,
+        let (node, at) = match pop_node(state) {
+            Some(popped) => popped,
             None => break,
         };
 
@@ -586,11 +598,12 @@ pub(crate) fn search_loop(state: &mut MipState) -> Result<TerminationReason, Err
         // A node budget limits LP solves, not free bookkeeping. Pop and apply
         // the stored-bound prune first so hitting the exact solve count can
         // still finish a proof whose remaining nodes are already dominated by
-        // the incumbent.
+        // the incumbent. The node goes back where it was, the dive as it was,
+        // and the solver still sits where the last node left it: a resume
+        // continues the very search.
         if let Some(nl) = state.options.node_limit {
             if nodes_this_run >= nl {
-                state.open.push(node);
-                state.diving = false;
+                put_back(state, node, at);
                 return Ok(TerminationReason::NodeLimit);
             }
         }
@@ -605,9 +618,10 @@ pub(crate) fn search_loop(state: &mut MipState) -> Result<TerminationReason, Err
                 if lp_solved {
                     state.stats.nodes_solved += 1;
                 }
-                state.open.push(node);
+                // Back where it was, the dive as it was; its LP, which the
+                // limit cut short, is solved again from its stored basis.
+                put_back(state, node, at);
                 state.last_solved_id = None;
-                state.diving = false;
                 return Ok(TerminationReason::TimeLimit);
             }
         }
