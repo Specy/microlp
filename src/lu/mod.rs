@@ -122,8 +122,8 @@ impl LUFactors {
 /// pivoting at `stability_coeff`.
 ///
 /// A column is dependent when the part of it left to pivot on is below
-/// [`LU_SINGULAR_REL`] of its largest transformed entry (or not a normal
-/// number): it is skipped, and the factors are completed at the end, each
+/// [`LU_SINGULAR_REL`] of its largest transformed entry per elimination
+/// applied to it (or not a normal number): it is skipped, and the factors are completed at the end, each
 /// dependent column paired with a row that no pivot took, whose unit column
 /// takes its place (a pivot of one, no elimination, exact since the row was
 /// never eliminated). Returns the factors of the matrix so repaired and the
@@ -221,10 +221,13 @@ fn factorize_in_order<'a>(
         // At this point all future nonzero positions of scratch.rhs are marked
         // and the order in which variables depend on each other is determined.
         // rev() because DFS returns vertices in reverse topological order.
+        // The eliminations applied to this column, for the singularity floor.
+        let mut eliminations = 0usize;
         for &orig_i in scratch.mark_nonzero.visited.iter().rev() {
             // values[orig_i] is already fully calculated, diag coeff = 1.0.
             let new_i = orig2new_row[orig_i];
             if new_i < i_col {
+                eliminations += 1;
                 let x_val = scratch.rhs.values[orig_i];
                 for (orig_r, coeff) in lower.col_iter(new_i) {
                     scratch.rhs.values[orig_r] -= x_val * coeff;
@@ -256,7 +259,11 @@ fn factorize_in_order<'a>(
                 }
             }
 
-            if !max_abs.is_normal() || max_abs < LU_SINGULAR_REL * col_max {
+            // Each elimination applied to this column rounded its entries
+            // once, so the part a dependent column has left is of order that
+            // many round-offs of its largest entry, not one.
+            let singular_floor = LU_SINGULAR_REL * eliminations.max(1) as f64 * col_max;
+            if !max_abs.is_normal() || max_abs < singular_floor {
                 dependent.push(orig_col);
                 continue;
             }

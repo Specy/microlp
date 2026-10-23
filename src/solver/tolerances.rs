@@ -37,9 +37,10 @@ pub(crate) const ROUNDOFF_FLOOR: f64 = 1e-14;
 
 /// A column of the basis whose largest eligible pivot, in the LU
 /// factorization, is below this fraction of the column's largest transformed
-/// entry is treated as singular: the eligible part is then within the
-/// round-off of the elimination, so the column is dependent on the previous
-/// ones as far as `f64` can tell. Relative, so that the test does not depend
+/// entry, once per elimination applied to the column, is treated as singular:
+/// the eligible part is then within the round-off of those eliminations,
+/// each of which rounded it once, so the column is dependent on the previous ones as
+/// far as `f64` can tell. Relative, so that the test does not depend
 /// on the units the column is written in; an ill-conditioned but non-singular
 /// basis is judged by the verification of the values it produces, not by its
 /// pivots.
