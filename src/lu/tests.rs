@@ -292,3 +292,75 @@ fn lu_completes_an_empty_column_with_trace_logging() {
     assert_eq!(replaced, [(2, 2)]);
     assert_factorizes_the_repaired_matrix(&lu, &mat, &replaced);
 }
+
+/// The basis of a DC power flow over `num_buses` buses on a ring, with a chord
+/// every seventh bus a third of the way round: one angle column per bus over a
+/// balance row per bus and a flow row per line, filled up to square with the
+/// unit columns of the flow rows. A balance row holds `+b` at one end of each
+/// incident line and `-b` at the other, and a flow row `+b` and `-b`, so the
+/// angle columns sum to zero in every row; with susceptances that are powers
+/// of two, from `2^-6` to `2^10`, they sum to exactly `0.0` in `f64`, and the
+/// matrix is singular in the arithmetic, not only up to round-off. A shunt
+/// `shunt` on bus 0's diagonal breaks that dependency, and none other.
+fn power_flow_basis(num_buses: usize, shunt: f64) -> CsMat<f64> {
+    let n = num_buses;
+    let mut lines: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
+    if n >= 9 {
+        for i in (0..n).step_by(7) {
+            let j = (i + n / 3) % n;
+            let (a, b) = (i.min(j), i.max(j));
+            if a != b && !lines.iter().any(|&(x, y)| (x.min(y), x.max(y)) == (a, b)) {
+                lines.push((a, b));
+            }
+        }
+    }
+    let size = n + lines.len();
+    let mut triplets = Vec::new();
+    for (e, &(i, j)) in lines.iter().enumerate() {
+        let b = 2f64.powi(-6 + ((e * 7) % 17) as i32);
+        triplets.extend([(i, i, b), (j, j, b), (i, j, -b), (j, i, -b)]);
+        triplets.extend([(n + e, i, b), (n + e, j, -b)]);
+        triplets.push((n + e, n + e, 1.0));
+    }
+    triplets.push((0, 0, shunt));
+    mat_from_triplets(size, size, &triplets)
+}
+
+/// A dependent column's remaining part is the round-off of the eliminations
+/// applied to it, which grows with their number: on the power flow bases
+/// above it measures between `2e-16` and `2e-14` of the column's largest
+/// entry, with no trend in the size, so a floor of `1e-14` alone sits inside
+/// that range and took a round-off pivot at 40 buses, after 18 eliminations.
+/// Every size has its one dependency found, and with a shunt on bus 0, none.
+/// A genuine pivot as small, after one elimination, is still taken: see
+/// `a_primal_blocking_entry_small_beside_its_column_bounds_the_step`.
+#[test]
+fn lu_finds_a_dependency_left_as_the_round_off_of_many_eliminations() {
+    init();
+    for num_buses in [5, 10, 20, 40, 80, 120, 200] {
+        let singular = power_flow_basis(num_buses, 0.0);
+        let mut row_sums = vec![0.0f64; singular.rows()];
+        for c in 0..num_buses {
+            for (r, &val) in singular.outer_view(c).unwrap().iter() {
+                row_sums[r] += val;
+            }
+        }
+        assert!(
+            row_sums.iter().all(|&s| s == 0.0),
+            "{num_buses} buses: the angle columns must sum to exactly zero"
+        );
+        let (_, replaced) = factorize(&singular, crate::solver::LU_STABILITY_THRESHOLD);
+        assert_eq!(
+            replaced.len(),
+            1,
+            "{num_buses} buses, singular: {replaced:?}"
+        );
+
+        let shunted = power_flow_basis(num_buses, 0.5);
+        let (_, replaced) = factorize(&shunted, crate::solver::LU_STABILITY_THRESHOLD);
+        assert!(
+            replaced.is_empty(),
+            "{num_buses} buses, shunted: {replaced:?}"
+        );
+    }
+}
