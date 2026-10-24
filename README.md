@@ -153,11 +153,17 @@ that coefficient range: a solve can then fail with `Error::InternalError`; in
 extreme cases a feasible model whose feasible points require very large
 variable values is reported `Infeasible`, and a solve whose last basis is
 singular to `f64` reports a solution for an unbounded model, or one far from
-the optimum of a bounded model. Outside the range, a bounded model can also be
-reported `Unbounded`. An objective whose terms (costs times values) or their
-sum overflow `f64` cannot be evaluated: a solve that meets one fails with
-`Error::InternalError`, even where the exact objective is representable. See
-the [known numerical limitations](src/ARCHITECTURE.md#79-known-limitations).
+the optimum of a bounded model. A common source is a group of free variables
+that can all shift together, such as every bus angle of a power-flow network
+left free: where rounding in the coefficients leaves that shift a tiny effect
+on the constraints, a model meant to have no solution can have one as written,
+at very large variable values, which a solve can return. Fix one of those
+variables, such as a reference angle, to remove the shift. Outside the range,
+a bounded model can also be reported `Unbounded`. An objective whose terms
+(costs times values) or their sum overflow `f64` cannot be evaluated: a solve
+that meets one fails with `Error::InternalError`, even where the exact
+objective is representable. See the
+[known numerical limitations](src/ARCHITECTURE.md#79-known-limitations).
 
 When a solver decides to produce a solution it might be for different reasons:
 

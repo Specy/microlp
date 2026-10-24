@@ -1343,6 +1343,16 @@ fails once a change fixes it: a `#[should_panic]` test named `..._is_a_known_lim
 test that expects the loud error. The wide-coefficient properties split at the range: a
 draw within it must solve, a draw outside it must give no wrong answer.
 
+A group of free vars that can all shift together, such as every bus angle of a DC power
+flow, is a common source of nearly dependent rows. Where its coefficients cancel only up to
+rounding (a Laplacian diagonal computed as `f64` sums), a model infeasible as intended can
+be exactly feasible as written, at angles near `1e14` to `1e15` where `f64` holds the rows
+only within the round-off of their terms. The solve answers the model as written: `Optimal`
+there, `Infeasible` where it stays infeasible, or an `InternalError`; where the
+coefficients cancel exactly, it proves the model `Infeasible` or ends in the
+`InternalError` of a dependency with no boxed var (the first limitation below). Fixing one
+var of the group (a reference angle) removes the shift.
+
 - **Nearly dependent rows** (in range). A basis the factorization finds singular whose
   repair keeps a var with an infinite bound out (no var of the dependency has both bounds
   finite, or a second factorization finds another number of dependencies) keeps its
