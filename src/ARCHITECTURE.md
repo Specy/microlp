@@ -889,7 +889,7 @@ contract is not in the box.
 | Is a reduced cost zero? | `dual_tol`: `EPS` in the engine's units and in the user's (a slack's per unit of its row's activity divided by the row's largest coefficient), so that a cost a column factor shrinks still counts (`a_cost_tiny_beside_its_columns_coefficients_decides_the_optimum`), floored at the round-off of `\|c_j\| + Σ\|a_ij y_i\|`, refreshed with the multipliers | `EPS = 1e-10` |
 | Is a tableau entry a pivot? Do its two computations agree? | §7.7 | `dual_pivot_tolerance`, `primal_pivot_tolerance`, `PIVOT_GROWTH_TOL = 1e-9`, `PIVOT_AGREEMENT_TOL = 1e-7`, `REFINEMENT_MAX_STEPS = 10`, `REFINEMENT_RATIO = 1/2` (the primal column's refinement) |
 | Does a certificate prove infeasibility? | its gap beyond the room of its terms (§7.3) | `REFINEMENT_CONVERGED = 2^-53`, `REFINEMENT_MAX_STEPS = 10`, `REFINEMENT_RATIO = 1/2`, `COMPENSATED_ERROR = 16·2^-104` |
-| Is an LU pivot column singular? | its eligible part below `LU_SINGULAR_REL` of its largest transformed entry (§7.7) | `= ROUNDOFF_FLOOR` |
+| Is an LU pivot column singular? | its eligible part below `LU_SINGULAR_REL` of its largest transformed entry, once per elimination applied to it (§7.7) | `= ROUNDOFF_FLOOR` |
 
 ### 7.3 Infeasibility only from a proof
 
@@ -1244,9 +1244,11 @@ through: `dual_pivot_tolerance` `1e-9`, `3e-8`, `1e-6` and `primal_pivot_toleran
   their agreement proves nothing. The column's element drives the step, the eta file and the
   steepest-edge updates, the row's the reduced costs.
 - *The factorization*: threshold `LU_STABILITY_THRESHOLD = 0.1`, raised as above. A column
-  whose eligible part is below `LU_SINGULAR_REL` of its largest transformed entry is
-  dependent as far as `f64` can tell, and the basis is repaired with a slack (§3); an
-  ill-conditioned basis is judged by the verification of its values (§7.5).
+  whose eligible part is below `LU_SINGULAR_REL` of its largest transformed entry, once per
+  elimination applied to it, is dependent as far as `f64` can tell: what a dependent column
+  keeps is the round-off its eliminations carry into it, including what the earlier columns'
+  factors left, and the bound on it grows with their number. The basis is repaired with a
+  slack (§3); an ill-conditioned basis is judged by the verification of its values (§7.5).
 
 **The recommended coefficient range** (`src/range.rs`): within every row and every column,
 the largest nonzero coefficient magnitude at most `1e6` times the smallest
@@ -1341,6 +1343,16 @@ fails once a change fixes it: a `#[should_panic]` test named `..._is_a_known_lim
 test that expects the loud error. The wide-coefficient properties split at the range: a
 draw within it must solve, a draw outside it must give no wrong answer.
 
+A group of free vars that can all shift together, such as every bus angle of a DC power
+flow, is a common source of nearly dependent rows. Where its coefficients cancel only up to
+rounding (a Laplacian diagonal computed as `f64` sums), a model infeasible as intended can
+be exactly feasible as written, at angles near `1e14` to `1e15` where `f64` holds the rows
+only within the round-off of their terms. The solve answers the model as written: `Optimal`
+there, `Infeasible` where it stays infeasible, or an `InternalError`, such as the stall
+among the other loud ends below; where the coefficients cancel exactly, it proves the model
+`Infeasible` or ends in the `InternalError` of a dependency with no boxed var (the first
+limitation below). Fixing one var of the group (a reference angle) removes the shift.
+
 - **Nearly dependent rows** (in range). A basis the factorization finds singular whose
   repair keeps a var with an infinite bound out (no var of the dependency has both bounds
   finite, or a second factorization finds another number of dependencies) keeps its
@@ -1380,7 +1392,14 @@ draw within it must solve, a draw outside it must give no wrong answer.
   within the pivot tolerance, "dual simplex: the pivot element of var … in row … is …
   through the row and … through the column of a fresh factorization":
   `an_infeasible_lp_whose_pivot_row_and_column_disagree_is_a_known_limitation` (three
-  nearly parallel rows, infeasible beyond the absolute tolerance).
+  nearly parallel rows, infeasible beyond the absolute tolerance). The dual phase can
+  shift its working costs by ever larger amounts, the objective of those costs rising
+  with them and then falling, until a check finds it no higher than `STALL_ITERATIONS`
+  iterations before (§7.8), "dual simplex stalled: the objective did not improve in
+  10000 iterations":
+  `a_dc_power_flow_whose_angles_can_all_shift_together_is_a_known_limitation`
+  (`src/tests/regressions.rs`, which expects the error: a DC power flow with every bus
+  angle free, infeasible as written, proven `Infeasible` with bus 0's angle fixed).
 - **Optimal at a numerically singular basis** (in range). Nearly dependent rows (decimal
   equalities `f64` rounds apart, near twins, nearly parallel rows) can leave the phases at a
   basis singular to `f64`, through pivots on genuine entries far below the pivot tolerance,

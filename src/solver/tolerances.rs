@@ -37,13 +37,13 @@ pub(crate) const ROUNDOFF_FLOOR: f64 = 1e-14;
 
 /// A column of the basis whose largest eligible pivot, in the LU
 /// factorization, is below this fraction of the column's largest transformed
-/// entry, once per elimination applied to the column, is treated as singular:
-/// the eligible part is then within the round-off of those eliminations,
-/// each of which rounded it once, so the column is dependent on the previous ones as
-/// far as `f64` can tell. Relative, so that the test does not depend
-/// on the units the column is written in; an ill-conditioned but non-singular
-/// basis is judged by the verification of the values it produces, not by its
-/// pivots.
+/// entry, once per elimination applied to the column, is treated as singular,
+/// dependent on the previous ones as far as `f64` can tell: what a dependent
+/// column keeps is the round-off its eliminations carry into it, including
+/// what the earlier columns' factors left, and the bound on it grows with
+/// their number. Relative, so that the test does not depend on the units the
+/// column is written in; an ill-conditioned but non-singular basis is judged
+/// by the verification of the values it produces, not by its pivots.
 pub(crate) const LU_SINGULAR_REL: f64 = ROUNDOFF_FLOOR;
 
 /// The pivot tolerance of the dual ratio test after `updates` basis changes
