@@ -250,11 +250,11 @@ place. Basic variable: update the row's bound mirrors, flag primal-infeasible if
 fell outside. Non-basic variable: move it to the new bound its state names (a var that was
 fixed goes to the bound at which its reduced cost is dual feasible, and one between its
 bounds stays where it is if they still hold it), and propagate the delta into the basic
-values through the variable's column (same mechanism as `fix_var`). Crossing bounds
-(`min > max`) return `Err(Infeasible)`, and a bound that is NaN or, in the engine's scaled
-units, a lower bound of `+∞` or an upper bound of `−∞` returns `Err(InternalError)`, both
-with state untouched. Infinite bounds on their open side remain valid. It does **not** run
-simplex — callers decide when to reoptimize.
+values through the variable's column. Crossing bounds (`min > max`) return
+`Err(Infeasible)`, and a bound that is NaN or, in the engine's scaled units, a lower bound
+of `+∞` or an upper bound of `−∞` returns `Err(InternalError)`, both with state untouched.
+Infinite bounds on their open side remain valid. It does **not** run simplex — callers
+decide when to reoptimize.
 
 *Why this is the branching primitive:* tightening a bound leaves every reduced cost
 untouched, so the current basis stays **dual feasible** — re-solving is a short dual-simplex
