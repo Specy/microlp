@@ -573,7 +573,8 @@ pub(crate) mod regression_tests {
     /// accept the value the solve just reported for a var in an equality row
     /// (it returned `Infeasible`), since the fix only restates what the row
     /// forces. The `Le` row is a control, and the third case moves the value
-    /// off the var's bounds and away from zero.
+    /// off the var's bounds and away from zero. Releasing the fix returns to
+    /// that value.
     #[test]
     fn issue_47_fix_var_accepts_the_value_solve_returned() {
         for (op, rhs, hi) in [
@@ -616,7 +617,87 @@ pub(crate) mod regression_tests {
                 (fixed_value - value).abs() < 1e-9,
                 "x in [0, {hi}], x {op:?} {rhs}: after fix_var(x, {value:?}) x = {fixed_value:?}"
             );
+
+            let (restored, was_fixed) = refixed.unfix_var(x).unwrap_or_else(|e| {
+                panic!("x in [0, {hi}], x {op:?} {rhs}: unfix_var(x) gave {e:?}")
+            });
+            assert!(
+                was_fixed,
+                "x in [0, {hi}], x {op:?} {rhs}: unfix_var(x) found no fix"
+            );
+            let restored = restored.into_solution().unwrap_or_else(|i| {
+                panic!("x in [0, {hi}], x {op:?} {rhs}: unfix_var must finish, got {i:?}")
+            });
+            let restored_value = restored.var_value(x);
+            assert!(
+                (restored_value - value).abs() < 1e-9,
+                "x in [0, {hi}], x {op:?} {rhs}: after unfix_var(x) x = {restored_value:?}"
+            );
         }
+    }
+
+    /// The other side of issue #47: a fix the equality row cannot meet is
+    /// `Infeasible`. `x = 1` over `x ∈ [0, 2]` solves with `x` basic, and a
+    /// fix at `0.5`, within the bounds, leaves the row unmet.
+    #[test]
+    fn issue_47_fix_var_off_the_equality_value_is_infeasible() {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_var(-1.0, (0.0, 2.0));
+        problem.add_constraint([(x, 1.0)], ComparisonOp::Eq, 1.0);
+        let solution = problem.solve().unwrap().into_solution().unwrap();
+        let value = solution[x];
+        assert!((value - 1.0).abs() < 1e-9, "fixture: x = {value:?}");
+        let fixed = solution.fix_var(x, 0.5);
+        assert!(
+            matches!(fixed, Err(crate::Error::Infeasible)),
+            "fix_var(x, 0.5) gave {fixed:?}"
+        );
+    }
+
+    /// `fix_var` applies a fix as bounds (issue #47), so a var fixed again is
+    /// validated against the bounds it had before the first fix, not the
+    /// pinned ones: on `[0, 3]`, fixed at `0.5`, it can be fixed at `2` but
+    /// not at `3.5`. Releasing it then restores those bounds and the optimum
+    /// in one step, and a second release finds no fix.
+    #[test]
+    fn issue_47_refix_validates_against_original_bounds_and_unfix_restores() {
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x = problem.add_var(1.0, (0.0, 3.0));
+        let y = problem.add_var(2.0, (0.0, 3.0));
+        problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
+        let solution = problem.solve().unwrap().into_solution().unwrap();
+        let optimum = (solution[x], solution[y], solution.objective());
+
+        let fixed = solution.fix_var(x, 0.5).unwrap().into_solution().unwrap();
+        let refixed = fixed
+            .fix_var(x, 2.0)
+            .unwrap_or_else(|e| panic!("fix_var(x, 2) on x fixed at 0.5 gave {e:?}"))
+            .into_solution()
+            .unwrap();
+        assert!(
+            (refixed[x] - 2.0).abs() < 1e-9 && (refixed[y] - 2.0).abs() < 1e-9,
+            "after fix_var(x, 2): x = {:?}, y = {:?}",
+            refixed[x],
+            refixed[y]
+        );
+        let beyond = refixed.clone().fix_var(x, 3.5);
+        assert!(
+            matches!(beyond, Err(crate::Error::Infeasible)),
+            "fix_var(x, 3.5) on x fixed at 2 gave {beyond:?}"
+        );
+
+        let (restored, was_fixed) = refixed.unfix_var(x).unwrap();
+        assert!(was_fixed);
+        let restored = restored.into_solution().unwrap();
+        let answer = (restored[x], restored[y], restored.objective());
+        assert!(
+            (answer.0 - optimum.0).abs() < 1e-9
+                && (answer.1 - optimum.1).abs() < 1e-9
+                && (answer.2 - optimum.2).abs() < 1e-9,
+            "after unfix_var(x): {answer:?}, expected the optimum {optimum:?}"
+        );
+        let (_, was_fixed) = restored.unfix_var(x).unwrap();
+        assert!(!was_fixed, "a second unfix_var(x) found a fix");
     }
 
     /// Issue #47 in general: a reported value may sit outside the var's
