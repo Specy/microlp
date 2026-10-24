@@ -122,12 +122,13 @@ impl LUFactors {
 /// pivoting at `stability_coeff`.
 ///
 /// A column is dependent when the part of it left to pivot on is below
-/// [`LU_SINGULAR_REL`] of its largest transformed entry per elimination
-/// applied to it (or not a normal number): it is skipped, and the factors are completed at the end, each
-/// dependent column paired with a row that no pivot took, whose unit column
-/// takes its place (a pivot of one, no elimination, exact since the row was
-/// never eliminated). Returns the factors of the matrix so repaired and the
-/// pairs `(column, row)` it replaced, none for a nonsingular matrix.
+/// [`LU_SINGULAR_REL`] of its largest transformed entry, once per elimination
+/// applied to it (or not a normal number): it is skipped, and the factors are
+/// completed at the end, each dependent column paired with a row that no pivot
+/// took, whose unit column takes its place (a pivot of one, no elimination,
+/// exact since the row was never eliminated). Returns the factors of the
+/// matrix so repaired and the pairs `(column, row)` it replaced, none for a
+/// nonsingular matrix.
 pub fn lu_factorize<'a>(
     size: usize,
     get_col: impl Fn(usize) -> (&'a [usize], &'a [f64]),
@@ -259,9 +260,9 @@ fn factorize_in_order<'a>(
                 }
             }
 
-            // Each elimination applied to this column rounded its entries
-            // once, so the part a dependent column has left is of order that
-            // many round-offs of its largest entry, not one.
+            // What a dependent column keeps is the round-off its eliminations
+            // carry into it, including what the earlier columns' factors left,
+            // and the bound on it grows with their number.
             let singular_floor = LU_SINGULAR_REL * eliminations.max(1) as f64 * col_max;
             if !max_abs.is_normal() || max_abs < singular_floor {
                 dependent.push(orig_col);

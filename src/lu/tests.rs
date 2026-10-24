@@ -326,13 +326,13 @@ fn power_flow_basis(num_buses: usize, shunt: f64) -> CsMat<f64> {
     mat_from_triplets(size, size, &triplets)
 }
 
-/// A dependent column's remaining part is the round-off of the eliminations
-/// applied to it, which grows with their number: on the power flow bases
-/// above it measures between `2e-16` and `2e-14` of the column's largest
-/// entry, with no trend in the size, so a floor of `1e-14` alone sits inside
-/// that range and took a round-off pivot at 40 buses, after 18 eliminations.
-/// Every size has its one dependency found, and with a shunt on bus 0, none.
-/// A genuine pivot as small, after one elimination, is still taken: see
+/// A dependent column keeps the round-off its eliminations carry into it,
+/// including what the earlier columns' factors left. On the power flow bases
+/// above, it lies on either side of `LU_SINGULAR_REL` of the column's largest
+/// entry, whatever the size, so a floor that does not count the eliminations
+/// misses a dependency. Every size has its one dependency found, and with a
+/// shunt on bus 0, none. A genuine pivot as small, after one elimination, is
+/// still taken: see
 /// `a_primal_blocking_entry_small_beside_its_column_bounds_the_step`.
 #[test]
 fn lu_finds_a_dependency_left_as_the_round_off_of_many_eliminations() {

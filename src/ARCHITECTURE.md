@@ -889,7 +889,7 @@ contract is not in the box.
 | Is a reduced cost zero? | `dual_tol`: `EPS` in the engine's units and in the user's (a slack's per unit of its row's activity divided by the row's largest coefficient), so that a cost a column factor shrinks still counts (`a_cost_tiny_beside_its_columns_coefficients_decides_the_optimum`), floored at the round-off of `\|c_j\| + Σ\|a_ij y_i\|`, refreshed with the multipliers | `EPS = 1e-10` |
 | Is a tableau entry a pivot? Do its two computations agree? | §7.7 | `dual_pivot_tolerance`, `primal_pivot_tolerance`, `PIVOT_GROWTH_TOL = 1e-9`, `PIVOT_AGREEMENT_TOL = 1e-7`, `REFINEMENT_MAX_STEPS = 10`, `REFINEMENT_RATIO = 1/2` (the primal column's refinement) |
 | Does a certificate prove infeasibility? | its gap beyond the room of its terms (§7.3) | `REFINEMENT_CONVERGED = 2^-53`, `REFINEMENT_MAX_STEPS = 10`, `REFINEMENT_RATIO = 1/2`, `COMPENSATED_ERROR = 16·2^-104` |
-| Is an LU pivot column singular? | its eligible part below `LU_SINGULAR_REL` of its largest transformed entry (§7.7) | `= ROUNDOFF_FLOOR` |
+| Is an LU pivot column singular? | its eligible part below `LU_SINGULAR_REL` of its largest transformed entry, once per elimination applied to it (§7.7) | `= ROUNDOFF_FLOOR` |
 
 ### 7.3 Infeasibility only from a proof
 
@@ -1244,9 +1244,11 @@ through: `dual_pivot_tolerance` `1e-9`, `3e-8`, `1e-6` and `primal_pivot_toleran
   their agreement proves nothing. The column's element drives the step, the eta file and the
   steepest-edge updates, the row's the reduced costs.
 - *The factorization*: threshold `LU_STABILITY_THRESHOLD = 0.1`, raised as above. A column
-  whose eligible part is below `LU_SINGULAR_REL` of its largest transformed entry is
-  dependent as far as `f64` can tell, and the basis is repaired with a slack (§3); an
-  ill-conditioned basis is judged by the verification of its values (§7.5).
+  whose eligible part is below `LU_SINGULAR_REL` of its largest transformed entry, once per
+  elimination applied to it, is dependent as far as `f64` can tell: what a dependent column
+  keeps is the round-off its eliminations carry into it, including what the earlier columns'
+  factors left, and the bound on it grows with their number. The basis is repaired with a
+  slack (§3); an ill-conditioned basis is judged by the verification of its values (§7.5).
 
 **The recommended coefficient range** (`src/range.rs`): within every row and every column,
 the largest nonzero coefficient magnitude at most `1e6` times the smallest
