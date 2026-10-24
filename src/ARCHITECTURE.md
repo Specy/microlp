@@ -1348,10 +1348,10 @@ flow, is a common source of nearly dependent rows. Where its coefficients cancel
 rounding (a Laplacian diagonal computed as `f64` sums), a model infeasible as intended can
 be exactly feasible as written, at angles near `1e14` to `1e15` where `f64` holds the rows
 only within the round-off of their terms. The solve answers the model as written: `Optimal`
-there, `Infeasible` where it stays infeasible, or an `InternalError`; where the
-coefficients cancel exactly, it proves the model `Infeasible` or ends in the
-`InternalError` of a dependency with no boxed var (the first limitation below). Fixing one
-var of the group (a reference angle) removes the shift.
+there, `Infeasible` where it stays infeasible, or an `InternalError`, such as the stall
+among the other loud ends below; where the coefficients cancel exactly, it proves the model
+`Infeasible` or ends in the `InternalError` of a dependency with no boxed var (the first
+limitation below). Fixing one var of the group (a reference angle) removes the shift.
 
 - **Nearly dependent rows** (in range). A basis the factorization finds singular whose
   repair keeps a var with an infinite bound out (no var of the dependency has both bounds
@@ -1392,7 +1392,14 @@ var of the group (a reference angle) removes the shift.
   within the pivot tolerance, "dual simplex: the pivot element of var … in row … is …
   through the row and … through the column of a fresh factorization":
   `an_infeasible_lp_whose_pivot_row_and_column_disagree_is_a_known_limitation` (three
-  nearly parallel rows, infeasible beyond the absolute tolerance).
+  nearly parallel rows, infeasible beyond the absolute tolerance). The dual phase can
+  shift its working costs by ever larger amounts, the objective of those costs rising
+  with them and then falling, until a check finds it no higher than `STALL_ITERATIONS`
+  iterations before (§7.8), "dual simplex stalled: the objective did not improve in
+  10000 iterations":
+  `a_dc_power_flow_whose_angles_can_all_shift_together_is_a_known_limitation`
+  (`src/tests/regressions.rs`, which expects the error: a DC power flow with every bus
+  angle free, infeasible as written, proven `Infeasible` with bus 0's angle fixed).
 - **Optimal at a numerically singular basis** (in range). Nearly dependent rows (decimal
   equalities `f64` rounds apart, near twins, nearly parallel rows) can leave the phases at a
   basis singular to `f64`, through pivots on genuine entries far below the pivot tolerance,

@@ -1125,6 +1125,111 @@ pub(crate) mod regression_tests {
         }
     }
 
+    /// A DC optimal power flow over `n` buses, its data drawn from a 64-bit
+    /// LCG seeded with `seed`: lines on a ring with a chord every seventh
+    /// bus, each with a susceptance and a flow within `cap` tied to the
+    /// angles of its ends; per bus a free angle (bus 0's fixed at 0 with
+    /// `fixed_reference`), a load, and a balance row whose diagonal is the
+    /// `f64` sum of its lines' susceptances; a generator every fifth bus. It
+    /// minimizes the cost of generation.
+    fn dc_power_flow(n: usize, seed: u64, cap: f64, fixed_reference: bool) -> Problem {
+        let mut state = seed;
+        let mut draw = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut lines: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
+        for i in (0..n).step_by(7) {
+            let j = (i + n / 3) % n;
+            let (a, b) = (i.min(j), i.max(j));
+            if a != b && !lines.iter().any(|&(x, y)| (x.min(y), x.max(y)) == (a, b)) {
+                lines.push((a, b));
+            }
+        }
+        let susceptance: Vec<f64> = lines.iter().map(|_| 0.02 + 50.0 * draw()).collect();
+
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let angle: Vec<_> = (0..n)
+            .map(|i| match i {
+                0 if fixed_reference => problem.add_var(0.0, (0.0, 0.0)),
+                _ => problem.add_var(0.0, (f64::NEG_INFINITY, f64::INFINITY)),
+            })
+            .collect();
+        let flow: Vec<_> = lines
+            .iter()
+            .map(|_| problem.add_var(0.0, (-cap, cap)))
+            .collect();
+        let mut generator = vec![None; n];
+        for i in (0..n).step_by(5) {
+            generator[i] = Some(problem.add_var(1.0 + (i % 7) as f64 + draw(), (0.0, 20.0)));
+        }
+        let load: Vec<f64> = (0..n).map(|_| 0.5 + 3.0 * draw()).collect();
+
+        for i in 0..n {
+            let mut terms = Vec::new();
+            let mut diagonal = 0.0;
+            for (e, &(a, c)) in lines.iter().enumerate() {
+                let other = if a == i {
+                    c
+                } else if c == i {
+                    a
+                } else {
+                    continue;
+                };
+                diagonal += susceptance[e];
+                terms.push((angle[other], -susceptance[e]));
+            }
+            terms.push((angle[i], diagonal));
+            if let Some(g) = generator[i] {
+                terms.push((g, -1.0));
+            }
+            problem.add_constraint(terms, ComparisonOp::Eq, -load[i]);
+        }
+        for (e, &(a, c)) in lines.iter().enumerate() {
+            let b = susceptance[e];
+            problem.add_constraint(
+                [(flow[e], 1.0), (angle[a], -b), (angle[c], b)],
+                ComparisonOp::Eq,
+                0.0,
+            );
+        }
+        problem
+    }
+
+    /// KNOWN LIMITATION (ARCHITECTURE §7.9): the DC power flow above over 77
+    /// buses, its angles all free, so that they can all shift together, and
+    /// each balance row's diagonal the `f64` sum of its lines' susceptances,
+    /// so that the rows cancel the shift only up to rounding. The model as
+    /// written is infeasible, and the dual simplex stalls ("dual simplex
+    /// stalled"), presolve on and off, its working costs shifted by ever
+    /// larger amounts. With bus 0's angle fixed, which removes the shift, the
+    /// model is proven `Infeasible`, presolve on and off.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "test is too slow in debug mode")]
+    fn a_dc_power_flow_whose_angles_can_all_shift_together_is_a_known_limitation() {
+        for presolve in [true, false] {
+            let options = crate::SolveOptions {
+                presolve,
+                ..crate::SolveOptions::default()
+            };
+            let got = dc_power_flow(77, 2, 6.0, false).solve_with(options.clone());
+            assert!(
+                matches!(&got, Err(crate::Error::InternalError(m))
+                    if m.contains("dual simplex stalled")),
+                "free angles, presolve {presolve}: {:?}",
+                got.map(|_| "solved")
+            );
+            let got = dc_power_flow(77, 2, 6.0, true).solve_with(options);
+            assert_eq!(
+                got.map(|_| "solved"),
+                Err(crate::Error::Infeasible),
+                "bus 0's angle fixed, presolve {presolve}"
+            );
+        }
+    }
+
     /// A facility-location MILP: three sites opened by binaries through big-M
     /// rows, an integer var fixed at 12 and two dense side rows, its proven
     /// optimum 395. With presolve, a node's certificate combines two rows and
