@@ -538,6 +538,37 @@ mod tests_presolve_api {
         assert!((hinted.objective() - 11.0).abs() <= int_tol * 12.0);
     }
 
+    /// `SolveOptions::dual_fixing` off agrees with it on, with presolve on and
+    /// off, and with a warm-start hint, on the model above.
+    #[test]
+    fn milp_dual_fixing_off_agrees() {
+        init();
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let a = p.add_integer_var(3.0, (0, 10));
+        let b = p.add_integer_var(4.0, (0, 10));
+        let pen = p.add_integer_var(5.0, (0, 8));
+        p.add_constraint(&[(a, 1.0), (b, 2.0)], ComparisonOp::Ge, 5.0);
+        p.add_constraint(&[(a, 3.0), (b, 1.0)], ComparisonOp::Ge, 4.0);
+        p.add_constraint(&[(pen, 1.0), (a, 1.0)], ComparisonOp::Le, 50.0);
+        let int_tol = SolveOptions::default().int_tol;
+        for presolve in [true, false] {
+            for warm_start in [None, Some(vec![(a, 5.0), (b, 0.0), (pen, 1.0)])] {
+                let sol = solution(p.solve_with(SolveOptions {
+                    presolve,
+                    dual_fixing: false,
+                    warm_start: warm_start.clone(),
+                    ..SolveOptions::default()
+                }));
+                assert_eq!(sol.status(), SolutionStatus::Optimal);
+                assert!(
+                    (sol.objective() - 11.0).abs() <= int_tol * 12.0,
+                    "presolve {presolve}, hint {warm_start:?}: objective {}",
+                    sol.objective()
+                );
+            }
+        }
+    }
+
     /// Big-M rows: coefficient tightening must preserve the optimum of a
     /// fixed-charge model.
     #[test]

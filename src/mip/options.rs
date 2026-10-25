@@ -92,6 +92,18 @@ pub struct SolveOptions {
     /// compare raw solver behavior or to rule it out when investigating a
     /// numerical issue. Default `true`.
     pub presolve: bool,
+    /// Let presolve fix an integer variable by an optimality argument (dual
+    /// fixing): a variable that neither the objective nor any of its rows
+    /// gives a reason to move off one of its bounds is fixed at that bound.
+    /// That keeps an optimum, not every feasible point, so it can remove
+    /// alternative optima and feasible points the objective does not prefer.
+    /// Turn it off when the search must keep every integral point, as an
+    /// enumeration of the solutions within an objective cutoff needs, or to
+    /// rule it out when investigating a result. It takes effect only with
+    /// [`SolveOptions::presolve`] on and for a problem with integer or
+    /// boolean variables, and a [`SolveOptions::warm_start`] hint turns it
+    /// off, so that a feasible hint is never excluded. Default `true`.
+    pub dual_fixing: bool,
     /// The tolerances of the solve. Most callers should leave this at
     /// [`Tolerances::default`]; override an individual field only once you
     /// understand the correctness/permissiveness trade-off documented on it.
@@ -107,6 +119,7 @@ impl Default for SolveOptions {
             int_tol: 1e-6,
             warm_start: None,
             presolve: true,
+            dual_fixing: true,
             tolerances: Tolerances::default(),
         }
     }

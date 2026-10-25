@@ -35,7 +35,7 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
     // Presolve what the search solves; `state.base` stays the user's problem,
     // so post-solve edits keep composing against it. The presolved bounds
     // become the root bounds. Dual fixing can exclude a feasible point, so a
-    // warm-start hint disables it.
+    // warm-start hint disables it, as does `SolveOptions::dual_fixing`.
     let presolved = if options.presolve {
         crate::presolve::reduced_model(crate::presolve::presolve(
             &problem.obj_coeffs,
@@ -46,7 +46,7 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
             crate::presolve::Mode::Mip,
             options.tolerances.feasibility,
             options.int_tol,
-            options.warm_start.is_none(),
+            options.dual_fixing && options.warm_start.is_none(),
         ))?
     } else {
         None

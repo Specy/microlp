@@ -1113,3 +1113,68 @@ fn an_unbounded_node_lp_is_solved_again_from_the_slack_basis() {
         "the node LP is solved again"
     );
 }
+
+/// `SolveOptions::dual_fixing` gates presolve's dual fixing. `pen` costs `5`
+/// and sits only in a `<=` row with a positive coefficient, so nothing
+/// rewards raising it: with the option on, presolve fixes it at `0` in the
+/// root box; off, it keeps its range, as it does under a warm-start hint.
+/// Both answers prove the same optimum.
+#[test]
+fn dual_fixing_off_keeps_the_range_of_a_var_only_optimality_fixes() {
+    let mut problem = Problem::new(OptimizationDirection::Minimize);
+    let a = problem.add_integer_var(3.0, (0, 10));
+    let b = problem.add_integer_var(4.0, (0, 10));
+    let pen = problem.add_integer_var(5.0, (0, 8));
+    problem.add_constraint(&[(a, 1.0), (b, 2.0)], ComparisonOp::Ge, 5.0);
+    problem.add_constraint(&[(a, 3.0), (b, 1.0)], ComparisonOp::Ge, 4.0);
+    problem.add_constraint(&[(pen, 1.0), (a, 1.0)], ComparisonOp::Le, 50.0);
+
+    let fixing = build_state(&problem, SolveOptions::default()).unwrap();
+    assert_eq!(fixing.root_bounds[pen.idx()], (0.0, 0.0));
+    let off = SolveOptions {
+        dual_fixing: false,
+        ..SolveOptions::default()
+    };
+    let kept = build_state(&problem, off.clone()).unwrap();
+    assert_eq!(kept.root_bounds[pen.idx()], (0.0, 8.0));
+
+    for options in [SolveOptions::default(), off] {
+        let sol = problem
+            .solve_with(options.clone())
+            .unwrap()
+            .into_solution()
+            .unwrap_or_else(|i| panic!("{options:?}: expected a solution, got {i:?}"));
+        assert!(
+            (sol.objective() - 11.0).abs() <= 1e-6 * 12.0,
+            "dual_fixing {}: objective {}",
+            options.dual_fixing,
+            sol.objective()
+        );
+    }
+}
+
+/// With dual fixing off, presolve keeps every integral point, so a zero-cost
+/// var that ties the optimum keeps its whole range: `y` is in a `<=` row
+/// only and costs nothing, so dual fixing would pin it at `0` and drop the
+/// alternative optima `y = 1..=3`. Its tighter bound `3` comes from the
+/// row, a reduction that keeps the feasible set, and stays.
+#[test]
+fn dual_fixing_off_keeps_a_tied_alternative_optimum() {
+    let mut problem = Problem::new(OptimizationDirection::Minimize);
+    let x = problem.add_integer_var(1.0, (0, 10));
+    let y = problem.add_integer_var(0.0, (0, 10));
+    problem.add_constraint(&[(x, 1.0)], ComparisonOp::Ge, 2.0);
+    problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 5.0);
+
+    let fixing = build_state(&problem, SolveOptions::default()).unwrap();
+    assert_eq!(fixing.root_bounds[y.idx()], (0.0, 0.0));
+    let kept = build_state(
+        &problem,
+        SolveOptions {
+            dual_fixing: false,
+            ..SolveOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(kept.root_bounds[y.idx()], (0.0, 3.0));
+}
