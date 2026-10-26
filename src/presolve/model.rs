@@ -24,11 +24,15 @@ pub(crate) struct Presolved {
     pub var_mins: Vec<f64>,
     pub var_maxs: Vec<f64>,
     pub constraints: Vec<(CsVec, ComparisonOp, f64)>,
+    /// Per row of `constraints`, the index of the input row it came from.
+    pub kept_rows: Vec<usize>,
     /// The input rows that `constraints` does not carry as written (dropped,
     /// or rewritten for integer points), unchanged. The engine checks the
     /// answer against them too (`Solver::set_validation_rows`), so a wrong
     /// reduction shows at the boundary, where an LP takes the row over.
     pub validation_rows: Vec<(CsVec, ComparisonOp, f64)>,
+    /// Per row of `validation_rows`, its index among the input rows.
+    pub validation_origs: Vec<usize>,
     /// Whether this differs from the model as written: an integer bound
     /// tightened or rounded, or a row dropped or rewritten. A model presolve
     /// did not reduce is solved as written

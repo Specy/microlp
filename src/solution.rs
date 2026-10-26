@@ -5,7 +5,7 @@ use crate::problem::{check_row, row_of};
 use crate::range::CoefficientRange;
 use crate::solver::Solver;
 use crate::{
-    mip, timed_lp_call, ComparisonOp, CsVec, Error, LinearExpr, OptimizationDirection,
+    mip, timed_lp_call, ComparisonOp, Constraint, CsVec, Error, LinearExpr, OptimizationDirection,
     ResumeOptions, SolutionStatus, SolveOptions, SolveOutcome, Stats, TerminationReason, VarDomain,
     Variable,
 };
@@ -46,6 +46,11 @@ pub struct Solution {
     /// For an LP solution, the objective of `lp_values` in internal (minimize)
     /// space, so the reported objective is exactly that of the reported values.
     pub(crate) lp_objective: f64,
+    /// For an LP solution, the dual of each of the user's rows and the
+    /// reduced cost of each var, in user units and internal (minimize) space
+    /// (`Solver::duals`). Empty for a MIP.
+    pub(crate) lp_duals: Vec<f64>,
+    pub(crate) lp_reduced_costs: Vec<f64>,
 }
 
 impl From<&SolveOptions> for ResumeOptions {
@@ -179,6 +184,100 @@ impl Solution {
         match &self.state {
             SolveState::Lp(_) => Some(0.0),
             SolveState::Mip(state) => state.stats.gap,
+        }
+    }
+
+    /// Returns a constraint's dual value (shadow price): the rate at which the
+    /// optimal objective changes as the constraint's right-hand side
+    /// increases, in the objective's units per unit of the right-hand side.
+    /// `None` for a problem with integer or boolean variables, whose
+    /// solutions carry no duals.
+    ///
+    /// The sign follows from that definition. When minimizing, a
+    /// [`ComparisonOp::Le`] constraint's dual is at most zero and a
+    /// [`ComparisonOp::Ge`] constraint's at least zero (raising the
+    /// right-hand side loosens the first and tightens the second); when
+    /// maximizing, the other way round. A [`ComparisonOp::Eq`] constraint's
+    /// may have either sign. A constraint that does not bind at the solution
+    /// has dual zero, within the tolerances, as has one that every point
+    /// satisfies, or that [`SolveOptions::presolve`] found implied by the
+    /// variable bounds (the bounds' reduced costs then carry its price).
+    ///
+    /// The duals are those of the final simplex basis. Where several sets of
+    /// duals are optimal (a degenerate optimum), this is one of them, which
+    /// another solver may not pick. They meet dual feasibility within the
+    /// solve's tolerances. After [`Solution::fix_var`], [`Solution::unfix_var`]
+    /// or [`Solution::add_constraint`], the new solution's duals are those of
+    /// the edited problem.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `constraint` is out of range for this solution.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use microlp::{ComparisonOp, OptimizationDirection, Problem};
+    ///
+    /// // Meet a demand of 10 from two generators, the cheaper one limited
+    /// // to 6.
+    /// let mut problem = Problem::new(OptimizationDirection::Minimize);
+    /// let cheap = problem.add_var(20.0, (0.0, f64::INFINITY));
+    /// let dear = problem.add_var(50.0, (0.0, f64::INFINITY));
+    /// let demand = problem.add_constraint(&[(cheap, 1.0), (dear, 1.0)], ComparisonOp::Eq, 10.0);
+    /// let limit = problem.add_constraint(&[(cheap, 1.0)], ComparisonOp::Le, 6.0);
+    /// let solution = problem.solve().unwrap().into_solution().unwrap();
+    ///
+    /// // One more unit of demand comes from the dearer generator, and one
+    /// // more unit of the cheap one's limit saves 50 - 20.
+    /// assert!((solution.dual(demand).unwrap() - 50.0).abs() < 1e-9);
+    /// assert!((solution.dual(limit).unwrap() + 30.0).abs() < 1e-9);
+    /// ```
+    pub fn dual(&self, constraint: Constraint) -> Option<f64> {
+        let duals = self.duals()?;
+        assert!(
+            constraint.0 < duals.len(),
+            "constraint {} is out of range 0..{}",
+            constraint.0,
+            duals.len()
+        );
+        Some(duals[constraint.0])
+    }
+
+    /// Returns the dual of every constraint, indexed by [`Constraint::idx`]:
+    /// the problem's constraints in the order added, then those
+    /// [`Solution::add_constraint`] added. `None` for a problem with integer
+    /// or boolean variables. See [`Solution::dual`].
+    pub fn duals(&self) -> Option<&[f64]> {
+        match &self.state {
+            SolveState::Lp(_) => Some(&self.lp_duals),
+            SolveState::Mip(_) => None,
+        }
+    }
+
+    /// Returns a variable's reduced cost: the rate at which the objective
+    /// changes as the variable moves away from its value with the other
+    /// variables at their bounds held there, in the objective's units per
+    /// unit of the variable. It equals the variable's objective coefficient
+    /// less the sum, over the constraints, of its coefficient times the
+    /// constraint's [dual](Solution::dual). `None` for a problem with integer
+    /// or boolean variables.
+    ///
+    /// A variable strictly between its bounds has reduced cost zero, within
+    /// the tolerances; one at a bound, the marginal value of that bound (when
+    /// minimizing, at least zero at a lower bound and at most zero at an upper
+    /// bound; the other way round when maximizing). For a variable fixed by
+    /// its bounds or by [`Solution::fix_var`], it is the marginal value of the
+    /// fix.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `var` is out of range for this solution.
+    pub fn reduced_cost(&self, var: Variable) -> Option<f64> {
+        assert!(var.0 < self.num_vars);
+        match &self.state {
+            SolveState::Lp(_) => Some(self.lp_reduced_costs[var.0]),
+            SolveState::Mip(_) => None,
         }
     }
 
@@ -440,6 +539,8 @@ impl Solution {
                             last_options,
                             lp_values: Vec::new(),
                             lp_objective: 0.0,
+                            lp_duals: Vec::new(),
+                            lp_reduced_costs: Vec::new(),
                         }),
                         false,
                     ));

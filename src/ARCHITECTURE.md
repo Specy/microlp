@@ -159,7 +159,9 @@ These normalizations happen at the boundary and hold everywhere inside:
   rewritten freely because nothing outside the `Solver` addresses them by index. That is
   what makes a postsolve layer unnecessary — solution read-out, resume, warm starts and
   post-solve edits all work off original indices, and the MIP search's root bounds are the
-  presolved bounds. Surviving rows are emitted as the user wrote them, fixed terms included
+  presolved bounds. The one reader of rows by index, a pure LP's duals (§6), goes through
+  `Solver::user_rows`, which presolve's `kept_rows`/`validation_origs` fill: in LP mode
+  presolve only drops rows the bounds imply, and zero is an optimal dual for such a row. Surviving rows are emitted as the user wrote them, fixed terms included
   (a row keeps the tolerance of its full magnitude only with them in it); only a row whose
   coefficients were rewritten is rebuilt, and the rows presolve dropped or rewrote go to the
   engine as written, for the checks at the boundary (§3.1). The reductions are exact; what
@@ -732,6 +734,15 @@ An integer variable's value lies within `int_tol` of an integer, not necessarily
 fixed one's on it (round it where an exact integer is needed, §5.4; `var_domain`, on the
 `Problem` and on the `Solution`, tells which variables are integer or boolean). Interrupted
 outcomes expose no answer-value accessors.
+
+Duals: `Problem::add_constraint` returns a `Constraint` handle, and a pure LP's `Solution`
+reports `dual(constraint)`, `duals()` and `reduced_cost(var)` (`None` for a MILP). They are
+read off the final basis when the solution is built (`Solver::duals`, multipliers refined
+once, like those the optimality check accepted), unscaled to user units (a row's dual times
+its row factor, a reduced cost over its column factor) and negated for `Maximize`: a dual is
+the rate of change of the user's objective with the row's right-hand side. A row the engine
+does not hold (every point satisfies it, or presolve dropped it) has dual zero; a row
+`Solution::add_constraint` adds is numbered after the problem's. Every edit recomputes them.
 
 ---
 
