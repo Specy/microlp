@@ -20,10 +20,13 @@ mod regression_tests {
     use crate::tests::oracle::{
         assert_solves_feasibly_within_contract, assert_solves_within_contract,
         assert_solves_within_contract_in_time, assert_solves_within_contract_without_presolve,
-        infeasible_or_answer_within_contract, infeasible_or_within_contract, row_tolerance,
-        row_violation, rows_hold, within_recommended_range, xstar_is_feasible, Model, Row, Var,
+        infeasible_or_answer_within_contract, infeasible_or_within_contract, objective_slack,
+        row_tolerance, row_violation, rows_hold, within_recommended_range, xstar_is_feasible,
+        Model, Row, Var,
     };
-    use crate::{ComparisonOp, Error, OptimizationDirection, SolveOptions, TerminationReason};
+    use crate::{
+        ComparisonOp, Error, OptimizationDirection, SolveOptions, TerminationReason, Tolerances,
+    };
     use std::time::Duration;
 
     fn real(obj: f64, lo: f64, hi: f64) -> Var {
@@ -58,6 +61,60 @@ mod regression_tests {
             "fixture error: x* must satisfy the model it was built around"
         );
         assert_solves_within_contract(&model);
+    }
+
+    /// Solves `model` at each feasibility tolerance below, `1e-9` to `1e-5`,
+    /// presolve on and off, and asserts each answer's objective no worse than
+    /// at `x*` beyond [`objective_slack`], then the default solve within the
+    /// contract ([`check`]). A hazard can show at some tolerances only, so a
+    /// pass at the default alone would not rule it out.
+    fn check_across_tolerances(model: Model) {
+        let target = model.objective_at(&model.xstar);
+        let slack = objective_slack(&model);
+        let tolerances = [
+            1e-9, 3e-9, 1e-8, 3e-8, 5e-8, 7e-8, 8e-8, 9e-8, 1e-7, 1.1e-7, 1.5e-7, 3e-7, 1e-6, 1e-5,
+        ];
+        let mut misses = Vec::new();
+        for tol in tolerances {
+            for presolve in [true, false] {
+                let (problem, _) = model.build();
+                let options = SolveOptions {
+                    presolve,
+                    tolerances: Tolerances {
+                        feasibility: tol,
+                        ..Tolerances::default()
+                    },
+                    ..SolveOptions::default()
+                };
+                match problem.solve_with(options).map(|o| o.into_solution()) {
+                    Ok(Ok(sol)) => {
+                        let worse = match model.direction {
+                            OptimizationDirection::Maximize => target - sol.objective(),
+                            OptimizationDirection::Minimize => sol.objective() - target,
+                        };
+                        if worse.is_nan() || worse > slack {
+                            misses.push(format!(
+                                "tolerance {tol:e}, presolve {presolve}: objective {:e} is worse \
+                                 than {target:e} at x* (slack {slack:e})",
+                                sol.objective()
+                            ));
+                        }
+                    }
+                    other => {
+                        misses.push(format!("tolerance {tol:e}, presolve {presolve}: {other:?}"))
+                    }
+                }
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "{} of {} solves missed:\n{}\n{}",
+            misses.len(),
+            2 * tolerances.len(),
+            misses.join("\n"),
+            model.source()
+        );
+        check(model);
     }
 
     /// `model` with `count` more rows `z + z' <= 1.5` over vars of their own,
@@ -6624,12 +6681,12 @@ mod regression_tests {
         check(model);
     }
 
-    /// Two rows spanning `1e10`, with `x* = [0, 107375]` meeting both exactly.
-    /// On `eabd025`, presolve's forcing rule pinned `x0` at a bound: the sliver
-    /// it compared against was exactly zero, because `x0`'s term at its corner
-    /// (`1e-7`) rounds away against a sum of `1.07e9`, whose ulp is `2.4e-7`,
-    /// and the row `-x0 <= 0` then made the model `Infeasible`, at every
-    /// tolerance with presolve on. Solves since `93204b9`.
+    /// Coefficients spanning `1e11`, with `x* = [0, 107375]` meeting both
+    /// rows exactly. At `x1`'s upper bound the equality sums to `1.07e9`,
+    /// whose ulp (`2.4e-7`) swallows `x0`'s term at its corner (`1e-7`), so
+    /// the row looks forcing, and fixing `x0` at that corner, `-1`, would make
+    /// `-x0 <= 0` infeasible. The model must solve at every tolerance,
+    /// presolve on and off.
     #[test]
     fn a_forcing_row_keeps_a_var_whose_term_rounds_away() {
         check_across_tolerances(Model {
@@ -6643,13 +6700,16 @@ mod regression_tests {
         });
     }
 
-    /// On `eabd025`, the primal ratio test let a row whose entry (`1.4e-5`)
-    /// was below the pivot floor go unchecked, so the var basic in it drifted
-    /// `2.2e-8` past its bound, 35x its tolerance; the answer check rejected
-    /// the point and the phases cycled until "simplex did not reach a verified
-    /// optimum in 8 phase rounds". Solves since `93204b9`.
+    /// Row 1 gives `x1` a coefficient of `0.0175` beside `1e4` on `x0`, and
+    /// row 0 gives `x1` `-1e4`: a step in `x1` meets row 1 through an entry
+    /// far below the rest of its column, though above the pivot tolerance.
+    /// Small beside its column, such an entry still limits the primal step:
+    /// passing over row 1 would let the var basic in it drift past its bound
+    /// beyond its tolerance, the answer check would reject the point, and the
+    /// phases would cycle until `8 phase rounds`. The model must solve at
+    /// every tolerance, presolve on and off.
     #[test]
-    fn a_row_too_small_to_pivot_on_still_limits_the_primal_step() {
+    fn a_column_entry_far_below_the_rest_solves() {
         check_across_tolerances(Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![
@@ -6669,12 +6729,13 @@ mod regression_tests {
         });
     }
 
-    /// The only repair of row 1's violation is a pivot on an entry of
-    /// `2^-50`, exact under power-of-two scaling and below the dual ratio
-    /// test's floors. On `eabd025` no candidate passed them, which
-    /// `choose_entering_col_dual` took for a proof: `Infeasible` on a feasible
-    /// model at every tolerance up to the default `1e-7`, presolve on and off.
-    /// Solves since `4bcdf68`.
+    /// Row 1, `100 x2 + 1e-8 x5 = 0`, puts `x2` below its lower bound wherever
+    /// `x5 > 0`, which the objective favors. With `x5` basic in row 0, only
+    /// `x0` repairs the row within the bounds, through an entry far below the
+    /// dual ratio test's floors, and `x2` only within its bound tolerance.
+    /// Finding no candidate above the floors proves nothing: taken for a
+    /// proof, it would answer `Infeasible` on this feasible model. The model
+    /// must solve at every tolerance, presolve on and off.
     #[test]
     fn a_refused_dual_pivot_is_no_proof_of_infeasibility() {
         check_across_tolerances(Model {
@@ -6695,14 +6756,16 @@ mod regression_tests {
         });
     }
 
-    /// Magnitudes to `1.25e7`. On `eabd025` the slack of row 1, already
-    /// `1.9e-8` past its bound inside a tolerance of `2.5e-8`, was offered its
-    /// whole tolerance again by the primal step limit; the step took it to
-    /// `2.59e-8`, verification rejected the point, and the phases repeated the
-    /// path until "8 phase rounds". A knife-edge: it failed at `8e-8` to
-    /// `1e-7` and solved at `1e-9` and `1e-6`. Solves since `93204b9`.
+    /// Values to `1.25e7`. Rows 1 to 4 and the bounds leave one point, `x*`,
+    /// where row 0 misses its bound by `1.4e-8` in exact arithmetic, within
+    /// its tolerance. A primal step can start with a basic var already past
+    /// its bound within its tolerance; a step limit that granted it that
+    /// tolerance again would take it beyond, verification would reject the
+    /// point, and the phases would repeat the path until `8 phase rounds`, at
+    /// some feasibility tolerances only. The model must solve at every
+    /// tolerance, presolve on and off.
     #[test]
-    fn a_basic_var_past_its_bound_does_not_get_its_tolerance_twice() {
+    fn a_row_met_only_within_its_tolerance_near_1e7_solves() {
         check_across_tolerances(Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
@@ -6732,14 +6795,13 @@ mod regression_tests {
         });
     }
 
-    /// `-20 x2 <= 0` only says `x2 >= 0`, so presolve folds it into the bound
-    /// and drops the row. On `eabd025` x2's bound tolerance then came from row
-    /// 0's coefficient of `1` rather than the dropped row's `20`, x2 settled
-    /// `1e-8` below zero, and the answer check, which reads the original rows,
-    /// rejected the point: "LP solution violates the original problem" with
-    /// presolve on. Solves since `b012cd3`.
+    /// Row 0 sets `x2 = -1e-8 x0`, and the objective rewards `x0`.
+    /// `-20 x2 <= 0` restates `x2 >= 0` with a coefficient of `20`, so it
+    /// holds `x2` to a twentieth of the row's tolerance below zero, much less
+    /// than `x2`'s bound tolerance: an answer must meet the row, presolve on
+    /// and off.
     #[test]
-    fn a_bound_tolerance_respects_a_row_presolve_folded_into_it() {
+    fn a_var_within_its_bound_tolerance_still_meets_a_singleton_row_on_it() {
         check_across_tolerances(Model {
             direction: OptimizationDirection::Minimize,
             vars: vec![
@@ -6753,55 +6815,5 @@ mod regression_tests {
             ],
             xstar: vec![0.0, 0.0, 0.0],
         });
-    }
-
-    /// [`check`], then a solve at each of 14 feasibility tolerances from
-    /// `1e-9` to `1e-5`, presolve on and off, each of which must find an
-    /// answer at least as good as `x*`. Two of the failures above were
-    /// knife-edges in the tolerance, so a pass at the default alone would not
-    /// show they are gone.
-    fn check_across_tolerances(model: Model) {
-        let target = model.objective_at(&model.xstar);
-        let mut misses = Vec::new();
-        for tol in [
-            1e-9, 3e-9, 1e-8, 3e-8, 5e-8, 7e-8, 8e-8, 9e-8, 1e-7, 1.1e-7, 1.5e-7, 3e-7, 1e-6, 1e-5,
-        ] {
-            for presolve in [true, false] {
-                let (problem, _) = model.build();
-                let mut options = crate::SolveOptions::default();
-                options.presolve = presolve;
-                options.tolerances.feasibility = tol;
-                match problem.solve_with(options).map(|o| o.into_solution()) {
-                    Ok(Ok(sol)) => {
-                        let worse = match model.direction {
-                            OptimizationDirection::Maximize => target - sol.objective(),
-                            OptimizationDirection::Minimize => sol.objective() - target,
-                        };
-                        if worse > 1e-6 * (1.0 + target.abs()) {
-                            misses.push(format!(
-                                "tolerance {tol:e}, presolve {presolve}: objective {} against                                  {target} at x*",
-                                sol.objective()
-                            ));
-                        }
-                    }
-                    other => {
-                        misses.push(format!("tolerance {tol:e}, presolve {presolve}: {other:?}"))
-                    }
-                }
-            }
-        }
-        assert!(
-            misses.is_empty(),
-            "{} of 28 solves missed:
-{}
-{}",
-            misses.len(),
-            misses.join(
-                "
-"
-            ),
-            model.source()
-        );
-        check(model);
     }
 }

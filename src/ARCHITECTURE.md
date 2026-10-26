@@ -1016,8 +1016,8 @@ row presolve keeps.
 
 What it keeps: every point of the model as written within the engine's box whose integer
 vars are exactly integral, up to round-off (dual fixing keeps an optimum instead, and
-`SolveOptions::dual_fixing` or a warm-start hint turns it off). Every
-decision is made in user units against the engine's contract:
+`SolveOptions::dual_fixing` or a warm-start hint turns it off). Every decision is made in
+user units against the engine's contract:
 
 - a row is held to the engine's budget, `slack_tol(f, m, n)`, at the magnitude of the corner
   the decision is about (never of the whole box, so a bound of `f64::MAX` cannot inflate

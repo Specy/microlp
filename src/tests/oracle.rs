@@ -190,6 +190,19 @@ pub(crate) fn rows_hold(model: &Model, x: &[f64]) -> bool {
         .all(|row| row_violation(row, x) <= row_tolerance(row, x))
 }
 
+/// How much worse than at `x*` the contract lets an answer's objective be:
+/// [`OBJECTIVE_SLACK`] of one plus the objective's extent over the variable
+/// box, `Σ |c_j| (|x*_j| + hi_j - lo_j)`.
+pub(crate) fn objective_slack(model: &Model) -> f64 {
+    let extent: f64 = model
+        .vars
+        .iter()
+        .zip(&model.xstar)
+        .map(|(v, &xj)| v.obj.abs() * (xj.abs() + (v.hi - v.lo)))
+        .sum();
+    OBJECTIVE_SLACK * (1.0 + extent)
+}
+
 /// Whether `model` lies within the recommended coefficient range: the
 /// nonzero coefficient magnitudes of every row, and of every column, within
 /// six orders of each other.
@@ -284,13 +297,7 @@ fn check_contract_with(
         return;
     }
     let at_star = model.objective_at(&model.xstar);
-    let extent: f64 = model
-        .vars
-        .iter()
-        .zip(&model.xstar)
-        .map(|(v, &xj)| v.obj.abs() * (xj.abs() + (v.hi - v.lo)))
-        .sum();
-    let slack = OBJECTIVE_SLACK * (1.0 + extent);
+    let slack = objective_slack(model);
     let worse = match model.direction {
         OptimizationDirection::Minimize => objective > at_star + slack,
         OptimizationDirection::Maximize => objective < at_star - slack,

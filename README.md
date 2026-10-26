@@ -297,14 +297,20 @@ let outcome = problem.solve_with(options)?;
   `1e-10`, and `int_tol` below `0.5`.
 * `presolve` (on by default): simplify the problem before the search. It never
   removes a variable or changes a real variable's bounds, and it keeps, up to
-  round-off, every solution whose integer variables are exactly integral;
-  every solution is still checked against the problem as you wrote it. A
+  round-off, every solution whose integer variables are exactly integral, or,
+  where `dual_fixing` fixes a variable because of the objective, an optimal
+  one; every solution is still checked against the problem as you wrote it. A
   solution relying on `int_tol` (an integer variable just off its integer
   under a big-M coefficient) is never sought: it is returned where the search
   lands on one, and where the objective can improve forever such a landing
   answers `Unbounded`. A problem with no solution whose integer variables are
   integral is answered `Infeasible` unless that happens, with presolve on or
   off.
+* `dual_fixing` (on by default): let presolve fix an integer variable at a
+  bound that neither the objective nor any constraint gives it a reason to
+  leave. That keeps an optimal solution, not every solution: turn it off when
+  every integral solution must stay reachable, for example to enumerate the
+  solutions within an objective cutoff. A `warm_start` hint turns it off.
 
 ## Changing a solved problem
 

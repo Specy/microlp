@@ -88,12 +88,13 @@ range. Within the range, an [`Error::InternalError`] is a bug or one of the
 [`SolveOptions::presolve`], on by default, simplifies the problem before the
 search. It never removes a variable or changes a real variable's bounds, and
 it keeps, up to round-off, every solution whose integer variables are exactly
-integral. A solution relying on [`SolveOptions::int_tol`] (an integer variable
-just off its integer under a big-M coefficient) is never sought: it is returned
-where the search lands on one, and where the objective can improve forever
-such a landing answers [`Error::Unbounded`]. A problem with no solution whose
-integer variables are integral is answered [`Error::Infeasible`] unless that
-happens, with presolve on or off.
+integral, or, where [`SolveOptions::dual_fixing`] fixes a variable because of
+the objective, an optimal one. A solution relying on [`SolveOptions::int_tol`]
+(an integer variable just off its integer under a big-M coefficient) is never
+sought: it is returned where the search lands on one, and where the objective
+can improve forever such a landing answers [`Error::Unbounded`]. A problem with
+no solution whose integer variables are integral is answered
+[`Error::Infeasible`] unless that happens, with presolve on or off.
 
 When a solve call returns successfully:
 

@@ -114,10 +114,10 @@
 //!   (integer bound rounding, binary coefficient tightening) or only some
 //!   optimum (dual fixing). This is sound because MILP post-solve edits
 //!   re-solve from the untouched `MipState::base` and incumbents are checked
-//!   against the original rows. Dual fixing also needs `allow_dual`, off when
-//!   a warm-start hint accompanies the solve, so that a feasible hint is
-//!   never excluded by an optimality-only argument, and when the caller turns
-//!   it off (`SolveOptions::dual_fixing`).
+//!   against the original rows. Dual fixing also needs `allow_dual`, which is
+//!   off when the caller turns dual fixing off (`SolveOptions::dual_fixing`)
+//!   and when a warm-start hint accompanies the solve, so that a feasible hint
+//!   is never excluded by an optimality-only argument.
 
 mod model;
 mod params;
