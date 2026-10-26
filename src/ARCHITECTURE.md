@@ -750,6 +750,7 @@ model is `src/solver/tolerances.rs`.
 | Knob | Default | Gates |
 |---|---|---|
 | `presolve` | `true` | the exact reductions of §7.4 before the solve; off, the engine gets the model as written |
+| `dual_fixing` | `true` | whether presolve may fix integer vars by an optimality argument, which keeps an optimum rather than every integral point (§7.4); off when a warm-start hint is given |
 | `int_tol` | `1e-6` | whether a value counts as integral, for acceptance only (§7.1): an integral LP point is adopted as computed and closes its node, so integer values are reported within it (§5.4); the integer `Solution::fix_var` fixes a value at; the post-edit incumbent prefilter's integrality. Finite, in `[0, 0.5)` |
 | `mip_gap` | `0.0` | early-stop proof quality (relative gap, §5.5) |
 | `tolerances.feasibility` | `1e-7`, absolute, at least `1e-10` | the contract (§7.1), which presolve, the engine, the incumbent guard, the LP answer check and the post-edit incumbent prefilter all hold to |
@@ -1014,7 +1015,8 @@ bounds, would take room the model leaves it, and the rooms of several vars can a
 row presolve keeps.
 
 What it keeps: every point of the model as written within the engine's box whose integer
-vars are exactly integral, up to round-off (dual fixing keeps an optimum instead). Every
+vars are exactly integral, up to round-off (dual fixing keeps an optimum instead, and
+`SolveOptions::dual_fixing` or a warm-start hint turns it off). Every
 decision is made in user units against the engine's contract:
 
 - a row is held to the engine's budget, `slack_tol(f, m, n)`, at the magnitude of the corner
