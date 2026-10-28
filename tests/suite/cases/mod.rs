@@ -28,8 +28,8 @@ pub enum Tier {
     /// From `--hard` up: instances a branch & bound may take minutes on.
     Hard,
     /// Only under `--xhard`: instances with 10-minute default budgets that
-    /// microlp is not expected to finish (they assert clean interrupts and
-    /// bound sanity against externally certified optima).
+    /// microlp is not expected to finish (they accept clean interrupts and
+    /// validate incumbents against externally certified results).
     XHard,
 }
 

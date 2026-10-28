@@ -8,6 +8,17 @@ mod tsp;
 
 mod resume;
 
-mod regressions;
+pub(crate) mod regressions;
 
 mod mip_api;
+
+mod feasibility;
+
+#[cfg(test)]
+mod oracle;
+
+mod magnitudes;
+
+mod scaling;
+
+mod presolve_api;

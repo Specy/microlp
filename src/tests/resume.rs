@@ -5,6 +5,7 @@ mod tests_resume {
     }
 
     use crate::{solver::float_eq, *};
+    use core::time::Duration;
 
     fn solution(outcome: SolveOutcome) -> Solution {
         outcome

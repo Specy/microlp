@@ -441,14 +441,17 @@ fn eq_chain_cases(cases: &mut Vec<Case>) {
     }
 }
 
-/// Big-M rows with M up to 1e8 and a by-construction optimum: the numerics
-/// guards (noise-scaled rounding, rounded-incumbent validation) end to end.
+/// Big-M rows with M up to 1e8 and a by-construction optimum. The answer is
+/// held to the contract and to that optimum as a bound: a facility "closed"
+/// within `int_tol` carries up to `M · 1e-6`, a point within the contract
+/// that the search is free to report (the documented big-M caveat), so it
+/// may beat the exact optimum but never lose to it.
 /// One facility is cheap-but-far (open cost high), one expensive-per-unit:
 /// optimum = min(open_a + demand*unit_a, open_b + demand*unit_b, open both).
 fn big_m_exact_cases(cases: &mut Vec<Case>) {
     for (i, &m) in [1e6f64, 1e7, 1e8].iter().enumerate() {
         let name = format!("family/bigm-exact/m1e{}", 6 + i);
-        cases.push(Case::solve(name, Tier::Medium, 30, move || {
+        cases.push(Case::custom(name, Tier::Medium, 30, move |budget| {
             // demand 10; a: open 100, unit 2; b: open 30, unit 9.
             // one(a) = 120, one(b) = 120, both: 130 + best mix 10*2 = 150 no —
             // both = 100 + 30 + 20 = 150. True optimum = 120 (tie, either).
@@ -465,7 +468,21 @@ fn big_m_exact_cases(cases: &mut Vec<Case>) {
             b.constraint(&[(xa, 1.0), (xb, 1.0)], Ge, demand);
             b.constraint(&[(xa, 1.0), (ya, -m)], Le, 0.0);
             b.constraint(&[(xb, 1.0), (yb, -m)], Le, 0.0);
-            Ok((b.spec, b.problem, Expected::objective(best)))
+            b.problem.set_time_limit(budget);
+            let outcome = b
+                .problem
+                .solve()
+                .map_err(|e| format!("solve failed: {e}"))?;
+            let sol = crate::verify::require_solution(outcome, "big-M")?;
+            crate::verify::validate_incumbent(&b.spec, &sol)?;
+            crate::LAST_SOLVE.with(|slot| *slot.borrow_mut() = Some((sol.objective(), best)));
+            if sol.objective() > best + 1e-6 {
+                return Err(format!(
+                    "objective {} is worse than the optimum {best}",
+                    sol.objective()
+                ));
+            }
+            Ok(())
         }));
     }
 }

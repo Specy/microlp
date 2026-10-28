@@ -229,12 +229,10 @@ pub fn register(cases: &mut Vec<Case>) {
 }
 
 fn warm_restart_time_cases(cases: &mut Vec<Case>) {
-    // stein27 (MIPLIB, optimum 18, Minimize). Cold full solve measured at
-    // ~530 ms / ~10,200 nodes; proving optimality even with the true optimum
-    // pre-seeded still costs ~9,850 nodes / ~500 ms (see module doc). Slice
-    // starts at 15 ms (~3% of the cold solve — reliably interrupts round 1,
-    // following incr::resume-midway-milp's small-fraction-of-full-solve
-    // approach to sizing) and doubles each round.
+    // stein27 (MIPLIB, optimum 18, Minimize). The slice starts at 15 ms, a
+    // small fraction of the cold solve, so that it reliably interrupts round
+    // 1 (incr::resume-midway-milp sizes its slice the same way), and doubles
+    // each round.
     cases.push(Case::custom(
         "milp/warm-restart-stein27",
         Tier::Medium,
@@ -252,11 +250,10 @@ fn warm_restart_time_cases(cases: &mut Vec<Case>) {
         },
     ));
 
-    // mod008 (MIPLIB, optimum 307, Minimize). Cold full solve ~2.3 s /
-    // ~39,500 nodes; proving-with-optimal-hint ~26,100 nodes / ~1.3 s. Kept
-    // Hard tier like its plain miplib/mod008/int case (same instance, same
-    // reason: too slow for the default run). Slice starts at 100 ms (~4% of
-    // the cold solve) and doubles each round.
+    // mod008 (MIPLIB, optimum 307, Minimize). Kept Hard tier like its plain
+    // miplib/mod008/int case (same instance, same reason: too slow for the
+    // default run). The slice starts at 100 ms, a small fraction of the cold
+    // solve, and doubles each round.
     cases.push(Case::custom(
         "milp/warm-restart-mod008",
         Tier::Hard,
@@ -274,11 +271,10 @@ fn warm_restart_time_cases(cases: &mut Vec<Case>) {
         },
     ));
 
-    // Oracle-backed random MILP: the hard (strongly-correlated) knapsack.
-    // Cold full solve ~1.8 s / ~107,000 nodes; proving-with-optimal-hint
-    // ~106,000 nodes / ~1.6 s (barely less — the LP bound is weak by
-    // construction). Slice starts at 60 ms (~3% of the cold solve) and
-    // doubles each round. Hard tier: heavier than the Standard-tier norm.
+    // Oracle-backed random MILP: the hard (strongly-correlated) knapsack,
+    // whose LP bound is weak by construction. The slice starts at 60 ms, a
+    // small fraction of the cold solve, and doubles each round. Hard tier:
+    // heavier than the Standard-tier norm.
     cases.push(Case::custom(
         "milp/warm-restart-knap-hard",
         Tier::Hard,
@@ -303,7 +299,7 @@ fn nodelimit_step_cases(cases: &mut Vec<Case>) {
     // Deterministic twin of milp/warm-restart-stein27: node_limit instead of
     // time_limit, so the round count and every intermediate outcome are
     // exactly reproducible (no wall-clock sensitivity at all). K starts at
-    // 250 nodes (~2.5% of the ~9,850-node proof cost) and doubles each round.
+    // 250 nodes, a small fraction of the proof's, and doubles each round.
     cases.push(Case::custom(
         "milp/nodelimit-steps-stein27",
         Tier::Medium,
@@ -322,12 +318,10 @@ fn nodelimit_step_cases(cases: &mut Vec<Case>) {
     ));
 
     // Deterministic twin of milp/warm-restart-knap-hard. K starts at 1,000
-    // nodes (~1% of the ~106,000-node proof cost) and doubles each round:
-    // round 8's 128,000-node budget exceeds even the 107,028-node COLD proof
-    // cost, so convergence there is guaranteed whatever the hint. (An earlier
-    // draft tripled instead, converging in 6 rounds, but with the growth^8
-    // plateau its never-converges worst case was ~60 min — doubling keeps it
-    // at ~2.4 min; see `geometric`.)
+    // nodes, a small fraction of the proof's, and doubles each round, so that
+    // a round's budget comes to exceed the cold proof's nodes and converges
+    // whatever the hint, while the plateau of `geometric` keeps the worst
+    // case of a search that never converges short.
     cases.push(Case::custom(
         "milp/nodelimit-steps-knap-hard",
         Tier::Hard,

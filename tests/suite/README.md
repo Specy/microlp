@@ -10,7 +10,7 @@ right answers, not merely the same answers as before.
 ## Running
 
 ```bash
-cargo test --release --test suite                          # default: easy + medium (~2 s)
+cargo test --release --test suite                          # default: easy + medium
 cargo test --release --test suite -- --hard                # + long-running MILPs (CI runs this)
 cargo test --release --test suite -- --xhard               # + 10-minute-budget instances
 cargo test --release --test suite -- --limit 25 --seed 42  # stable shuffled subset
@@ -19,6 +19,11 @@ cargo test --release --test suite -- --list                # show selected cases
 cargo test --release --test suite -- --parallel 8          # worker threads
 cargo test --release --test suite -- --help
 ```
+
+The test-only `highs` feature also cross-checks the MWIS warm-start cases
+against HiGHS: add `--features highs` to a command above, before any `--`
+(building it needs CMake, a C++ compiler and libclang). CI runs the hard tier
+with it on Linux.
 
 The runner prints one line per case and a final summary with pass/fail counts,
 then exits nonzero if anything failed (CI-friendly). Under a debug build only

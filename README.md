@@ -19,6 +19,11 @@ recommended to use it with the [rooc modeling language](https://github.com/specy
 
 The sections below show how to use microlp directly.
 
+microlp requires Rust 1.86 or later. The latest releases of its `sprs`
+dependency need Rust 1.88, so on Rust 1.86 and 1.87 resolve dependencies with
+the MSRV-aware resolver (`resolver = "3"`, the default of edition 2024), or
+run `cargo update -p sprs --precise 0.11.4`.
+
 ## Features
 
 * Pure Rust. Runs on WebAssembly.
@@ -28,8 +33,9 @@ The sections below show how to use microlp directly.
 * Handles problems with hundreds of thousands of variables and constraints.
 
 Integer and boolean variables are handled with branch & bound. The library is
-already quite powerful and fast, but it may still cycle or lose precision on
-some hard problems. Please report bugs and contribute code!
+already quite powerful and fast, but on some hard or ill-conditioned problems a
+solve can still fail with `Error::InternalError` rather than answer. Please
+report bugs and contribute code!
 
 ## Basic usage
 
@@ -46,11 +52,12 @@ let y = problem.add_integer_var(2.0, (0, 3));
 problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
 problem.add_constraint(&[(x, 2.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
 
-// The optimum is 7, at x = 1, y = 3.
+// The optimum is 7, at x = 1, y = 3. An integer variable's value is
+// reported within `int_tol` of its integer: round it for an exact one.
 let solution = problem.solve().unwrap().into_solution().unwrap();
-assert_eq!(solution.objective(), 7.0);
-assert_eq!(solution.var_value(x), 1.0);
-assert_eq!(solution.var_value(y), 3.0);
+assert!((solution.objective() - 7.0).abs() < 1e-6);
+assert!((solution.var_value(x) - 1.0).abs() < 1e-6);
+assert_eq!(solution.var_value(y).round(), 3.0);
 ```
 
 ## Defining a problem
@@ -58,7 +65,12 @@ assert_eq!(solution.var_value(y), 3.0);
 A `Problem` is created with an optimization direction and filled with
 variables and constraints. Each variable is defined by its objective
 coefficient and its bounds, and is represented by a `Variable` handle that you
-keep to reference it later.
+keep to reference it later. A handle belongs to the problem that created it:
+use it only with that problem and its solutions. Another problem does not
+detect a foreign handle; it refers to that problem's variable with the same
+index. If the index is absent, accessors and `Problem::add_constraint` panic;
+`Solution::add_constraint` and a solve's warm-start hints return
+`Error::InvalidOperation`.
 
 ```rust
 use microlp::{ComparisonOp, LinearExpr, OptimizationDirection, Problem};
@@ -69,6 +81,16 @@ let x = problem.add_var(1.5, (0.0, f64::INFINITY)); // real, x >= 0
 let y = problem.add_integer_var(1.0, (-10, 10));    // integer, -10 <= y <= 10
 let z = problem.add_binary_var(2.0);                // boolean: 0 or 1
 ```
+
+A bound of magnitude 2^52 (about 4.5e15) or more on its side of infinity is
+treated as infinite, so an upper bound of `f64::MAX` or `i64::MAX` means no
+upper bound. A bound that large meant as a real bound is therefore not one,
+and a solution can lie beyond it. Each bound is judged on its own, so
+`(5e15, f64::MAX)` means `x >= 5e15`; only bounds with `min >= max` are kept
+as given, so a variable fixed at such a value stays fixed and an empty range
+stays infeasible. A constraint's right-hand side is not cut off: it is used as
+given, so a bound that large can be written as a constraint such as
+`x <= 5e15`.
 
 The left-hand side of a constraint can be given as a slice of
 `(variable, coefficient)` pairs, as any iterator of such pairs, or as a
@@ -88,14 +110,67 @@ problem.add_constraint(lhs, ComparisonOp::Eq, 0.0);
 
 ## Solving and reading the solution
 
-`solve()` tries to find the optimal solution, it returns `Error::Infeasible` when the constraints contradict each other and `Error::Unbounded` when the objective can grow forever. Invalid numeric options return `Error::InvalidOptions`, and unrecoverable numerical failures return `Error::InternalError`.
+`solve()` tries to find the optimal solution. Every solution meets each
+constraint and each variable bound within an absolute tolerance (`1e-7` by
+default, `Tolerances::feasibility`, or the round-off of evaluating it in `f64`
+where that is larger), checked against the problem as you wrote it. Otherwise
+the solve returns an error:
+
+* `Error::Infeasible`: the solver proved, from the problem's data, that no
+  assignment with every integer variable at an integer within its bounds, and
+  every variable whose bounds are equal at its value, meets the constraints
+  and the other bounds within that tolerance (see `Tolerances::feasibility`).
+* `Error::Unbounded`: the objective can improve forever.
+* `Error::InternalError`: a numerical failure the solver could not recover
+  from. It returns this rather than an answer it could not verify.
+* `Error::InvalidOptions` for an invalid numeric option, and
+  `Error::InvalidOperation` for invalid input, both checked before anything
+  is solved. Every number of the problem must be finite, but a bound or a
+  constraint's right-hand side may be infinite on the side it leaves open:
+  `f64::NEG_INFINITY` as a lower bound or on a `Ge` constraint,
+  `f64::INFINITY` as an upper bound or on a `Le` constraint, where it
+  constrains nothing. A warm-start hint must give finite values to variables
+  of the problem.
+
+An optimal solution is optimal at the point the solver ends at, within the
+tolerance, not over every point the tolerance admits: on an ill-conditioned
+problem, where a small coefficient sits beside a large one, the tolerance can
+move the objective far from the exact optimum.
+
+Keep the coefficients of each constraint, and those of each variable across
+the constraints, within six orders of magnitude: the largest magnitude at most
+`1e6` times the smallest. Nothing outside that range is refused or changed,
+and every solution is still checked against the model as you wrote it, but a
+solve can then fail with `Error::InternalError`, whose message names the
+constraint (in the order added) and the variable (its index) whose
+coefficients span the most, those of them outside the range. Changing the
+units of a variable or of a constraint usually brings a model back into
+range. Within the range, an `Error::InternalError` is a bug or one of the
+known limitations below: please report it.
+
+Nearly dependent constraints can exceed floating-point resolution even within
+that coefficient range: a solve can then fail with `Error::InternalError`; in
+extreme cases a feasible model whose feasible points require very large
+variable values is reported `Infeasible`, and a solve whose last basis is
+singular to `f64` reports a solution for an unbounded model, or one far from
+the optimum of a bounded model. A common source is a group of free variables
+that can all shift together, such as every bus angle of a power-flow network
+left free: where rounding in the coefficients leaves that shift a tiny effect
+on the constraints, a model meant to have no solution can have one as written,
+at very large variable values, which a solve can return. Fix one of those
+variables, such as a reference angle, to remove the shift. Outside the range,
+a bounded model can also be reported `Unbounded`. An objective whose terms
+(costs times values) or their sum overflow `f64` cannot be evaluated: a solve
+that meets one fails with `Error::InternalError`, even where the exact
+objective is representable. See the
+[known numerical limitations](src/ARCHITECTURE.md#79-known-limitations).
 
 When a solver decides to produce a solution it might be for different reasons:
 
 * `SolveOutcome::Solution` contains a validated assignment. Its status is
-  `SolutionStatus::Optimal` when exact optimality was proved, or
-  `SolutionStatus::Feasible` when a valid incumbent is available without an
-  exact proof, for example if a time or node limit has been reached.
+  `SolutionStatus::Optimal` when optimality was proved, with no MIP gap, or
+  `SolutionStatus::Feasible` when a valid incumbent is available without that
+  proof, for example if a time or node limit has been reached.
 * `SolveOutcome::Interrupted` means a time or node limit fired before a usable
   incumbent existed. It exposes the termination reason and statistics, but no
   objective or variable-value accessors as they are not available. This case is
@@ -123,17 +198,31 @@ match problem.solve()? {
 }
 ```
 
-Values on a `Solution` are read per variable or by iterating. For integer and boolean
-variables `var_value` returns an exact integer, and the reported objective is
-computed from exactly the values you read:
+Values on a `Solution` are read per variable or by iterating, as the solver
+computed them, and the reported objective is computed from exactly the values
+you read. An integer or boolean variable's value lies within `int_tol` (default
+`1e-6`) of an integer, not necessarily on it: values like `0.9999999` are
+normal. One fixed at an integer (by its bounds, the search or an edit) lies on
+it. Use `.round()` where you need an exact integer (`var_domain` tells which
+variables are integer or boolean), bearing in mind that rounded values need
+not meet the constraints: under a big-M constraint such as `x <= 1e7 * y`, a
+`y` of `1e-6` allows `x` up to 10, which `y` rounded to zero forbids. Keep
+big-M coefficients no larger than the model needs.
 
 ```rust
-let value = solution.var_value(x);   // rounded to an exact integer for
-                                     // integer/boolean variables
-let raw = solution.var_value_raw(x); // without the rounding
-let same = solution[x];              // indexing is equivalent to var_value_raw()
+use microlp::VarDomain;
+
+let value = solution.var_value(x);           // as computed
+let count = solution.var_value(y).round();   // an exact integer
+let same = solution[x];                      // indexing is equivalent to var_value()
 
 for (var, value) in &solution {
+    // Exact integers for the integer and boolean variables (`+ 0.0` turns
+    // the `-0` that rounds a value just below zero into `0`).
+    let value = match solution.var_domain(var) {
+        VarDomain::Integer | VarDomain::Boolean => value.round() + 0.0,
+        VarDomain::Real => value,
+    };
     println!("{}: {}", var.idx(), value);
 }
 ```
@@ -146,7 +235,7 @@ iterations, elapsed time, the best proven bound and the current gap.
 Set a time budget with `set_time_limit`. When it runs out, the outcome
 contains either a feasible incumbent or an interrupted search. `resume()`
 continues the same search with the per-call options used by the immediately
-preceding solve or resume.
+preceding solve, resume or edit.
 
 Use `resume_with` to resume with different settings.
 
@@ -169,6 +258,8 @@ while matches!(
 ```
 
 Time limits are checked periodically, so a solve can run slightly past its budget.
+A budget too long to add to the clock, such as `Duration::MAX`, counts as no
+limit.
 
 ## Solve options
 
@@ -194,9 +285,32 @@ let outcome = problem.solve_with(options)?;
   reason `MipGap`. The default `0.0` requires exact optimality.
 * `warm_start`: a starting assignment (it may cover only some variables).
   A good one gives the solver an immediate solution to improve on. It is
-  advisory: if it isn't usable it is ignored.
-* `int_tol`, `tolerances`: numeric tolerances. Values must be finite and non-negative, and the two integrality
-  tolerances must be below `0.5`.
+  advisory: if it isn't usable it is ignored, and a problem with only real
+  variables does not use it. A value that is NaN or infinite, or a variable
+  outside the problem, returns `Error::InvalidOperation`.
+* `int_tol`, `tolerances`: numeric tolerances. A value within `int_tol` of an
+  integer counts as integral, for acceptance only (see `presolve` below), and
+  integer values are reported within it (a fixed integer variable's on its
+  integer); the feasibility tolerance is absolute, for every variable bound
+  and constraint.
+  Values must be finite and non-negative, the feasibility tolerance at least
+  `1e-10`, and `int_tol` below `0.5`.
+* `presolve` (on by default): simplify the problem before the search. It never
+  removes a variable or changes a real variable's bounds, and it keeps, up to
+  round-off, every solution whose integer variables are exactly integral, or,
+  where `dual_fixing` fixes a variable because of the objective, an optimal
+  one; every solution is still checked against the problem as you wrote it. A
+  solution relying on `int_tol` (an integer variable just off its integer
+  under a big-M coefficient) is never sought: it is returned where the search
+  lands on one, and where the objective can improve forever such a landing
+  answers `Unbounded`. A problem with no solution whose integer variables are
+  integral is answered `Infeasible` unless that happens, with presolve on or
+  off.
+* `dual_fixing` (on by default): let presolve fix an integer variable at a
+  bound that neither the objective nor any constraint gives it a reason to
+  leave. That keeps an optimal solution, not every solution: turn it off when
+  every integral solution must stay reachable, for example to enumerate the
+  solutions within an objective cutoff. A `warm_start` hint turns it off.
 
 ## Changing a solved problem
 
@@ -270,7 +384,9 @@ fn main() -> Result<(), Error> {
         .into_solution()
         .expect("resume_until_answer guarantees a solution");
     for (i, &unit) in units.iter().enumerate() {
-        println!("product {}: {} units", i, solution.var_value(unit));
+        // Rounded: an integer variable's value is reported as computed.
+        let count = solution.var_value(unit).round() + 0.0;
+        println!("product {}: {} units", i, count);
     }
     Ok(())
 }
@@ -285,7 +401,7 @@ Besides unit tests, the repository ships a correctness suite of 200+ LP/MILP
 problems with independently known answers:
 
 ```bash
-cargo test --release --test suite            # default set, a few seconds
+cargo test --release --test suite            # default: easy + medium
 cargo test --release --test suite -- --hard  # plus the long-running ones
 ```
 
@@ -293,7 +409,13 @@ See [tests/suite/README.md](tests/suite/README.md) for how it works, and
 [src/ARCHITECTURE.md](src/ARCHITECTURE.md) if you want to know how the solver
 itself works.
 
-There is also a harder tier called `xhard` which microlp currently cannot solve in reasonable time. (under 10 minutes) which you can run with. This tier is being used to compare with other solvers.
+The origin-feasible property test runs 50,000 cases by default. For a deeper
+run, use `HEGEL_TEST_CASES=500000 cargo test --release --lib origin`, which
+takes about a minute and some 4 GB of memory.
+
+The `xhard` tier gives larger instances a 10-minute budget. It accepts clean
+interruptions and checks returned incumbents against externally certified results:
+
 ```
 cargo test --release --test suite -- --xhard
 ```
@@ -301,10 +423,11 @@ cargo test --release --test suite -- --xhard
 ## Benchmarks
 
 [BENCHMARK.md](https://github.com/Specy/microlp/blob/master/BENCHMARK.md)
-compares microlp against other open-source solvers on the suite's benchmark
-instances, and tracks how close it gets on the instances it cannot yet solve
-within a time budget. Regenerate it from a clone of this repository (the
-crates.io package does not include the benchmark data) with:
+records a comparison of an earlier revision against other open-source solvers
+on the suite's benchmark instances. Its date and revision identify the code
+measured; it does not describe the current release. Regenerate it from a clone
+of this repository (the crates.io package does not include the benchmark data)
+with:
 
 ```bash
 cargo run -p microlp-benchmark --release

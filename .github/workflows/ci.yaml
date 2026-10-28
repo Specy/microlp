@@ -94,10 +94,10 @@ jobs:
       # (MILPBench instances beyond the solver's ceiling, 10-minute budgets)
       # stays manual: run it locally with
       # `cargo test --release --test suite -- --xhard`.
-      # On Linux, additionally cross-check every result against HiGHS via
-      # `--features highs`. The grounding is OS-independent, so it runs on one
-      # runner only; building HiGHS needs CMake and a C++ compiler, both
-      # preinstalled on ubuntu-latest.
+      # On Linux, additionally cross-check the MWIS warm-start cases against
+      # HiGHS via the test-only `--features highs`. The grounding is
+      # OS-independent, so it runs on one runner only; building HiGHS needs
+      # CMake, a C++ compiler and libclang, all preinstalled on ubuntu-latest.
       # The `--features highs` fragment below is a workflow literal selected by
       # the matrix, not external input, so interpolating it into the command is
       # safe and keeps the step shell-agnostic (this job also runs on Windows,
@@ -109,6 +109,31 @@ jobs:
         env:
           RUST_LOG: "trace"
         run: cargo test --locked --lib
+
+  msrv:
+    name: MSRV
+    runs-on: "ubuntu-latest"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          key: ${{ runner.os }}-msrv-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+
+      # What a crate that depends on microlp builds, the library, must build
+      # on the `rust-version` of Cargo.toml with the committed lockfile.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.86.0
+
+      - name: Check the library on the minimum supported Rust version
+        run: cargo check --locked --lib
 
   wasm:
     name: WASM
@@ -161,7 +186,7 @@ jobs:
 
   publish-crate:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [conformance, test, wasm]
+    needs: [conformance, test, msrv, wasm]
 
     name: Publish to Crates.io
     runs-on: "ubuntu-latest"

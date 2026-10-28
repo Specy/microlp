@@ -79,10 +79,6 @@ fn instances() -> Vec<MipInstance> {
         // solve may not finish in budget, and a mid-B&B deadline must yield a
         // clean status. See register.
         mk("mod008", 307.0, 290.93, T2DP, EXACT, 600),
-        // enigma deterministically triggers a singular-matrix error at a B&B
-        // node re-solve; solve_node_lp retries such a node once from the
-        // all-slack basis (the singular-LU robustness valve, see
-        // src/ARCHITECTURE.md §5.3), so enigma solves to its optimum (~14 s).
         mk("enigma", 0.0, 0.0, EXACT, EXACT, 600),
         mk("vpm1", 20.0, 15.4167, T2DP, EXACT, 600),
         mk("gt2", 21166.0, 13460.233074, T2DP, EXACT, 600),

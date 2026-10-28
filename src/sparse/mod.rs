@@ -2,7 +2,6 @@ use crate::helpers::to_dense;
 use sprs::CsMat;
 #[cfg(test)]
 use sprs::CsVec;
-use std::fmt::{Display, Formatter};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SparseVec {
@@ -328,42 +327,5 @@ pub struct Perm {
     pub(crate) new2orig: Vec<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Error {
-    SingularMatrix,
-}
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let r = match self {
-            Error::SingularMatrix => "Singular matrix",
-        };
-        write!(f, "{}", r)
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn init() {
-        let _ = env_logger::builder().is_test(true).try_init();
-    }
-
-    #[test]
-    fn mat_transpose() {
-        init();
-        let mut mat = SparseMat::new(2);
-        mat.push(0, 1.1);
-        mat.push(1, 2.2);
-        mat.seal_column();
-        mat.push(1, 3.3);
-        mat.seal_column();
-        mat.push(0, 4.4);
-        mat.seal_column();
-
-        let transp = mat.transpose();
-        assert_eq!(&transp.indptr, &[0, 2, 4]);
-        assert_eq!(&transp.indices, &[2, 0, 1, 0]);
-        assert_eq!(&transp.data, &[4.4, 1.1, 3.3, 2.2]);
-    }
-}
+mod tests;

@@ -1,12 +1,19 @@
 use microlp::{
-    ComparisonOp, Error, OptimizationDirection, Problem, SolutionStatus, SolveOptions,
-    SolveOutcome, Variable,
+    ComparisonOp, Error, OptimizationDirection, Problem, ResumeOptions, SolutionStatus,
+    SolveOptions, SolveOutcome, Variable,
 };
 
 fn expect_solution(outcome: SolveOutcome) -> microlp::Solution {
     outcome
         .into_solution()
         .expect("an unlimited bounded feasible solve must return a solution")
+}
+
+/// The distance from an integer within which a solve reports an integer
+/// var's value (`SolveOptions::int_tol`): values are reported as computed, so
+/// an optimum's objective lies within it times the costs of the enumeration's.
+fn int_tol() -> f64 {
+    SolveOptions::default().int_tol
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -291,6 +298,29 @@ fn mixed_oracle(case: &MixedCase) -> Option<(f64, [i32; 3], f64)> {
     best
 }
 
+/// How far the objective of `case` moves per unit its integer vars lie off
+/// their integers: their costs, and the real var's cost times the most the
+/// integer terms of a row move the real var (whose entry, an integer, is at
+/// least one where it is not zero).
+fn mixed_objective_reach(case: &MixedCase) -> f64 {
+    let n = case.n_int;
+    let costs: f64 = case.objective[..n]
+        .iter()
+        .map(|&c| f64::from(c).abs())
+        .sum();
+    let reach = case
+        .rows
+        .iter()
+        .map(|row| {
+            row.coeffs[..n]
+                .iter()
+                .map(|&a| f64::from(a).abs())
+                .sum::<f64>()
+        })
+        .fold(0.0, f64::max);
+    costs + f64::from(case.objective[n]).abs() * reach
+}
+
 fn build_mixed_problem(case: &MixedCase) -> (Problem, Vec<Variable>) {
     let mut problem = Problem::new(OptimizationDirection::Minimize);
     let mut vars: Vec<_> = (0..case.n_int)
@@ -322,14 +352,23 @@ fn assert_solution(
         SolutionStatus::Optimal,
         "seed {seed}: {case:?}"
     );
+    let costs: f64 = case.objective[..case.n]
+        .iter()
+        .map(|&c| f64::from(c).abs())
+        .sum();
     assert!(
-        (solution.objective() - expected as f64).abs() < 1e-7,
+        (solution.objective() - expected as f64).abs() < 1e-7 + int_tol() * costs,
         "seed {seed}: objective {}, expected {expected}; {case:?}",
         solution.objective()
     );
     let mut values = [0; 4];
     for (v, value) in values.iter_mut().enumerate().take(case.n) {
-        *value = solution.var_value(vars[v]).round() as i32;
+        let x = solution.var_value(vars[v]);
+        assert!(
+            (x - x.round()).abs() <= int_tol(),
+            "seed {seed}: x{v} = {x} is not integral within int_tol; {case:?}"
+        );
+        *value = x.round() as i32;
     }
     assert!(
         case.rows.iter().all(|row| row_holds(row, &values, case.n)),
@@ -339,6 +378,8 @@ fn assert_solution(
 
 #[test]
 fn bounded_integer_models_match_exhaustive_enumeration() {
+    // How many of the searches sliced by the node limit were interrupted.
+    let mut resumed_searches = 0;
     for seed in 0..50_000 {
         let case = generated_case(seed);
         let expected = brute_force(&case);
@@ -349,7 +390,10 @@ fn bounded_integer_models_match_exhaustive_enumeration() {
             (Some((objective, values)), Ok(outcome)) => {
                 let solution = expect_solution(outcome);
                 assert_solution(&case, &vars, seed, objective, &solution);
-                let cold_values: Vec<_> = vars.iter().map(|&var| solution.var_value(var)).collect();
+                let cold_values: Vec<_> = vars
+                    .iter()
+                    .map(|&var| solution.var_value(var).round())
+                    .collect();
 
                 if seed % 10 == 0 {
                     let (hinted_problem, hinted_vars, options) =
@@ -363,11 +407,23 @@ fn bounded_integer_models_match_exhaustive_enumeration() {
                 }
 
                 if seed % 25 == 0 {
+                    // The root alone, then one node a call: every search the
+                    // root does not end resumes, the first time with new
+                    // options, then with those, and must end on the point of
+                    // the search solved at once.
                     let mut options = SolveOptions::default();
-                    options.node_limit = Some(1);
+                    options.node_limit = Some(0);
                     let mut resumed = problem.solve_with(options).unwrap_or_else(|error| {
                         panic!("seed {seed}: node-limited solve failed: {error}; {case:?}")
                     });
+                    if !resumed.is_optimal() {
+                        resumed_searches += 1;
+                        let mut one_node = ResumeOptions::default();
+                        one_node.node_limit = Some(1);
+                        resumed = resumed.resume_with(one_node).unwrap_or_else(|error| {
+                            panic!("seed {seed}: resume failed: {error}; {case:?}")
+                        });
+                    }
                     for _ in 0..10_000 {
                         if resumed.is_optimal() {
                             break;
@@ -378,8 +434,10 @@ fn bounded_integer_models_match_exhaustive_enumeration() {
                     }
                     let resumed = expect_solution(resumed);
                     assert_solution(&case, &vars, seed, objective, &resumed);
-                    let resumed_values: Vec<_> =
-                        vars.iter().map(|&var| resumed.var_value(var)).collect();
+                    let resumed_values: Vec<_> = vars
+                        .iter()
+                        .map(|&var| resumed.var_value(var).round())
+                        .collect();
                     assert_eq!(
                         resumed_values, cold_values,
                         "seed {seed}: resumed solve selected a different optimum; {case:?}"
@@ -388,6 +446,106 @@ fn bounded_integer_models_match_exhaustive_enumeration() {
             }
             (Some(expected), other) => {
                 panic!("seed {seed}: expected {expected:?}, got {other:?}; {case:?}")
+            }
+        }
+    }
+    // Most searches end at their root; enough others must resume for the
+    // comparison above to test resumes.
+    assert!(
+        resumed_searches >= 20,
+        "only {resumed_searches} sliced searches were interrupted"
+    );
+}
+
+/// The integer models with their costs times `step`, maximized when
+/// `maximize`, beside a continuous var fixed at `0.7` with a cost of `0.3`:
+/// the objective takes the values `0.21 + k * step` at the integral points.
+/// Returns the problem and the integer vars.
+fn build_lattice_problem(case: &Case, step: f64, maximize: bool) -> (Problem, Vec<Variable>) {
+    let direction = if maximize {
+        OptimizationDirection::Maximize
+    } else {
+        OptimizationDirection::Minimize
+    };
+    let mut problem = Problem::new(direction);
+    let vars: Vec<_> = (0..case.n)
+        .map(|v| {
+            problem.add_integer_var(
+                f64::from(case.objective[v]) * step,
+                (case.lo[v], case.hi[v]),
+            )
+        })
+        .collect();
+    problem.add_var(0.3, (0.7, 0.7));
+    for row in &case.rows {
+        problem.add_constraint(
+            (0..case.n).map(|v| (vars[v], f64::from(row.coeffs[v]) * row.scale)),
+            row.op,
+            f64::from(row.rhs) * row.scale,
+        );
+    }
+    (problem, vars)
+}
+
+/// The search rounds a node's bound up to the values the objective takes at
+/// integral points: with a step other than one, an offset from a fixed var
+/// and either direction, presolve on and off, the optimum is still the
+/// enumeration's.
+#[test]
+fn objectives_on_a_lattice_match_exhaustive_enumeration() {
+    const STEPS: [f64; 5] = [2.0, 0.5, 3.0, 0.25, 6.0];
+    for seed in 0..20_000u64 {
+        let case = generated_case(seed ^ 0x9e37_79b9_7f4a_7c15);
+        let maximize = seed % 2 == 1;
+        let step = STEPS[(seed / 2 % 5) as usize];
+        let presolve = seed % 3 != 0;
+        // The enumeration minimizes: a maximum is the minimum of the negation.
+        let sign = if maximize { -1 } else { 1 };
+        let mut minimized = case.clone();
+        for cost in &mut minimized.objective {
+            *cost *= sign;
+        }
+        let expected = brute_force(&minimized)
+            .map(|(objective, _)| step * (i64::from(sign) * objective) as f64 + 0.3 * 0.7);
+        let (problem, vars) = build_lattice_problem(&case, step, maximize);
+        let mut options = SolveOptions::default();
+        options.presolve = presolve;
+        let context = format!("seed {seed}, step {step}, maximize {maximize}, presolve {presolve}");
+        match (expected, problem.solve_with(options)) {
+            (None, Err(Error::Infeasible)) => {}
+            (None, other) => panic!("{context}: expected infeasible, got {other:?}; {case:?}"),
+            (Some(objective), Ok(outcome)) => {
+                let solution = expect_solution(outcome);
+                assert_eq!(
+                    solution.status(),
+                    SolutionStatus::Optimal,
+                    "{context}: {case:?}"
+                );
+                let costs: f64 = case.objective[..case.n]
+                    .iter()
+                    .map(|&c| f64::from(c).abs() * step)
+                    .sum();
+                assert!(
+                    (solution.objective() - objective).abs() < 1e-7 + int_tol() * costs,
+                    "{context}: objective {}, expected {objective}; {case:?}",
+                    solution.objective()
+                );
+                let mut values = [0; 4];
+                for (v, value) in values.iter_mut().enumerate().take(case.n) {
+                    let x = solution.var_value(vars[v]);
+                    assert!(
+                        (x - x.round()).abs() <= int_tol(),
+                        "{context}: x{v} = {x} is not integral within int_tol; {case:?}"
+                    );
+                    *value = x.round() as i32;
+                }
+                assert!(
+                    case.rows.iter().all(|row| row_holds(row, &values, case.n)),
+                    "{context}: solver returned infeasible values {values:?}; {case:?}"
+                );
+            }
+            (Some(expected), other) => {
+                panic!("{context}: expected {expected}, got {other:?}; {case:?}")
             }
         }
     }
@@ -410,13 +568,17 @@ fn mixed_integer_models_match_integer_enumeration_and_analytic_lp() {
                     "seed {seed}: {case:?}"
                 );
                 assert!(
-                    (solution.objective() - objective).abs() < 1e-6,
+                    (solution.objective() - objective).abs()
+                        < 1e-6 + int_tol() * mixed_objective_reach(&case),
                     "seed {seed}: objective {}, expected {objective}; {case:?}",
                     solution.objective()
                 );
                 for &var in &vars[..case.n_int] {
                     let value = solution.var_value(var);
-                    assert_eq!(value, value.round(), "seed {seed}: {case:?}");
+                    assert!(
+                        (value - value.round()).abs() <= int_tol(),
+                        "seed {seed}: {value} is not integral within int_tol; {case:?}"
+                    );
                 }
             }
             (Some(expected), other) => {
