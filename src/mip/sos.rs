@@ -34,6 +34,17 @@
 //! Either way the left child zeroes position `b` and the right child position
 //! `a`, so both children exclude the current point.
 //!
+//! Of the violated sets, the search splits the one with the most mass outside
+//! the heaviest group of members the set allows nonzero together (one member
+//! for SOS1, two adjacent ones for SOS2; [`SosSet::violation`]), the first in
+//! declaration order on a tie. Splitting the first violated set instead makes
+//! the tree grow quickly with the number of sets: on six interconnector loss
+//! curves of 60 to 120 breakpoints (`crate::tests::sos_losses`, seeds 0 to
+//! 23), the first violated set took 81,395 nodes, one seed stopping at a
+//! 50,000-node limit, and the most violated set took 738, every seed at the
+//! same optimum. The split position stays at the weighted mean: the midpoint
+//! of the span `a..=b` took 1,972 nodes with the most violated set.
+//!
 //! Adapted from Adel Kaleche's SOS branching (Specy/microlp#50).
 
 use crate::solver::{outside_bounds, Solver};
@@ -119,6 +130,26 @@ impl SosSet {
             .collect()
     }
 
+    /// The mass (`Σ |x|` over the counted nonzero members) outside the
+    /// heaviest group of members the set allows nonzero together: one member
+    /// for SOS1, two adjacent ones for SOS2. Zero when the set holds.
+    pub(crate) fn violation(&self, point: &Point) -> f64 {
+        let mass: Vec<f64> = self
+            .members
+            .iter()
+            .map(|&v| point.nonzero(v).unwrap_or(0.0))
+            .collect();
+        let total: f64 = mass.iter().sum();
+        let kept = match self.kind {
+            SosKind::Sos1 => mass.iter().copied().fold(0.0, f64::max),
+            SosKind::Sos2 => mass
+                .windows(2)
+                .map(|pair| pair[0] + pair[1])
+                .fold(0.0, f64::max),
+        };
+        total - kept
+    }
+
     /// Whether the set holds at `point`.
     pub(crate) fn is_satisfied(&self, point: &Point) -> bool {
         let nz = self.nonzero_positions(point);
@@ -199,9 +230,19 @@ pub(crate) fn all_satisfied(sets: &[SosSet], point: &Point) -> bool {
     sets.iter().all(|s| s.is_satisfied(point))
 }
 
-/// The split of the first set violated at `point`, in declaration order.
-pub(crate) fn first_violated(sets: &[SosSet], point: &Point) -> Option<Split> {
-    sets.iter().find_map(|s| s.split(point))
+/// The split of the set most violated at `point` ([`SosSet::violation`]),
+/// the first in declaration order on a tie, or `None` when every set holds.
+pub(crate) fn most_violated(sets: &[SosSet], point: &Point) -> Option<Split> {
+    let mut best: Option<(f64, Split)> = None;
+    for set in sets {
+        if let Some(split) = set.split(point) {
+            let violation = set.violation(point);
+            if best.as_ref().is_none_or(|&(b, _)| violation > b) {
+                best = Some((violation, split));
+            }
+        }
+    }
+    best.map(|(_, split)| split)
 }
 
 /// Whether `sets` hold at `values` (user units), a member counting as zero
@@ -230,7 +271,7 @@ pub(crate) fn solver_split(
     solver: &Solver,
     zero_tol: Option<f64>,
 ) -> Option<Split> {
-    first_violated(
+    most_violated(
         sets,
         &Point {
             value: &|v| solver.get_value(v),
@@ -271,6 +312,64 @@ mod tests {
 
     fn none_fixed(_: usize) -> bool {
         false
+    }
+
+    /// An SOS2 over members `first..first + x.len()`, weights 1 up.
+    fn sos2_at(first: usize, n: usize) -> SosSet {
+        SosSet {
+            kind: SosKind::Sos2,
+            members: (first..first + n).collect(),
+            weights: (0..n).map(|i| i as f64 + 1.0).collect(),
+        }
+    }
+
+    #[test]
+    fn the_most_violated_set_is_split_first_on_a_tie() {
+        // Set A (members 10..15) has half its mass outside its best adjacent
+        // pair, set B (20..25) a tenth, set C (30..35) holds.
+        let mut x = vec![0.0; 40];
+        x[10] = 0.5;
+        x[14] = 0.5;
+        x[20] = 0.9;
+        x[24] = 0.1;
+        x[31] = 0.4;
+        x[32] = 0.6;
+        let point = Point {
+            value: &|v| x[v],
+            fixed_to_zero: &none_fixed,
+            zero_tol: Some(1e-9),
+        };
+        let (a, b, c) = (sos2_at(10, 5), sos2_at(20, 5), sos2_at(30, 5));
+        assert_eq!(a.violation(&point), 0.5);
+        assert!((b.violation(&point) - 0.1).abs() < 1e-15);
+        assert_eq!(c.violation(&point), 0.0);
+        let sets = [c.clone(), b.clone(), a.clone()];
+        assert_eq!(most_violated(&sets, &point), a.split(&point));
+        // A tie goes to the set declared first.
+        let a2 = sos2_at(10, 5);
+        let mut y = x.clone();
+        y[20] = 0.5;
+        y[24] = 0.5;
+        let tie = Point {
+            value: &|v| y[v],
+            fixed_to_zero: &none_fixed,
+            zero_tol: Some(1e-9),
+        };
+        assert_eq!(most_violated(&[b.clone(), a2.clone()], &tie), b.split(&tie));
+        assert_eq!(most_violated(&[a2.clone(), b], &tie), a2.split(&tie));
+        assert_eq!(most_violated(&[c], &point), None);
+    }
+
+    #[test]
+    fn sos1_violation_is_the_mass_off_its_heaviest_member() {
+        let s = set(SosKind::Sos1, 4);
+        let x = [1.0, 0.0, -3.0, 0.5];
+        let point = Point {
+            value: &|v| x[v - 10],
+            fixed_to_zero: &none_fixed,
+            zero_tol: None,
+        };
+        assert_eq!(s.violation(&point), 1.5);
     }
 
     #[test]

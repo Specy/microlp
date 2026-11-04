@@ -637,12 +637,17 @@ re-branch, which takes an integer var off its integer at `int_tol = 0`, else a s
 by a member that is not exactly zero (`zero_tol = None`), whose child holds it at zero.
 
 **Branching** is one decision (`choose_branch`): an integer var off its integer first, by
-pseudocost, else the first violated set, split Beale–Tomlin style (`SosSet::split`). With
+pseudocost, else the most violated set (`sos::most_violated`: the most mass outside the
+heaviest group of members the set allows nonzero, the first set on a tie), split
+Beale–Tomlin style (`SosSet::split`). With
 the counted nonzero members at positions `a..=b` and the weighted mean of their weights
 choosing `r`, SOS1 takes `a ≤ r < b` (left zeroes `> r`, right `≤ r`), SOS2 `a < r < b`
 (left zeroes `> r`, right `< r`, `r` free in both): the left child zeroes `b`, the right `a`,
 so both exclude the point. Integer branching keeps priority because set children record no
-pseudocost. Two rules make the search terminate whatever the tolerances:
+pseudocost. Picking the first violated set instead made the tree grow with the number of
+sets: on six synthetic interconnector loss curves (`src/tests/sos_losses.rs`, seeds 0–23),
+81,395 nodes against 738, at the same optima. Two rules make the search terminate whatever
+the tolerances:
 
 - A member whose bounds in force are `[0, 0]` counts as zero and is never re-fixed, so every
   child fixes at least one member still free, and the free members strictly decrease along
