@@ -38,10 +38,12 @@ pub struct Constraint(pub(crate) usize);
 impl Constraint {
     /// Returns the constraint's zero-based creation order.
     ///
-    /// The first constraint added to a problem has index `0`. A constraint
-    /// added by [`Solution::add_constraint`](crate::Solution::add_constraint)
-    /// is numbered after the problem's and those added before it, which is
-    /// its index in [`Solution::duals`](crate::Solution::duals).
+    /// The first constraint added to a problem has index `0`, and the index is
+    /// the constraint's position in [`Solution::duals`](crate::Solution::duals).
+    /// [`Solution::add_constraint`](crate::Solution::add_constraint) returns
+    /// no handle: a row it adds is numbered after the problem's rows and the
+    /// rows added before it, and its dual is read from `Solution::duals` at
+    /// that index.
     pub fn idx(&self) -> usize {
         self.0
     }

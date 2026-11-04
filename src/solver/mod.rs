@@ -278,21 +278,19 @@ pub(crate) struct Solver {
     /// recomputed from the multipliers.
     dual_tols: Vec<f64>,
     /// The user's rows, in user units, that presolve dropped (implied by the
-    /// bounds it emitted) or rewrote (valid for integer points only). No pivot
+    /// bounds it emitted) or rewrote (valid for integer points only), each
+    /// with its index among the user's rows ([`Self::user_rows`]). No pivot
     /// sees them; the boundary checks the answer against them
     /// ([`Self::first_violated_row`]): an LP takes over a row its answer
     /// misses ([`Self::hold_validation_rows`]), and the MIP guard rejects such
     /// a candidate.
-    validation_rows: Vec<(CsVec, ComparisonOp, f64)>,
+    validation_rows: Vec<(usize, (CsVec, ComparisonOp, f64))>,
     /// Per row of the user's model (the problem's rows in the order added,
     /// then those [`Self::add_constraint`] added), the engine row that holds
     /// it, or `None` for one the engine does not hold: a row every point
     /// satisfies ([`prepare_row`]), or one presolve dropped that the engine
     /// has not taken over. Read by [`Self::duals`] only.
     user_rows: Vec<Option<usize>>,
-    /// Per validation row, its index among the user's rows (empty where the
-    /// caller did not say, as in the MIP, whose duals are not read).
-    validation_user_rows: Vec<usize>,
 
     enable_primal_steepest_edge: bool,
     enable_dual_steepest_edge: bool,
@@ -780,7 +778,6 @@ impl Solver {
             dual_tols: vec![0.0; num_total_vars],
             validation_rows: Vec::new(),
             user_rows,
-            validation_user_rows: Vec::new(),
             deadline,
             operation_time_limit: None,
             lp_iterations: 0,
@@ -910,8 +907,10 @@ impl Solver {
     /// check accepted. The engine's row `r` is the user's times the factor
     /// `ρ_r`, and its column `j` the user's times `s_j`, so the user's dual
     /// is `ρ_r y_r` and the user's reduced cost the engine's over `s_j`. A
-    /// row the engine does not hold has dual zero: every point satisfies it,
-    /// or presolve dropped it as implied by the bounds, which then price it.
+    /// row whose slack is basic has dual exactly zero, its multiplier's
+    /// round-off dropped before the reduced costs are taken, as has a row the
+    /// engine does not hold: every point satisfies it, or presolve dropped it
+    /// as implied by the bounds.
     pub(crate) fn duals(&mut self) -> (Vec<f64>, Vec<f64>) {
         debug_assert!(
             self.artificial_obj.is_none() && !self.costs_modified,
@@ -919,6 +918,11 @@ impl Solver {
         );
         let mut multipliers = self.multipliers();
         self.refine_multipliers(&mut multipliers);
+        for (r, y) in multipliers.iter_mut().enumerate() {
+            if matches!(self.var_states[self.num_vars + r], VarState::Basic(_)) {
+                *y = 0.0;
+            }
+        }
         let row_duals = self
             .user_rows
             .iter()
@@ -1157,58 +1161,52 @@ impl Solver {
         self.validation_rows
             .iter()
             .enumerate()
-            .find_map(|(k, (coeffs, op, rhs))| {
+            .find_map(|(k, (_, (coeffs, op, rhs)))| {
                 row_violation(coeffs, *op, *rhs, |v| values[v], self.feasibility)
                     .map(|violation| (self.num_constraints() + k, violation))
             })
     }
 
-    /// Install the rows the answer must satisfy beyond the engine's own (see
-    /// [`Self::validation_rows`]): those presolve dropped or rewrote.
-    pub(crate) fn set_validation_rows(&mut self, rows: Vec<(CsVec, ComparisonOp, f64)>) {
-        self.validation_rows = rows;
-    }
-
-    /// Number the engine's rows by the user's rows once presolve has reduced
-    /// them: the engine was built on presolve's rows, the input rows
-    /// `kept_rows` (in that order) of `num_user_rows`, and the validation
-    /// rows are the input rows `validation_origs`.
-    pub(crate) fn map_presolved_rows(
+    /// Take presolve's reduction of the user's `num_user_rows` rows: the
+    /// engine was built on the input rows `kept_rows`, in that order, and the
+    /// answer must also satisfy `validation_rows`, those presolve dropped or
+    /// rewrote, each with its input index ([`Self::validation_rows`]).
+    pub(crate) fn set_presolved_rows(
         &mut self,
         kept_rows: &[usize],
-        validation_origs: Vec<usize>,
+        validation_rows: Vec<(usize, (CsVec, ComparisonOp, f64))>,
         num_user_rows: usize,
     ) {
         debug_assert_eq!(kept_rows.len(), self.user_rows.len());
-        debug_assert_eq!(validation_origs.len(), self.validation_rows.len());
         let mut user_rows = vec![None; num_user_rows];
         for (&orig, &row) in kept_rows.iter().zip(&self.user_rows) {
             user_rows[orig] = row;
         }
         self.user_rows = user_rows;
-        self.validation_user_rows = validation_origs;
+        self.validation_rows = validation_rows;
     }
 
     /// Hold a finished LP's answer to the rows presolve dropped or rewrote
     /// ([`Self::validation_rows`]): a row the reported point misses beyond the
     /// contract left presolve's reduction short of the model as written, so
-    /// the engine takes the row over ([`Self::add_constraint`]) and the solve
+    /// the engine takes the row over ([`Self::add_row`]) and the solve
     /// resumes from the current basis. Each row is taken over once, so this
     /// ends, and an `Infeasible` re-solve holds for the model as written,
     /// which has the row too.
     pub(crate) fn hold_validation_rows(&mut self) -> Result<StopReason, Error> {
         loop {
             let values = self.reported_values();
-            let missed = self.validation_rows.iter().position(|(coeffs, op, rhs)| {
-                row_violation(coeffs, *op, *rhs, |v| values[v], self.feasibility).is_some()
-            });
+            let missed = self
+                .validation_rows
+                .iter()
+                .position(|(_, (coeffs, op, rhs))| {
+                    row_violation(coeffs, *op, *rhs, |v| values[v], self.feasibility).is_some()
+                });
             let Some(k) = missed else {
                 return Ok(StopReason::Finished);
             };
             debug!("the answer misses validation row {k}; the engine takes it over");
-            let (coeffs, op, rhs) = self.validation_rows.remove(k);
-            let user_row =
-                (k < self.validation_user_rows.len()).then(|| self.validation_user_rows.remove(k));
+            let (user_row, (coeffs, op, rhs)) = self.validation_rows.remove(k);
             if self.add_row(coeffs, op, rhs, user_row)? == StopReason::Limit {
                 return Ok(StopReason::Limit);
             }
@@ -2994,17 +2992,17 @@ impl Solver {
     ) -> Result<StopReason, Error> {
         let user_row = self.user_rows.len();
         self.user_rows.push(None);
-        self.add_row(coeffs, cmp_op, rhs, Some(user_row))
+        self.add_row(coeffs, cmp_op, rhs, user_row)
     }
 
     /// Add the row `coeffs cmp_op rhs` to the engine, as the user's row
-    /// `user_row` where one is given ([`Self::user_rows`]), and re-solve.
+    /// `user_row` ([`Self::user_rows`]), and re-solve.
     fn add_row(
         &mut self,
         coeffs: CsVec,
         cmp_op: ComparisonOp,
         rhs: f64,
-        user_row: Option<usize>,
+        user_row: usize,
     ) -> Result<StopReason, Error> {
         assert!(self.is_primal_feasible);
 
@@ -3059,9 +3057,7 @@ impl Solver {
 
         // The new slack, basic: its row evaluated at the current values.
         let new_row = self.num_constraints() - 1;
-        if let Some(user_row) = user_row {
-            self.user_rows[user_row] = Some(new_row);
-        }
+        self.user_rows[user_row] = Some(new_row);
         let (value, tols) = self.row_slack(new_row);
         self.basic_var_vals.push(value);
         self.var_tols.push(tols);

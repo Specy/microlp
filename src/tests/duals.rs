@@ -368,7 +368,7 @@ fn rows_the_engine_does_not_hold_have_zero_duals() {
         assert_eq!(solution.duals().unwrap().len(), 4);
         assert_eq!(solution.dual(empty), Some(0.0));
         assert_eq!(solution.dual(open), Some(0.0));
-        assert!(solution.dual(implied).unwrap().abs() < 1e-12);
+        assert_eq!(solution.dual(implied), Some(0.0));
         assert!((solution.dual(binding).unwrap() - 2.0).abs() < 1e-9);
         // x at its upper bound, which prices it at 1 - 2.
         assert!((solution.reduced_cost(x).unwrap() + 1.0).abs() < 1e-9);

@@ -30,6 +30,7 @@ run `cargo update -p sprs --precise 0.11.4`.
 * Real, integer and boolean variables.
 * Time limits and MIP gap, with possibility to edit and resume the solve.
 * Warm starts from a known solution.
+* Duals (shadow prices) and reduced costs for linear programs.
 * Handles problems with hundreds of thousands of variables and constraints.
 
 Integer and boolean variables are handled with branch & bound. The library is
@@ -107,6 +108,10 @@ lhs.add(x, 1.0);
 lhs.add(z, -3.0);
 problem.add_constraint(lhs, ComparisonOp::Eq, 0.0);
 ```
+
+`add_constraint` returns a `Constraint` handle, which reads the constraint's
+dual from a solution (see [Duals](#duals)). Like a `Variable`, it belongs to
+the problem that created it.
 
 ## Solving and reading the solution
 
@@ -229,6 +234,38 @@ for (var, value) in &solution {
 
 `stats()` returns counters for the solve so far: branch & bound nodes, simplex
 iterations, elapsed time, the best proven bound and the current gap.
+
+### Duals
+
+For a problem without integer or boolean variables, a `Solution` also reports
+duals. `dual(constraint)` is the constraint's shadow price: the rate at which
+the optimal objective changes as its right-hand side increases. `duals()`
+gives every constraint's, in the order they were added, and
+`reduced_cost(var)` gives a variable's objective coefficient less its
+coefficients times the duals. All three are `None` for a problem with integer
+or boolean variables.
+
+```rust
+use microlp::{ComparisonOp, OptimizationDirection, Problem};
+
+// Meet a demand of 10 from two generators, the cheaper one limited to 6.
+let mut problem = Problem::new(OptimizationDirection::Minimize);
+let cheap = problem.add_var(20.0, (0.0, f64::INFINITY));
+let dear = problem.add_var(50.0, (0.0, f64::INFINITY));
+let demand = problem.add_constraint(&[(cheap, 1.0), (dear, 1.0)], ComparisonOp::Eq, 10.0);
+let limit = problem.add_constraint(&[(cheap, 1.0)], ComparisonOp::Le, 6.0);
+let solution = problem.solve()?.into_solution().expect("an LP solves to optimality");
+
+// One more unit of demand comes from the dearer generator (50), and one more
+// unit of the cheap one's limit saves 50 - 20.
+println!("demand: {}", solution.dual(demand).unwrap()); // 50
+println!("limit: {}", solution.dual(limit).unwrap()); // -30
+```
+
+The duals are those of the final simplex basis. Where several sets of duals
+are optimal, this is one of them, which another solver may not pick. A row
+added by `Solution::add_constraint` gets no handle: its dual is in `duals()`
+after the problem's constraints and the rows added before it.
 
 ## Time limits and resuming
 

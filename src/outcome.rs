@@ -89,8 +89,9 @@ impl SolveOutcome {
                 }
                 let (mut lp_duals, mut lp_reduced_costs) = solver.duals();
                 if direction == OptimizationDirection::Maximize {
+                    // `0 - v`, not `-v`: a zero stays `+0`.
                     for value in lp_duals.iter_mut().chain(&mut lp_reduced_costs) {
-                        *value = -*value;
+                        *value = 0.0 - *value;
                     }
                 }
                 Ok(Self::Solution(Solution {

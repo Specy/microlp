@@ -160,13 +160,15 @@ These normalizations happen at the boundary and hold everywhere inside:
   what makes a postsolve layer unnecessary — solution read-out, resume, warm starts and
   post-solve edits all work off original indices, and the MIP search's root bounds are the
   presolved bounds. The one reader of rows by index, a pure LP's duals (§6), goes through
-  `Solver::user_rows`, which presolve's `kept_rows`/`validation_origs` fill: in LP mode
-  presolve only drops rows the bounds imply, and zero is an optimal dual for such a row. Surviving rows are emitted as the user wrote them, fixed terms included
-  (a row keeps the tolerance of its full magnitude only with them in it); only a row whose
-  coefficients were rewritten is rebuilt, and the rows presolve dropped or rewrote go to the
-  engine as written, for the checks at the boundary (§3.1). The reductions are exact; what
-  they keep is §7.4. When presolve finds the model infeasible, or reduces nothing, the solve
-  goes on with the model as written (`presolve::reduced_model`, logged at debug level).
+  `Solver::user_rows`, filled from presolve's `kept_rows` (`Solver::set_presolved_rows`);
+  a validation row the engine takes over keeps its input index. In LP mode presolve only
+  drops rows the bounds imply, and zero is an optimal dual for such a row. Surviving rows
+  are emitted as the user wrote them, fixed terms included (a row keeps the tolerance of
+  its full magnitude only with them in it); only a row whose coefficients were rewritten
+  is rebuilt, and the rows presolve dropped or rewrote go to the engine as written, for the
+  checks at the boundary (§3.1). The reductions are exact; what they keep is §7.4. When
+  presolve finds the model infeasible, or reduces nothing, the solve goes on with the model
+  as written (`presolve::reduced_model`, logged at debug level).
 
 `prepare_row` is the single row-normalization contract used by both `Solver::try_new` and
 incremental `Solver::add_constraint`. It settles the rows whose data alone decide them
@@ -302,7 +304,7 @@ passes, and the checks are independent of the current basis values.
 `first_violated_row` also checks the rows presolve dropped or rewrote, as the user wrote
 them (`validation_rows`, installed from `Presolved`): the engine never pivots on them, so the
 answer is held to the whole model only here. An LP answer that misses one is no error: the
-engine takes the row over (`hold_validation_rows`, through `add_constraint`) and resumes
+engine takes the row over (`hold_validation_rows`, through `add_row`) and resumes
 from its basis, within the call's deadline, so a reduction presolve got wrong costs pivots,
 not the answer; a MIP candidate that misses one is rejected (§5.4).
 
@@ -740,9 +742,10 @@ reports `dual(constraint)`, `duals()` and `reduced_cost(var)` (`None` for a MILP
 read off the final basis when the solution is built (`Solver::duals`, multipliers refined
 once, like those the optimality check accepted), unscaled to user units (a row's dual times
 its row factor, a reduced cost over its column factor) and negated for `Maximize`: a dual is
-the rate of change of the user's objective with the row's right-hand side. A row the engine
-does not hold (every point satisfies it, or presolve dropped it) has dual zero; a row
-`Solution::add_constraint` adds is numbered after the problem's. Every edit recomputes them.
+the rate of change of the user's objective with the row's right-hand side. A row whose
+slack is basic, or that the engine does not hold (every point satisfies it, or presolve
+dropped it), has dual zero; a row `Solution::add_constraint` adds is numbered after the
+problem's. Every edit recomputes them.
 
 ---
 
@@ -1123,7 +1126,7 @@ where pivots updated them incrementally).
 - *Report*: the objective is recomputed from the verified values, which are what is
   reported, so they pass the boundary's compensated check (§7.1).
 - *Takeover*: an LP answer that misses a row presolve dropped or rewrote is no error: the
-  engine adds the row (`hold_validation_rows`, through `add_constraint`) and resumes from
+  engine adds the row (`hold_validation_rows`, through `add_row`) and resumes from
   its basis within the call's deadline, once per row, so a reduction presolve got wrong
   costs pivots, not the answer. A miss of an engine row or a bound after that is an
   `InternalError`. A MILP candidate that misses a validation row is rejected and its node

@@ -397,10 +397,9 @@ impl Problem {
             // The engine also holds the answer to the rows presolve dropped or
             // rewrote, as written, here and on every later edit or resume.
             if let Some(presolved) = presolved {
-                solver.set_validation_rows(presolved.validation_rows);
-                solver.map_presolved_rows(
+                solver.set_presolved_rows(
                     &presolved.kept_rows,
-                    presolved.validation_origs,
+                    presolved.validation_rows,
                     self.constraints.len(),
                 );
             }

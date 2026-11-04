@@ -31,10 +31,10 @@
 //!
 //! The variable set never changes: a var presolve "removes" gets `lo == hi`
 //! bounds, which the simplex prices out, and its value is substituted out of
-//! every row. Rows may be dropped or rewritten freely, since nothing outside
-//! the `Solver` addresses constraints by index. So no postsolve is needed:
-//! read-out, resume, warm starts and post-solve edits all work off the
-//! original variable indices.
+//! every row. Rows may be dropped or rewritten within *Soundness by mode*,
+//! since nothing outside the `Solver` addresses constraints by index. So no
+//! postsolve is needed: read-out, resume, warm starts and post-solve edits
+//! all work off the original variable indices.
 //!
 //! # Working vs emitted bounds
 //!
@@ -109,7 +109,10 @@
 //! * [`Mode::Lp`] applies only reductions that keep the feasible set exactly
 //!   (within the tolerances above), so facts baked into the live solver stay
 //!   valid under every later edit (`Solution::add_constraint` and `fix_var`
-//!   only shrink the region).
+//!   only shrink the region). It only drops rows the bounds as written imply,
+//!   which keeps an LP's duals exact without a postsolve: zero is an optimal
+//!   dual for such a row (`Solver::duals`). Any other reduction here would
+//!   need its own dual postsolve.
 //! * [`Mode::Mip`] adds reductions that keep the integer feasible set
 //!   (integer bound rounding, binary coefficient tightening) or only some
 //!   optimum (dual fixing). This is sound because MILP post-solve edits
@@ -270,12 +273,10 @@ pub(crate) fn presolve(
     let mut out = Vec::with_capacity(rows.len());
     let mut kept_rows = Vec::with_capacity(rows.len());
     let mut validation_rows = Vec::new();
-    let mut validation_origs = Vec::new();
     for row in rows.iter_mut() {
         let orig = row.orig as usize;
         if !row.alive {
-            validation_rows.push(constraints[orig].clone());
-            validation_origs.push(orig);
+            validation_rows.push((orig, constraints[orig].clone()));
             continue;
         }
         // A row can become all-substituted after the final pass (e.g. by a
@@ -283,8 +284,7 @@ pub(crate) fn presolve(
         work.fold_fixed(row);
         if row.vars.is_empty() {
             work.empty_row_check(row)?;
-            validation_rows.push(constraints[orig].clone());
-            validation_origs.push(orig);
+            validation_rows.push((orig, constraints[orig].clone()));
             continue;
         }
         kept_rows.push(orig);
@@ -308,8 +308,7 @@ pub(crate) fn presolve(
             out.push(constraints[orig].clone());
             continue;
         }
-        validation_rows.push(constraints[orig].clone());
-        validation_origs.push(orig);
+        validation_rows.push((orig, constraints[orig].clone()));
         let mut vars = row.vars.clone();
         let mut coeffs = row.coeffs.clone();
         for &(v, a) in &row.folded {
@@ -356,7 +355,6 @@ pub(crate) fn presolve(
         constraints: out,
         kept_rows,
         validation_rows,
-        validation_origs,
         reduced,
         stats: work.stats,
     })
