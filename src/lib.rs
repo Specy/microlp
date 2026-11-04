@@ -121,6 +121,12 @@ bearing in mind that rounded values need not meet the constraints: under
 `x <= 1e7 * y`, a `y` of `1e-6` allows `x` up to 10, which `y` rounded to zero
 forbids.
 
+For a problem without integer or boolean variables, [`Solution::dual`] reports
+a constraint's dual value (shadow price), by the [`Constraint`] handle
+[`Problem::add_constraint`] returns: the rate at which the optimal objective
+changes as the constraint's right-hand side increases.
+[`Solution::reduced_cost`] reports a variable's reduced cost.
+
 # Known limitations
 
 The solver computes in floating point. Nearly dependent constraints can exceed
@@ -180,7 +186,7 @@ mod sparse;
 mod tests;
 
 pub use error::Error;
-pub use expr::{ComparisonOp, LinearExpr, LinearTerm, OptimizationDirection, Variable};
+pub use expr::{ComparisonOp, Constraint, LinearExpr, LinearTerm, OptimizationDirection, Variable};
 pub use mip::{ResumeOptions, SolutionStatus, SolveOptions, Stats, TerminationReason, Tolerances};
 pub use outcome::{InterruptedSolve, SolveOutcome};
 pub use problem::{Problem, VarDomain};

@@ -87,6 +87,12 @@ impl SolveOutcome {
                             .to_string(),
                     ));
                 }
+                let (mut lp_duals, mut lp_reduced_costs) = solver.duals();
+                if direction == OptimizationDirection::Maximize {
+                    for value in lp_duals.iter_mut().chain(&mut lp_reduced_costs) {
+                        *value = -*value;
+                    }
+                }
                 Ok(Self::Solution(Solution {
                     direction,
                     num_vars,
@@ -94,6 +100,8 @@ impl SolveOutcome {
                     termination_reason: TerminationReason::ProvenOptimal,
                     lp_values,
                     lp_objective,
+                    lp_duals,
+                    lp_reduced_costs,
                     state: SolveState::Lp(solver),
                     last_options,
                 }))
@@ -128,6 +136,8 @@ impl SolveOutcome {
                     last_options,
                     lp_values: Vec::new(),
                     lp_objective: 0.0,
+                    lp_duals: Vec::new(),
+                    lp_reduced_costs: Vec::new(),
                 })
             }
             TerminationReason::MipGap => {
@@ -141,6 +151,8 @@ impl SolveOutcome {
                     last_options,
                     lp_values: Vec::new(),
                     lp_objective: 0.0,
+                    lp_duals: Vec::new(),
+                    lp_reduced_costs: Vec::new(),
                 })
             }
             TerminationReason::TimeLimit | TerminationReason::NodeLimit if has_incumbent => {
@@ -153,6 +165,8 @@ impl SolveOutcome {
                     last_options,
                     lp_values: Vec::new(),
                     lp_objective: 0.0,
+                    lp_duals: Vec::new(),
+                    lp_reduced_costs: Vec::new(),
                 })
             }
             TerminationReason::TimeLimit | TerminationReason::NodeLimit => {

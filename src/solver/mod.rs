@@ -284,6 +284,15 @@ pub(crate) struct Solver {
     /// misses ([`Self::hold_validation_rows`]), and the MIP guard rejects such
     /// a candidate.
     validation_rows: Vec<(CsVec, ComparisonOp, f64)>,
+    /// Per row of the user's model (the problem's rows in the order added,
+    /// then those [`Self::add_constraint`] added), the engine row that holds
+    /// it, or `None` for one the engine does not hold: a row every point
+    /// satisfies ([`prepare_row`]), or one presolve dropped that the engine
+    /// has not taken over. Read by [`Self::duals`] only.
+    user_rows: Vec<Option<usize>>,
+    /// Per validation row, its index among the user's rows (empty where the
+    /// caller did not say, as in the MIP, whose duals are not read).
+    validation_user_rows: Vec<usize>,
 
     enable_primal_steepest_edge: bool,
     enable_dual_steepest_edge: bool,
@@ -599,11 +608,15 @@ impl Solver {
         let is_fixed = |var: usize| var_mins[var] == var_maxs[var];
         let mut prepared_rows = Vec::with_capacity(constraints.len());
         let mut slack_dual_units = Vec::with_capacity(constraints.len());
+        let mut user_rows = Vec::with_capacity(constraints.len());
         for (coeffs, cmp_op, rhs) in constraints {
             let scaled = scale_columns(coeffs.clone(), &col_scales);
             if let Some(row) = prepare_row(scaled, *cmp_op, *rhs, feasibility, is_fixed)? {
+                user_rows.push(Some(prepared_rows.len()));
                 slack_dual_units.push(slack_dual_unit(coeffs, row.row_scale, is_fixed));
                 prepared_rows.push(row);
+            } else {
+                user_rows.push(None);
             }
         }
         let var_tols: Vec<BoundTols> = (0..num_vars)
@@ -766,6 +779,8 @@ impl Solver {
             var_tols,
             dual_tols: vec![0.0; num_total_vars],
             validation_rows: Vec::new(),
+            user_rows,
+            validation_user_rows: Vec::new(),
             deadline,
             operation_time_limit: None,
             lp_iterations: 0,
@@ -883,6 +898,46 @@ impl Solver {
     /// at exactly these values.
     pub(crate) fn reported_values(&self) -> Vec<f64> {
         (0..self.num_vars).map(|v| self.get_value(v)).collect()
+    }
+
+    /// The duals of a finished solve in user units, internal (minimize)
+    /// space: per row of the user's model ([`Self::user_rows`]) the rate of
+    /// change of the objective with its right-hand side, and per structural
+    /// var its reduced cost, `c_j - Σ_i a_ij y_i`, zero for a basic var.
+    ///
+    /// They come from the multipliers `B^T y = c_B` of the final basis,
+    /// refined once ([`Self::refine_multipliers`]): those the optimality
+    /// check accepted. The engine's row `r` is the user's times the factor
+    /// `ρ_r`, and its column `j` the user's times `s_j`, so the user's dual
+    /// is `ρ_r y_r` and the user's reduced cost the engine's over `s_j`. A
+    /// row the engine does not hold has dual zero: every point satisfies it,
+    /// or presolve dropped it as implied by the bounds, which then price it.
+    pub(crate) fn duals(&mut self) -> (Vec<f64>, Vec<f64>) {
+        debug_assert!(
+            self.artificial_obj.is_none() && !self.costs_modified,
+            "duals read off a solve that is not finished"
+        );
+        let mut multipliers = self.multipliers();
+        self.refine_multipliers(&mut multipliers);
+        let row_duals = self
+            .user_rows
+            .iter()
+            .map(|row| row.map_or(0.0, |r| multipliers[r] * self.row_scales[r]))
+            .collect();
+        let reduced_costs = (0..self.num_vars)
+            .map(|var| match self.var_states[var] {
+                VarState::Basic(_) => 0.0,
+                VarState::NonBasic(_) => {
+                    let mut sum = CDouble::from(self.orig_obj_coeffs[var]);
+                    //guaranteed to be a valid index
+                    for (r, &coeff) in self.orig_constraints_csc.outer_view(var).unwrap().iter() {
+                        sum.add_product(-coeff, multipliers[r]);
+                    }
+                    sum.value() / self.col_scales[var]
+                }
+            })
+            .collect();
+        (row_duals, reduced_costs)
     }
 
     /// The column factor of `var`: `s_j` for a structural var, one for a slack.
@@ -1114,6 +1169,26 @@ impl Solver {
         self.validation_rows = rows;
     }
 
+    /// Number the engine's rows by the user's rows once presolve has reduced
+    /// them: the engine was built on presolve's rows, the input rows
+    /// `kept_rows` (in that order) of `num_user_rows`, and the validation
+    /// rows are the input rows `validation_origs`.
+    pub(crate) fn map_presolved_rows(
+        &mut self,
+        kept_rows: &[usize],
+        validation_origs: Vec<usize>,
+        num_user_rows: usize,
+    ) {
+        debug_assert_eq!(kept_rows.len(), self.user_rows.len());
+        debug_assert_eq!(validation_origs.len(), self.validation_rows.len());
+        let mut user_rows = vec![None; num_user_rows];
+        for (&orig, &row) in kept_rows.iter().zip(&self.user_rows) {
+            user_rows[orig] = row;
+        }
+        self.user_rows = user_rows;
+        self.validation_user_rows = validation_origs;
+    }
+
     /// Hold a finished LP's answer to the rows presolve dropped or rewrote
     /// ([`Self::validation_rows`]): a row the reported point misses beyond the
     /// contract left presolve's reduction short of the model as written, so
@@ -1132,7 +1207,9 @@ impl Solver {
             };
             debug!("the answer misses validation row {k}; the engine takes it over");
             let (coeffs, op, rhs) = self.validation_rows.remove(k);
-            if self.add_constraint(coeffs, op, rhs)? == StopReason::Limit {
+            let user_row =
+                (k < self.validation_user_rows.len()).then(|| self.validation_user_rows.remove(k));
+            if self.add_row(coeffs, op, rhs, user_row)? == StopReason::Limit {
                 return Ok(StopReason::Limit);
             }
         }
@@ -2907,11 +2984,27 @@ impl Solver {
         })
     }
 
+    /// Add a row of the user's model, numbered after the user's rows so far,
+    /// and re-solve.
     pub(crate) fn add_constraint(
         &mut self,
         coeffs: CsVec,
         cmp_op: ComparisonOp,
         rhs: f64,
+    ) -> Result<StopReason, Error> {
+        let user_row = self.user_rows.len();
+        self.user_rows.push(None);
+        self.add_row(coeffs, cmp_op, rhs, Some(user_row))
+    }
+
+    /// Add the row `coeffs cmp_op rhs` to the engine, as the user's row
+    /// `user_row` where one is given ([`Self::user_rows`]), and re-solve.
+    fn add_row(
+        &mut self,
+        coeffs: CsVec,
+        cmp_op: ComparisonOp,
+        rhs: f64,
+        user_row: Option<usize>,
     ) -> Result<StopReason, Error> {
         assert!(self.is_primal_feasible);
 
@@ -2966,6 +3059,9 @@ impl Solver {
 
         // The new slack, basic: its row evaluated at the current values.
         let new_row = self.num_constraints() - 1;
+        if let Some(user_row) = user_row {
+            self.user_rows[user_row] = Some(new_row);
+        }
         let (value, tols) = self.row_slack(new_row);
         self.basic_var_vals.push(value);
         self.var_tols.push(tols);

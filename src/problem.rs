@@ -7,8 +7,8 @@ use web_time::Instant;
 use crate::range::CoefficientRange;
 use crate::solver::{deadline_after, valid_rhs, Solver};
 use crate::{
-    mip, presolve, ComparisonOp, CsVec, Error, LinearExpr, OptimizationDirection, ResumeOptions,
-    SolveOptions, SolveOutcome, Variable,
+    mip, presolve, ComparisonOp, Constraint, CsVec, Error, LinearExpr, OptimizationDirection,
+    ResumeOptions, SolveOptions, SolveOutcome, Variable,
 };
 
 /// A linear optimization model that can be populated and solved.
@@ -159,7 +159,9 @@ impl Problem {
         var
     }
 
-    /// Adds the linear constraint `expr cmp_op rhs` to the problem.
+    /// Adds the linear constraint `expr cmp_op rhs` to the problem, and
+    /// returns its handle, by which [`Solution::dual`](crate::Solution::dual)
+    /// reports its dual.
     ///
     /// The expression may be a [`LinearExpr`] or any supported collection or
     /// iterator of `(Variable, coefficient)` pairs. Use variables created by
@@ -204,11 +206,17 @@ impl Problem {
     /// }
     /// problem.add_constraint(lhs, ComparisonOp::Ge, 2.0);
     /// ```
-    pub fn add_constraint(&mut self, expr: impl Into<LinearExpr>, cmp_op: ComparisonOp, rhs: f64) {
+    pub fn add_constraint(
+        &mut self,
+        expr: impl Into<LinearExpr>,
+        cmp_op: ComparisonOp,
+        rhs: f64,
+    ) -> Constraint {
         let row = self.constraints.len();
         let coeffs = row_of(expr.into(), self.obj_coeffs.len(), row)
             .unwrap_or_else(|message| panic!("{message}"));
         self.constraints.push((coeffs, cmp_op, rhs));
+        Constraint(row)
     }
 }
 
@@ -390,6 +398,11 @@ impl Problem {
             // rewrote, as written, here and on every later edit or resume.
             if let Some(presolved) = presolved {
                 solver.set_validation_rows(presolved.validation_rows);
+                solver.map_presolved_rows(
+                    &presolved.kept_rows,
+                    presolved.validation_origs,
+                    self.constraints.len(),
+                );
             }
             solver.range = range.clone();
             solver.operation_time_limit = options.time_limit;

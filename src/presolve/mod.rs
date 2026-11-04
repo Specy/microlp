@@ -268,10 +268,14 @@ pub(crate) fn presolve(
     // every input row the output does not carry as written for the engine to
     // check the answer against (`Presolved::validation_rows`).
     let mut out = Vec::with_capacity(rows.len());
+    let mut kept_rows = Vec::with_capacity(rows.len());
     let mut validation_rows = Vec::new();
+    let mut validation_origs = Vec::new();
     for row in rows.iter_mut() {
+        let orig = row.orig as usize;
         if !row.alive {
-            validation_rows.push(constraints[row.orig as usize].clone());
+            validation_rows.push(constraints[orig].clone());
+            validation_origs.push(orig);
             continue;
         }
         // A row can become all-substituted after the final pass (e.g. by a
@@ -279,16 +283,18 @@ pub(crate) fn presolve(
         work.fold_fixed(row);
         if row.vars.is_empty() {
             work.empty_row_check(row)?;
-            validation_rows.push(constraints[row.orig as usize].clone());
+            validation_rows.push(constraints[orig].clone());
+            validation_origs.push(orig);
             continue;
         }
+        kept_rows.push(orig);
         if !row.coeffs_touched {
             // Not rewritten: emit the input row as written, fixed terms
             // included. Folded, the row would have a smaller magnitude, hence
             // a tighter tolerance than the contract grants it, and the fold's
             // round-off (1e-7 on a shift of 1e9) could make two consistent
             // rows disagree beyond that tolerance.
-            out.push(constraints[row.orig as usize].clone());
+            out.push(constraints[orig].clone());
             continue;
         }
         // Rewritten: the rewritten terms, the folded terms restored so that
@@ -299,10 +305,11 @@ pub(crate) fn presolve(
         // keeps every point the rewrites kept.
         let (op, rhs) = work.rewritten_bound(row);
         if !rhs.is_finite() {
-            out.push(constraints[row.orig as usize].clone());
+            out.push(constraints[orig].clone());
             continue;
         }
-        validation_rows.push(constraints[row.orig as usize].clone());
+        validation_rows.push(constraints[orig].clone());
+        validation_origs.push(orig);
         let mut vars = row.vars.clone();
         let mut coeffs = row.coeffs.clone();
         for &(v, a) in &row.folded {
@@ -347,7 +354,9 @@ pub(crate) fn presolve(
         var_mins: work.elo,
         var_maxs: work.ehi,
         constraints: out,
+        kept_rows,
         validation_rows,
+        validation_origs,
         reduced,
         stats: work.stats,
     })

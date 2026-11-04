@@ -22,3 +22,6 @@ mod magnitudes;
 mod scaling;
 
 mod presolve_api;
+
+#[cfg(test)]
+mod duals;
