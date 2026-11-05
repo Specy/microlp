@@ -23,6 +23,8 @@ pub struct Problem {
     pub(crate) var_maxs: Vec<f64>,
     pub(crate) var_domains: Vec<VarDomain>,
     pub(crate) constraints: Vec<(CsVec, ComparisonOp, f64)>,
+    /// Special ordered sets, enforced by branching (see `mip::sos`).
+    pub(crate) sos: Vec<mip::sos::SosSet>,
     time_limit: Option<Duration>,
 }
 
@@ -33,6 +35,7 @@ impl std::fmt::Debug for Problem {
             .field("direction", &self.direction)
             .field("num_vars", &self.obj_coeffs.len())
             .field("num_constraints", &self.constraints.len())
+            .field("num_sos", &self.sos.len())
             .finish()
     }
 }
@@ -60,6 +63,7 @@ impl Problem {
             var_maxs: vec![],
             var_domains: vec![],
             constraints: vec![],
+            sos: vec![],
             time_limit: None,
         }
     }
@@ -113,6 +117,13 @@ impl Problem {
         self.var_domains
             .iter()
             .any(|v| *v == VarDomain::Integer || *v == VarDomain::Boolean)
+    }
+
+    /// Whether solving goes through branch & bound: the problem has integer
+    /// or boolean variables, or special ordered sets, which are enforced by
+    /// branching.
+    pub(crate) fn needs_branching(&self) -> bool {
+        self.has_integer_vars() || !self.sos.is_empty()
     }
 
     /// Returns whether `var` is a real, integer or boolean variable, as it was
@@ -223,6 +234,124 @@ impl Problem {
             .unwrap_or_else(|message| panic!("{message}"));
         self.constraints.push((coeffs, cmp_op, rhs));
         Constraint(row)
+    }
+
+    /// Adds a special ordered set of type 1: at most one member may be
+    /// nonzero.
+    ///
+    /// `members` pairs each variable with a weight, given like the terms of a
+    /// constraint (a slice, an iterator, or a [`LinearExpr`]). Weights order
+    /// the set; for SOS1 they may repeat, and affect only how long the solve
+    /// takes, not which solutions are allowed. Members may
+    /// be real, integer or boolean, and must have finite bounds on both sides.
+    /// A member counts as zero when its value is within
+    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility) of zero,
+    /// the tolerance of a bound at zero: values are reported as computed, so
+    /// a zero member may read `1e-9` rather than `0.0`.
+    ///
+    /// A set with fewer than two members constrains nothing and is ignored.
+    /// A problem with a set solves through branch & bound even when it has no
+    /// integer variables (see [`Solution::dual`](crate::Solution::dual) for
+    /// its duals).
+    ///
+    /// A NaN or infinite weight, or a member with an infinite bound, makes
+    /// the solve return [`Error::InvalidOperation`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a member is repeated or refers to a variable outside this
+    /// problem.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use microlp::*;
+    /// let mut problem = Problem::new(OptimizationDirection::Maximize);
+    /// let x = problem.add_var(3.0, (0.0, 10.0));
+    /// let y = problem.add_var(2.0, (0.0, 10.0));
+    /// problem.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Le, 15.0);
+    /// // Only one of x, y may be nonzero.
+    /// problem.add_sos1_constraint([(x, 1.0), (y, 2.0)]);
+    /// let solution = problem.solve().unwrap().into_solution().unwrap();
+    /// assert!((solution.objective() - 30.0).abs() < 1e-9);
+    /// assert!(solution.var_value(y).abs() < 1e-7);
+    /// ```
+    pub fn add_sos1_constraint(&mut self, members: impl Into<LinearExpr>) {
+        self.add_sos(mip::sos::SosKind::Sos1, members.into());
+    }
+
+    /// Adds a special ordered set of type 2: at most two members may be
+    /// nonzero, and they must be adjacent in weight order.
+    ///
+    /// `members` pairs each variable with a weight, given like the terms of a
+    /// constraint. Weights must be distinct: adjacency is defined by their
+    /// order. Members may be real, integer or boolean, and must have finite
+    /// bounds on both sides. A member counts as zero as in
+    /// [`Problem::add_sos1_constraint`].
+    ///
+    /// A set with fewer than three members constrains nothing and is ignored.
+    /// A problem with a set solves through branch & bound even when it has no
+    /// integer variables.
+    ///
+    /// The classic use is a piecewise-linear function `f` of one variable:
+    /// with breakpoints `t_i`, convex-combination variables `λ_i ∈ [0, 1]`,
+    /// `Σ λ_i = 1`, `x = Σ t_i λ_i` and `f(x) = Σ f(t_i) λ_i`, an SOS2 over the
+    /// `λ_i` (weights `t_i`) restricts `x` to one segment at a time, so `f`
+    /// need not be convex.
+    ///
+    /// A NaN or infinite weight, a weight that repeats, or a member with an
+    /// infinite bound, makes the solve return [`Error::InvalidOperation`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a member is repeated or refers to a variable outside this
+    /// problem.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use microlp::*;
+    /// // min f(x) at x = 1.5, f through (0, 0), (1, 3), (2, 1), (3, 4): not
+    /// // convex, so the LP alone would mix the first and third breakpoints.
+    /// let mut problem = Problem::new(OptimizationDirection::Minimize);
+    /// let (t, f) = ([0.0, 1.0, 2.0, 3.0], [0.0, 3.0, 1.0, 4.0]);
+    /// let lambda: Vec<Variable> = f.iter().map(|&fi| problem.add_var(fi, (0.0, 1.0))).collect();
+    /// problem.add_constraint(lambda.iter().map(|&l| (l, 1.0)), ComparisonOp::Eq, 1.0);
+    /// problem.add_constraint(lambda.iter().zip(t).map(|(&l, ti)| (l, ti)), ComparisonOp::Eq, 1.5);
+    /// problem.add_sos2_constraint(lambda.iter().zip(t).map(|(&l, ti)| (l, ti)));
+    /// let solution = problem.solve().unwrap().into_solution().unwrap();
+    /// assert!((solution.objective() - 2.0).abs() < 1e-9);
+    /// ```
+    pub fn add_sos2_constraint(&mut self, members: impl Into<LinearExpr>) {
+        self.add_sos(mip::sos::SosKind::Sos2, members.into());
+    }
+
+    fn add_sos(&mut self, kind: mip::sos::SosKind, expr: LinearExpr) {
+        let num_vars = self.obj_coeffs.len();
+        let set = self.sos.len();
+        if let Some(var) = expr.vars.iter().find(|&&var| var >= num_vars) {
+            panic!("invalid special ordered set {set}: variable index {var} is out of range 0..{num_vars}");
+        }
+        let mut sorted = expr.vars.clone();
+        sorted.sort_unstable();
+        if let Some(pair) = sorted.windows(2).find(|pair| pair[0] == pair[1]) {
+            panic!(
+                "invalid special ordered set {set}: variable {} appears more than once",
+                pair[0]
+            );
+        }
+        if expr.vars.len() < kind.min_members() {
+            return;
+        }
+        // Stable sort by weight: ties keep insertion order. A NaN weight sorts
+        // somewhere; the solve refuses it before the order matters.
+        let mut order: Vec<usize> = (0..expr.vars.len()).collect();
+        order.sort_by(|&i, &j| expr.coeffs[i].total_cmp(&expr.coeffs[j]));
+        self.sos.push(mip::sos::SosSet {
+            kind,
+            members: order.iter().map(|&i| expr.vars[i]).collect(),
+            weights: order.iter().map(|&i| expr.coeffs[i]).collect(),
+        });
     }
 }
 
@@ -362,7 +491,7 @@ impl Problem {
         range: &CoefficientRange,
     ) -> Result<SolveOutcome, Error> {
         let num_vars = self.obj_coeffs.len();
-        if self.has_integer_vars() {
+        if self.needs_branching() {
             let run = mip::run(self, options.clone())?;
             let resume_options = ResumeOptions::from(&options);
             Ok(SolveOutcome::from_mip_run(
@@ -466,6 +595,44 @@ impl Problem {
         }
         for (row, (coeffs, cmp_op, rhs)) in self.constraints.iter().enumerate() {
             check_row(coeffs, *cmp_op, *rhs, row)?;
+        }
+        for (set, sos) in self.sos.iter().enumerate() {
+            self.check_sos(set, sos)?;
+        }
+        Ok(())
+    }
+
+    /// `InvalidOperation` for special ordered set `set` (in the order added,
+    /// counting only those with enough members to constrain anything) where
+    /// a weight is NaN or infinite, an SOS2 weight repeats, or a member has
+    /// an infinite bound. The last is what makes the unboundedness proof
+    /// sound: it combines a set-feasible point with a ray of the relaxation,
+    /// and a ray moves no var with finite bounds, so it never switches a
+    /// member on.
+    fn check_sos(&self, set: usize, sos: &mip::sos::SosSet) -> Result<(), Error> {
+        for (&var, &weight) in sos.members.iter().zip(&sos.weights) {
+            if !weight.is_finite() {
+                return Err(Error::InvalidOperation(format!(
+                    "invalid weight {weight} of variable {var} in special ordered set {set}: \
+                     expected a finite value"
+                )));
+            }
+            let (min, max) = (self.var_mins[var], self.var_maxs[var]);
+            if !min.is_finite() || !max.is_finite() {
+                return Err(Error::InvalidOperation(format!(
+                    "variable {var} of special ordered set {set} has the bounds [{min}, {max}]: \
+                     a member needs finite bounds"
+                )));
+            }
+        }
+        if sos.kind == mip::sos::SosKind::Sos2 {
+            if let Some(pair) = sos.weights.windows(2).find(|pair| pair[0] == pair[1]) {
+                return Err(Error::InvalidOperation(format!(
+                    "special ordered set {set} repeats the weight {}: SOS2 weights must be \
+                     distinct, since they define adjacency",
+                    pair[0]
+                )));
+            }
         }
         Ok(())
     }

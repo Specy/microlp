@@ -26,15 +26,18 @@ microlp requires Rust 1.88 or later.
 
 * Pure Rust. Runs on WebAssembly.
 * Real, integer and boolean variables.
+* Special ordered sets of type 1 and 2, for example for piecewise-linear
+  functions that are not convex.
 * Time limits and MIP gaps. You can edit a solved problem and resume an
   interrupted solve.
 * Warm starts from a known solution.
 * Dual values (shadow prices) and reduced costs for linear programs.
 * Handles problems with hundreds of thousands of variables and constraints.
 
-Problems with integer or boolean variables are solved with branch & bound. On
-hard or ill-conditioned problems, a solve can fail with `Error::InternalError`
-instead of returning an answer. Please report bugs and contribute code.
+Problems with integer or boolean variables, or special ordered sets, are
+solved with branch & bound. On hard or ill-conditioned problems, a solve can
+fail with `Error::InternalError` instead of returning an answer. Please report
+bugs and contribute code.
 
 ## Basic usage
 

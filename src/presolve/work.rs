@@ -937,10 +937,17 @@ impl Work<'_> {
     /// `v` can only be derived from a row that also blocks decreasing `v` (Ge
     /// with a>0, Le with a<0, or Eq), so `!bad_dec` implies `wlo == elo`
     /// (mirrored for the upper side).
-    pub(crate) fn dual_fix(&mut self, rows: &[Row], obj: &[f64]) -> bool {
+    pub(crate) fn dual_fix(&mut self, rows: &[Row], obj: &[f64], locked: &[usize]) -> bool {
         let n = self.wlo.len();
         let mut bad_dec = vec![false; n];
         let mut bad_inc = vec![false; n];
+        // A var something outside the rows holds (a special ordered set's
+        // member) is locked both ways: the rows cannot tell whether moving it
+        // to a bound keeps the point feasible.
+        for &v in locked {
+            bad_dec[v] = true;
+            bad_inc[v] = true;
+        }
         for row in rows.iter().filter(|r| r.alive) {
             let le_side = row.hi.is_finite();
             let ge_side = row.lo.is_finite();

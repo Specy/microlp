@@ -28,8 +28,8 @@ impl SolveState {
 }
 
 /// A validated feasible assignment returned by a solve, resume, or edit.
-/// For a problem with integer or boolean variables, it is the incumbent,
-/// the best feasible solution found so far.
+/// For a problem with integer or boolean variables or special ordered sets, it
+/// is the incumbent, the best feasible solution found so far.
 ///
 /// Use [`Solution::status`] to distinguish a proven optimum from an assignment
 /// that is feasible without a proof of optimality. Edits consume the
@@ -201,8 +201,8 @@ impl Solution {
     /// Returns a constraint's dual value (shadow price). This is the change in
     /// optimal objective per unit increase in the constraint's right-hand
     /// side, in objective units per right-hand-side unit. Returns `None` for a
-    /// problem with integer or boolean variables, whose solutions have no
-    /// dual values.
+    /// problem with integer or boolean variables or special ordered sets,
+    /// whose solutions have no dual values.
     ///
     /// The sign follows from this definition. When minimizing, a
     /// [`ComparisonOp::Le`] constraint's dual is at most zero because raising
@@ -226,8 +226,8 @@ impl Solution {
     ///
     /// # Panics
     ///
-    /// For a problem without integer or boolean variables, panics if
-    /// `constraint` is out of range for this solution.
+    /// For a problem without integer or boolean variables or special ordered
+    /// sets, panics if `constraint` is out of range for this solution.
     ///
     /// # Examples
     ///
@@ -262,8 +262,8 @@ impl Solution {
     /// Returns the dual value for every constraint, indexed by
     /// [`Constraint::idx`]. The order is the problem's constraints as added,
     /// followed by constraints added with [`Solution::add_constraint`].
-    /// Returns `None` for a problem with integer or boolean variables. See
-    /// [`Solution::dual`].
+    /// Returns `None` for a problem with integer or boolean variables or
+    /// special ordered sets. See [`Solution::dual`].
     pub fn duals(&self) -> Option<&[f64]> {
         match &self.state {
             SolveState::Lp(_) => Some(&self.lp_duals),
@@ -277,7 +277,7 @@ impl Solution {
     /// bound stay there. It equals the variable's objective coefficient minus
     /// the sum, over the constraints, of its coefficient times the constraint's
     /// [dual value](Solution::dual). Returns `None` for a problem with integer
-    /// or boolean variables.
+    /// or boolean variables or special ordered sets.
     ///
     /// A variable strictly between its bounds has reduced cost zero, within
     /// the tolerances. For a variable at a bound, the reduced cost is the

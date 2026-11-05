@@ -3,6 +3,7 @@
 
 use super::node::{with_var_bounds, Node};
 use super::params;
+use super::sos::{self, Point, Split};
 use super::state::{Incumbent, MipState};
 use super::{
     branching, candidate_variables_feasible, dominated, global_bound_internal, relative_gap,
@@ -13,9 +14,11 @@ use crate::{Error, StopReason, VarDomain};
 
 /// Validate and adopt the solver's current point, as the engine computed it:
 /// every bound and row of the model (the rows presolve dropped or rewrote
-/// included) within the contract, and every integer var within `int_tol` of
+/// included) within the contract, every integer var within `int_tol` of
 /// an integer (one the node fixes lies on its value, where the engine holds
-/// it). The bounds are the root's: the node's are not always within them,
+/// it), and every special ordered set holding, a member counting as zero
+/// within the bound contract at `[0, 0]` (`super::sos`). The bounds are the
+/// root's: the node's are not always within them,
 /// since a warm-start hint fixes a var up to `params::HINT_BOUNDS_SLACK`
 /// outside them, and the var may sit its whole tolerance beyond that.
 /// `Ok(false)` means the point fails the check and the caller must branch. A
@@ -33,6 +36,10 @@ pub(crate) fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
         root_bounds[v]
     }) {
         debug!("integral-within-tol solution rejected: a value violates its bounds or domain");
+        return Ok(false);
+    }
+    if !sos_hold(state, Some(tolerances.feasibility)) {
+        debug!("integral-within-tol solution rejected: a special ordered set is violated");
         return Ok(false);
     }
     if let Some((row, violation)) = solver.first_violated_row(&values) {
@@ -62,23 +69,75 @@ pub(crate) fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
     }
 }
 
-enum IntegralCandidate {
-    Closed,
-    Branch(usize),
+/// Whether every special ordered set holds at the solver's current point, a
+/// member counting as zero within `zero_tol` (strictly, for `None`).
+fn sos_hold(state: &MipState, zero_tol: Option<f64>) -> bool {
+    let solver = &state.solver;
+    sos::all_satisfied(
+        &state.base.sos,
+        &Point {
+            value: &|v| solver.get_value(v),
+            fixed_to_zero: &|v| solver.get_var_bounds(v) == (0.0, 0.0),
+            zero_tol,
+        },
+    )
 }
 
-/// Adopt the node's LP point, integral within `int_tol`, and close the
-/// subtree: its objective is the node's bound. The engine verified its own
-/// rows and bounds at these very values, within their contract less the
-/// round-off of its own evaluation, which the guard's compensated sums leave
-/// it, so a point fails the guard only on a row presolve dropped or rewrote. Such
-/// a row holds where the integer vars are exactly integral, but an LP value
-/// within `int_tol` of an integer, or past a bound within its tolerance, can
-/// break it (a rewritten coefficient is exact only at an integral binary):
-/// the node then branches at `int_tol = 0` on an integer var off its integer,
-/// which the child that fixes it holds exactly at its value. A point that
-/// fails with every integer var exactly integral, nothing left to branch on,
-/// is an `InternalError`: presolve's reduction did not keep it.
+/// Whether the solver's current point is a candidate: every integer var the
+/// search can branch on within `int_tol` of an integer, and every special
+/// ordered set holding within the bound contract.
+fn is_candidate(state: &MipState, domains: &[VarDomain], int_tol: f64) -> bool {
+    branching::is_integral(&state.solver, domains, int_tol)
+        && sos_hold(state, Some(state.options.tolerances.feasibility))
+}
+
+/// What a node branches on.
+enum Branch {
+    /// An integer var, split at its value.
+    Var(usize),
+    /// A violated special ordered set.
+    Sos(Split),
+}
+
+/// What to branch on at the solver's current point: an integer var off its
+/// integer by more than `int_tol` first (pseudocost score), else the first
+/// special ordered set violated with members counting as zero within
+/// `zero_tol` (strictly, for `None`). Integer branching keeps priority: set
+/// branching records no pseudocost, so an integer var branched first lets the
+/// search learn the costs it needs.
+fn choose_branch(
+    state: &MipState,
+    domains: &[VarDomain],
+    int_tol: f64,
+    zero_tol: Option<f64>,
+) -> Option<Branch> {
+    if let Some(var) =
+        branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts)
+    {
+        return Some(Branch::Var(var));
+    }
+    sos::solver_split(&state.base.sos, &state.solver, zero_tol).map(Branch::Sos)
+}
+
+enum IntegralCandidate {
+    Closed,
+    Branch(Branch),
+}
+
+/// Adopt the node's LP point, a candidate within `int_tol` and the bound
+/// contract, and close the subtree: its objective is the node's bound. The
+/// engine verified its own rows and bounds at these very values, within
+/// their contract less the round-off of its own evaluation, which the guard's
+/// compensated sums leave it, so a point fails the guard only on a row
+/// presolve dropped or rewrote. Such a row holds where the integer vars are
+/// exactly integral, but an LP value within `int_tol` of an integer, or past
+/// a bound within its tolerance, can break it (a rewritten coefficient is
+/// exact only at an integral binary): the node then branches at
+/// `int_tol = 0` on an integer var off its integer, which the child that
+/// fixes it holds exactly at its value, or else on a set violated by a
+/// member that is not exactly zero, which the child that fixes it holds at
+/// zero. A point that fails with nothing left to branch on is an
+/// `InternalError`: presolve's reduction did not keep it.
 fn process_integral_candidate(
     state: &mut MipState,
     domains: &[VarDomain],
@@ -86,8 +145,8 @@ fn process_integral_candidate(
     if try_adopt_incumbent(state)? {
         return Ok(IntegralCandidate::Closed);
     }
-    match branching::choose_branch_var(&state.solver, domains, 0.0, &state.pseudocosts) {
-        Some(var) => Ok(IntegralCandidate::Branch(var)),
+    match choose_branch(state, domains, 0.0, None) {
+        Some(branch) => Ok(IntegralCandidate::Branch(branch)),
         None => Err(Error::InternalError(
             "an integral solution the search cannot branch on failed feasibility validation"
                 .to_string(),
@@ -126,9 +185,73 @@ fn apply_node_bounds(state: &mut MipState, node: &Node) -> bool {
     true
 }
 
+/// Branch at the solver's current (just solved) optimum.
+fn branch(state: &mut MipState, parent: &Node, decision: Branch) {
+    match decision {
+        Branch::Var(var) => branch_var(state, parent, var),
+        Branch::Sos(split) => branch_sos(state, parent, split),
+    }
+}
+
+/// Split a violated special ordered set: each child fixes one side of the
+/// split to zero, carrying the parent's basis, objective bound and lattice
+/// bound. A fixing intersects the member's bounds in force with `[0, 0]`, as
+/// `(max(lo, 0), min(hi, 0))`, so a member whose bounds exclude zero gives its
+/// child crossed bounds, which `apply_node_bounds` prunes without an LP,
+/// instead of widening them. The children carry no branch var: a pseudocost
+/// is a per-var statistic, and a set fixing moves several vars.
+fn branch_sos(state: &mut MipState, parent: &Node, split: Split) {
+    let z = state.solver.cur_obj_val;
+    let lattice_bound = state.lattice_bound(z);
+    let solver = &state.solver;
+    let fix_to_zero = |members: &[usize]| {
+        debug_assert!(
+            !members.is_empty(),
+            "a set split fixes a free member on each side"
+        );
+        members
+            .iter()
+            .fold(parent.bound_changes.clone(), |changes, &v| {
+                let (lo, hi) = solver.get_var_bounds(v);
+                with_var_bounds(&changes, v, lo.max(0.0), hi.min(0.0))
+            })
+    };
+    let left_changes = fix_to_zero(&split.left_zero);
+    let right_changes = fix_to_zero(&split.right_zero);
+
+    state.node_seq += 1;
+    let id = state.node_seq;
+    state.last_solved_id = Some(id);
+    let basis = state.solver.snapshot_basis();
+    let child = |bound_changes, basis| Node {
+        bound_changes,
+        basis,
+        lp_bound: z,
+        lattice_bound,
+        depth: parent.depth + 1,
+        parent_id: id,
+        branch_var: None,
+        branch_up: false,
+        branch_frac: 1.0,
+    };
+    let left = child(left_changes, basis.clone());
+    let right = child(right_changes, basis);
+
+    // Dive first into the child that keeps more of the current point's mass:
+    // it is the more likely to stay feasible and close quickly.
+    if split.left_mass >= split.right_mass {
+        state.open.push(right);
+        state.open.push(left);
+    } else {
+        state.open.push(left);
+        state.open.push(right);
+    }
+    state.diving = true;
+}
+
 /// Branch on `var` at the solver's current (just solved) optimum: push the two
 /// children carrying the parent's basis, objective bound and lattice bound.
-fn branch(state: &mut MipState, parent: &Node, var: usize) {
+fn branch_var(state: &mut MipState, parent: &Node, var: usize) {
     let z = state.solver.cur_obj_val;
     let lattice_bound = state.lattice_bound(z);
     let val = state.solver.get_value(var);
@@ -448,16 +571,16 @@ fn initialize_root(
         branch_frac: 1.0,
     };
     let int_tol = state.options.int_tol;
-    if branching::is_integral(&state.solver, domains, int_tol) {
+    if is_candidate(state, domains, int_tol) {
         match process_integral_candidate(state, domains)? {
-            IntegralCandidate::Branch(var) => branch(state, &root, var),
+            IntegralCandidate::Branch(decision) => branch(state, &root, decision),
             IntegralCandidate::Closed => {
                 return Ok(Some(TerminationReason::ProvenOptimal));
             }
         }
     } else {
-        let var = fractional_branch_var(state, domains, int_tol);
-        branch(state, &root, var);
+        let decision = non_candidate_branch(state, domains, int_tol);
+        branch(state, &root, decision);
     }
 
     Ok(None)
@@ -516,9 +639,9 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
     }
 
     let int_tol = state.options.int_tol;
-    if branching::is_integral(&state.solver, domains, int_tol) {
+    if is_candidate(state, domains, int_tol) {
         match process_integral_candidate(state, domains)? {
-            IntegralCandidate::Branch(var) => branch(state, &node, var),
+            IntegralCandidate::Branch(decision) => branch(state, &node, decision),
             IntegralCandidate::Closed => {
                 state.last_solved_id = None;
                 state.diving = false;
@@ -527,17 +650,19 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
         return Ok(NodeVisit::Solved);
     }
 
-    let var = fractional_branch_var(state, domains, int_tol);
-    branch(state, &node, var);
+    let decision = non_candidate_branch(state, domains, int_tol);
+    branch(state, &node, decision);
     Ok(NodeVisit::Solved)
 }
 
-/// The var to branch on at a point that is not integral within `int_tol`:
-/// one exists, since `branching::is_integral` weighs only the vars the search
-/// can branch on.
-fn fractional_branch_var(state: &MipState, domains: &[VarDomain], int_tol: f64) -> usize {
-    branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts)
-        .expect("a point that is not integral has an integer var the search can branch on")
+/// What to branch on at a point that is no candidate within `int_tol` and the
+/// bound contract: one exists, since `branching::is_integral` weighs only the
+/// vars the search can branch on, and a set violated within the contract
+/// counts two members beyond it, neither fixed at zero.
+fn non_candidate_branch(state: &MipState, domains: &[VarDomain], int_tol: f64) -> Branch {
+    let zero_tol = Some(state.options.tolerances.feasibility);
+    choose_branch(state, domains, int_tol, zero_tol)
+        .expect("a point that is no candidate has an integer var or a set to branch on")
 }
 
 pub(crate) fn search_loop(state: &mut MipState) -> Result<TerminationReason, Error> {

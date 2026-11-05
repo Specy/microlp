@@ -611,6 +611,61 @@ branching); a false acceptance would be a wrong answer.
   - The reported bound is not rounded: an answer can lie below its lattice value by its
     integer vars' `int_tol`, and `Stats::best_bound` bounds every answer still to come.
 
+### 5.5b Special ordered sets (`src/mip/sos.rs`)
+
+Adapted from Adel Kaleche's Specy/microlp#50. A `Problem` carries special ordered sets
+(`mip::sos::SosSet`: SOS1 "at most one member nonzero", SOS2 "at most two, adjacent in weight
+order", each a list of structural vars sorted by weight). Sets never reach the engine; the
+search enforces them by branching, and they travel with every clone of the problem, so
+`MipState::base`, post-solve edits and unboundedness classification keep them. A problem
+with a set solves through the search even with no integer var (`Problem::needs_branching`).
+A set too small to constrain anything is dropped when added; its numbers (weights, which
+SOS2 needs distinct, and the members' bounds, which must be finite) are checked by
+`Problem::validate` with the rest.
+
+**When a member counts as zero.** Within the contract every bound is held to, at `[0, 0]`
+(`outside_bounds` at `Tolerances::feasibility`), or when its bounds in force are `[0, 0]`.
+Nothing is snapped: values are reported as the engine computed them, as an integer var's
+are within `int_tol` of its integer (§5.4), so the guard checks the point the engine
+verified, and a zero member can read `1e-9`.
+
+**Candidates.** A node's point is a candidate (`search::is_candidate`) when it is integral
+within `int_tol` and every set holds within the contract. `try_adopt_incumbent` checks the
+sets again, at the same contract, whoever calls it (the warm start included), and that check
+is what guards an incumbent: a point it rejects goes to `process_integral_candidate`'s
+re-branch, which takes an integer var off its integer at `int_tol = 0`, else a set violated
+by a member that is not exactly zero (`zero_tol = None`), whose child holds it at zero.
+
+**Branching** is one decision (`choose_branch`): an integer var off its integer first, by
+pseudocost, else the first violated set, split Beale–Tomlin style (`SosSet::split`). With
+the counted nonzero members at positions `a..=b` and the weighted mean of their weights
+choosing `r`, SOS1 takes `a ≤ r < b` (left zeroes `> r`, right `≤ r`), SOS2 `a < r < b`
+(left zeroes `> r`, right `< r`, `r` free in both): the left child zeroes `b`, the right `a`,
+so both exclude the point. Integer branching keeps priority because set children record no
+pseudocost. Two rules make the search terminate whatever the tolerances:
+
+- A member whose bounds in force are `[0, 0]` counts as zero and is never re-fixed, so every
+  child fixes at least one member still free, and the free members strictly decrease along
+  any path.
+- A fixing intersects the member's bounds in force with `[0, 0]`, as `(max(lo, 0), min(hi,
+  0))`: a member whose bounds exclude zero gives its child crossed bounds, which
+  `apply_node_bounds` prunes without an LP, instead of widening them.
+
+**Presolve.** Dual fixing (§7.4) reads only the rows, which do not hold a set: it would fix an
+integer member that nothing in the rows stops at a nonzero bound, two such members in one
+SOS1 contradicting it, and the search would answer `Infeasible` for a feasible model.
+`build_state` locks every member in both directions (`presolve_with_locks`, marking it as
+`Work::dual_fix` marks a var a row resists), so dual fixing leaves the members alone and
+still fixes the other integer vars: fixing a non-member cannot break a set. It never touches
+a continuous var, and presolve's other reductions are implied by the rows, so a model whose
+members are continuous (an SOS2 of convex-combination weights) keeps them.
+
+**Finite bounds** make §5.1's unboundedness classification sound: it proves unboundedness from
+one set-feasible point plus a ray of the relaxation, and a ray moves no var with finite
+bounds, so it never switches a member on. With an unbounded member it could (`x − y = 0`,
+SOS1 `{x, y}`, minimize `−x − y`: the relaxation is unbounded, the only set-feasible point the
+origin).
+
 ### 5.6 Pseudocost branching (`src/mip/branching/`)
 
 The driver learns **pseudocosts**: per variable and direction, the average objective
@@ -789,7 +844,9 @@ fixed one's on it (round it where an exact integer is needed, §5.4; `var_domain
 outcomes expose no answer-value accessors.
 
 Duals: `Problem::add_constraint` returns a `Constraint` handle, and a pure LP's `Solution`
-reports `dual(constraint)`, `duals()` and `reduced_cost(var)` (`None` for a MILP). They are
+reports `dual(constraint)`, `duals()` and `reduced_cost(var)` (`None` for a problem that
+solves through branch & bound: one with integer or boolean variables, or with a special
+ordered set). They are
 read off the final basis when the solution is built (`Solver::duals`, multipliers refined
 once, like those the optimality check accepted), unscaled to user units (a row's dual times
 its row factor, a reduced cost over its column factor) and negated for `Maximize`: a dual is
