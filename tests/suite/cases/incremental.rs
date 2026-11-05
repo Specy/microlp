@@ -88,6 +88,7 @@ fn add_constraint_lp(cases: &mut Vec<Case>) {
                 let terms = row_terms(&inst, &vars, i);
                 sol = require_solution(
                     sol.add_constraint(&terms, Le, inst.b[i] as f64)
+                        .map(|(outcome, _)| outcome)
                         .map_err(|e| format!("add_constraint row {}: {}", i, e))?,
                     &format!("add_constraint row {}", i),
                 )?;
@@ -121,6 +122,7 @@ fn add_constraint_lp(cases: &mut Vec<Case>) {
 
             let sol = require_solution(
                 sol.add_constraint(&[(x, 1.0), (y, 1.0)], Le, 15.0)
+                    .map(|(outcome, _)| outcome)
                     .map_err(|e| format!("step 1: {}", e))?,
                 "step 1",
             )?;
@@ -128,6 +130,7 @@ fn add_constraint_lp(cases: &mut Vec<Case>) {
 
             let sol = require_solution(
                 sol.add_constraint(&[(x, 1.0)], Le, 3.0)
+                    .map(|(outcome, _)| outcome)
                     .map_err(|e| format!("step 2: {}", e))?,
                 "step 2",
             )?;
@@ -135,6 +138,7 @@ fn add_constraint_lp(cases: &mut Vec<Case>) {
 
             let sol = require_solution(
                 sol.add_constraint(&[(y, 1.0), (x, -1.0)], Le, 0.0)
+                    .map(|(outcome, _)| outcome)
                     .map_err(|e| format!("step 3: {}", e))?,
                 "step 3",
             )?;
@@ -434,6 +438,7 @@ fn milp_edits(cases: &mut Vec<Case>) {
             // With x0 + x1 <= 1 the best is still 4 (e.g. items 0 and 2).
             let sol = require_solution(
                 sol.add_constraint(&[(vars[0], 1.0), (vars[1], 1.0)], Le, 1.0)
+                    .map(|(outcome, _)| outcome)
                     .map_err(|e| format!("add_constraint on MILP solution: {}", e))?,
                 "add_constraint on MILP solution",
             )?;
@@ -533,6 +538,7 @@ fn milp_edits(cases: &mut Vec<Case>) {
                 conflicts.push((i, j));
                 sol = require_solution(
                     sol.add_constraint(&[(vars[i], 1.0), (vars[j], 1.0)], Le, 1.0)
+                        .map(|(outcome, _)| outcome)
                         .map_err(|e| format!("adding conflict {:?}: {}", (i, j), e))?,
                     &format!("adding conflict {:?}", (i, j)),
                 )?;
@@ -665,6 +671,7 @@ fn milp_edits(cases: &mut Vec<Case>) {
 
             let sol = require_solution(
                 sol.add_constraint(&[(y, 1.0)], Le, 5.0)
+                    .map(|(outcome, _)| outcome)
                     .map_err(|e| format!("adding y <= 5: {}", e))?,
                 "adding y <= 5",
             )?;

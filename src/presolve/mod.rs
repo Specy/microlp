@@ -187,7 +187,7 @@ pub(crate) fn presolve(
         }
     }
 
-    let mut dropped_on_input = 0usize;
+    let mut dropped_on_input = Vec::new();
     let mut rows: Vec<Row> = Vec::with_capacity(constraints.len());
     for (orig, (coeffs, op, rhs)) in constraints.iter().enumerate() {
         // Rows whose data alone decide them (empty, or an infinite
@@ -195,7 +195,7 @@ pub(crate) fn presolve(
         // same contract.
         match trivial_row_verdict(coeffs, *op, *rhs, feasibility) {
             Some(true) => {
-                dropped_on_input += 1;
+                dropped_on_input.push(orig);
                 continue;
             }
             Some(false) => return Err(Error::Infeasible),
@@ -234,7 +234,7 @@ pub(crate) fn presolve(
         mode,
         feas: feasibility,
         stats: PresolveStats {
-            rows_dropped: dropped_on_input,
+            rows_dropped: dropped_on_input.len(),
             ..PresolveStats::default()
         },
         adj_start,
@@ -272,7 +272,14 @@ pub(crate) fn presolve(
     // check the answer against (`Presolved::validation_rows`).
     let mut out = Vec::with_capacity(rows.len());
     let mut kept_rows = Vec::with_capacity(rows.len());
-    let mut validation_rows = Vec::new();
+    // A row dropped on input is kept too: every point satisfies it, so the
+    // check never fails, but an edit of its right-hand side
+    // (`Solution::set_rhs`) can make it bind, and the engine then takes it
+    // over.
+    let mut validation_rows: Vec<_> = dropped_on_input
+        .iter()
+        .map(|&orig| (orig, constraints[orig].clone()))
+        .collect();
     for row in rows.iter_mut() {
         let orig = row.orig as usize;
         if !row.alive {

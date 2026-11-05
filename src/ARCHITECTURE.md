@@ -271,6 +271,16 @@ with drift) recompute reduced costs and run primal simplex. Returns `StopReason:
 the deadline fires mid-run — leaving the honest feasibility flags so a later call continues
 where it left off.
 
+**`set_rhs(user_row, rhs)` / `set_obj_coeff(var, coeff)` -> `Result<StopReason, Error>`** —
+the pure-LP warm edits, in user units (the cost in minimize space), each followed by a
+re-solve from the current basis. A right-hand side does not enter the reduced costs, so the
+basis stays dual feasible and the re-solve is a dual simplex run, as after a bound change:
+the row keeps its row factor, its scaled right-hand side is replaced and the basic values are
+recomputed first (a dual phase starts from them as they stand). Where the row lives decides
+the rest (§3.2). A cost does not enter the values, so the basis stays primal feasible:
+`phase_rounds` recomputes the reduced costs from the multipliers and the primal simplex
+prices them. The B&B never calls them: a MILP edit re-solves from its base problem (§5.8).
+
 **`snapshot_basis() / load_basis(&Basis)`** — a `Basis` is one status per total variable:
 `Basic | AtLower | AtUpper | Free` (~1 byte each). That is the *entire* warm-start state a
 tree node needs. `load_basis` rebuilds everything from statuses + **current** bounds:
@@ -307,6 +317,35 @@ answer is held to the whole model only here. An LP answer that misses one is no 
 engine takes the row over (`hold_validation_rows`, through `add_row`) and resumes
 from its basis, within the call's deadline, so a reduction presolve got wrong costs pivots,
 not the answer; a MIP candidate that misses one is rejected (§5.4).
+
+### 3.2 Where a user row lives
+
+A row of the user's model (the problem's, in the order added, then those
+`Solution::add_constraint` added) is in exactly one of two places, and every edit, read-out
+and check has to know which:
+
+- **Held by the engine**: `user_rows[i] = Some(r)`, engine row `r`. It is stored as
+  `ρ_r (a · S) x' + s_r = ρ_r b` (`orig_constraints`, `orig_rhs`): the coefficients scaled by
+  the column factors `S` (§7) and the row factor `ρ_r` (`row_scales`, chosen once, when the
+  row enters, by `equilibration_scale`), and one slack per row. **The row's sense is its
+  slack's bounds** (`slack_bounds`: `Le` → `[0, ∞)`, `Ge` → `(−∞, 0]`, `Eq` → `[0, 0]`); the
+  engine never stores the comparison for its own use. `row_ops` keeps it for the edits,
+  which move those bounds: `set_rhs` with an infinite right-hand side frees the slack rather
+  than store an infinity, and a finite one later restores the bounds from `row_ops`.
+- **Not held** (`user_rows[i] = None`): kept as written, in user units, among the
+  `validation_rows` with its user index. These are the rows presolve dropped (implied by the
+  emitted bounds), the rows every point satisfies (an empty row within the contract, or an
+  infinite right-hand side on the open side: `prepare_row` returns `None`, and presolve drops
+  them on input, both keeping them), and, in a MILP, the as-written form of a row presolve
+  rewrote (that one is also held, rewritten). No pivot sees them. The boundary checks the
+  answer against them (`first_violated_row`): an LP that misses one takes it over
+  (`hold_validation_rows` → `add_row`, which sets `user_rows[i]`) and resumes from its basis.
+
+So an edit of a row not held needs no pivot: `set_rhs` changes its right-hand side in place,
+and the boundary enforces it, taking the row over only where the answer misses it. This is
+also why `Solution::duals` reports zero for such a row (`Solver::duals` reads `user_rows`): a
+dropped row is implied by the bounds, so zero is an optimal dual for it, and one taken over
+is priced like any other.
 
 ---
 
@@ -628,8 +667,8 @@ sequenceDiagram
     participant U as user
     participant S as Solution (MILP)
     participant M as mip::reedit_and_resolve
-    U->>S: add_constraint / fix_var / unfix_var
-    S->>S: mutate state.base (push row) or state.fixed (insert/remove)
+    U->>S: add_constraint / set_rhs / set_obj_coeff / fix_var / unfix_var
+    S->>S: mutate state.base (push row, set a rhs or a cost) or state.fixed (insert/remove)
     S->>M: reedit_and_resolve(state)
     M->>M: drop the open tree (its bounds may exclude new optima)
     M->>M: old incumbent still feasible for base+fixed? (cheap check)
@@ -643,7 +682,15 @@ sequenceDiagram
 `fix_var` overlay (so `unfix_var` can restore original bounds). Every edit re-solves the
 *composed* problem from the root, warm-started by the surviving incumbent. Edits exist only
 on a validated `Solution`, including a feasible-but-unproven one; an `InterruptedSolve`
-cannot be edited. `unfix_var` returns `Result<(SolveOutcome, bool), Error>`, so every
+cannot be edited. Keeping the open tree would be valid only for an edit that tightens (a row
+added, a right-hand side tightened, a var fixed), which no edit does yet.
+
+A pure LP edits its one `Solver` in place instead (`add_row`, `set_var_bounds`,
+`set_rhs`, `set_obj_coeff`, §3.1) and re-solves from its basis: an added row, a fix or a new
+right-hand side keep the basis dual feasible (dual simplex), a new cost or a released fix
+keep it primal feasible (primal simplex). `Solution::add_constraint` returns the new row's
+`Constraint` handle, numbered after the problem's rows and those added before it, which
+`set_rhs` and `dual` take like any other. `unfix_var` returns `Result<(SolveOutcome, bool), Error>`, so every
 limited re-solve remains typed explicitly.
 
 ### 5.9 Interruption and resume, end to end
@@ -745,7 +792,7 @@ its row factor, a reduced cost over its column factor) and negated for `Maximize
 the rate of change of the user's objective with the row's right-hand side. A row whose
 slack is basic, or that the engine does not hold (every point satisfies it, or presolve
 dropped it), has dual zero; a row `Solution::add_constraint` adds is numbered after the
-problem's. Every edit recomputes them.
+problem's, and its handle is returned by the call. Every edit recomputes them.
 
 ---
 

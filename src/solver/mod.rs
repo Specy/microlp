@@ -241,6 +241,12 @@ pub(crate) struct Solver {
     orig_constraints: CsMat, // excluding rhs
     orig_constraints_csc: CsMat,
     orig_rhs: Vec<f64>,
+    /// Per engine row, the comparison the user wrote it with. The engine
+    /// itself reads a row's sense off its slack's bounds ([`slack_bounds`]);
+    /// this record is for the edits, which change those bounds: a right-hand
+    /// side made infinite frees the slack ([`Self::set_rhs`]), and one made
+    /// finite again restores them from here.
+    row_ops: Vec<ComparisonOp>,
     /// Positive per-row equilibration factors. Every row is multiplied by
     /// these internally; validation multiplies its absolute user tolerance by
     /// the same factor so the public feasibility contract stays unscaled.
@@ -277,10 +283,14 @@ pub(crate) struct Solver {
     /// zero ([`dual_tol`]); refreshed whenever the reduced costs are
     /// recomputed from the multipliers.
     dual_tols: Vec<f64>,
-    /// The user's rows, in user units, that presolve dropped (implied by the
-    /// bounds it emitted) or rewrote (valid for integer points only), each
+    /// The user's rows, in user units, that the engine does not hold: those
+    /// presolve dropped (implied by the bounds it emitted) or rewrote (valid
+    /// for integer points only), and those every point satisfies, which
+    /// [`prepare_row`] leaves out (an empty row within the contract, an
+    /// infinite right-hand side on the side the row leaves open). Each comes
     /// with its index among the user's rows ([`Self::user_rows`]). No pivot
-    /// sees them; the boundary checks the answer against them
+    /// sees them; the boundary checks the answer against them, so an edit of
+    /// one's right-hand side ([`Self::set_rhs`]) is enforced there
     /// ([`Self::first_violated_row`]): an LP takes over a row its answer
     /// misses ([`Self::hold_validation_rows`]), and the MIP guard rejects such
     /// a candidate.
@@ -607,14 +617,20 @@ impl Solver {
         let mut prepared_rows = Vec::with_capacity(constraints.len());
         let mut slack_dual_units = Vec::with_capacity(constraints.len());
         let mut user_rows = Vec::with_capacity(constraints.len());
-        for (coeffs, cmp_op, rhs) in constraints {
+        let mut row_ops = Vec::with_capacity(constraints.len());
+        // The rows every point satisfies, kept as written so that an edit of
+        // their right-hand side can bring them in (`validation_rows`).
+        let mut satisfied_rows = Vec::new();
+        for (k, (coeffs, cmp_op, rhs)) in constraints.iter().enumerate() {
             let scaled = scale_columns(coeffs.clone(), &col_scales);
             if let Some(row) = prepare_row(scaled, *cmp_op, *rhs, feasibility, is_fixed)? {
                 user_rows.push(Some(prepared_rows.len()));
                 slack_dual_units.push(slack_dual_unit(coeffs, row.row_scale, is_fixed));
+                row_ops.push(*cmp_op);
                 prepared_rows.push(row);
             } else {
                 user_rows.push(None);
+                satisfied_rows.push((k, (coeffs.clone(), *cmp_op, *rhs)));
             }
         }
         let var_tols: Vec<BoundTols> = (0..num_vars)
@@ -768,6 +784,7 @@ impl Solver {
             orig_constraints,
             orig_constraints_csc,
             orig_rhs,
+            row_ops,
             row_scales,
             slack_dual_units,
             col_scales,
@@ -776,7 +793,7 @@ impl Solver {
             range: CoefficientRange::default(),
             var_tols,
             dual_tols: vec![0.0; num_total_vars],
-            validation_rows: Vec::new(),
+            validation_rows: satisfied_rows,
             user_rows,
             deadline,
             operation_time_limit: None,
@@ -1183,6 +1200,9 @@ impl Solver {
             user_rows[orig] = row;
         }
         self.user_rows = user_rows;
+        // Presolve drops every row every point satisfies on input, and keeps
+        // it among its validation rows, so the reduced model has none.
+        debug_assert!(self.validation_rows.is_empty());
         self.validation_rows = validation_rows;
     }
 
@@ -2316,6 +2336,108 @@ impl Solver {
         Ok((true, stop))
     }
 
+    /// How many rows the user's model has: the problem's, then those
+    /// [`Self::add_constraint`] added ([`Self::user_rows`]).
+    pub(crate) fn num_user_rows(&self) -> usize {
+        self.user_rows.len()
+    }
+
+    /// The comparison of the user's row `user_row`, as written.
+    pub(crate) fn user_row_op(&self, user_row: usize) -> ComparisonOp {
+        match self.user_rows[user_row] {
+            Some(row) => self.row_ops[row],
+            None => self.validation_row(user_row).1 .1,
+        }
+    }
+
+    /// The position in [`Self::validation_rows`] of the user's row
+    /// `user_row`, one the engine does not hold, with the row.
+    fn validation_row(&self, user_row: usize) -> (usize, &(CsVec, ComparisonOp, f64)) {
+        self.validation_rows
+            .iter()
+            .enumerate()
+            .find(|(_, (u, _))| *u == user_row)
+            .map(|(k, (_, row))| (k, row))
+            .expect("a row the engine does not hold is a validation row")
+    }
+
+    /// Set the right-hand side of the user's row `user_row` to `rhs` (user
+    /// units, a value [`valid_rhs`] takes for the row's comparison) and
+    /// re-solve from the current basis.
+    ///
+    /// The reduced costs do not depend on the right-hand sides, so the basis
+    /// stays dual feasible and the re-solve is a dual simplex run, as after a
+    /// bound change. A row the engine holds keeps its row factor: its
+    /// right-hand side becomes `rhs` times that factor, the basic values are
+    /// recomputed, and an infinite `rhs` (which [`valid_rhs`] allows only on
+    /// the side the row leaves open) frees the row's slack instead, so that
+    /// no infinity enters the arithmetic; a finite one later restores the
+    /// slack's bounds from the row's comparison ([`Self::row_ops`]). A row
+    /// the engine does not hold (presolve dropped it, or every point
+    /// satisfied it) is edited where it is kept, among the validation rows:
+    /// the answer is checked against it as edited, and the engine takes it
+    /// over where the answer misses it ([`Self::hold_validation_rows`]).
+    ///
+    /// Returns `Err(InternalError)`, with the state untouched, where the row
+    /// factor takes `rhs` beyond `f64`.
+    pub(crate) fn set_rhs(&mut self, user_row: usize, rhs: f64) -> Result<StopReason, Error> {
+        debug_assert!(valid_rhs(self.user_row_op(user_row), rhs));
+        let Some(row) = self.user_rows[user_row] else {
+            let (k, _) = self.validation_row(user_row);
+            self.validation_rows[k].1 .2 = rhs;
+            return Ok(StopReason::Finished);
+        };
+        let slack = self.num_vars + row;
+        if rhs.is_infinite() {
+            self.set_var_bounds(slack, f64::NEG_INFINITY, f64::INFINITY)?;
+        } else {
+            let scaled = rhs * self.row_scales[row];
+            if !scaled.is_finite() {
+                return Err(Error::InternalError(format!(
+                    "constraint {user_row} cannot take the right-hand side {rhs:e} in the \
+                     engine's scaled units"
+                )));
+            }
+            self.orig_rhs[row] = scaled;
+            // A dual phase starts from the basic values as they stand, so
+            // they are recomputed for the new right-hand side first.
+            self.recalc_basic_var_vals()?;
+            let (min, max) = slack_bounds(self.row_ops[row]);
+            self.set_var_bounds(slack, min, max)?;
+            self.recalc_obj_coeffs()?;
+        }
+        self.is_primal_feasible = false;
+        self.values_dirty = true;
+        self.reoptimize()
+    }
+
+    /// Set the objective coefficient of structural var `var` to `coeff`
+    /// (user units, internal minimize space) and re-solve from the current
+    /// basis.
+    ///
+    /// The values do not depend on the objective, so the basis stays primal
+    /// feasible and the re-solve is a primal simplex run on the recomputed
+    /// reduced costs, as after a bound is loosened ([`Self::run_phases`]).
+    ///
+    /// Returns `Err(InternalError)`, with the state untouched, where the
+    /// var's column factor takes `coeff` beyond `f64`.
+    pub(crate) fn set_obj_coeff(&mut self, var: usize, coeff: f64) -> Result<StopReason, Error> {
+        debug_assert!(var < self.num_vars);
+        debug_assert!(self.artificial_obj.is_none() && !self.costs_modified);
+        let scaled = coeff * self.col_scales[var];
+        if !scaled.is_finite() {
+            return Err(Error::InternalError(format!(
+                "variable {var} cannot take the objective coefficient {coeff:e} in the \
+                 engine's scaled units"
+            )));
+        }
+        // The reduced costs and the objective are recomputed by the re-solve:
+        // a primal feasible state goes straight to the dual check
+        // ([`Self::phase_rounds`]), which takes them from the multipliers.
+        self.orig_obj_coeffs[var] = scaled;
+        self.reoptimize()
+    }
+
     pub(crate) fn num_constraints(&self) -> usize {
         self.orig_constraints.rows()
     }
@@ -3008,17 +3130,22 @@ impl Solver {
 
         let is_fixed = |var: usize| self.orig_var_mins[var] == self.orig_var_maxs[var];
         let user_coeffs = coeffs.clone();
-        let coeffs = scale_columns(coeffs, &self.col_scales);
+        let scaled = scale_columns(coeffs, &self.col_scales);
         let Some(PreparedRow {
             mut coeffs,
-            rhs,
+            rhs: scaled_rhs,
             row_scale,
             slack_var_min,
             slack_var_max,
-        }) = prepare_row(coeffs, cmp_op, rhs, self.feasibility, is_fixed)?
+        }) = prepare_row(scaled, cmp_op, rhs, self.feasibility, is_fixed)?
         else {
+            // Every point satisfies it: kept as written, for a later edit of
+            // its right-hand side (`validation_rows`).
+            self.validation_rows
+                .push((user_row, (user_coeffs, cmp_op, rhs)));
             return Ok(StopReason::Finished);
         };
+        let rhs = scaled_rhs;
         let slack_unit = slack_dual_unit(&user_coeffs, row_scale, is_fixed);
 
         let slack_var = self.num_total_vars();
@@ -3049,6 +3176,7 @@ impl Solver {
         new_orig_constraints = new_orig_constraints.append_outer_csvec(coeffs.view());
 
         self.orig_rhs.push(rhs);
+        self.row_ops.push(cmp_op);
         self.row_scales.push(row_scale);
         self.slack_dual_units.push(slack_unit);
 

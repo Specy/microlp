@@ -1,7 +1,7 @@
 //! [`Solution`]: a validated assignment, everything that can be read off it,
 //! and the post-solve edits that continue from it.
 
-use crate::problem::{check_row, row_of};
+use crate::problem::{check_rhs, check_row, row_of};
 use crate::range::CoefficientRange;
 use crate::solver::Solver;
 use crate::{
@@ -206,9 +206,10 @@ impl Solution {
     /// The duals are those of the final simplex basis. Where several sets of
     /// duals are optimal (a degenerate optimum), this is one of them, which
     /// another solver may not pick. They meet dual feasibility within the
-    /// solve's tolerances. After [`Solution::fix_var`], [`Solution::unfix_var`]
-    /// or [`Solution::add_constraint`], the new solution's duals are those of
-    /// the edited problem.
+    /// solve's tolerances. After [`Solution::fix_var`], [`Solution::unfix_var`],
+    /// [`Solution::add_constraint`], [`Solution::set_rhs`] or
+    /// [`Solution::set_obj_coeff`], the new solution's duals are those of the
+    /// edited problem.
     ///
     /// # Panics
     ///
@@ -319,7 +320,10 @@ impl Solution {
     /// The returned [`SolveOutcome`] may contain an optimal solution, a feasible
     /// solution, or an interrupted call when a configured limit is reached.
     /// The edit uses the per-call limits and MIP gap associated with this
-    /// solution.
+    /// solution. The returned [`Constraint`] identifies the new constraint,
+    /// for [`Solution::dual`] and [`Solution::set_rhs`] on the solutions that
+    /// follow: it is numbered after the problem's constraints and those added
+    /// before it.
     ///
     /// Use variables from the problem that produced this solution, with each
     /// variable appearing at most once in `expr`.
@@ -339,15 +343,202 @@ impl Solution {
         expr: impl Into<LinearExpr>,
         cmp_op: ComparisonOp,
         rhs: f64,
-    ) -> Result<SolveOutcome, Error> {
+    ) -> Result<(SolveOutcome, Constraint), Error> {
         let mut range = self.state.coefficient_range();
         let row = range.rows();
         let coefficients =
             row_of(expr.into(), self.num_vars, row).map_err(Error::InvalidOperation)?;
         check_row(&coefficients, cmp_op, rhs, row)?;
         range.add_row(&coefficients);
-        self.add_row(coefficients, cmp_op, rhs, range.clone())
+        let outcome = self
+            .add_row(coefficients, cmp_op, rhs, range.clone())
+            .map_err(|error| range.annotate(error))?;
+        Ok((outcome, Constraint(row)))
+    }
+
+    /// Consumes this solution, sets a constraint's right-hand side to `rhs`,
+    /// and solves the edited problem.
+    ///
+    /// `constraint` is one of the problem's ([`Problem::add_constraint`]) or
+    /// one [`Solution::add_constraint`] added; its comparison and terms stay
+    /// as they are. A later call sets it again. The returned [`SolveOutcome`]
+    /// uses the per-call limits and MIP gap associated with this solution.
+    ///
+    /// A problem without integer or boolean variables re-solves from this
+    /// solution's basis: the old basis stays dual feasible, so the dual
+    /// simplex usually needs only a few pivots, and the new solution's
+    /// [duals](Solution::dual) are those of the edited problem. A problem with
+    /// integer or boolean variables searches anew from the edited problem,
+    /// starting from this solution where it still meets every constraint.
+    ///
+    /// An infinite `rhs` on the side the constraint leaves open (`inf` for
+    /// [`ComparisonOp::Le`], `-inf` for [`ComparisonOp::Ge`]) switches the
+    /// constraint off; a finite one later switches it on again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOperation`], before anything is solved, when
+    /// `rhs` is NaN or infinite on the side the constraint bounds (an
+    /// [`ComparisonOp::Eq`] constraint takes only a finite one). Returns
+    /// [`Error::Infeasible`] when the solver proves the edited problem
+    /// infeasible (see [`Error::Infeasible`]), and [`Error::InternalError`]
+    /// for a failure while solving.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `constraint` is out of range for this solution.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use microlp::{ComparisonOp, OptimizationDirection, Problem};
+    ///
+    /// let mut problem = Problem::new(OptimizationDirection::Minimize);
+    /// let cheap = problem.add_var(20.0, (0.0, 6.0));
+    /// let dear = problem.add_var(50.0, (0.0, f64::INFINITY));
+    /// let demand = problem.add_constraint(&[(cheap, 1.0), (dear, 1.0)], ComparisonOp::Ge, 10.0);
+    /// let solution = problem.solve().unwrap().into_solution().unwrap();
+    /// assert!((solution.objective() - 320.0).abs() < 1e-9);
+    ///
+    /// // Demand falls to 5: the cheap generator alone meets it.
+    /// let solution = solution.set_rhs(demand, 5.0).unwrap().into_solution().unwrap();
+    /// assert!((solution.objective() - 100.0).abs() < 1e-9);
+    /// assert!((solution.dual(demand).unwrap() - 20.0).abs() < 1e-9);
+    /// ```
+    ///
+    /// [`Problem::add_constraint`]: crate::Problem::add_constraint
+    pub fn set_rhs(self, constraint: Constraint, rhs: f64) -> Result<SolveOutcome, Error> {
+        let range = self.state.coefficient_range();
+        self.edit_rhs(constraint.0, rhs)
             .map_err(|error| range.annotate(error))
+    }
+
+    /// [`Solution::set_rhs`] of the user's row `row`, its loud errors not yet
+    /// naming the range.
+    fn edit_rhs(self, row: usize, rhs: f64) -> Result<SolveOutcome, Error> {
+        let last_options = self.last_options.clone();
+        let Self {
+            direction,
+            num_vars,
+            state,
+            ..
+        } = self;
+        match state {
+            SolveState::Lp(mut solver) => {
+                let rows = solver.num_user_rows();
+                assert!(row < rows, "constraint {row} is out of range 0..{rows}");
+                check_rhs(solver.user_row_op(row), rhs, row)?;
+                let time_limit = solver.operation_time_limit;
+                let stop =
+                    timed_lp_call(&mut solver, time_limit, |solver| solver.set_rhs(row, rhs))?;
+                SolveOutcome::from_lp_stop(direction, num_vars, stop, solver, last_options)
+            }
+            SolveState::Mip(mut state) => {
+                let rows = state.base.constraints.len();
+                assert!(row < rows, "constraint {row} is out of range 0..{rows}");
+                let (_, cmp_op, old_rhs) = &mut state.base.constraints[row];
+                check_rhs(*cmp_op, rhs, row)?;
+                *old_rhs = rhs;
+                let run = mip::reedit_and_resolve(state)?;
+                Ok(SolveOutcome::from_mip_run(
+                    direction,
+                    num_vars,
+                    run,
+                    last_options,
+                ))
+            }
+        }
+    }
+
+    /// Consumes this solution, sets a variable's objective coefficient to
+    /// `obj_coeff`, and solves the edited problem.
+    ///
+    /// `obj_coeff` is given as for
+    /// [`Problem::add_var`](crate::Problem::add_var), in the problem's
+    /// optimization direction. A later call sets it again. The returned
+    /// [`SolveOutcome`] uses the per-call limits and MIP gap associated with
+    /// this solution.
+    ///
+    /// A problem without integer or boolean variables re-solves from this
+    /// solution's basis: the old basis stays primal feasible, so the primal
+    /// simplex usually needs only a few pivots. A problem with integer or
+    /// boolean variables searches anew from the edited problem, starting from
+    /// this solution, which every objective admits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOperation`], before anything is solved, when
+    /// `obj_coeff` is NaN or infinite. Returns [`Error::Unbounded`] when the
+    /// edited objective has no finite optimum, and [`Error::InternalError`]
+    /// for a failure while solving.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `var` is out of range for this solution.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use microlp::{ComparisonOp, OptimizationDirection, Problem};
+    ///
+    /// let mut problem = Problem::new(OptimizationDirection::Minimize);
+    /// let a = problem.add_var(20.0, (0.0, f64::INFINITY));
+    /// let b = problem.add_var(50.0, (0.0, f64::INFINITY));
+    /// problem.add_constraint(&[(a, 1.0), (b, 1.0)], ComparisonOp::Ge, 10.0);
+    /// let solution = problem.solve().unwrap().into_solution().unwrap();
+    /// assert!((solution[a] - 10.0).abs() < 1e-9);
+    ///
+    /// // `a` becomes the dearer one: the demand moves to `b`.
+    /// let solution = solution.set_obj_coeff(a, 60.0).unwrap().into_solution().unwrap();
+    /// assert!((solution[b] - 10.0).abs() < 1e-9);
+    /// assert!((solution.objective() - 500.0).abs() < 1e-9);
+    /// ```
+    pub fn set_obj_coeff(self, var: Variable, obj_coeff: f64) -> Result<SolveOutcome, Error> {
+        let range = self.state.coefficient_range();
+        self.edit_obj_coeff(var, obj_coeff)
+            .map_err(|error| range.annotate(error))
+    }
+
+    /// [`Solution::set_obj_coeff`], its loud errors not yet naming the range.
+    fn edit_obj_coeff(self, var: Variable, obj_coeff: f64) -> Result<SolveOutcome, Error> {
+        let last_options = self.last_options.clone();
+        let Self {
+            direction,
+            num_vars,
+            state,
+            ..
+        } = self;
+        assert!(var.0 < num_vars);
+        if !obj_coeff.is_finite() {
+            return Err(Error::InvalidOperation(format!(
+                "invalid objective coefficient {obj_coeff} of variable {}: expected a finite value",
+                var.0
+            )));
+        }
+        // Stored in internal (minimize) space, as `Problem` stores it.
+        let internal = match direction {
+            OptimizationDirection::Minimize => obj_coeff,
+            OptimizationDirection::Maximize => -obj_coeff,
+        };
+        match state {
+            SolveState::Lp(mut solver) => {
+                let time_limit = solver.operation_time_limit;
+                let stop = timed_lp_call(&mut solver, time_limit, |solver| {
+                    solver.set_obj_coeff(var.0, internal)
+                })?;
+                SolveOutcome::from_lp_stop(direction, num_vars, stop, solver, last_options)
+            }
+            SolveState::Mip(mut state) => {
+                state.base.obj_coeffs[var.0] = internal;
+                let run = mip::reedit_and_resolve(state)?;
+                Ok(SolveOutcome::from_mip_run(
+                    direction,
+                    num_vars,
+                    run,
+                    last_options,
+                ))
+            }
+        }
     }
 
     /// [`Solution::add_constraint`] of the row `coefficients cmp_op rhs`;
