@@ -289,9 +289,9 @@ pub(crate) struct Solver {
     /// [`prepare_row`] leaves out (an empty row within the contract, an
     /// infinite right-hand side on the side the row leaves open). Each comes
     /// with its index among the user's rows ([`Self::user_rows`]). No pivot
-    /// sees them; the boundary checks the answer against them, so an edit of
-    /// one's right-hand side ([`Self::set_rhs`]) is enforced there
-    /// ([`Self::first_violated_row`]): an LP takes over a row its answer
+    /// sees them; the boundary checks the answer against them
+    /// ([`Self::first_violated_row`]), and an edit giving one a finite
+    /// right-hand side has the engine take it over ([`Self::set_rhs`]): an LP takes over a row its answer
     /// misses ([`Self::hold_validation_rows`]), and the MIP guard rejects such
     /// a candidate.
     validation_rows: Vec<(usize, (CsVec, ComparisonOp, f64))>,
@@ -2374,9 +2374,12 @@ impl Solver {
     /// no infinity enters the arithmetic; a finite one later restores the
     /// slack's bounds from the row's comparison ([`Self::row_ops`]). A row
     /// the engine does not hold (presolve dropped it, or every point
-    /// satisfied it) is edited where it is kept, among the validation rows:
-    /// the answer is checked against it as edited, and the engine takes it
-    /// over where the answer misses it ([`Self::hold_validation_rows`]).
+    /// satisfied it) is taken over ([`Self::add_row`]) as soon as its
+    /// right-hand side is finite: checking only the answer against it, as
+    /// for a row presolve dropped, is not enough, since a row every point
+    /// satisfied can now block a ray, and a primal phase returns
+    /// `Unbounded` before any answer is checked. An infinite right-hand side
+    /// leaves it among the validation rows, edited in place.
     ///
     /// Returns `Err(InternalError)`, with the state untouched, where the row
     /// factor takes `rhs` beyond `f64`.
@@ -2384,8 +2387,12 @@ impl Solver {
         debug_assert!(valid_rhs(self.user_row_op(user_row), rhs));
         let Some(row) = self.user_rows[user_row] else {
             let (k, _) = self.validation_row(user_row);
-            self.validation_rows[k].1 .2 = rhs;
-            return Ok(StopReason::Finished);
+            if rhs.is_infinite() {
+                self.validation_rows[k].1 .2 = rhs;
+                return Ok(StopReason::Finished);
+            }
+            let (_, (coeffs, op, _)) = self.validation_rows.remove(k);
+            return self.add_row(coeffs, op, rhs, user_row);
         };
         let slack = self.num_vars + row;
         if rhs.is_infinite() {

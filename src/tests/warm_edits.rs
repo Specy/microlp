@@ -370,3 +370,47 @@ fn a_constraint_added_open_binds_once_its_rhs_is_finite() {
     assert!((sol[x] - 10.0).abs() < 1e-9 && (sol[y] - 1.0).abs() < 1e-9);
     assert!((sol.objective() - 11.0).abs() < 1e-9);
 }
+
+/// A row every point satisfied, once given a finite right-hand side, bounds
+/// the region for every later edit, not only where an answer misses it: a
+/// cost edit's primal ray stops at it (Specy/microlp#57). Here `(0, 0)`
+/// meets the edited row, so a check of the answer alone never takes it
+/// over, and the cost edit then finds the ray `x → ∞` the row blocks.
+#[test]
+fn a_row_given_a_finite_rhs_blocks_the_rays_of_later_edits() {
+    for (presolve, added) in [(true, false), (false, false), (true, true), (false, true)] {
+        let mut problem = Problem::new(OptimizationDirection::Minimize);
+        let x = problem.add_var(1.0, (0.0, f64::INFINITY));
+        let y = problem.add_var(1.0, (0.0, f64::INFINITY));
+        let (sol, row) = if added {
+            let sol = solution(problem.solve_with(options(presolve)));
+            let (outcome, row) = sol
+                .add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, f64::INFINITY)
+                .unwrap();
+            (outcome.into_solution().unwrap(), row)
+        } else {
+            let row =
+                problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, f64::INFINITY);
+            (solution(problem.solve_with(options(presolve))), row)
+        };
+        let sol = solution(sol.set_rhs(row, 5.0));
+        assert_eq!(sol.objective(), 0.0);
+        let what = format!("presolve {presolve}, added {added}");
+        let sol = sol
+            .set_obj_coeff(x, -1.0)
+            .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        let sol = sol.into_solution().unwrap();
+        assert!(
+            (sol.objective() + 5.0).abs() < 1e-9,
+            "{what}: {}",
+            sol.objective()
+        );
+        assert!((sol.dual(row).unwrap() + 1.0).abs() < 1e-9, "{what}");
+        // Switched off again, the ray is back.
+        assert_eq!(
+            sol.set_rhs(row, f64::INFINITY).unwrap_err(),
+            Error::Unbounded,
+            "{what}"
+        );
+    }
+}

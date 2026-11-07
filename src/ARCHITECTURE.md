@@ -341,8 +341,12 @@ and check has to know which:
   answer against them (`first_violated_row`): an LP that misses one takes it over
   (`hold_validation_rows` → `add_row`, which sets `user_rows[i]`) and resumes from its basis.
 
-So an edit of a row not held needs no pivot: `set_rhs` changes its right-hand side in place,
-and the boundary enforces it, taking the row over only where the answer misses it. This is
+So `set_rhs` on a row not held takes it over at once (`add_row`) when the new right-hand
+side is finite, and only edits it in place when it is infinite. Checking the answer against
+it, as for a row presolve dropped, would not be enough: a row every point satisfied can block
+a ray once it has a finite right-hand side, and the primal phase returns `Unbounded` before
+any answer is checked (#57). A row presolve dropped cannot: the bounds imply it, so they
+are finite in every direction that raises its activity, and no ray moves it. This is
 also why `Solution::duals` reports zero for such a row (`Solver::duals` reads `user_rows`): a
 dropped row is implied by the bounds, so zero is an optimal dual for it, and one taken over
 is priced like any other.
