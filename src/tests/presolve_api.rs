@@ -452,7 +452,10 @@ mod tests_presolve_api {
         let sol = solution(p.solve());
         assert_eq!(sol.objective(), 20.0);
         // Edit: a row that, unlike the dropped one, binds.
-        let sol = solution(sol.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 12.0));
+        let sol = solution(
+            sol.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 12.0)
+                .map(|(outcome, _)| outcome),
+        );
         assert_eq!(sol.objective(), 12.0);
     }
 
@@ -503,7 +506,10 @@ mod tests_presolve_api {
         assert!(was_fixed);
         let sol = solution(Ok(outcome));
         assert_eq!(sol.objective(), 21.0);
-        let sol = solution(sol.add_constraint(&[(y, 1.0), (z, 1.0)], ComparisonOp::Le, 1.0));
+        let sol = solution(
+            sol.add_constraint(&[(y, 1.0), (z, 1.0)], ComparisonOp::Le, 1.0)
+                .map(|(outcome, _)| outcome),
+        );
         // With y + z <= 1: {x, y} weighs 12 and scores 19, the best of the
         // remaining subsets.
         assert_eq!(sol.objective(), 19.0);

@@ -49,7 +49,11 @@ mod tests_general {
         {
             let mut sol = solution(problem.solve().unwrap());
             for (expr, op, b) in trivial.iter().cloned() {
-                sol = solution(sol.add_constraint(expr, op, b).unwrap());
+                sol = solution(
+                    sol.add_constraint(expr, op, b)
+                        .map(|(outcome, _)| outcome)
+                        .unwrap(),
+                );
             }
             assert_eq!(sol.objective(), 0.0);
         }
@@ -151,6 +155,7 @@ mod tests_general {
             let x = problem.add_var(1.0, (0.0, 10.0));
             let got = solution(problem.solve().unwrap())
                 .add_constraint(row(x), op, rhs)
+                .map(|(outcome, _)| outcome)
                 .map(|outcome| solution(outcome).objective());
             assert_eq!(
                 got, expected,
@@ -739,6 +744,7 @@ mod tests_general {
                 orig_sol
                     .clone()
                     .add_constraint([(v1, -1.0), (v2, 1.0)], ComparisonOp::Le, 0.0)
+                    .map(|(outcome, _)| outcome)
                     .unwrap(),
             );
 
@@ -752,6 +758,7 @@ mod tests_general {
             let sol = solution(
                 fixed
                     .add_constraint([(v1, -1.0), (v2, 1.0)], ComparisonOp::Le, 0.0)
+                    .map(|(outcome, _)| outcome)
                     .unwrap(),
             );
             assert_eq!(sol[v1], 1.5);
@@ -764,6 +771,7 @@ mod tests_general {
                 orig_sol
                     .clone()
                     .add_constraint([(v1, -1.0), (v2, 1.0)], ComparisonOp::Ge, 3.0)
+                    .map(|(outcome, _)| outcome)
                     .unwrap(),
             );
 

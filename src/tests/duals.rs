@@ -25,21 +25,21 @@ use crate::{
 };
 use rand::prelude::*;
 
-struct Row {
-    terms: Vec<(usize, f64)>,
-    op: ComparisonOp,
-    rhs: f64,
+pub(super) struct Row {
+    pub(super) terms: Vec<(usize, f64)>,
+    pub(super) op: ComparisonOp,
+    pub(super) rhs: f64,
 }
 
-struct Lp {
-    direction: OptimizationDirection,
-    obj: Vec<f64>,
-    bounds: Vec<(f64, f64)>,
-    rows: Vec<Row>,
+pub(super) struct Lp {
+    pub(super) direction: OptimizationDirection,
+    pub(super) obj: Vec<f64>,
+    pub(super) bounds: Vec<(f64, f64)>,
+    pub(super) rows: Vec<Row>,
 }
 
 impl Lp {
-    fn build(&self) -> (Problem, Vec<Variable>, Vec<Constraint>) {
+    pub(super) fn build(&self) -> (Problem, Vec<Variable>, Vec<Constraint>) {
         let mut problem = Problem::new(self.direction);
         let vars: Vec<Variable> = self
             .obj
@@ -69,7 +69,12 @@ impl Lp {
 
     /// A random feasible, bounded LP of `n` vars and `m` rows, built around a
     /// point inside the box; about a third of the rows bind there.
-    fn random(rng: &mut impl Rng, n: usize, m: usize, direction: OptimizationDirection) -> Self {
+    pub(super) fn random(
+        rng: &mut impl Rng,
+        n: usize,
+        m: usize,
+        direction: OptimizationDirection,
+    ) -> Self {
         fn factor(rng: &mut impl Rng) -> f64 {
             10f64.powf(rng.random_range(-2.0..2.0))
         }
@@ -388,6 +393,7 @@ fn an_edit_numbers_its_row_after_the_problems() {
 
     let solution = solution
         .add_constraint(&[(cheap, 1.0)], ComparisonOp::Le, 6.0)
+        .map(|(outcome, _)| outcome)
         .unwrap()
         .into_solution()
         .unwrap();
