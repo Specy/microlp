@@ -156,9 +156,13 @@ post-solve edit call.
 every field replaces the previous setting, and values are not merged.
 
 A [`Solution`] can be edited and re-solved. [`Solution::add_constraint`] adds a
-constraint, [`Solution::fix_var`] pins a variable to a value, and
+constraint and returns its [`Constraint`] handle, [`Solution::set_rhs`] changes a
+constraint's right-hand side, [`Solution::set_obj_coeff`] a variable's objective
+coefficient, [`Solution::fix_var`] pins a variable to a value, and
 [`Solution::unfix_var`] releases a previous fix. Each edit consumes the
-solution and returns a new [`SolveOutcome`] for the edited problem.
+solution and returns a new [`SolveOutcome`] for the edited problem; for a
+problem without integer or boolean variables it re-solves from the previous
+basis.
 */
 
 #![deny(missing_debug_implementations, missing_docs)]

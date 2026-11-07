@@ -263,8 +263,8 @@ println!("limit: {}", solution.dual(limit).unwrap()); // -30
 ```
 
 The duals are those of the final simplex basis. Where several sets of duals
-are optimal, this is one of them, which another solver may not pick. A row
-added by `Solution::add_constraint` gets no handle: its dual is in `duals()`
+are optimal, this is one of them, which another solver may not pick.
+`Solution::add_constraint` returns a handle for the row it adds, numbered
 after the problem's constraints and the rows added before it.
 
 ## Time limits and resuming
@@ -352,11 +352,35 @@ let outcome = problem.solve_with(options)?;
 ## Changing a solved problem
 
 A `Solution` can be edited and re-solved: `add_constraint` adds a new
-constraint, `fix_var` pins a variable to a value, `unfix_var` releases a
+constraint (and returns its `Constraint` handle), `set_rhs` changes a
+constraint's right-hand side, `set_obj_coeff` a variable's objective
+coefficient, `fix_var` pins a variable to a value, `unfix_var` releases a
 previous fix. Each call consumes the solution and returns a new, re-solved
 one, keeping as much earlier work as possible, in particular, the previous
 solution is used as a starting point whenever it is still valid for the
 changed problem.
+
+For a problem without integer or boolean variables, an edit re-solves from
+the previous basis: a new right-hand side or a fix keeps it dual feasible, a
+new objective coefficient keeps it primal feasible, so the re-solve usually
+takes a few pivots. This is the cheap way to price a scenario or sweep a
+parameter. An infinite right-hand side on the side a constraint leaves open
+switches it off, and a finite one switches it back on.
+
+```rust
+use microlp::{ComparisonOp, OptimizationDirection, Problem};
+
+let mut problem = Problem::new(OptimizationDirection::Minimize);
+let cheap = problem.add_var(20.0, (0.0, 6.0));
+let dear = problem.add_var(50.0, (0.0, f64::INFINITY));
+let demand = problem.add_constraint(&[(cheap, 1.0), (dear, 1.0)], ComparisonOp::Ge, 0.0);
+let mut solution = problem.solve().unwrap().into_solution().unwrap();
+// The cost of each demand level, each solve warm from the one before.
+for level in [2.0, 4.0, 6.0, 8.0, 10.0] {
+    solution = solution.set_rhs(demand, level).unwrap().into_solution().unwrap();
+    println!("demand {level}: cost {}, price {}", solution.objective(), solution.dual(demand).unwrap());
+}
+```
 
 Only a `Solution` can be edited. An interrupted outcome deliberately has no
 edit methods because it has no validated assignment. A feasible-but-unproven
@@ -404,7 +428,7 @@ fn main() -> Result<(), Error> {
     // Requirements change after seeing the plan: a customer needs at least
     // 3 units of product 0, and product 3 is out of stock. Edits apply to
     // the problem as you originally defined it, plus the other edits.
-    let outcome =
+    let (outcome, _at_least_3) =
         solution.add_constraint(&[(units[0], 1.0)], ComparisonOp::Ge, 3.0)?;
     let solution = resume_until_answer(outcome)?
         .into_solution()

@@ -255,6 +255,13 @@ pub(crate) fn check_row(
              value"
         )));
     }
+    check_rhs(cmp_op, rhs, row)
+}
+
+/// `InvalidOperation` for a right-hand side of constraint `row` (in the order
+/// added) no solve can take: NaN, or infinite on the side the constraint
+/// bounds ([`valid_rhs`]).
+pub(crate) fn check_rhs(cmp_op: ComparisonOp, rhs: f64, row: usize) -> Result<(), Error> {
     if !valid_rhs(cmp_op, rhs) {
         let expected = match cmp_op {
             ComparisonOp::Le => "a finite value or inf",

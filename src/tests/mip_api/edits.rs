@@ -17,6 +17,7 @@ fn milp_add_constraint_resolves_on_base_problem() {
     // violates a+2b>=5. → unique optimum 13 at (3,1).
     let sol = solution(
         sol.add_constraint(&[(a, 1.0), (b, 1.0)], ComparisonOp::Ge, 4.0)
+            .map(|(outcome, _)| outcome)
             .unwrap(),
     );
     assert_eq!(sol.status(), SolutionStatus::Optimal);
@@ -128,6 +129,7 @@ fn milp_edit_after_pause_completes_correctly() {
     // the edited optimum is 8 + 11 = 19.
     let mut edited = sol
         .add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 2.0)
+        .map(|(outcome, _)| outcome)
         .unwrap();
     let mut resumes = 0;
     while !edited.is_optimal() {
