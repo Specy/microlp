@@ -345,7 +345,7 @@ So `set_rhs` on a row not held takes it over at once (`add_row`) when the new ri
 side is finite, and only edits it in place when it is infinite. Checking the answer against
 it, as for a row presolve dropped, would not be enough: a row every point satisfied can block
 a ray once it has a finite right-hand side, and the primal phase returns `Unbounded` before
-any answer is checked (#57). A row presolve dropped cannot: the bounds imply it, so they
+any answer is checked. A row presolve dropped cannot: the bounds imply it, so they
 are finite in every direction that raises its activity, and no ray moves it. This is
 also why `Solution::duals` reports zero for such a row (`Solver::duals` reads `user_rows`): a
 dropped row is implied by the bounds, so zero is an optimal dual for it, and one taken over

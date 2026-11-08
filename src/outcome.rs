@@ -75,9 +75,10 @@ impl SolveOutcome {
                 if let Some((row, violation)) = solver.first_violated_row(&lp_values) {
                     return Err(Error::InternalError(format!(
                         "LP solution violates engine row {row} by {violation:e} (the engine's \
-                         numbering, not the problem's: it leaves out the rows every point \
-                         satisfies, empty or with an infinite right-hand side on their open \
-                         side, and numbers the rows presolve took out last)"
+                         numbering, not the problem's: the rows the engine holds first, then \
+                         those it does not, the rows presolve took out and the rows every \
+                         point satisfies, empty or with an infinite right-hand side on their \
+                         open side)"
                     )));
                 }
                 if !lp_objective.is_finite() {

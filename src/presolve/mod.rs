@@ -107,12 +107,17 @@
 //! # Soundness by mode
 //!
 //! * [`Mode::Lp`] applies only reductions that keep the feasible set exactly
-//!   (within the tolerances above), so facts baked into the live solver stay
-//!   valid under every later edit (`Solution::add_constraint` and `fix_var`
-//!   only shrink the region). It only drops rows the bounds as written imply,
-//!   which keeps an LP's duals exact without a postsolve: zero is an optimal
-//!   dual for such a row (`Solver::duals`). Any other reduction here would
-//!   need its own dual postsolve.
+//!   (within the tolerances above). It only drops rows the bounds as written
+//!   imply, which keeps an LP's duals exact without a postsolve: zero is an
+//!   optimal dual for such a row (`Solver::duals`). Any other reduction here
+//!   would need its own dual postsolve. A drop rests on the row's own data
+//!   and the bounds as written, never on the objective, so it holds through
+//!   every later edit of the live solver: `fix_var`, `unfix_var` and
+//!   `add_constraint` keep the vars within those bounds (a fix to within
+//!   their tolerance, which the answer check covers), `set_obj_coeff`
+//!   changes nothing presolve read, and `set_rhs` re-decides only the row it
+//!   edits, which the engine takes over once its right-hand side is finite
+//!   (`Solver::set_rhs`).
 //! * [`Mode::Mip`] adds reductions that keep the integer feasible set
 //!   (integer bound rounding, binary coefficient tightening) or only some
 //!   optimum (dual fixing). This is sound because MILP post-solve edits

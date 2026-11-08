@@ -373,9 +373,9 @@ fn a_constraint_added_open_binds_once_its_rhs_is_finite() {
 
 /// A row every point satisfied, once given a finite right-hand side, bounds
 /// the region for every later edit, not only where an answer misses it: a
-/// cost edit's primal ray stops at it (Specy/microlp#57). Here `(0, 0)`
-/// meets the edited row, so a check of the answer alone never takes it
-/// over, and the cost edit then finds the ray `x → ∞` the row blocks.
+/// cost edit's primal ray stops at it. Here `(0, 0)` meets the edited row,
+/// so a check of the answer alone never takes it over, and the cost edit
+/// then finds the ray `x → ∞` the row blocks.
 #[test]
 fn a_row_given_a_finite_rhs_blocks_the_rays_of_later_edits() {
     for (presolve, added) in [(true, false), (false, false), (true, true), (false, true)] {

@@ -1154,7 +1154,7 @@ impl Solver {
     /// verified passes, whatever the order of either sum. The tolerance is not
     /// relative to the coefficients, so that a violation of `5.0` on a
     /// `1e9`-scale big-M row counts; only its round-off floor is relative, to
-    /// the row's activity. The rows presolve dropped or rewrote
+    /// the row's activity. The rows the engine does not hold
     /// ([`Self::validation_rows`]) are then checked as the user wrote them.
     pub(crate) fn first_violated_row(&self, values: &[f64]) -> Option<(usize, f64)> {
         for r in 0..self.num_constraints() {
@@ -1173,8 +1173,8 @@ impl Solver {
                 return Some((r, excursion(implied, smin, smax) / self.row_scales[r]));
             }
         }
-        // The rows presolve took over: the same contract on the rows as the
-        // user wrote them (numbered after the engine's own).
+        // The rows the engine does not hold: the same contract on the rows as
+        // the user wrote them (numbered after the engine's own).
         self.validation_rows
             .iter()
             .enumerate()
