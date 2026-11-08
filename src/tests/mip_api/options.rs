@@ -322,6 +322,7 @@ fn a_time_limit_too_long_to_add_is_no_limit() {
         assert_eq!(sol.last_resume_options().time_limit, long, "{label}");
         let edited = solution(
             sol.add_constraint(&[(x, 1.0)], ComparisonOp::Le, 1.0)
+                .map(|(outcome, _)| outcome)
                 .unwrap(),
         );
         assert_eq!(edited.status(), SolutionStatus::Optimal, "{label}");

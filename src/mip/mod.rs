@@ -83,7 +83,11 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
     // Incumbents are held to the rows as written, the ones presolve dropped
     // or rewrote included (the guard checks them through the solver).
     if let Some(presolved) = presolved {
-        solver.set_validation_rows(presolved.validation_rows);
+        solver.set_presolved_rows(
+            &presolved.kept_rows,
+            presolved.validation_rows,
+            problem.constraints.len(),
+        );
     }
     let pseudocosts = branching::PseudoCosts::new(&problem.obj_coeffs, problem.obj_coeffs.len());
     Ok(MipState {

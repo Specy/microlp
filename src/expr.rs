@@ -26,6 +26,29 @@ impl Variable {
     }
 }
 
+/// Identifies a constraint created by
+/// [`Problem::add_constraint`](crate::Problem::add_constraint) or
+/// [`Solution::add_constraint`](crate::Solution::add_constraint), to read its
+/// dual with [`Solution::dual`](crate::Solution::dual) or change its
+/// right-hand side with [`Solution::set_rhs`](crate::Solution::set_rhs).
+///
+/// A constraint should only be used with the problem that created it and with
+/// solutions obtained from that problem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Constraint(pub(crate) usize);
+
+impl Constraint {
+    /// Returns the constraint's zero-based creation order.
+    ///
+    /// The first constraint added to a problem has index `0`, and the index is
+    /// the constraint's position in [`Solution::duals`](crate::Solution::duals).
+    /// A constraint [`Solution::add_constraint`](crate::Solution::add_constraint)
+    /// adds is numbered after the problem's and those added before it.
+    pub fn idx(&self) -> usize {
+        self.0
+    }
+}
+
 /// A weighted sum of variables used on the left-hand side of a constraint.
 #[derive(Clone, Debug)]
 pub struct LinearExpr {

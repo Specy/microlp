@@ -4393,6 +4393,7 @@ mod regression_tests {
                 .into_solution()
                 .unwrap()
                 .add_constraint([(f, 1e17), (y, 1.0)], ComparisonOp::Ge, 1.0)
+                .map(|(outcome, _)| outcome)
                 .unwrap_or_else(|e| panic!("presolve {presolve}: the edit returned {e:?}"))
                 .into_solution()
                 .unwrap();
@@ -5560,10 +5561,14 @@ mod regression_tests {
                 .expect("the solve must return a solution")
         };
         let sol = solution(problem.solve());
-        let sol =
-            solution(sol.add_constraint([(x0, -1.0), (x1, -100.0)], ComparisonOp::Eq, -8388700.0));
-        let sol =
-            solution(sol.add_constraint([(x0, -1000.0), (x1, 1e-3)], ComparisonOp::Eq, 83.887));
+        let sol = solution(
+            sol.add_constraint([(x0, -1.0), (x1, -100.0)], ComparisonOp::Eq, -8388700.0)
+                .map(|(outcome, _)| outcome),
+        );
+        let sol = solution(
+            sol.add_constraint([(x0, -1000.0), (x1, 1e-3)], ComparisonOp::Eq, 83.887)
+                .map(|(outcome, _)| outcome),
+        );
         assert_eq!(sol.var_value(x1), 83887.0);
         assert!(
             sol.var_value(x0).abs() <= 1e-9,
@@ -5882,7 +5887,9 @@ mod regression_tests {
             .into_solution()
             .unwrap();
         let expr: Vec<_> = kept.terms.iter().map(|&(j, a)| (vars[j], a)).collect();
-        solution.add_constraint(expr, kept.op, kept.rhs)
+        solution
+            .add_constraint(expr, kept.op, kept.rhs)
+            .map(|(outcome, _)| outcome)
     }
 
     /// The MILP above with an integer `k` of cost -1 whose `1.44e-7 k` the kept
