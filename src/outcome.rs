@@ -8,18 +8,19 @@ use crate::{
 };
 use web_time::Instant;
 
-/// The result of a successful solve.
+/// The outcome of a solve, resume or edit.
 ///
-/// The outcome either contains a validated [`Solution`] or reports that a
-/// configured limit interrupted the call before a usable assignment was found.
-/// An interrupted outcome has no objective or variable values, but it can be
-/// resumed to keep searching for an incumbent.
+/// It contains a validated [`Solution`], or reports that a time or node limit
+/// interrupted the solve before a usable assignment was found. An interrupted
+/// outcome has no objective or variable values, but you can resume it to keep
+/// searching for an incumbent, the best solution found so far.
 #[derive(Clone)]
 pub enum SolveOutcome {
-    /// A validated assignment that is optimal or feasible without a proof of
+    /// A validated solution that is optimal or feasible without proof of
     /// optimality.
     Solution(Solution),
-    /// A time or node limit was reached before a usable assignment was found.
+    /// A time or node limit stopped the solve before a usable assignment was
+    /// found.
     Interrupted(InterruptedSolve),
 }
 
@@ -183,7 +184,8 @@ impl SolveOutcome {
         }
     }
 
-    /// Borrows the solution contained in this outcome, if one is available.
+    /// Returns a reference to the solution in this outcome, if one is
+    /// available.
     ///
     /// Returns `None` for [`SolveOutcome::Interrupted`].
     pub fn solution(&self) -> Option<&Solution> {
@@ -195,8 +197,8 @@ impl SolveOutcome {
 
     /// Consumes this outcome and returns its solution.
     ///
-    /// If the outcome was interrupted, the [`InterruptedSolve`] value is
-    /// returned as the error so it can still be inspected or resumed.
+    /// If the outcome was interrupted, its [`InterruptedSolve`] value is
+    /// returned as the error so you can inspect it or resume it.
     pub fn into_solution(self) -> Result<Solution, InterruptedSolve> {
         match self {
             Self::Solution(solution) => Ok(solution),
@@ -204,7 +206,7 @@ impl SolveOutcome {
         }
     }
 
-    /// Returns why the call that produced this outcome stopped.
+    /// Returns the reason the call that produced this outcome ended.
     pub fn termination_reason(&self) -> TerminationReason {
         match self {
             Self::Solution(solution) => solution.termination_reason(),
@@ -245,14 +247,14 @@ impl SolveOutcome {
         }
     }
 
-    /// Consumes this outcome and continues using the preceding call's settings.
+    /// Consumes this outcome and resumes the solve with the preceding call's
+    /// settings. If it is already optimal, returns it unchanged.
     ///
-    /// Time and node limits are applied as fresh budgets for this call. An
-    /// already optimal outcome is returned unchanged.
+    /// Time and node limits are fresh budgets for this call.
     ///
     /// # Errors
     ///
-    /// Returns errors encountered while continuing the solve, such as
+    /// Returns errors from the resumed solve, such as
     /// [`Error::Infeasible`], [`Error::Unbounded`], or
     /// [`Error::InternalError`].
     pub fn resume(self) -> Result<Self, Error> {
@@ -260,12 +262,11 @@ impl SolveOutcome {
         self.resume_with(options)
     }
 
-    /// Consumes this outcome and continues using the supplied settings.
+    /// Consumes this outcome and resumes the solve with the supplied settings.
     ///
-    /// The fields replace, rather than merge with, the preceding call's
-    /// settings. Time and node limits are fresh budgets for this call, and
-    /// `None` makes either budget unlimited. A `mip_gap` of `None` requests
-    /// exact optimality.
+    /// These settings replace the preceding call's settings. Time and node
+    /// limits are fresh budgets for this call, and `None` makes either budget
+    /// unlimited. A `mip_gap` of `None` requests exact optimality.
     ///
     /// An already optimal outcome is returned unchanged after validating
     /// `options`.
@@ -324,11 +325,12 @@ impl SolveOutcome {
     }
 }
 
-/// An outcome returned when a limit is reached before a usable solution exists.
+/// An interrupted solve returned when a time or node limit stops the search
+/// before it finds a usable assignment.
 ///
 /// It has a termination reason and statistics, but no objective or variable
-/// values because no validated assignment is available. It does not mean that
-/// the problem is infeasible. Continue it through [`SolveOutcome::resume`] or
+/// values because no validated assignment is available. This does not mean the
+/// problem is infeasible. Resume it with [`SolveOutcome::resume`] or
 /// [`SolveOutcome::resume_with`].
 #[derive(Clone)]
 pub struct InterruptedSolve {

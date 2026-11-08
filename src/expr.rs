@@ -10,15 +10,15 @@ pub enum OptimizationDirection {
     Maximize,
 }
 
-/// Identifies a variable created by a [`Problem`](crate::Problem).
+/// A handle for a variable created by a [`Problem`](crate::Problem).
 ///
-/// A variable should only be used with the problem that created it and with
-/// solutions obtained from that problem.
+/// Use a variable only with the problem that created it and with solutions
+/// obtained from that problem.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Variable(pub(crate) usize);
 
 impl Variable {
-    /// Returns the variable's zero-based creation order.
+    /// Returns the variable's zero-based index in the problem.
     ///
     /// The first variable added to a problem has index `0`.
     pub fn idx(&self) -> usize {
@@ -26,30 +26,33 @@ impl Variable {
     }
 }
 
-/// Identifies a constraint created by
+/// A handle for a constraint created by
 /// [`Problem::add_constraint`](crate::Problem::add_constraint) or
-/// [`Solution::add_constraint`](crate::Solution::add_constraint), to read its
-/// dual with [`Solution::dual`](crate::Solution::dual) or change its
-/// right-hand side with [`Solution::set_rhs`](crate::Solution::set_rhs).
+/// [`Solution::add_constraint`](crate::Solution::add_constraint). Use it to
+/// read the constraint's dual value with
+/// [`Solution::dual`](crate::Solution::dual) or change its right-hand side
+/// with [`Solution::set_rhs`](crate::Solution::set_rhs).
 ///
-/// A constraint should only be used with the problem that created it and with
-/// solutions obtained from that problem.
+/// Use a constraint only with the problem that created it and with solutions
+/// obtained from that problem.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Constraint(pub(crate) usize);
 
 impl Constraint {
-    /// Returns the constraint's zero-based creation order.
+    /// Returns the constraint's zero-based index.
     ///
-    /// The first constraint added to a problem has index `0`, and the index is
-    /// the constraint's position in [`Solution::duals`](crate::Solution::duals).
-    /// A constraint [`Solution::add_constraint`](crate::Solution::add_constraint)
-    /// adds is numbered after the problem's and those added before it.
+    /// The first constraint added to a problem has index `0`. This is also the
+    /// constraint's position in
+    /// [`Solution::duals`](crate::Solution::duals). Constraints added with
+    /// [`Solution::add_constraint`](crate::Solution::add_constraint) are
+    /// numbered after the problem's constraints and any constraints added
+    /// earlier through a solution.
     pub fn idx(&self) -> usize {
         self.0
     }
 }
 
-/// A weighted sum of variables used on the left-hand side of a constraint.
+/// A weighted sum of variables used as a constraint's left-hand side.
 #[derive(Clone, Debug)]
 pub struct LinearExpr {
     pub(crate) vars: Vec<usize>,
@@ -67,19 +70,19 @@ impl LinearExpr {
 
     /// Adds the term `coeff * var` to the expression.
     ///
-    /// Terms may be added in any order, but each variable may appear only once.
-    /// Passing an expression with repeated variables to
-    /// [`Problem::add_constraint`](crate::Problem::add_constraint) will panic;
+    /// Add terms in any order, but include each variable only once. If
+    /// [`Problem::add_constraint`](crate::Problem::add_constraint) receives
+    /// an expression with repeated variables, it panics.
     /// [`Solution::add_constraint`](crate::Solution::add_constraint) returns
-    /// [`Error::InvalidOperation`](crate::Error::InvalidOperation) for it.
+    /// [`Error::InvalidOperation`](crate::Error::InvalidOperation) instead.
     pub fn add(&mut self, var: Variable, coeff: f64) {
         self.vars.push(var.0);
         self.coeffs.push(coeff);
     }
 }
 
-/// A single `variable * constant` term in a linear expression.
-/// This is an auxiliary struct for specifying conversions.
+/// A term that pairs a variable with its coefficient in a linear expression.
+/// This auxiliary type supports conversions into [`LinearExpr`].
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct LinearTerm(Variable, f64);
@@ -126,7 +129,7 @@ impl std::iter::Extend<(Variable, f64)> for LinearExpr {
 }
 
 /// Specifies how a constraint's left-hand expression is compared with its
-/// right-hand value.
+/// right-hand side.
 #[derive(Clone, Copy, Debug)]
 pub enum ComparisonOp {
     /// The left-hand side must equal the right-hand side (`==`).

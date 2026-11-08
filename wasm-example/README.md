@@ -1,15 +1,16 @@
 # microlp WebAssembly example
 
-A minimal [`wasm-bindgen`](https://github.com/rustwasm/wasm-bindgen) wrapper that
-compiles microlp to WebAssembly and solves an LP and a MILP from JavaScript.
+This example builds a [`wasm-bindgen`](https://github.com/rustwasm/wasm-bindgen)
+wrapper around microlp. JavaScript calls it to solve a linear program and a
+mixed-integer linear program.
 
-microlp is wasm-ready out of the box: it reads the clock through
-[`web-time`](https://crates.io/crates/web-time) instead of `std::time::Instant`
-(which panics on `wasm32-unknown-unknown`), so `set_time_limit` and the branch &
-bound deadline checks work in the browser and in Node.
+microlp reads the clock through [`web-time`](https://crates.io/crates/web-time)
+instead of `std::time::Instant`, which panics on `wasm32-unknown-unknown`, so
+`set_time_limit` and the branch & bound deadline checks work in browsers and
+Node.
 
-This crate is intentionally **not** part of the microlp workspace, so a plain
-`cargo build` at the repo root never pulls in `wasm-bindgen`.
+This example is outside the microlp Cargo workspace. Running `cargo build` at
+the repository root does not build its `wasm-bindgen` dependency.
 
 ## Run under Node
 
@@ -29,7 +30,8 @@ PASS: microlp solved both problems correctly under wasm
 
 ## Use in the browser
 
-Build for the web target instead and import the generated ES module:
+To use the example in a browser, build for the web target and import the
+generated ES module:
 
 ```bash
 wasm-pack build --target web

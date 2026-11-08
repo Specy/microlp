@@ -11,7 +11,7 @@ use crate::{
     ResumeOptions, SolveOptions, SolveOutcome, Variable,
 };
 
-/// A linear optimization model that can be populated and solved.
+/// A linear optimization problem that you can populate and solve.
 ///
 /// Add variables and constraints, then call [`Problem::solve`] or
 /// [`Problem::solve_with`].
@@ -38,14 +38,15 @@ impl std::fmt::Debug for Problem {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/// The values a variable is allowed to take ([`Problem::var_domain`],
-/// [`Solution::var_domain`](crate::Solution::var_domain)).
+/// A `VarDomain` says whether a variable is real, integer or boolean.
+/// [`Problem::var_domain`] and
+/// [`Solution::var_domain`](crate::Solution::var_domain) report this domain.
 pub enum VarDomain {
-    /// Any integer within the variable's bounds.
+    /// An integer variable can take any integer within its bounds.
     Integer,
-    /// Any real value within the variable's bounds.
+    /// A real variable can take any real value within its bounds.
     Real,
-    /// Either `0` or `1`.
+    /// A boolean variable can take `0` or `1`.
     Boolean,
 }
 
@@ -63,14 +64,14 @@ impl Problem {
         }
     }
 
-    /// Sets the time budget used by [`Problem::solve`].
+    /// Sets the time limit used by [`Problem::solve`].
     ///
-    /// If the budget expires, the outcome contains a feasible
+    /// If the time limit expires, the outcome contains a feasible
     /// [`Solution`](crate::Solution) when one is available, or
     /// [`SolveOutcome::Interrupted`] when no usable assignment has been found.
-    /// The outcome can be continued with [`SolveOutcome::resume`]. A budget too
-    /// long to add to the current time, such as [`Duration::MAX`], counts as no
-    /// limit.
+    /// Resume the outcome with [`SolveOutcome::resume`] to continue searching.
+    /// A duration too long to add to the current time, such as
+    /// [`Duration::MAX`], counts as no limit.
     ///
     /// [`Problem::solve_with`] uses the `time_limit` in its supplied
     /// [`SolveOptions`] instead of this setting.
@@ -78,28 +79,28 @@ impl Problem {
         self.time_limit = Some(duration);
     }
 
-    /// Adds a real-valued variable to the problem.
+    /// Adds a real variable to the problem.
     ///
-    /// `obj_coeff` is the variable's coefficient in the objective; a NaN or
-    /// infinite one makes the solve return [`Error::InvalidOperation`]. `min`
-    /// and `max` are inclusive bounds; use [`f64::NEG_INFINITY`] or
+    /// `obj_coeff` is the variable's objective coefficient. If it is NaN or
+    /// infinite, the solve returns [`Error::InvalidOperation`]. `min` and
+    /// `max` are inclusive bounds. Use [`f64::NEG_INFINITY`] or
     /// [`f64::INFINITY`] for an unbounded side. A NaN bound, a `min` of
-    /// [`f64::INFINITY`] or a `max` of [`f64::NEG_INFINITY`] makes the solve
-    /// return [`Error::InvalidOperation`]. A `min <= -2^52` or a
-    /// `max >= 2^52` (2^52 is about 4.5e15) is treated as infinite, so
-    /// `f64::MAX` works like [`f64::INFINITY`] and a solution may lie beyond
+    /// [`f64::INFINITY`], or a `max` of [`f64::NEG_INFINITY`] also makes the
+    /// solve return [`Error::InvalidOperation`]. A `min <= -2^52` or a
+    /// `max >= 2^52` (2^52 is about 4.5e15) is treated as infinite. So
+    /// `f64::MAX` works like [`f64::INFINITY`], and a solution may lie beyond
     /// such a bound. Each bound is judged on its own: `(5e15, f64::MAX)` means
-    /// `x >= 5e15`. Bounds with `min >= max` are kept as given, so a variable
-    /// fixed at a huge value stays fixed and an empty range stays infeasible.
+    /// `x >= 5e15`. When `min >= max`, the bounds are kept as given: a variable
+    /// fixed at a huge value stays fixed, and an empty range stays infeasible.
     pub fn add_var(&mut self, obj_coeff: f64, (min, max): (f64, f64)) -> Variable {
         self.internal_add_var(obj_coeff, (min, max), VarDomain::Real)
     }
 
-    /// Adds an integer-valued variable to the problem.
+    /// Adds an integer variable to the problem.
     ///
-    /// `obj_coeff` is the variable's coefficient in the objective; a NaN or
-    /// infinite one makes the solve return [`Error::InvalidOperation`]. `min`
-    /// and `max` are inclusive bounds. Use [`i32::MIN`] or [`i32::MAX`] when no
+    /// `obj_coeff` is the variable's objective coefficient. If it is NaN or
+    /// infinite, the solve returns [`Error::InvalidOperation`]. `min` and
+    /// `max` are inclusive bounds. Use [`i32::MIN`] or [`i32::MAX`] when no
     /// tighter integer bound is required on that side.
     pub fn add_integer_var(&mut self, obj_coeff: f64, (min, max): (i32, i32)) -> Variable {
         self.internal_add_var(obj_coeff, (min as f64, max as f64), VarDomain::Integer)
@@ -112,13 +113,14 @@ impl Problem {
             .any(|v| *v == VarDomain::Integer || *v == VarDomain::Boolean)
     }
 
-    /// Returns a variable's domain: whether it is real, integer or boolean,
-    /// as it was added. [`Solution::var_domain`](crate::Solution::var_domain)
-    /// returns the same, to round a solution's values: an integer or boolean
-    /// variable's value lies within [`SolveOptions::int_tol`] of an integer,
-    /// not necessarily on it. Bear in mind that the rounded values need not
-    /// meet the constraints: under `x <= 1e7 * y`, a `y` of `1e-6` allows `x`
-    /// up to 10, which `y` rounded to zero forbids.
+    /// Returns whether `var` is a real, integer or boolean variable, as it was
+    /// added to the problem.
+    /// [`Solution::var_domain`](crate::Solution::var_domain) reports the same
+    /// domain. For an integer or boolean variable, a solution value lies within
+    /// [`SolveOptions::int_tol`] of an integer, but may not equal it. Rounding
+    /// values can make a solution violate constraints. For example, with
+    /// `x <= 1e7 * y`, a `y` of `1e-6` allows `x` up to 10, but rounding `y` to
+    /// zero forbids that value of `x`.
     ///
     /// # Panics
     ///
@@ -128,10 +130,10 @@ impl Problem {
         self.var_domains[var.0]
     }
 
-    /// Adds a variable restricted to `0` or `1`.
+    /// Adds a boolean variable restricted to `0` or `1`.
     ///
-    /// `obj_coeff` is the variable's coefficient in the objective; a NaN or
-    /// infinite one makes the solve return [`Error::InvalidOperation`].
+    /// `obj_coeff` is the variable's objective coefficient. If it is NaN or
+    /// infinite, the solve returns [`Error::InvalidOperation`].
     pub fn add_binary_var(&mut self, obj_coeff: f64) -> Variable {
         self.internal_add_var(obj_coeff, (0.0, 1.0), VarDomain::Boolean)
     }
@@ -159,22 +161,24 @@ impl Problem {
         var
     }
 
-    /// Adds the linear constraint `expr cmp_op rhs` to the problem, and
-    /// returns its handle, by which [`Solution::dual`](crate::Solution::dual)
-    /// reports its dual.
+    /// Adds the linear constraint `expr cmp_op rhs` to the problem and returns
+    /// its handle. For a problem without integer or boolean variables,
+    /// [`Solution::dual`](crate::Solution::dual) uses it to report the
+    /// constraint's dual value.
     ///
-    /// The expression may be a [`LinearExpr`] or any supported collection or
-    /// iterator of `(Variable, coefficient)` pairs. Use variables created by
-    /// this problem, with each variable appearing at most once. Keep the
-    /// magnitudes of its nonzero coefficients within six orders of each other,
-    /// as those of each variable across the constraints: the recommended
-    /// range of the crate documentation.
+    /// `expr` may be a [`LinearExpr`] or any supported collection or iterator
+    /// of `(Variable, coefficient)` pairs. Use variables created by this
+    /// problem, with each variable appearing at most once. Keep the magnitudes
+    /// of the nonzero coefficients in each constraint, and of the nonzero
+    /// coefficients for each variable across constraints, within six orders
+    /// of magnitude. This is the range recommended in the crate documentation.
     ///
     /// A NaN or infinite coefficient, or a NaN `rhs`, makes the solve return
-    /// [`Error::InvalidOperation`], as does an infinite `rhs` on the side the
-    /// constraint bounds: [`f64::NEG_INFINITY`] on [`ComparisonOp::Le`],
-    /// [`f64::INFINITY`] on [`ComparisonOp::Ge`], either on
-    /// [`ComparisonOp::Eq`]. On the other side it constrains nothing.
+    /// [`Error::InvalidOperation`]. An infinite `rhs` also makes the solve
+    /// return [`Error::InvalidOperation`] if it is [`f64::NEG_INFINITY`] with
+    /// [`ComparisonOp::Le`], [`f64::INFINITY`] with [`ComparisonOp::Ge`], or
+    /// either infinity with [`ComparisonOp::Eq`]. The opposite infinity with
+    /// [`ComparisonOp::Le`] or [`ComparisonOp::Ge`] imposes no restriction.
     ///
     /// # Panics
     ///
@@ -295,7 +299,7 @@ pub(crate) fn timed_lp_call<T>(
 }
 
 impl Problem {
-    /// Tries to solve the problem using the default options.
+    /// Solves the problem with the default options.
     ///
     /// A time limit configured with [`Problem::set_time_limit`] is applied to
     /// this call.
@@ -316,26 +320,25 @@ impl Problem {
         self.solve_with(options)
     }
 
-    /// Tries to solve the problem using the supplied [`SolveOptions`].
+    /// Solves the problem with the supplied [`SolveOptions`].
     ///
-    /// These options control this call directly and override any previously set
+    /// These options apply to this call and override any previously set
     /// options.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidOptions`] when an option is non-finite or outside
-    /// its accepted range, and [`Error::InvalidOperation`] for the first number
-    /// of the problem no solve can take: an objective or constraint
+    /// its accepted range. Returns [`Error::InvalidOperation`] for the first
+    /// value of the problem that no solve can take: an objective or constraint
     /// coefficient that is NaN or infinite, a bound or right-hand side that is
     /// NaN, a lower bound of [`f64::INFINITY`], an upper bound of
     /// [`f64::NEG_INFINITY`], or a right-hand side infinite on the side its
     /// constraint bounds (see [`Problem::add_constraint`]); then for a
     /// [`SolveOptions::warm_start`] entry that names a variable outside the
-    /// problem or gives one a NaN or infinite value. All are checked before
-    /// anything is solved. The message of `InvalidOperation` names the value
-    /// as given, and its variable (by index) or constraint (in the order
-    /// added). See [`Problem::solve`] for errors that can be reported while
-    /// solving.
+    /// problem or gives it a NaN or infinite value. All of these are checked
+    /// before anything is solved. The error message gives the value as written
+    /// and its variable (by index) or constraint (in the order added). See
+    /// [`Problem::solve`] for errors that can be reported while solving.
     pub fn solve_with(&self, options: SolveOptions) -> Result<SolveOutcome, Error> {
         options.validate()?;
         self.validate()?;

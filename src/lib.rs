@@ -1,14 +1,13 @@
 /*!
-A linear programming solver: it finds the minimum (or maximum) of a linear
-function of a set of variables subject to linear equality and inequality
-constraints. Variables can be real, integer, or boolean.
+microlp solves linear programs (LPs) and mixed-integer linear programs (MILPs).
+It minimizes or maximizes a linear function of variables subject to equality
+and inequality constraints. Variables can be real, integer, or boolean.
 
 # Getting started
 
-You can use microlp directly, but the
-[rooc modeling language](https://github.com/specy/rooc) and
-[good_lp](https://github.com/rust-or/good_lp) provide
-higher-level ways to write models.
+Use microlp directly, or write models at a higher level with the
+[rooc modeling language](https://github.com/specy/rooc) or
+[good_lp](https://github.com/rust-or/good_lp).
 
 # Features
 
@@ -18,17 +17,17 @@ higher-level ways to write models.
 * Warm starts from a known solution.
 * Handles problems with hundreds of thousands of variables and constraints.
 
-Integer and boolean variables are handled with branch & bound. On some hard or
-ill-conditioned problems a solve can still fail with [`Error::InternalError`]
-rather than answer.
+Problems with integer or boolean variables are solved with branch & bound. A
+solve on a hard or ill-conditioned problem can still return
+[`Error::InternalError`] instead of a solution.
 
 # Example
 
 ```
 use microlp::{ComparisonOp, OptimizationDirection, Problem};
 
-// Maximize x + 2y, where x is real with x >= 0 and y is an integer
-// with 0 <= y <= 3.
+// Maximize x + 2y, where x is a real variable with x >= 0 and y is an integer
+// variable with 0 <= y <= 3.
 let mut problem = Problem::new(OptimizationDirection::Maximize);
 let x = problem.add_var(1.0, (0.0, f64::INFINITY));
 let y = problem.add_integer_var(2.0, (0, 3));
@@ -37,8 +36,8 @@ let y = problem.add_integer_var(2.0, (0, 3));
 problem.add_constraint(&[(x, 1.0), (y, 1.0)], ComparisonOp::Le, 4.0);
 problem.add_constraint(&[(x, 2.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
 
-// The optimum is 7, at x = 1, y = 3. An integer variable's value is
-// reported within `int_tol` of its integer: round it for an exact one.
+// The optimum is 7, at x = 1, y = 3. An integer variable's value is within
+// `int_tol` of an integer. Round it when you need an exact integer.
 let solution = problem.solve().unwrap().into_solution().unwrap();
 assert!((solution.objective() - 7.0).abs() < 1e-6);
 assert!((solution.var_value(x) - 1.0).abs() < 1e-6);
@@ -47,11 +46,11 @@ assert_eq!(solution.var_value(y).round(), 3.0);
 
 # Solving and reading the solution
 
-[`Problem::solve`] tries to find the optimal solution. Every solution meets
-each constraint and each variable bound within an absolute tolerance (`1e-7`
-by default, [`Tolerances::feasibility`], or the round-off of evaluating it in
-`f64` where that is larger), checked against the problem as written. Otherwise
-the solve returns an error:
+[`Problem::solve`] tries to find an optimal solution. The solver checks each
+solution against the problem as written. Every constraint and variable bound
+must hold within the absolute feasibility tolerance: `1e-7` by default
+([`Tolerances::feasibility`]), or the round-off from evaluating it in `f64` if
+that is larger. Otherwise, the solve returns an error:
 
 * [`Error::Infeasible`]: the solver proved, from the problem's data, that no
   assignment with every integer variable at an integer within its bounds, and
@@ -69,100 +68,104 @@ the solve returns an error:
   constraint, where it constrains nothing. A warm-start hint must give finite
   values to variables of the problem.
 
-An optimal solution is optimal at the point the solver ends at, within the
-tolerance, not over every point the tolerance admits: on an ill-conditioned
-problem, where a small coefficient sits beside a large one, the tolerance can
-move the objective far from the exact optimum.
+An optimal solution is optimal at the point where the solver ends, within the
+tolerance. It is not necessarily optimal over every point that the tolerance
+admits. On an ill-conditioned problem, where a small coefficient sits beside
+a large one, the tolerance can move the objective far from the exact optimum.
 
-Keep the coefficients of each constraint, and those of each variable across
-the constraints, within six orders of magnitude: the largest magnitude at most
-`1e6` times the smallest. Nothing outside that range is refused or changed,
-and every solution is still checked against the model as written, but a solve
-can then fail with [`Error::InternalError`], whose message names the
-constraint (in the order added) and the variable (its index) whose
-coefficients span the most, those of them outside the range. Changing the
-units of a variable or of a constraint usually brings a model back into
-range. Within the range, an [`Error::InternalError`] is a bug or one of the
-[known limitations](#known-limitations): please report it.
+Keep the nonzero coefficients in each constraint, and the nonzero
+coefficients for each variable across the constraints, within six orders of
+magnitude: the largest magnitude should be at most `1e6` times the smallest.
+The solver does not reject or change coefficients outside that range, and it
+still checks every solution against the model as written, but a solve can then
+return [`Error::InternalError`]. Its message names the constraint (in the order
+added) and the variable (by index) whose coefficients span the most, those of
+them that lie outside the range.
+Changing a variable's or constraint's units usually brings a model back into
+range. Within the recommended range, an [`Error::InternalError`] is a bug or
+one of the [known limitations](#known-limitations): please report it.
 
-[`SolveOptions::presolve`], on by default, simplifies the problem before the
-search. It never removes a variable or changes a real variable's bounds, and
-it keeps, up to round-off, every solution whose integer variables are exactly
-integral, or, where [`SolveOptions::dual_fixing`] fixes a variable because of
-the objective, an optimal one. A solution relying on [`SolveOptions::int_tol`]
-(an integer variable just off its integer under a big-M coefficient) is never
-sought: it is returned where the search lands on one, and where the objective
-can improve forever such a landing answers [`Error::Unbounded`]. A problem with
-no solution whose integer variables are integral is answered
-[`Error::Infeasible`] unless that happens, with presolve on or off.
+[`SolveOptions::presolve`] simplifies the problem before the search and is on
+by default. It never removes a variable or changes a real variable's bounds.
+Up to round-off, it keeps every solution whose integer variables are exactly
+integral. If [`SolveOptions::dual_fixing`] fixes a variable because of the
+objective, presolve keeps an optimal solution. The search never seeks a
+solution that relies on [`SolveOptions::int_tol`], such as an integer variable
+just off its integer under a big-M coefficient. It can still return such a
+solution if it lands on one; if the objective can improve forever from that
+point, the solve returns [`Error::Unbounded`].
+A problem with no solution whose integer variables are integral returns
+[`Error::Infeasible`] unless the search lands on a solution that relies on
+`int_tol`, whether presolve is on or off.
 
 When a solve call returns successfully:
 
-* [`SolveOutcome::Solution`] contains a validated assignment. Its status is
+* [`SolveOutcome::Solution`] contains a validated solution. Its status is
   [`SolutionStatus::Optimal`] when optimality was proved, with no MIP gap, or
-  [`SolutionStatus::Feasible`] when a valid assignment is available without
+  [`SolutionStatus::Feasible`] when a valid solution is available without
   that proof, for example after reaching a time limit, node limit, or MIP gap.
-* [`SolveOutcome::Interrupted`] means a time or node limit fired before a usable
-  assignment was found. It exposes the [`TerminationReason`] and [`Stats`], but
-  no objective or variable values because no validated assignment is available.
-  This does not mean the problem is impossible to solve. Use
-  [`SolveOutcome::resume`] to continue the search.
+* [`SolveOutcome::Interrupted`] means a time limit or node limit fired before
+  the solver found a usable solution. It exposes the [`TerminationReason`]
+  and [`Stats`], but no objective or variable values because no validated
+  solution is available. This does not mean the problem is impossible to
+  solve. Use [`SolveOutcome::resume`] to continue the search.
 
 [`SolveOutcome::termination_reason`] distinguishes
 [`TerminationReason::ProvenOptimal`], [`TerminationReason::MipGap`],
 [`TerminationReason::TimeLimit`], and [`TerminationReason::NodeLimit`].
 
-[`Solution::var_value`] reports a value as the solver computed it. An integer
-or boolean variable's value lies within [`SolveOptions::int_tol`] of an
-integer, not necessarily on it: values like `0.9999999` are normal; one fixed
-at an integer lies on it. Round it where an exact integer is needed
-([`Solution::var_domain`] tells which variables are integer or boolean),
-bearing in mind that rounded values need not meet the constraints: under
-`x <= 1e7 * y`, a `y` of `1e-6` allows `x` up to 10, which `y` rounded to zero
-forbids.
+[`Solution::var_value`] reports the value computed by the solver. An integer
+or boolean variable's value is within [`SolveOptions::int_tol`] of an integer,
+but is not necessarily equal to one. Values such as `0.9999999` are normal; a
+variable fixed at an integer has that exact value. Round the value when you
+need an exact integer. [`Solution::var_domain`] identifies integer and boolean
+variables. Rounded values need not meet the constraints: under
+`x <= 1e7 * y`, a `y` of `1e-6` allows `x` up to 10, but rounding `y` to zero
+forbids that value of `x`.
 
-For a problem without integer or boolean variables, [`Solution::dual`] reports
-a constraint's dual value (shadow price), by the [`Constraint`] handle
-[`Problem::add_constraint`] returns: the rate at which the optimal objective
-changes as the constraint's right-hand side increases.
-[`Solution::reduced_cost`] reports a variable's reduced cost.
+For a problem without integer or boolean variables, [`Solution::dual`] returns
+a constraint's dual value, also called its shadow price. Pass the [`Constraint`]
+handle returned by [`Problem::add_constraint`]. The dual value is the rate at
+which the optimal objective changes as the constraint's right-hand side
+increases. [`Solution::reduced_cost`] returns a variable's reduced cost.
 
 # Known limitations
 
 The solver computes in floating point. Nearly dependent constraints can exceed
-its resolution even within the recommended coefficient range: a solve can then
-fail with [`Error::InternalError`]; in extreme cases a feasible model whose
-feasible points need very large variable values is reported
-[`Error::Infeasible`], and a solve whose last basis is singular to `f64` reports
-a solution for an unbounded model, or one far from the optimum of a bounded
-model. A common source is a group of free variables that can all shift
-together, such as every bus angle of a power-flow network left free: where
-rounding in the coefficients leaves that shift a tiny effect on the
-constraints, a model meant to have no solution can have one as written, at very
-large variable values, which a solve can return. Fix one of those variables,
-such as a reference angle, to remove the shift. Outside the range, a bounded
-model can also be reported [`Error::Unbounded`]. An objective whose terms
-(costs times values) or their sum overflow `f64` cannot be evaluated: a solve
-that meets one fails with [`Error::InternalError`], even where the exact
-objective is representable. The known cases are listed in the
+its resolution even within the recommended coefficient range, causing a solve
+to return [`Error::InternalError`]. In extreme cases, the solver reports
+[`Error::Infeasible`] for a feasible model whose feasible points require very
+large variable values. If the last basis is singular to `f64`, a solve can
+return a solution for an unbounded model or one far from the optimum of a
+bounded model. A common source is a group of free variables that can all shift
+together, such as every bus angle of a power-flow network left free. Rounding
+in the coefficients can make that shift have only a tiny effect on the
+constraints, so a model meant to have no solution can have one as written at
+very large variable values, which a solve can return. Fix one of those
+variables, such as a reference angle, to remove the shift. Outside the
+recommended range, a bounded model can also be reported as
+[`Error::Unbounded`]. If objective terms (costs times values) or their sum
+overflow `f64`, the solver cannot evaluate the objective and returns
+[`Error::InternalError`], even when the exact objective is representable. The
+known cases are listed in the
 [architecture notes](https://github.com/Specy/microlp/blob/v0.7.0/src/ARCHITECTURE.md#79-known-limitations).
 
 # Time limits, resuming, and editing
 
-[`Problem::set_time_limit`] sets a time budget. [`SolveOutcome::resume`] uses
+[`Problem::set_time_limit`] sets a time limit. [`SolveOutcome::resume`] uses
 the per-call options from the immediately preceding solve, resume, or
-post-solve edit call.
-[`SolveOutcome::resume_with`] instead uses only the supplied [`ResumeOptions`]:
-every field replaces the previous setting, and values are not merged.
+post-solve edit. [`SolveOutcome::resume_with`] uses only the supplied
+[`ResumeOptions`]. Each field replaces the previous setting; the options are
+not merged.
 
 A [`Solution`] can be edited and re-solved. [`Solution::add_constraint`] adds a
-constraint and returns its [`Constraint`] handle, [`Solution::set_rhs`] changes a
-constraint's right-hand side, [`Solution::set_obj_coeff`] a variable's objective
-coefficient, [`Solution::fix_var`] pins a variable to a value, and
-[`Solution::unfix_var`] releases a previous fix. Each edit consumes the
-solution and returns a new [`SolveOutcome`] for the edited problem; for a
-problem without integer or boolean variables it re-solves from the previous
-basis.
+constraint and returns its [`Constraint`] handle. [`Solution::set_rhs`]
+changes a constraint's right-hand side, and [`Solution::set_obj_coeff`]
+changes a variable's objective coefficient. [`Solution::fix_var`] fixes a
+variable to a value, and [`Solution::unfix_var`] releases a previous fix. Each
+edit consumes the solution and returns a new [`SolveOutcome`] for the edited
+problem. For a problem without integer or boolean variables, the solver
+re-solves from the previous basis.
 */
 
 #![deny(missing_debug_implementations, missing_docs)]

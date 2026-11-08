@@ -5,109 +5,117 @@
 use crate::{Error, Variable};
 use core::time::Duration;
 
-/// Whether a usable solution is proven optimal.
+/// Says whether a solution is proven optimal or only feasible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SolutionStatus {
-    /// The solver completed the optimality proof ([`Tolerances::feasibility`]
-    /// says what that means on an ill-conditioned problem).
+    /// The solver proved this solution optimal. For what that means on an
+    /// ill-conditioned problem, see [`Tolerances::feasibility`].
     Optimal,
-    /// A valid incumbent is available, but exact optimality was not proven.
+    /// A valid incumbent, the best solution found so far, is available, but
+    /// the solver has not proved it optimal.
     Feasible,
 }
 
-/// Why a solve or resume call returned.
+/// Says why a solve or resume call stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TerminationReason {
-    /// The LP or branch-and-bound optimality proof completed.
+    /// The LP or branch & bound search proved optimality.
     ProvenOptimal,
-    /// The configured relative MIP gap was reached before exact proof completed.
+    /// The search reached the configured relative MIP gap before proving
+    /// optimality.
     MipGap,
-    /// The wall-clock budget for this call was exhausted.
+    /// The solve or resume call reached its wall-clock time limit.
     TimeLimit,
-    /// The branch-and-bound node budget for this call was exhausted.
+    /// The solve or resume call reached its branch & bound node limit.
     NodeLimit,
 }
 
-/// Options controlling a solve. Construct with [`SolveOptions::default`] and
-/// mutate the fields you need.
+/// Settings for a solve call. Start with [`SolveOptions::default`] and change
+/// the fields you need.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct SolveOptions {
-    /// Wall-clock budget for this call (`None` = unlimited, as is a budget too
-    /// long to add to the current time, such as [`Duration::MAX`]). On expiry
-    /// the search stops and can be resumed.
+    /// Wall-clock time limit for one call. `None` means unlimited. A time limit
+    /// too long to add to the current time, such as [`Duration::MAX`], is also
+    /// unlimited. When it expires, the search stops and can be resumed.
     pub time_limit: Option<Duration>,
-    /// Maximum number of branch & bound nodes to solve in this call
-    /// (`None` = unlimited). Deterministic alternative to `time_limit`; the
-    /// budget applies per call, so [`crate::SolveOutcome::resume`] reapplies it
-    /// as a fresh budget. The root relaxation does not count as a node.
+    /// Maximum number of branch & bound nodes to solve in one call. `None`
+    /// means unlimited. This is a deterministic alternative to
+    /// `time_limit`. The limit applies per call, so
+    /// [`crate::SolveOutcome::resume`] reapplies it as a fresh limit. The root
+    /// LP relaxation does not count as a node.
     pub node_limit: Option<u64>,
-    /// Relative MIP gap at which the search may stop with a feasible incumbent.
-    /// Such a stop reports [`SolutionStatus::Feasible`] and
+    /// Relative MIP gap at which the search may stop with its incumbent, the
+    /// best solution found so far. Stopping at this gap reports [`SolutionStatus::Feasible`] and
     /// [`TerminationReason::MipGap`]. Must be finite and non-negative. Default
     /// `0.0` (prove exact optimality).
     pub mip_gap: f64,
-    /// Integrality tolerance, for acceptance only: a value within this distance
-    /// of an integer counts as integral, while the search seeks solutions whose
-    /// integer variables are integral (see [`SolveOptions::presolve`]). A
-    /// solution reports an integer or boolean variable's value as the solver
-    /// computed it, within this distance of an integer, not necessarily on it:
-    /// values like `0.9999999` are normal (one fixed at an integer, by its
-    /// bounds, the search or an edit, lies on it). Round it where an exact
-    /// integer is needed: [`crate::Solution::var_domain`] tells which
-    /// variables are integer or boolean, and its documentation why the
-    /// rounded values need not meet the constraints. Keep a big-M coefficient
-    /// times this tolerance small against the quantities it bounds. It also
-    /// decides integrality in [`crate::Solution::fix_var`] and in the check of
-    /// an incumbent kept across an edit. Default `1e-6`. Must be finite and
-    /// in the half-open range `[0, 0.5)`.
+    /// Integrality tolerance for accepting integer and boolean variable values.
+    /// A value within this distance of an integer counts as integral, though
+    /// the search seeks solutions whose integer variables are integral (see
+    /// [`SolveOptions::presolve`]). Returned values are the values the solver
+    /// computed and may be within this distance of an integer without lying
+    /// exactly on one; values like `0.9999999` are normal. A variable fixed at
+    /// an integer by its bounds, the search or an edit lies on that integer.
+    /// Round values when you need exact integers.
+    /// [`crate::Solution::var_domain`] identifies integer and boolean
+    /// variables; see its documentation for why rounded values need not meet
+    /// the constraints. Keep a big-M coefficient
+    /// times this tolerance small relative to the quantities it bounds. This
+    /// tolerance also determines integrality in [`crate::Solution::fix_var`]
+    /// and when checking whether an incumbent survives an edit. Default
+    /// `1e-6`. Must be finite and in the half-open range `[0, 0.5)`.
     pub int_tol: f64,
-    /// Optional (partial) starting assignment used to seed the incumbent of a
-    /// problem with integer or boolean variables. The variables it leaves out
-    /// are completed by an LP; a hint that is invalid or infeasible for the
-    /// model (a value outside its variable's bounds, or one the constraints
-    /// exclude), or whose completion is fractional or fails, is ignored. A
-    /// value that is NaN or infinite, or a variable outside the problem, makes
-    /// the solve return [`Error::InvalidOperation`] instead. A problem with
-    /// only real variables validates the hint the same way but does not use
-    /// it. Default `None`.
+    /// Optional partial assignment used to seed an incumbent for a problem
+    /// with integer or boolean variables. The solver completes omitted
+    /// variables with an LP. It ignores a hint that is invalid or infeasible
+    /// for the model (a value is outside its variable's bounds, or a constraint
+    /// excludes it), or whose LP completion is fractional or fails. A NaN or
+    /// infinite value, or a variable outside the problem, makes the solve
+    /// return [`Error::InvalidOperation`] instead. For a problem with only
+    /// real variables, the solver validates the hint the same way but does not
+    /// use it. Default `None`.
     pub warm_start: Option<Vec<(Variable, f64)>>,
-    /// Enable presolve, which reduces the problem before the search starts
-    /// (dropping redundant rows and, for integer variables, tightening bounds,
-    /// fixing variables and tightening big-M coefficients). It never removes
-    /// variables or changes a continuous variable's bounds, and it keeps, up
-    /// to round-off, every point whose integer variables are exactly integral
-    /// that meets each constraint within the tolerance the simplex holds it to
-    /// (see [`Tolerances::feasibility`]) and each bound within its tolerance,
-    /// or, where it fixes a variable because of the objective, an optimum.
-    /// Solutions are always checked against the problem as you wrote it. A
-    /// solution relying on `int_tol`, an integer variable off its integer
-    /// under a coefficient that makes the offset count, is never sought: it is
-    /// returned where the search lands on one, and where the objective can
-    /// improve forever such a landing answers `Unbounded`. A problem with no
-    /// solution whose integer variables are integral is answered `Infeasible`
-    /// unless that happens, with presolve on or off. If presolve finds the
-    /// problem infeasible, the problem is solved without it. Disable it only to
-    /// compare raw solver behavior or to rule it out when investigating a
-    /// numerical issue. Default `true`.
+    /// Enable presolve. It reduces a problem before the solve starts by
+    /// removing redundant constraints and, for integer variables, tightening
+    /// bounds, fixing variables and tightening big-M coefficients. It never
+    /// removes variables or changes a real variable's bounds.
+    ///
+    /// Up to round-off, presolve keeps every point whose integer variables are
+    /// exactly integral and that meets every constraint within the tolerance
+    /// the simplex holds it to (see [`Tolerances::feasibility`]), and every
+    /// bound within its tolerance. If presolve fixes a variable because of the objective, it
+    /// keeps an optimum. Every solution is checked against the problem as
+    /// written.
+    ///
+    /// The search does not target solutions that rely on `int_tol`, such as an
+    /// integer variable slightly off an integer under a coefficient that makes
+    /// that offset matter. It may return such a solution if it lands on one. If
+    /// the objective can improve forever from there, the result is
+    /// `Unbounded`. If no solution has every integer variable exactly integral,
+    /// the result is `Infeasible` unless the search lands on such a
+    /// tolerance-based point. This applies whether presolve is on or off. If
+    /// presolve finds the problem infeasible, microlp solves it without
+    /// presolve. Disable presolve only to compare solver behavior without it or
+    /// to rule it out when investigating a numerical issue. Default `true`.
     pub presolve: bool,
-    /// Let presolve fix an integer variable by an optimality argument (dual
-    /// fixing): a variable that neither the objective nor any of its rows
-    /// gives a reason to move off one of its bounds is fixed at that bound.
-    /// That keeps an optimum, not every feasible point, so it can remove
+    /// Let presolve fix an integer variable at a bound when neither the
+    /// objective nor any of its constraints gives a reason to move away from
+    /// that bound (dual fixing). This keeps an optimum, not every feasible point. It can remove
     /// alternative optima and feasible points the objective does not prefer.
-    /// Turn it off when every integral point must stay reachable, for example
-    /// to enumerate the solutions within an objective cutoff by adding
-    /// constraints and solving again, or to rule it out when investigating a
-    /// result. It takes effect only with [`SolveOptions::presolve`] on and for
-    /// a problem with integer or boolean variables, and a
-    /// [`SolveOptions::warm_start`] hint turns it off, so that a feasible hint
-    /// is never excluded. Default `true`.
+    ///
+    /// Turn this off when every integral point must stay reachable. For
+    /// example, turn it off to enumerate solutions within an objective cutoff
+    /// by adding constraints and solving again, or to rule it out when
+    /// investigating a result. It takes effect only when
+    /// [`SolveOptions::presolve`] is on and the problem has integer or boolean
+    /// variables. Supplying a [`SolveOptions::warm_start`] hint turns it off so
+    /// that it cannot exclude a feasible hint. Default `true`.
     pub dual_fixing: bool,
-    /// The tolerances of the solve. Most callers should leave this at
-    /// [`Tolerances::default`]; override an individual field only once you
-    /// understand the correctness/permissiveness trade-off documented on it.
+    /// Numeric tolerances used by the solve. Defaults suit most problems.
+    /// Change a field only after you understand the correctness and
+    /// permissiveness trade-off documented for it.
     pub tolerances: Tolerances,
 }
 
@@ -156,20 +164,21 @@ impl SolveOptions {
     }
 }
 
-/// Overrides for the solver settings used for a subsequent search/resume call.
+/// Settings to override for the next search or resume call.
 ///
-/// These fields override the ones defined in the previous call to
+/// Each field replaces the corresponding setting from the preceding call to
 /// [`Problem::solve_with`](crate::Problem::solve_with) or
 /// [`SolveOutcome::resume_with`](crate::SolveOutcome::resume_with).
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct ResumeOptions {
-    /// New wall-clock budget (`None` = unlimited, as is a budget too long to
-    /// add to the current time, such as [`Duration::MAX`]).
+    /// New wall-clock time limit. `None` means unlimited. A time limit too long
+    /// to add to the current time, such as [`Duration::MAX`], is also unlimited.
     pub time_limit: Option<Duration>,
-    /// New branch-and-bound node budget (`None` = unlimited).
+    /// New branch & bound node limit. `None` means unlimited.
     pub node_limit: Option<u64>,
-    /// New relative MIP gap (`None` = no MIP gap / exact optimality `0.0`).
+    /// New relative MIP gap. `None` removes gap-based stopping and sets the gap
+    /// to `0.0`, so the search must prove exact optimality.
     pub mip_gap: Option<f64>,
 }
 
@@ -193,52 +202,59 @@ impl ResumeOptions {
 /// few ulps off a bound is infeasible and the simplex pivots on round-off.
 const MIN_FEASIBILITY_TOLERANCE: f64 = 1e-10;
 
-/// Numeric tolerances for a solve (see [`SolveOptions::tolerances`]).
+/// Numeric tolerances used by a solve (see [`SolveOptions::tolerances`]).
 ///
-/// The defaults suit most problems; change one only once you understand the
-/// trade-off documented on it.
+/// Defaults suit most problems. Change a field only after you understand the
+/// trade-off documented for it.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct Tolerances {
-    /// The absolute feasibility tolerance, the contract every solution meets:
-    /// each variable lies within its bounds, and each constraint within its
-    /// range, by at most this, or by the round-off of evaluating the bound or
-    /// the constraint in `f64` where that is larger. It is checked against the
-    /// problem as written on every solution before it is returned, on a
-    /// candidate before it becomes the incumbent, and on a previous incumbent
-    /// before it survives a [`crate::Solution`] edit.
+    /// Absolute feasibility tolerance for variable bounds and constraint
+    /// ranges. The solver checks every returned solution against the problem
+    /// as written. A variable may lie outside its bounds, and a constraint
+    /// outside its range, by at most this tolerance, or by the round-off of
+    /// evaluating the bound or constraint in `f64` where that is larger. The
+    /// solver applies the same check to each candidate before it becomes the
+    /// incumbent (the best solution found so far), and to an incumbent before
+    /// it survives a [`crate::Solution`] edit.
     ///
-    /// The simplex holds each bound to all of it (an integer variable its
-    /// bounds fix to its value exactly) and each constraint to it less the
-    /// round-off of evaluating the constraint, so a solution it finds passes
-    /// the check. [`Error::Infeasible`] means it proved that no point lies
-    /// within that with every integer variable at an integer within its
-    /// bounds and every fixed variable at its value: a problem feasible only
-    /// through the round-off of a constraint is reported infeasible, and so
-    /// is one feasible only by using [`SolveOptions::int_tol`] unless the
+    /// The simplex keeps each variable within the full tolerance of its
+    /// bounds. An integer variable fixed by its bounds stays at that value
+    /// exactly. For a constraint, the simplex allows this tolerance minus the
+    /// round-off from evaluating the constraint, so every solution it finds
+    /// passes the check.
+    ///
+    /// [`Error::Infeasible`] means the solver proved that no point meets this
+    /// tolerance with every integer variable at an integer within its bounds
+    /// and every fixed variable at its fixed value. A problem feasible only
+    /// because round-off lets a constraint pass is reported infeasible. So is
+    /// a problem feasible only by using [`SolveOptions::int_tol`], unless the
     /// search lands on such a point (see [`SolveOptions::presolve`]).
+    ///
     /// [`SolutionStatus::Optimal`] means optimal at the vertices the simplex
-    /// ends at, not over every point within the tolerance: being absolute, it
-    /// lets a variable with a large coefficient move its constraints far, and
-    /// the objective with them (a `y` `1e-7` above its upper bound `u` lets
-    /// `x <= 1e8 * y` hold at `x = 1e8 * u + 10`), which coefficients within
-    /// the recommended range of the crate documentation keep small. Must be
-    /// finite and at least `1e-10`. Default `1e-7`.
+    /// reaches, not over every point admitted by this tolerance. Because the
+    /// tolerance is absolute, a variable with a large coefficient can move its
+    /// constraints far within it, and the objective with them. For example, `y` `1e-7` above upper bound `u` lets `x <= 1e8 * y` hold at
+    /// `x = 1e8 * u + 10`. The coefficient range recommended in the crate
+    /// documentation keeps these effects small. Must be finite and at least
+    /// `1e-10`. Default `1e-7`.
     pub feasibility: f64,
-    /// Relative slack subtracted from the incumbent objective to form the
-    /// branch & bound pruning cutoff: a node whose bound is not strictly
-    /// better than `incumbent - max(prune_epsilon, prune_epsilon *
-    /// |incumbent|)` is pruned. Guards against continuing to explore or
-    /// retain nodes that could only ever match the incumbent to within
-    /// float noise. Where every variable with a nonzero cost is an integer
-    /// variable or fixed, the objective takes values a whole number of
-    /// steps apart at the points whose integer variables are integral, and
-    /// a node is also pruned when its bound, lowered by what the tolerances
-    /// and round-off can put on it and then rounded up to the next such
-    /// value, is not strictly better: then none of its points whose integer
-    /// variables are integral and that meet every constraint and bound
-    /// exactly is. A point that relies on the tolerances can be pruned even
-    /// where it is better.
+    /// Relative slack in the branch & bound pruning cutoff. The solver prunes
+    /// a node whose bound is not strictly better than
+    /// `incumbent - max(prune_epsilon, prune_epsilon * |incumbent|)`. This
+    /// avoids searching nodes that could only match the incumbent within
+    /// floating-point noise.
+    ///
+    /// When every variable with a nonzero objective coefficient is integer or
+    /// fixed, objective values at points with integral integer variables are
+    /// separated by fixed-size steps. The solver also accounts for the room
+    /// that tolerances and round-off could leave for improvement, then rounds
+    /// the node's bound up to the next objective value on those steps. If this
+    /// value is not strictly better than the incumbent, the solver prunes the
+    /// node. No point in that node with integral integer variables and every
+    /// constraint and bound met exactly can then beat the incumbent. A point
+    /// that relies on tolerances can still be pruned even if its objective is
+    /// better.
     ///
     /// Must be finite and non-negative. Default `1e-9`.
     pub prune_epsilon: f64,
@@ -253,21 +269,24 @@ impl Default for Tolerances {
     }
 }
 
-/// Statistics of a solve, available via [`crate::Solution::stats`],
+/// Statistics for a solve, available via [`crate::Solution::stats`],
 /// [`crate::SolveOutcome::stats`] and [`crate::InterruptedSolve::stats`].
 #[derive(Clone, Copy, Debug, Default)]
 #[non_exhaustive]
 pub struct Stats {
-    /// Branch & bound nodes whose LP was solved (0 for pure-LP problems).
+    /// Branch & bound nodes whose LP relaxation was solved. This is `0` for
+    /// pure-LP problems.
     pub nodes_solved: u64,
-    /// Total simplex pivots across the whole solve (including the root LP).
+    /// Total simplex pivots across the whole solve, including the root LP.
     pub lp_iterations: u64,
     /// Wall-clock time spent inside the solver, accumulated across resumes.
     pub elapsed: Duration,
-    /// Best proven bound on the objective, in user space. `None` until an
-    /// incumbent or an open node exists to derive one from.
+    /// Best proven bound on the objective, expressed in the problem's
+    /// optimization direction. `None` until an incumbent or an open node
+    /// provides a bound.
     pub best_bound: Option<f64>,
-    /// Relative gap between incumbent and best bound. `None` until both are
-    /// known; `Some(0.0)` once optimality is proven.
+    /// Relative gap between the incumbent (the best solution found so far) and
+    /// the best bound. `None` until both are known; `Some(0.0)` once
+    /// optimality is proven.
     pub gap: Option<f64>,
 }
