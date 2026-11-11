@@ -78,7 +78,14 @@ let mut problem = Problem::new(OptimizationDirection::Minimize);
 let x = problem.add_var(1.5, (0.0, f64::INFINITY)); // real, x >= 0
 let y = problem.add_integer_var(1.0, (-10, 10));    // integer, -10 <= y <= 10
 let z = problem.add_binary_var(2.0);                // boolean: 0 or 1
+let n = problem.add_integer_var_f64(0.5, (0.0, f64::INFINITY)); // integer, n >= 0
 ```
+
+`add_integer_var`'s `i32` bounds are always finite. `i32::MAX` is the bound
+`2^31 - 1`, so a problem that improves without limit along such a variable has
+its optimum there. For an integer variable with no bound on a side, use
+`add_integer_var_f64` with an infinite bound. Its finite bounds must be whole
+numbers.
 
 A bound with magnitude 2^52 (about 4.5e15) or more on its side of infinity is
 treated as infinite. An upper bound of `f64::MAX` or `i64::MAX` therefore means

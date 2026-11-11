@@ -28,3 +28,6 @@ mod duals;
 
 #[cfg(test)]
 mod warm_edits;
+
+#[cfg(test)]
+mod integer_bounds;
