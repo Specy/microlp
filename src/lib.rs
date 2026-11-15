@@ -15,6 +15,7 @@ Use microlp directly, or write models at a higher level with the
 * Real, integer, and boolean variables.
 * Time limits and MIP gap, with the possibility to edit and resume a solve.
 * Warm starts from a known solution.
+* Dual values (shadow prices) and reduced costs for linear programs.
 * Handles problems with hundreds of thousands of variables and constraints.
 
 Problems with integer or boolean variables are solved with branch & bound. A
@@ -48,55 +49,52 @@ assert_eq!(solution.var_value(y).round(), 3.0);
 
 [`Problem::solve`] tries to find an optimal solution. The solver checks each
 solution against the problem as written. Every constraint and variable bound
-must hold within the absolute feasibility tolerance: `1e-7` by default
+must hold within the absolute feasibility tolerance of `1e-7` by default
 ([`Tolerances::feasibility`]), or the round-off from evaluating it in `f64` if
 that is larger. Otherwise, the solve returns an error:
 
-* [`Error::Infeasible`]: the solver proved, from the problem's data, that no
-  assignment with every integer variable at an integer within its bounds, and
-  every variable whose bounds are equal at its value, meets the constraints
-  and the other bounds within that tolerance (see [`Tolerances::feasibility`]).
+* [`Error::Infeasible`]: the problem has no solution. No assignment meets every
+  constraint and bound within the feasibility tolerance while every integer
+  variable takes a whole number. See [`Error::Infeasible`] for the exact
+  conditions.
 * [`Error::Unbounded`]: the objective can improve forever.
 * [`Error::InternalError`]: a numerical failure the solver could not recover
   from. It returns this rather than an answer it could not verify.
 * [`Error::InvalidOptions`] for an invalid explicit numeric option, and
-  [`Error::InvalidOperation`] for invalid input, both checked before anything
-  is solved. Every number of the problem must be finite, but a bound or a
-  constraint's right-hand side may be infinite on the side it leaves open:
-  `f64::NEG_INFINITY` as a lower bound or on a [`ComparisonOp::Ge`]
-  constraint, `f64::INFINITY` as an upper bound or on a [`ComparisonOp::Le`]
-  constraint, where it constrains nothing. A warm-start hint must give finite
-  values to variables of the problem.
+  [`Error::InvalidOperation`] for invalid input. Both are checked before
+  solving. See [`Problem::solve_with`] for accepted model values and
+  [`SolveOptions::warm_start`] for valid hints.
 
-An optimal solution is optimal at the point where the solver ends, within the
-tolerance. It is not necessarily optimal over every point that the tolerance
-admits. On an ill-conditioned problem, where a small coefficient sits beside
-a large one, the tolerance can move the objective far from the exact optimum.
+[`SolutionStatus::Optimal`] means optimal up to numerical tolerances. It
+does not guarantee the best objective over every assignment the tolerances
+allow. A large coefficient can multiply a tolerance-sized difference in a
+variable's value into substantial objective error. See
+[`Tolerances::feasibility`] for an example.
 
 Keep the nonzero coefficients in each constraint, and the nonzero
 coefficients for each variable across the constraints, within six orders of
-magnitude: the largest magnitude should be at most `1e6` times the smallest.
-The solver does not reject or change coefficients outside that range, and it
-still checks every solution against the model as written, but a solve can then
-return [`Error::InternalError`]. Its message names the constraint (in the order
-added) and the variable (by index) whose coefficients span the most, those of
-them that lie outside the range.
-Changing a variable's or constraint's units usually brings a model back into
-range. Within the recommended range, an [`Error::InternalError`] is a bug or
-one of the [known limitations](#known-limitations): please report it.
+magnitude. The largest magnitude should be at most `1e6` times the smallest.
+The solver accepts coefficients outside that range without changing them.
+It still checks every returned solution against the problem as written, but
+[`Error::InternalError`] becomes more likely. Its message identifies the
+constraint with the widest coefficient range, by order added, and the
+variable with the widest range, by index, when those ranges exceed the
+recommendation. Changing a variable's or constraint's units usually brings a
+model back into range. Within the recommended range, an
+[`Error::InternalError`] is a bug or one of the
+[known limitations](#known-limitations). Please report it.
 
-[`SolveOptions::presolve`] simplifies the problem before the search and is on
-by default. It never removes a variable or changes a real variable's bounds.
-Up to round-off, it keeps every solution whose integer variables are exactly
-integral. If [`SolveOptions::dual_fixing`] fixes a variable because of the
-objective, presolve keeps an optimal solution. The search never seeks a
-solution that relies on [`SolveOptions::int_tol`], such as an integer variable
-just off its integer under a big-M coefficient. It can still return such a
-solution if it lands on one; if the objective can improve forever from that
-point, the solve returns [`Error::Unbounded`].
-A problem with no solution whose integer variables are integral returns
-[`Error::Infeasible`] unless the search lands on a solution that relies on
-`int_tol`, whether presolve is on or off.
+[`SolveOptions::presolve`] is on by default and simplifies the problem before
+solving. It makes most solves faster. Every variable is still reported, and
+returned solutions satisfy the original problem within the documented
+tolerances. See [`SolveOptions::dual_fixing`] before enumerating solutions
+through edits.
+
+[`SolveOptions::int_tol`] permits slightly nonintegral returned values for
+integer and boolean variables. Increasing it does not make the solver seek
+all assignments within that tolerance of an integer. A model feasible only
+at such assignments normally returns [`Error::Infeasible`], though the solver
+can return one if it happens to find it. This applies with presolve on or off.
 
 When a solve call returns successfully:
 
@@ -116,10 +114,10 @@ When a solve call returns successfully:
 
 [`Solution::var_value`] reports the value computed by the solver. An integer
 or boolean variable's value is within [`SolveOptions::int_tol`] of an integer,
-but is not necessarily equal to one. Values such as `0.9999999` are normal; a
-variable fixed at an integer has that exact value. Round the value when you
+but is not necessarily equal to one. Values such as `0.9999999` are normal.
+A variable fixed at an integer has that exact value. Round the value when you
 need an exact integer. [`Solution::var_domain`] identifies integer and boolean
-variables. Rounded values need not meet the constraints: under
+variables. Rounded values need not meet the constraints. For example, under
 `x <= 1e7 * y`, a `y` of `1e-6` allows `x` up to 10, but rounding `y` to zero
 forbids that value of `x`.
 
@@ -131,24 +129,26 @@ increases. [`Solution::reduced_cost`] returns a variable's reduced cost.
 
 # Known limitations
 
-The solver computes in floating point. Nearly dependent constraints can exceed
-its resolution even within the recommended coefficient range, causing a solve
-to return [`Error::InternalError`]. In extreme cases, the solver reports
-[`Error::Infeasible`] for a feasible model whose feasible points require very
-large variable values. If the last basis is singular to `f64`, a solve can
-return a solution for an unbounded model or one far from the optimum of a
-bounded model. A common source is a group of free variables that can all shift
-together, such as every bus angle of a power-flow network left free. Rounding
-in the coefficients can make that shift have only a tiny effect on the
-constraints, so a model meant to have no solution can have one as written at
-very large variable values, which a solve can return. Fix one of those
-variables, such as a reference angle, to remove the shift. Outside the
-recommended range, a bounded model can also be reported as
-[`Error::Unbounded`]. If objective terms (costs times values) or their sum
-overflow `f64`, the solver cannot evaluate the objective and returns
-[`Error::InternalError`], even when the exact objective is representable. The
-known cases are listed in the
-[architecture notes](https://github.com/Specy/microlp/blob/v0.7.0/src/ARCHITECTURE.md#79-known-limitations).
+The solver computes in floating point. Nearly repeating constraints, or
+constraints nearly implied by others, can exceed its numerical resolution
+even within the recommended coefficient range. A solve can then return
+[`Error::InternalError`]. In extreme cases, a feasible model requiring very
+large variable values can be reported as [`Error::Infeasible`]. Rarely, a
+solve can return a solution for an unbounded model or a solution far from a
+bounded model's optimum. Outside the recommended range, a bounded model can
+also be reported as [`Error::Unbounded`].
+
+Free variables that can all shift together need particular care. For example,
+leaving every bus angle free in a power-flow model can allow very large
+variable values with almost no effect on the constraints. Coefficient
+round-off can then make a model intended to be infeasible admit a solution
+at those values, and the solver can return it. Fix a reference variable,
+such as one bus angle, to remove the shared shift.
+
+If an objective coefficient times its variable value, or the sum of those
+terms, overflows `f64`, the solve returns [`Error::InternalError`]. This can
+happen even when the exact objective is representable. See the
+[known numerical cases](https://github.com/Specy/microlp/blob/v0.8.0/src/ARCHITECTURE.md#79-known-limitations).
 
 # Time limits, resuming, and editing
 
@@ -163,9 +163,16 @@ constraint and returns its [`Constraint`] handle. [`Solution::set_rhs`]
 changes a constraint's right-hand side, and [`Solution::set_obj_coeff`]
 changes a variable's objective coefficient. [`Solution::fix_var`] fixes a
 variable to a value, and [`Solution::unfix_var`] releases a previous fix. Each
-edit consumes the solution and returns a new [`SolveOutcome`] for the edited
-problem. For a problem without integer or boolean variables, the solver
-re-solves from the previous basis.
+edit consumes the solution even if it returns an error, and returns a new
+[`SolveOutcome`] on success. Clone the solution first if you need to keep it.
+For LPs, edits continue from the preceding solve and are usually much faster
+than starting over.
+
+Edits return the same errors as solving. [`Error::Infeasible`] means the
+changed problem has no solution. [`Error::Unbounded`] means its objective can
+improve forever, for example after disabling a limiting constraint with
+[`Solution::set_rhs`], changing an objective coefficient with
+[`Solution::set_obj_coeff`], or releasing a fix with [`Solution::unfix_var`].
 */
 
 #![deny(missing_debug_implementations, missing_docs)]

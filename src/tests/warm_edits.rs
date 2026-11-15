@@ -265,6 +265,29 @@ fn a_cost_edit_can_make_the_problem_unbounded() {
     assert_eq!(sol.set_obj_coeff(x, -1.0).unwrap_err(), Error::Unbounded);
 }
 
+/// An infinite right-hand side on the only row that bounds the objective
+/// leaves no finite optimum, for an LP and for a MIP.
+#[test]
+fn an_rhs_edit_can_make_the_problem_unbounded() {
+    for (presolve, integer) in [(true, false), (false, false), (true, true), (false, true)] {
+        let mut problem = Problem::new(OptimizationDirection::Maximize);
+        let x = if integer {
+            problem.add_integer_var(1.0, (0, 10))
+        } else {
+            problem.add_var(1.0, (0.0, 10.0))
+        };
+        let y = problem.add_var(1.0, (0.0, f64::INFINITY));
+        let cap = problem.add_constraint(&[(x, 1.0), (y, 2.0)], ComparisonOp::Le, 8.0);
+        let sol = solution(problem.solve_with(options(presolve)));
+        assert!((sol.objective() - 8.0).abs() < 1e-9);
+        assert_eq!(
+            sol.set_rhs(cap, f64::INFINITY).unwrap_err(),
+            Error::Unbounded,
+            "presolve {presolve}, integer {integer}"
+        );
+    }
+}
+
 #[test]
 fn edits_refuse_numbers_no_solve_takes() {
     let mut problem = Problem::new(OptimizationDirection::Minimize);

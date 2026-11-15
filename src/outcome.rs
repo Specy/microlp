@@ -266,7 +266,9 @@ impl SolveOutcome {
     ///
     /// These settings replace the preceding call's settings. Time and node
     /// limits are fresh budgets for this call, and `None` makes either budget
-    /// unlimited. A `mip_gap` of `None` requests exact optimality.
+    /// unlimited. A `mip_gap` of `None` removes gap-based stopping. Numerical
+    /// tolerances still apply as documented in
+    /// [`crate::SolveOptions::mip_gap`].
     ///
     /// An already optimal outcome is returned unchanged after validating
     /// `options`.

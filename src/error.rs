@@ -4,11 +4,14 @@
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Error {
-    /// The solver proved from the problem's data that no assignment satisfies
-    /// the constraints and bounds within the feasibility tolerance, with
-    /// every integer variable at an integer within its bounds and every
-    /// variable with equal bounds at that value (see
-    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility)).
+    /// The problem has no solution.
+    ///
+    /// No assignment satisfies the constraints and bounds within
+    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility) while each
+    /// integer variable is at an integer within its bounds. Variables with
+    /// equal bounds must be exactly at that value. Increasing
+    /// [`SolveOptions::int_tol`](crate::SolveOptions::int_tol) does not make
+    /// a model with no integer solution feasible.
     ///
     /// In extreme cases, the solver can report a feasible model as infeasible
     /// when it has nearly dependent constraints and its feasible points need
@@ -18,7 +21,7 @@ pub enum Error {
     /// The objective can improve without a finite limit.
     ///
     /// Outside the recommended coefficient range, a bounded model can be
-    /// reported unbounded: see the crate's
+    /// reported unbounded. See the crate's
     /// [known limitations](crate#known-limitations).
     Unbounded,
     /// A solve or resume option is non-finite or outside its accepted range.
@@ -26,7 +29,7 @@ pub enum Error {
     /// The message identifies the invalid field.
     InvalidOptions(String),
     /// The input is invalid, so the requested solve or edit did not run. This
-    /// can mean a model number is outside its accepted range: every objective
+    /// can mean a model number is outside its accepted range. Every objective
     /// coefficient, constraint coefficient, bound, and right-hand side must
     /// be finite, except that a bound or right-hand side may be infinite on
     /// the side it leaves open (see
@@ -46,10 +49,10 @@ pub enum Error {
     ///
     /// If the model is outside the recommended coefficient range (see the
     /// crate documentation), the message names the constraint (in the order
-    /// added) and the variable (by index) whose coefficients span the most,
-    /// those of them that lie outside the range.
-    /// Within the range, it is a bug or one of the crate's
-    /// [known limitations](crate#known-limitations): please report it.
+    /// added) and the variable (by index) with the widest coefficient ranges,
+    /// when those ranges exceed the recommendation. Within the range, it is
+    /// a bug or one of the crate's
+    /// [known limitations](crate#known-limitations). Please report it.
     InternalError(String),
 }
 impl std::fmt::Display for Error {

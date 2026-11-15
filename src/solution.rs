@@ -28,11 +28,14 @@ impl SolveState {
 }
 
 /// A validated feasible assignment returned by a solve, resume, or edit.
-/// For a problem with integer or boolean variables, it is the incumbent: the
-/// best feasible solution found so far.
+/// For a problem with integer or boolean variables, it is the incumbent,
+/// the best feasible solution found so far.
 ///
 /// Use [`Solution::status`] to distinguish a proven optimum from an assignment
-/// that is feasible without a proof of optimality.
+/// that is feasible without a proof of optimality. Edits consume the
+/// solution even if they return an error. Clone it first if you need to keep
+/// the preceding solution. LP edits continue from the preceding solve and
+/// are usually much faster than starting over.
 #[derive(Clone)]
 pub struct Solution {
     pub(crate) direction: OptimizationDirection,
@@ -115,7 +118,7 @@ impl Solution {
     /// or boolean variable's value is within the integrality tolerance
     /// [`SolveOptions::int_tol`] of an integer, but it need not equal that
     /// integer. Values like `0.9999999` are normal. A variable fixed at an
-    /// integer by its bounds, branch & bound, or an edit has that exact value.
+    /// integer by its bounds, the solve, or an edit has that exact value.
     /// Round integer and boolean values where you need exact integers.
     /// [`Solution::var_domain`] tells you which variables to round, and its
     /// documentation explains why the rounded values need not meet the
@@ -195,7 +198,7 @@ impl Solution {
         }
     }
 
-    /// Returns a constraint's dual value (shadow price): the change in the
+    /// Returns a constraint's dual value (shadow price). This is the change in
     /// optimal objective per unit increase in the constraint's right-hand
     /// side, in objective units per right-hand-side unit. Returns `None` for a
     /// problem with integer or boolean variables, whose solutions have no
@@ -209,13 +212,13 @@ impl Solution {
     /// [`ComparisonOp::Eq`] constraint's dual may have either sign. A
     /// constraint that does not bind at the solution has dual value zero
     /// within the tolerances. The same is true for a constraint that every
-    /// point satisfies or that [`SolveOptions::presolve`] found implied by
-    /// the variable bounds; the bounds' reduced costs then carry its price.
+    /// point satisfies or that is implied by variable bounds and detected
+    /// by [`SolveOptions::presolve`]. The bounds' reduced costs then carry
+    /// its price.
     ///
-    /// The dual values come from the final simplex basis. If a degenerate
-    /// optimum has several optimal sets of dual values, this is one of them;
-    /// a different optimal basis may give different values. They meet dual
-    /// feasibility within the solve's tolerances. After
+    /// When several valid sets of dual values exist at the optimum, this is
+    /// one of them within the solve's tolerances. Another solver can return
+    /// different values at the same optimum. After
     /// [`Solution::fix_var`], [`Solution::unfix_var`],
     /// [`Solution::add_constraint`], [`Solution::set_rhs`] or
     /// [`Solution::set_obj_coeff`], the new solution's dual values are those
@@ -223,7 +226,8 @@ impl Solution {
     ///
     /// # Panics
     ///
-    /// Panics if `constraint` is out of range for this solution.
+    /// For a problem without integer or boolean variables, panics if
+    /// `constraint` is out of range for this solution.
     ///
     /// # Examples
     ///
@@ -267,19 +271,19 @@ impl Solution {
         }
     }
 
-    /// Returns a variable's reduced cost: the rate at which the objective
-    /// changes as the variable moves away from its value, in objective units
-    /// per unit of the variable, while the other variables at a bound stay
-    /// there. It equals the variable's objective coefficient minus the sum,
-    /// over the constraints, of its coefficient times the constraint's
+    /// Returns a variable's reduced cost. This is the rate at which the
+    /// objective changes as the variable moves away from its value, in
+    /// objective units per unit of the variable, while other variables at a
+    /// bound stay there. It equals the variable's objective coefficient minus
+    /// the sum, over the constraints, of its coefficient times the constraint's
     /// [dual value](Solution::dual). Returns `None` for a problem with integer
     /// or boolean variables.
     ///
     /// A variable strictly between its bounds has reduced cost zero, within
     /// the tolerances. For a variable at a bound, the reduced cost is the
-    /// marginal value of that bound: when minimizing, at least zero at a lower
-    /// bound and at most zero at an upper bound, and the other way round when
-    /// maximizing. For a variable fixed by its bounds or by
+    /// marginal value of that bound. When minimizing, it is at least zero at
+    /// a lower bound and at most zero at an upper bound. These signs are
+    /// reversed when maximizing. For a variable fixed by its bounds or by
     /// [`Solution::fix_var`], it is the marginal value of the fix.
     ///
     /// # Panics
@@ -349,9 +353,9 @@ impl Solution {
     /// [`Problem::solve_with`](crate::Problem::solve_with) refuses. The
     /// error message numbers the new constraint after the problem's
     /// constraints and those added earlier. Returns
-    /// [`Error::Infeasible`] if the solver proves the edited problem
-    /// infeasible (see [`Error::Infeasible`]), and [`Error::InternalError`]
-    /// if solving fails.
+    /// [`Error::Infeasible`] if the edited problem has no solution (see
+    /// [`Error::Infeasible`]). Returns
+    /// [`Error::InternalError`] if solving fails.
     pub fn add_constraint(
         self,
         expr: impl Into<LinearExpr>,
@@ -379,13 +383,11 @@ impl Solution {
     /// [`SolveOutcome`] uses this solution's per-call time limit, node limit,
     /// and MIP gap.
     ///
-    /// A problem without integer or boolean variables re-solves from this
-    /// solution's basis. The basis stays dual feasible, so the dual simplex
-    /// usually needs only a few pivots. The new solution's
-    /// [dual values](Solution::dual) are those of the edited problem. For a
-    /// problem with integer or boolean variables, the solver starts a new
-    /// branch & bound search and uses this solution as a warm start if it
-    /// remains feasible for the edited problem.
+    /// An LP continues from the preceding solve and usually solves much
+    /// faster than starting over. The new solution's
+    /// [dual values](Solution::dual) describe the edited problem. For a MILP,
+    /// this solution is used as a warm start if it remains feasible for the
+    /// edited problem.
     ///
     /// Set `rhs` to `inf` for [`ComparisonOp::Le`] or `-inf` for
     /// [`ComparisonOp::Ge`] to switch the constraint off. Set it to a finite
@@ -394,11 +396,14 @@ impl Solution {
     /// # Errors
     ///
     /// Returns [`Error::InvalidOperation`] before solving if `rhs` is NaN or
-    /// infinite with the wrong sign for the comparison: `-inf` for
-    /// [`ComparisonOp::Le`], `inf` for [`ComparisonOp::Ge`], or either
-    /// infinity for [`ComparisonOp::Eq`]. Returns [`Error::Infeasible`] if
-    /// the solver proves the edited problem infeasible (see
-    /// [`Error::Infeasible`]), and [`Error::InternalError`] if solving fails.
+    /// infinite with the wrong sign for the comparison. Invalid signs are
+    /// `-inf` for [`ComparisonOp::Le`], `inf` for [`ComparisonOp::Ge`], or
+    /// either infinity for [`ComparisonOp::Eq`]. Returns
+    /// [`Error::Infeasible`] if the edited problem has no solution (see
+    /// [`Error::Infeasible`]). Returns [`Error::Unbounded`] if the edited
+    /// objective can improve without a finite limit. This can happen when
+    /// an infinite `rhs` switches off a constraint that bounds the
+    /// objective. Returns [`Error::InternalError`] if solving fails.
     ///
     /// # Panics
     ///
@@ -474,18 +479,16 @@ impl Solution {
     /// again. The returned [`SolveOutcome`] uses this solution's per-call time
     /// limit, node limit, and MIP gap.
     ///
-    /// A problem without integer or boolean variables re-solves from this
-    /// solution's basis. The basis stays primal feasible, so the primal
-    /// simplex usually needs only a few pivots. For a problem with integer or
-    /// boolean variables, the solver starts a new branch & bound search and
-    /// uses this solution as a warm start. Changing the objective does not
-    /// make this solution infeasible.
+    /// An LP continues from the preceding solve and usually solves much
+    /// faster than starting over. For a MILP, this solution is used as a warm
+    /// start. Changing the objective does not make this solution infeasible.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidOperation`] before solving if `obj_coeff` is
     /// NaN or infinite. Returns [`Error::Unbounded`] if the edited objective
-    /// has no finite optimum, and [`Error::InternalError`] if solving fails.
+    /// can improve without a finite limit, and [`Error::InternalError`] if
+    /// solving fails.
     ///
     /// # Panics
     ///
@@ -597,41 +600,38 @@ impl Solution {
     /// Fixes a variable at `val` and solves the edited problem, consuming this
     /// solution.
     ///
-    /// Fixing the same variable again replaces its previous fixed value. A
-    /// later [`Solution::unfix_var`] restores the variable's original bounds.
-    /// The returned [`SolveOutcome`] uses this solution's per-call time limit,
-    /// node limit, and MIP gap.
+    /// A real variable is fixed at `val` itself. An integer or boolean
+    /// variable is fixed at the integer within [`SolveOptions::int_tol`] of
+    /// `val`, or of the bound if `val` lies outside it. Fixing the same
+    /// variable again replaces its previous fixed value. A later
+    /// [`Solution::unfix_var`] restores its original bounds. The returned
+    /// [`SolveOutcome`] uses this solution's per-call time limit, node limit,
+    /// and MIP gap.
+    ///
+    /// Bound and domain checks accept any finite value this solution reports.
+    /// A value may lie outside a bound by
+    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility), or by the
+    /// evaluation round-off floor at a large bound. An integer or boolean
+    /// value may be within `int_tol` of an integer without equaling it. A
+    /// variable already fixed at an integer has that exact value.
+    ///
+    /// Acceptance of `val` does not guarantee the edited problem is feasible.
+    /// Fixing a slightly nonintegral value, or one just outside a bound, can
+    /// still return [`Error::Infeasible`]. The same can happen when the
+    /// preceding solution relied on several bound and constraint tolerances
+    /// at once. Fixing the variable exactly can leave the other variables
+    /// unable to satisfy the edited problem's feasibility conditions.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidOperation`] if `val` is NaN or infinite.
     /// Returns [`Error::Infeasible`] if `val` violates an original bound
-    /// beyond that bound's tolerance, is incompatible with the variable's
-    /// integer or boolean domain, or the solver proves the edited problem
-    /// infeasible (see [`Error::Infeasible`]). A `min <= -2^52` or
-    /// `max >= 2^52` counts as infinite here too (see
-    /// [`Problem::add_var`](crate::Problem::add_var)).
-    /// The bound and domain checks allow the solve's tolerances, so any value
-    /// this solution reports is accepted: `val` may lie outside a bound by up
-    /// to [`Tolerances::feasibility`](crate::Tolerances::feasibility), or by
-    /// the round-off floor at a large bound, and an integer or boolean
-    /// variable's `val` may be within the integrality tolerance
-    /// [`SolveOptions::int_tol`] of an integer without equaling it (one fixed
-    /// at an integer lies on it).
-    ///
-    /// A real variable is fixed at `val` itself. An integer or boolean
-    /// variable is fixed at the integer within `int_tol` of `val`, or of the
-    /// bound if `val` lies outside it.
-    ///
-    /// A MILP edit starts a new branch & bound search. If a reported integer
-    /// value is just beyond a bound or is not exactly integral, fixing the
-    /// variable can leave the edited problem feasible only within the solve's
-    /// tolerances, so the solver can answer `Infeasible` (see
-    /// [`Tolerances::feasibility`](crate::Tolerances::feasibility)). The same
-    /// can happen with any fix where this solution used the tolerances of
-    /// several bounds and constraints at once: with the variable fixed exactly
-    /// at that value, the others can be left less room than the infeasibility
-    /// proof grants.
+    /// beyond its tolerance, is incompatible with the integer or boolean
+    /// domain, or the edited problem has no solution (see
+    /// [`Error::Infeasible`]). A `min <= -2^52` or `max >= 2^52` counts as
+    /// infinite here too (see
+    /// [`Problem::add_var`](crate::Problem::add_var)). Returns
+    /// [`Error::InternalError`] if solving fails.
     ///
     /// # Panics
     ///
@@ -707,7 +707,9 @@ impl Solution {
     ///
     /// # Errors
     ///
-    /// Returns errors encountered while solving after the fix is released.
+    /// Returns errors from solving after the fix is released. These include
+    /// [`Error::Unbounded`] if releasing the fix lets the objective improve
+    /// without a finite limit, and [`Error::InternalError`] if solving fails.
     ///
     /// # Panics
     ///

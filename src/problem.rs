@@ -70,8 +70,8 @@ impl Problem {
     /// [`Solution`](crate::Solution) when one is available, or
     /// [`SolveOutcome::Interrupted`] when no usable assignment has been found.
     /// Resume the outcome with [`SolveOutcome::resume`] to continue searching.
-    /// A duration too long to add to the current time, such as
-    /// [`Duration::MAX`], counts as no limit.
+    /// A duration too large to represent as a time limit, such as
+    /// [`Duration::MAX`], means no limit.
     ///
     /// [`Problem::solve_with`] uses the `time_limit` in its supplied
     /// [`SolveOptions`] instead of this setting.
@@ -89,9 +89,11 @@ impl Problem {
     /// solve return [`Error::InvalidOperation`]. A `min <= -2^52` or a
     /// `max >= 2^52` (2^52 is about 4.5e15) is treated as infinite. So
     /// `f64::MAX` works like [`f64::INFINITY`], and a solution may lie beyond
-    /// such a bound. Each bound is judged on its own: `(5e15, f64::MAX)` means
-    /// `x >= 5e15`. When `min >= max`, the bounds are kept as given: a variable
-    /// fixed at a huge value stays fixed, and an empty range stays infeasible.
+    /// such a bound. Each bound is treated separately. `(5e15, f64::MAX)`
+    /// means `x >= 5e15`. When `min >= max`, the bounds are kept as given.
+    /// A variable fixed at a huge value stays fixed, and an empty range stays
+    /// infeasible. Constraint right-hand sides are used as given, without
+    /// this conversion.
     pub fn add_var(&mut self, obj_coeff: f64, (min, max): (f64, f64)) -> Variable {
         self.internal_add_var(obj_coeff, (min, max), VarDomain::Real)
     }
@@ -306,12 +308,12 @@ impl Problem {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Infeasible`] when the solver proves the problem
-    /// infeasible (see [`Error::Infeasible`]), [`Error::Unbounded`] when the
-    /// objective has no finite optimum, [`Error::InvalidOperation`] when the
-    /// problem holds a number no solve can take (see [`Problem::solve_with`]),
-    /// or [`Error::InternalError`] when the solve cannot reach an answer it can
-    /// verify.
+    /// Returns [`Error::Infeasible`] when the problem has no solution (see
+    /// [`Error::Infeasible`]). Returns [`Error::Unbounded`] when
+    /// the objective can improve without a finite limit. Returns
+    /// [`Error::InvalidOperation`] when the problem contains an invalid
+    /// number (see [`Problem::solve_with`]). Returns [`Error::InternalError`]
+    /// when the solve cannot reach an answer it can verify.
     pub fn solve(&self) -> Result<SolveOutcome, Error> {
         let options = SolveOptions {
             time_limit: self.time_limit,
@@ -327,18 +329,20 @@ impl Problem {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidOptions`] when an option is non-finite or outside
-    /// its accepted range. Returns [`Error::InvalidOperation`] for the first
-    /// value of the problem that no solve can take: an objective or constraint
-    /// coefficient that is NaN or infinite, a bound or right-hand side that is
-    /// NaN, a lower bound of [`f64::INFINITY`], an upper bound of
-    /// [`f64::NEG_INFINITY`], or a right-hand side infinite on the side its
-    /// constraint bounds (see [`Problem::add_constraint`]); then for a
-    /// [`SolveOptions::warm_start`] entry that names a variable outside the
-    /// problem or gives it a NaN or infinite value. All of these are checked
-    /// before anything is solved. The error message gives the value as written
-    /// and its variable (by index) or constraint (in the order added). See
-    /// [`Problem::solve`] for errors that can be reported while solving.
+    /// Returns [`Error::InvalidOptions`] when an option is non-finite or
+    /// outside its accepted range. Returns [`Error::InvalidOperation`] for
+    /// the first invalid model value. Objective and constraint coefficients
+    /// must be finite. Bounds and right-hand sides must not be NaN. A lower
+    /// bound must not be [`f64::INFINITY`], and an upper bound must not be
+    /// [`f64::NEG_INFINITY`]. A constraint right-hand side may be infinite
+    /// only on the side it leaves open (see [`Problem::add_constraint`]).
+    ///
+    /// Model values are checked before [`SolveOptions::warm_start`] entries.
+    /// A hint entry is invalid if it names a variable outside the problem or
+    /// gives it a NaN or infinite value. All checks run before solving. An
+    /// invalid-value message gives the value as written and identifies its
+    /// variable by index or its constraint by order added. See
+    /// [`Problem::solve`] for errors reported while solving.
     pub fn solve_with(&self, options: SolveOptions) -> Result<SolveOutcome, Error> {
         options.validate()?;
         self.validate()?;
