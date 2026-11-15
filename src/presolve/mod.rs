@@ -31,10 +31,10 @@
 //!
 //! The variable set never changes: a var presolve "removes" gets `lo == hi`
 //! bounds, which the simplex prices out, and its value is substituted out of
-//! every row. Rows may be dropped or rewritten freely, since nothing outside
-//! the `Solver` addresses constraints by index. So no postsolve is needed:
-//! read-out, resume, warm starts and post-solve edits all work off the
-//! original variable indices.
+//! every row. Rows may be dropped or rewritten within *Soundness by mode*,
+//! since nothing outside the `Solver` addresses constraints by index. So no
+//! postsolve is needed: read-out, resume, warm starts and post-solve edits
+//! all work off the original variable indices.
 //!
 //! # Working vs emitted bounds
 //!
@@ -107,9 +107,17 @@
 //! # Soundness by mode
 //!
 //! * [`Mode::Lp`] applies only reductions that keep the feasible set exactly
-//!   (within the tolerances above), so facts baked into the live solver stay
-//!   valid under every later edit (`Solution::add_constraint` and `fix_var`
-//!   only shrink the region).
+//!   (within the tolerances above). It only drops rows the bounds as written
+//!   imply, which keeps an LP's duals exact without a postsolve: zero is an
+//!   optimal dual for such a row (`Solver::duals`). Any other reduction here
+//!   would need its own dual postsolve. A drop rests on the row's own data
+//!   and the bounds as written, never on the objective, so it holds through
+//!   every later edit of the live solver: `fix_var`, `unfix_var` and
+//!   `add_constraint` keep the vars within those bounds (a fix to within
+//!   their tolerance, which the answer check covers), `set_obj_coeff`
+//!   changes nothing presolve read, and `set_rhs` re-decides only the row it
+//!   edits, which the engine takes over once its right-hand side is finite
+//!   (`Solver::set_rhs`).
 //! * [`Mode::Mip`] adds reductions that keep the integer feasible set
 //!   (integer bound rounding, binary coefficient tightening) or only some
 //!   optimum (dual fixing). This is sound because MILP post-solve edits
@@ -184,7 +192,7 @@ pub(crate) fn presolve(
         }
     }
 
-    let mut dropped_on_input = 0usize;
+    let mut dropped_on_input = Vec::new();
     let mut rows: Vec<Row> = Vec::with_capacity(constraints.len());
     for (orig, (coeffs, op, rhs)) in constraints.iter().enumerate() {
         // Rows whose data alone decide them (empty, or an infinite
@@ -192,7 +200,7 @@ pub(crate) fn presolve(
         // same contract.
         match trivial_row_verdict(coeffs, *op, *rhs, feasibility) {
             Some(true) => {
-                dropped_on_input += 1;
+                dropped_on_input.push(orig);
                 continue;
             }
             Some(false) => return Err(Error::Infeasible),
@@ -231,7 +239,7 @@ pub(crate) fn presolve(
         mode,
         feas: feasibility,
         stats: PresolveStats {
-            rows_dropped: dropped_on_input,
+            rows_dropped: dropped_on_input.len(),
             ..PresolveStats::default()
         },
         adj_start,
@@ -268,10 +276,19 @@ pub(crate) fn presolve(
     // every input row the output does not carry as written for the engine to
     // check the answer against (`Presolved::validation_rows`).
     let mut out = Vec::with_capacity(rows.len());
-    let mut validation_rows = Vec::new();
+    let mut kept_rows = Vec::with_capacity(rows.len());
+    // A row dropped on input is kept too: every point satisfies it, so the
+    // check never fails, but an edit of its right-hand side
+    // (`Solution::set_rhs`) can make it bind, and the engine then takes it
+    // over.
+    let mut validation_rows: Vec<_> = dropped_on_input
+        .iter()
+        .map(|&orig| (orig, constraints[orig].clone()))
+        .collect();
     for row in rows.iter_mut() {
+        let orig = row.orig as usize;
         if !row.alive {
-            validation_rows.push(constraints[row.orig as usize].clone());
+            validation_rows.push((orig, constraints[orig].clone()));
             continue;
         }
         // A row can become all-substituted after the final pass (e.g. by a
@@ -279,16 +296,17 @@ pub(crate) fn presolve(
         work.fold_fixed(row);
         if row.vars.is_empty() {
             work.empty_row_check(row)?;
-            validation_rows.push(constraints[row.orig as usize].clone());
+            validation_rows.push((orig, constraints[orig].clone()));
             continue;
         }
+        kept_rows.push(orig);
         if !row.coeffs_touched {
             // Not rewritten: emit the input row as written, fixed terms
             // included. Folded, the row would have a smaller magnitude, hence
             // a tighter tolerance than the contract grants it, and the fold's
             // round-off (1e-7 on a shift of 1e9) could make two consistent
             // rows disagree beyond that tolerance.
-            out.push(constraints[row.orig as usize].clone());
+            out.push(constraints[orig].clone());
             continue;
         }
         // Rewritten: the rewritten terms, the folded terms restored so that
@@ -299,10 +317,10 @@ pub(crate) fn presolve(
         // keeps every point the rewrites kept.
         let (op, rhs) = work.rewritten_bound(row);
         if !rhs.is_finite() {
-            out.push(constraints[row.orig as usize].clone());
+            out.push(constraints[orig].clone());
             continue;
         }
-        validation_rows.push(constraints[row.orig as usize].clone());
+        validation_rows.push((orig, constraints[orig].clone()));
         let mut vars = row.vars.clone();
         let mut coeffs = row.coeffs.clone();
         for &(v, a) in &row.folded {
@@ -347,6 +365,7 @@ pub(crate) fn presolve(
         var_mins: work.elo,
         var_maxs: work.ehi,
         constraints: out,
+        kept_rows,
         validation_rows,
         reduced,
         stats: work.stats,

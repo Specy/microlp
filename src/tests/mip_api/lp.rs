@@ -17,6 +17,7 @@ fn lp_path_still_solves_and_edits_incrementally() {
     // Live-basis incremental add on the LP path.
     let sol = solution(
         sol.add_constraint(&[(x, 1.0)], ComparisonOp::Le, 1.0)
+            .map(|(outcome, _)| outcome)
             .unwrap(),
     );
     assert!((sol.objective() - 7.0).abs() < 1e-6);
@@ -51,6 +52,7 @@ fn lp_edit_uses_the_most_recent_resume_time_budget() {
     let edited = solution(
         resumed
             .add_constraint([(x, 1.0)], ComparisonOp::Le, 4.0)
+            .map(|(outcome, _)| outcome)
             .unwrap(),
     );
     assert_eq!(edited.status(), SolutionStatus::Optimal);
@@ -69,6 +71,7 @@ fn lp_stats_report_nonzero_elapsed_time() {
 
     let edited = solution(
         sol.add_constraint([(x, 1.0)], ComparisonOp::Ge, 4.0)
+            .map(|(outcome, _)| outcome)
             .unwrap(),
     );
     assert!(edited.stats().elapsed >= initial_elapsed);
@@ -88,6 +91,7 @@ fn lp_edit_gets_a_fresh_time_budget() {
 
     let edited = solution(
         sol.add_constraint([(x, 1.0)], ComparisonOp::Ge, 4.0)
+            .map(|(outcome, _)| outcome)
             .unwrap(),
     );
     assert_eq!(edited.status(), SolutionStatus::Optimal);
@@ -150,6 +154,7 @@ fn interrupted_lp_edit_resumes_to_the_edited_models_optimum() {
     // reoptimize — work that the zero budget defers entirely to resume.
     let interrupted = sol
         .add_constraint([(x, 1.0)], ComparisonOp::Le, 2.0)
+        .map(|(outcome, _)| outcome)
         .unwrap();
     assert!(interrupted.solution().is_none());
     assert_eq!(
@@ -197,6 +202,7 @@ fn lp_solution_var_domain_is_real_across_edits() {
     check(&sol);
     let sol = solution(
         sol.add_constraint(&[(x, 1.0)], ComparisonOp::Le, 1.0)
+            .map(|(outcome, _)| outcome)
             .unwrap(),
     );
     check(&sol);

@@ -188,6 +188,7 @@ fn milp_solution_var_domain_returns_each_variables_domain_across_edits() {
     check(&sol);
     let sol = solution(
         sol.add_constraint(&[(n, 1.0)], ComparisonOp::Le, 5.0)
+            .map(|(outcome, _)| outcome)
             .unwrap(),
     );
     check(&sol);

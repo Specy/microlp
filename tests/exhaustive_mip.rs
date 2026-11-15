@@ -656,11 +656,13 @@ fn integer_edits_match_fresh_exhaustive_models() {
         let mut edited_case = case.clone();
         edited_case.rows.push(added_row);
         let edited_expected = brute_force(&edited_case);
-        let edited = solution.add_constraint(
-            (0..case.n).map(|v| (vars[v], f64::from(added_row.coeffs[v]) * added_row.scale)),
-            added_row.op,
-            f64::from(added_row.rhs) * added_row.scale,
-        );
+        let edited = solution
+            .add_constraint(
+                (0..case.n).map(|v| (vars[v], f64::from(added_row.coeffs[v]) * added_row.scale)),
+                added_row.op,
+                f64::from(added_row.rhs) * added_row.scale,
+            )
+            .map(|(outcome, _)| outcome);
         match (edited_expected, edited) {
             (None, Err(Error::Infeasible)) => {}
             (None, other) => panic!(
@@ -751,11 +753,13 @@ fn mixed_scale_incremental_rows_are_not_misclassified_infeasible() {
     let solution = expect_solution(
         solution
             .add_constraint([(x, 4.0e6), (y, 5.0e6)], ComparisonOp::Ge, 13.0e6)
+            .map(|(outcome, _)| outcome)
             .unwrap(),
     );
     let solution = expect_solution(
         solution
             .add_constraint([(x, 7.0e-6), (y, 6.0e-6)], ComparisonOp::Ge, 26.0e-6)
+            .map(|(outcome, _)| outcome)
             .unwrap(),
     );
 

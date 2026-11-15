@@ -1325,19 +1325,21 @@ fn values_an_ulp_apart_gain_nothing_beyond_the_allowance() {
 
 /// A row presolve took over (a validation row) that a finished LP's answer
 /// misses is no error: the engine takes the row over and resumes, so the
-/// answer holds the model as written. Planted: `max x + y` over `[0, 2]^2`
-/// with the engine's row `x + 2 y <= 4` and `x + y <= 2.5` held back, as a
-/// wrong reduction would: the engine's optimum `(2, 1)` misses it by `0.5`,
-/// and the answer is the model's optimum, `2.5`. Held back with
-/// `x + y <= -1`, the model as written is infeasible, and so is the answer.
-/// Taken over at a deadline already passed, the re-solve stops before its
-/// first step: the answer is interrupted, and resumed, the optimum.
+/// answer holds the model as written. Planted: `max 3 x + 2 y` over
+/// `[0, 2]^2` with the engine's row `x + 2 y <= 4`, the user's second, and
+/// the user's first, `2 x + y <= 4`, held back, as a wrong reduction would:
+/// the engine's optimum `(2, 1)` misses it by `1`, and the answer is the
+/// model's optimum, `20/3` at `(4/3, 4/3)`, whose duals, `4/3` on the first
+/// row and `1/3` on the second, are reported at those user indices. Held back
+/// with `2 x + y <= -1`, the model as written is infeasible, and so is the
+/// answer. Taken over at a deadline already passed, the re-solve stops before
+/// its first step: the answer is interrupted, and resumed, the optimum.
 #[test]
 fn a_validation_row_the_answer_misses_is_taken_over() {
     init();
     let solve = |held_back: f64, stopped: bool| {
         let mut sol = Solver::try_new(
-            &[-1.0, -1.0],
+            &[-3.0, -2.0],
             &[0.0, 0.0],
             &[2.0, 2.0],
             &[(to_sparse(&[1.0, 2.0]), ComparisonOp::Le, 4.0)],
@@ -1346,7 +1348,11 @@ fn a_validation_row_the_answer_misses_is_taken_over() {
             crate::Tolerances::default().feasibility,
         )
         .unwrap();
-        sol.set_validation_rows(vec![(to_sparse(&[1.0, 1.0]), ComparisonOp::Le, held_back)]);
+        sol.set_presolved_rows(
+            &[1],
+            vec![(0, (to_sparse(&[2.0, 1.0]), ComparisonOp::Le, held_back))],
+            2,
+        );
         let stop = sol.initial_solve().unwrap();
         assert_eq!((sol.get_value(0), sol.get_value(1)), (2.0, 1.0));
         if stopped {
@@ -1360,16 +1366,26 @@ fn a_validation_row_the_answer_misses_is_taken_over() {
             crate::ResumeOptions::default(),
         )
     };
-    let solution = solve(2.5, false).unwrap().into_solution().unwrap();
-    assert!((solution.objective() - 2.5).abs() < 1e-9, "{solution:?}");
+    let optimal = |solution: &crate::Solution| {
+        assert!(
+            (solution.objective() - 20.0 / 3.0).abs() < 1e-9,
+            "{solution:?}"
+        );
+        let duals = solution.duals().unwrap();
+        assert_eq!(duals.len(), 2);
+        assert!(
+            (duals[0] - 4.0 / 3.0).abs() < 1e-9 && (duals[1] - 1.0 / 3.0).abs() < 1e-9,
+            "{duals:?}"
+        );
+    };
+    optimal(&solve(4.0, false).unwrap().into_solution().unwrap());
     assert!(solve(-1.0, false).is_err_and(|e| e == Error::Infeasible));
-    let interrupted = solve(2.5, true).unwrap();
+    let interrupted = solve(4.0, true).unwrap();
     assert_eq!(
         interrupted.termination_reason(),
         crate::TerminationReason::TimeLimit
     );
-    let solution = interrupted.resume().unwrap().into_solution().unwrap();
-    assert!((solution.objective() - 2.5).abs() < 1e-9, "{solution:?}");
+    optimal(&interrupted.resume().unwrap().into_solution().unwrap());
 }
 
 /// The boundary sums a row in compensated arithmetic, so its verdict does not

@@ -3,9 +3,10 @@
 [![Crates.io](https://img.shields.io/crates/v/microlp.svg)](https://crates.io/crates/microlp)
 [![Documentation](https://docs.rs/microlp/badge.svg)](https://docs.rs/microlp/)
 
-A linear programming solver: it finds the minimum (or maximum) of a linear
-function of a set of variables subject to linear equality and inequality
-constraints. Variables can be real, integer or boolean.
+microlp is a Rust library for solving linear programs (LPs) and mixed-integer
+linear programs (MILPs). It finds the minimum or maximum of a linear objective
+subject to equality and inequality constraints. Variables can be real, integer
+or boolean.
 
 ### Disclaimer
 
@@ -13,29 +14,27 @@ I cannot guarantee that the solver always gives optimal solutions (nor that it i
 
 ## Getting started
 
-You can use [microlp](https://crates.io/crates/microlp) on its own, but it's
-recommended to use it with the [rooc modeling language](https://github.com/specy/rooc) or 
-[good_lp](https://github.com/rust-or/good_lp), as they make it easier to write models.
+You can use [microlp](https://crates.io/crates/microlp) directly. For easier
+model construction, use it with the [rooc modeling
+language](https://github.com/specy/rooc) or [good_lp](https://github.com/rust-or/good_lp).
 
-The sections below show how to use microlp directly.
+The examples below use microlp directly.
 
-microlp requires Rust 1.86 or later. The latest releases of its `sprs`
-dependency need Rust 1.88, so on Rust 1.86 and 1.87 resolve dependencies with
-the MSRV-aware resolver (`resolver = "3"`, the default of edition 2024), or
-run `cargo update -p sprs --precise 0.11.4`.
+microlp requires Rust 1.88 or later.
 
 ## Features
 
 * Pure Rust. Runs on WebAssembly.
 * Real, integer and boolean variables.
-* Time limits and MIP gap, with possibility to edit and resume the solve.
+* Time limits and MIP gaps. You can edit a solved problem and resume an
+  interrupted solve.
 * Warm starts from a known solution.
+* Dual values (shadow prices) and reduced costs for linear programs.
 * Handles problems with hundreds of thousands of variables and constraints.
 
-Integer and boolean variables are handled with branch & bound. The library is
-already quite powerful and fast, but on some hard or ill-conditioned problems a
-solve can still fail with `Error::InternalError` rather than answer. Please
-report bugs and contribute code!
+Problems with integer or boolean variables are solved with branch & bound. On
+hard or ill-conditioned problems, a solve can fail with `Error::InternalError`
+instead of returning an answer. Please report bugs and contribute code.
 
 ## Basic usage
 
@@ -62,15 +61,14 @@ assert_eq!(solution.var_value(y).round(), 3.0);
 
 ## Defining a problem
 
-A `Problem` is created with an optimization direction and filled with
-variables and constraints. Each variable is defined by its objective
-coefficient and its bounds, and is represented by a `Variable` handle that you
-keep to reference it later. A handle belongs to the problem that created it:
-use it only with that problem and its solutions. Another problem does not
-detect a foreign handle; it refers to that problem's variable with the same
-index. If the index is absent, accessors and `Problem::add_constraint` panic;
-`Solution::add_constraint` and a solve's warm-start hints return
-`Error::InvalidOperation`.
+Create a `Problem` with an optimization direction, then add variables and
+constraints. Each variable has an objective coefficient and bounds. Its
+`Variable` handle lets you refer to it later. A handle belongs to the problem
+that created it, so use it only with that problem and its solutions.
+
+If a handle's index is absent from the problem, accessors and
+`Problem::add_constraint` panic. `Solution::add_constraint` and a solve with
+that index in its warm-start hint return `Error::InvalidOperation`.
 
 ```rust
 use microlp::{ComparisonOp, LinearExpr, OptimizationDirection, Problem};
@@ -82,15 +80,13 @@ let y = problem.add_integer_var(1.0, (-10, 10));    // integer, -10 <= y <= 10
 let z = problem.add_binary_var(2.0);                // boolean: 0 or 1
 ```
 
-A bound of magnitude 2^52 (about 4.5e15) or more on its side of infinity is
-treated as infinite, so an upper bound of `f64::MAX` or `i64::MAX` means no
-upper bound. A bound that large meant as a real bound is therefore not one,
-and a solution can lie beyond it. Each bound is judged on its own, so
-`(5e15, f64::MAX)` means `x >= 5e15`; only bounds with `min >= max` are kept
-as given, so a variable fixed at such a value stays fixed and an empty range
-stays infeasible. A constraint's right-hand side is not cut off: it is used as
-given, so a bound that large can be written as a constraint such as
-`x <= 5e15`.
+A bound with magnitude 2^52 (about 4.5e15) or more on its side of infinity is
+treated as infinite. An upper bound of `f64::MAX` or `i64::MAX` therefore means
+there is no upper bound. When `min >= max`, microlp keeps the
+bounds as given, so a variable fixed at such a value stays fixed and an empty
+range stays infeasible. microlp uses a constraint's right-hand side as given,
+even when its magnitude is that large. You can express a bound such as
+`x <= 5e15` as a constraint.
 
 The left-hand side of a constraint can be given as a slice of
 `(variable, coefficient)` pairs, as any iterator of such pairs, or as a
@@ -108,74 +104,63 @@ lhs.add(z, -3.0);
 problem.add_constraint(lhs, ComparisonOp::Eq, 0.0);
 ```
 
+`add_constraint` returns a `Constraint` handle which you can use to read the
+constraint's dual value from a solution (see [Duals](#duals)). Like a
+`Variable`, the handle belongs to the problem that created it.
+
 ## Solving and reading the solution
 
-`solve()` tries to find the optimal solution. Every solution meets each
-constraint and each variable bound within an absolute tolerance (`1e-7` by
-default, `Tolerances::feasibility`, or the round-off of evaluating it in `f64`
-where that is larger), checked against the problem as you wrote it. Otherwise
-the solve returns an error:
+`solve()` searches for an optimal solution. Every solution meets each
+constraint and variable bound within an absolute feasibility tolerance of
+`1e-7` by default (`Tolerances::feasibility`), or the round-off of evaluating
+the constraint or bound in `f64` where that is larger. If the solve cannot
+return a verified solution, it returns an error:
 
-* `Error::Infeasible`: the solver proved, from the problem's data, that no
-  assignment with every integer variable at an integer within its bounds, and
-  every variable whose bounds are equal at its value, meets the constraints
-  and the other bounds within that tolerance (see `Tolerances::feasibility`).
+* `Error::Infeasible`: the problem has no solution. No assignment meets every
+  constraint and bound within the feasibility tolerance while every integer
+  variable takes a whole number. See [`Error::Infeasible`] for the exact
+  conditions.
 * `Error::Unbounded`: the objective can improve forever.
 * `Error::InternalError`: a numerical failure the solver could not recover
-  from. It returns this rather than an answer it could not verify.
-* `Error::InvalidOptions` for an invalid numeric option, and
-  `Error::InvalidOperation` for invalid input, both checked before anything
-  is solved. Every number of the problem must be finite, but a bound or a
-  constraint's right-hand side may be infinite on the side it leaves open:
-  `f64::NEG_INFINITY` as a lower bound or on a `Ge` constraint,
-  `f64::INFINITY` as an upper bound or on a `Le` constraint, where it
-  constrains nothing. A warm-start hint must give finite values to variables
-  of the problem.
+  from.
+* `Error::InvalidOptions` reports an invalid numeric option.
+  `Error::InvalidOperation` reports invalid input. Both are checked before
+  solving.
 
-An optimal solution is optimal at the point the solver ends at, within the
-tolerance, not over every point the tolerance admits: on an ill-conditioned
-problem, where a small coefficient sits beside a large one, the tolerance can
-move the objective far from the exact optimum.
+An optimal solution is optimal up to numerical tolerances. This does not
+guarantee the best objective over every assignment the tolerances allow.
+When a very large coefficient sits beside small ones, a tolerance-sized
+difference in one variable can make the reported objective differ noticeably
+from the exact optimum.
 
-Keep the coefficients of each constraint, and those of each variable across
-the constraints, within six orders of magnitude: the largest magnitude at most
-`1e6` times the smallest. Nothing outside that range is refused or changed,
-and every solution is still checked against the model as you wrote it, but a
-solve can then fail with `Error::InternalError`, whose message names the
-constraint (in the order added) and the variable (its index) whose
-coefficients span the most, those of them outside the range. Changing the
-units of a variable or of a constraint usually brings a model back into
-range. Within the range, an `Error::InternalError` is a bug or one of the
-known limitations below: please report it.
+Keep the largest nonzero coefficient magnitude at most `1e6` times the
+smallest in each constraint and for each variable across constraints.
+Changing the units of a variable or of a constraint usually brings a model
+into this range. Outside it, microlp still accepts the model and tries to
+solve it, but `Error::InternalError` becomes more likely. The error message
+names the constraint and variable with the widest ranges, reporting each
+only if its range exceeds the recommendation. Please report an
+`Error::InternalError` that occurs inside the recommended range.
 
-Nearly dependent constraints can exceed floating-point resolution even within
-that coefficient range: a solve can then fail with `Error::InternalError`; in
-extreme cases a feasible model whose feasible points require very large
-variable values is reported `Infeasible`, and a solve whose last basis is
-singular to `f64` reports a solution for an unbounded model, or one far from
-the optimum of a bounded model. A common source is a group of free variables
-that can all shift together, such as every bus angle of a power-flow network
-left free: where rounding in the coefficients leaves that shift a tiny effect
-on the constraints, a model meant to have no solution can have one as written,
-at very large variable values, which a solve can return. Fix one of those
-variables, such as a reference angle, to remove the shift. Outside the range,
-a bounded model can also be reported `Unbounded`. An objective whose terms
-(costs times values) or their sum overflow `f64` cannot be evaluated: a solve
-that meets one fails with `Error::InternalError`, even where the exact
-objective is representable. See the
-[known numerical limitations](src/ARCHITECTURE.md#79-known-limitations).
+Constraints that nearly repeat one another can make a solve fail with
+`Error::InternalError`. In rare cases, a feasible model can be reported
+`Infeasible`, or the returned solution can be far from the optimum. A common
+cause is free variables that can all shift together, such as every bus angle
+in a power-flow model. Fix one of them, such as a reference angle, to remove
+the shared shift. See the crate's [known limitations] for the full list.
 
-When a solver decides to produce a solution it might be for different reasons:
+A successful solve returns a `SolveOutcome`, which is one of:
 
 * `SolveOutcome::Solution` contains a validated assignment. Its status is
-  `SolutionStatus::Optimal` when optimality was proved, with no MIP gap, or
-  `SolutionStatus::Feasible` when a valid incumbent is available without that
-  proof, for example if a time or node limit has been reached.
-* `SolveOutcome::Interrupted` means a time or node limit fired before a usable
-  incumbent existed. It exposes the termination reason and statistics, but no
-  objective or variable-value accessors as they are not available. This case is
-  not "impossible" to solve, just that not enough time was spent to find a
-  solution. In this case you might want to use `resume()` to continue the search.
+  `SolutionStatus::Optimal` when the solver proved optimality with no MIP gap,
+  or `SolutionStatus::Feasible` when an incumbent (the best solution found so
+  far) is available but optimality is unproved, for example because a time or
+  node limit was reached.
+* `SolveOutcome::Interrupted` means a time or node limit was reached before
+  the solver found a usable incumbent. It provides the termination reason and
+  statistics, but no objective or variable-value accessors because no solution
+  is available. It doesn't mean the problem has no solution, you can resume
+  the solve with `resume()` to continue the search.
 
 `termination_reason()` distinguishes `ProvenOptimal`, `MipGap`, `TimeLimit`,
 and `NodeLimit`.
@@ -198,16 +183,14 @@ match problem.solve()? {
 }
 ```
 
-Values on a `Solution` are read per variable or by iterating, as the solver
-computed them, and the reported objective is computed from exactly the values
-you read. An integer or boolean variable's value lies within `int_tol` (default
-`1e-6`) of an integer, not necessarily on it: values like `0.9999999` are
-normal. One fixed at an integer (by its bounds, the search or an edit) lies on
-it. Use `.round()` where you need an exact integer (`var_domain` tells which
-variables are integer or boolean), bearing in mind that rounded values need
-not meet the constraints: under a big-M constraint such as `x <= 1e7 * y`, a
-`y` of `1e-6` allows `x` up to 10, which `y` rounded to zero forbids. Keep
-big-M coefficients no larger than the model needs.
+Read a variable's value with `var_value` or by iterating over a `Solution`.
+An integer or boolean variable's value is within `int_tol` (default `1e-6`)
+of an integer, but is not necessarily that integer. Values like `0.9999999`
+are normal. A variable fixed at an integer by its bounds, the solve or an
+edit lies on that integer. Use `.round()` when you need an exact integer
+(`var_domain` identifies integer and boolean variables), but remember that
+rounded values need not meet the constraints. Keep big-M coefficients no
+larger than the model needs.
 
 ```rust
 use microlp::VarDomain;
@@ -227,17 +210,44 @@ for (var, value) in &solution {
 }
 ```
 
-`stats()` returns counters for the solve so far: branch & bound nodes, simplex
-iterations, elapsed time, the best proven bound and the current gap.
+[`stats()`] reports LP iterations, elapsed time, the best proven bound and
+the current gap. For MILPs, it also reports the number of nodes solved.
+
+### Duals
+
+For a problem without integer or boolean variables, a `Solution` also reports
+dual values. [`dual(constraint)`] is the constraint's shadow price, the rate
+at which the optimal objective changes as its right-hand side increases.
+`duals()` returns the dual value for each constraint, in the order they were
+added. `reduced_cost(var)` returns a variable's objective coefficient minus
+the sum of its constraint coefficients times the corresponding dual values.
+All three methods return `None` for a problem with integer or boolean
+variables.
+
+```rust
+use microlp::{ComparisonOp, OptimizationDirection, Problem};
+
+// Meet a demand of 10 from two generators, the cheaper one limited to 6.
+let mut problem = Problem::new(OptimizationDirection::Minimize);
+let cheap = problem.add_var(20.0, (0.0, f64::INFINITY));
+let dear = problem.add_var(50.0, (0.0, f64::INFINITY));
+let demand = problem.add_constraint(&[(cheap, 1.0), (dear, 1.0)], ComparisonOp::Eq, 10.0);
+let limit = problem.add_constraint(&[(cheap, 1.0)], ComparisonOp::Le, 6.0);
+let solution = problem.solve()?.into_solution().expect("an LP solves to optimality");
+
+// One more unit of demand comes from the dearer generator (50), and one more
+// unit of the cheap one's limit saves 50 - 20.
+println!("demand: {}", solution.dual(demand).unwrap()); // 50
+println!("limit: {}", solution.dual(limit).unwrap()); // -30
+```
 
 ## Time limits and resuming
 
-Set a time budget with `set_time_limit`. When it runs out, the outcome
-contains either a feasible incumbent or an interrupted search. `resume()`
-continues the same search with the per-call options used by the immediately
-preceding solve, resume or edit.
-
-Use `resume_with` to resume with different settings.
+Set a time limit with `set_time_limit`. When the limit expires, the outcome
+contains either the best solution found so far or an interrupted solve.
+[`resume()`] continues with fresh time and node budgets using the preceding
+call's settings. [`resume_with`] replaces those settings with the options you
+supply.
 
 ```rust
 use microlp::{ResumeOptions, TerminationReason};
@@ -257,14 +267,14 @@ while matches!(
 }
 ```
 
-Time limits are checked periodically, so a solve can run slightly past its budget.
-A budget too long to add to the clock, such as `Duration::MAX`, counts as no
-limit.
+The solver checks time limits periodically, so a solve can run slightly past
+its limit. A duration too large to represent as a time limit, such as
+`Duration::MAX`, means no limit.
 
 ## Solve options
 
-`solve_with` accepts a `SolveOptions` for everything beyond a plain time
-limit. Start from the default and change what you need:
+Use `solve_with` to set options beyond a time limit. Start with the defaults
+and change the options you need:
 
 ```rust
 use microlp::SolveOptions;
@@ -279,52 +289,69 @@ options.warm_start = Some(vec![(x, 1.0), (y, 3.0)]);
 let outcome = problem.solve_with(options)?;
 ```
 
-* `time_limit`, `node_limit`: execution budgets for this call.
-* `mip_gap`: stop as soon as the solution is proven within this relative
-  distance of the optimum, and report a feasible solution with termination
-  reason `MipGap`. The default `0.0` requires exact optimality.
+* `time_limit`, `node_limit`: execution budgets for this solve call.
+* `mip_gap`: stop when the best solution found so far is proven within this
+  relative distance of the optimum and report a feasible solution with
+  termination reason `MipGap`. The default `0.0` keeps solving until
+  optimality is proven.
 * `warm_start`: a starting assignment (it may cover only some variables).
   A good one gives the solver an immediate solution to improve on. It is
-  advisory: if it isn't usable it is ignored, and a problem with only real
+  advisory, if it isn't usable it is ignored, and a problem with only real
   variables does not use it. A value that is NaN or infinite, or a variable
   outside the problem, returns `Error::InvalidOperation`.
-* `int_tol`, `tolerances`: numeric tolerances. A value within `int_tol` of an
-  integer counts as integral, for acceptance only (see `presolve` below), and
-  integer values are reported within it (a fixed integer variable's on its
-  integer); the feasibility tolerance is absolute, for every variable bound
-  and constraint.
-  Values must be finite and non-negative, the feasibility tolerance at least
-  `1e-10`, and `int_tol` below `0.5`.
-* `presolve` (on by default): simplify the problem before the search. It never
-  removes a variable or changes a real variable's bounds, and it keeps, up to
-  round-off, every solution whose integer variables are exactly integral, or,
-  where `dual_fixing` fixes a variable because of the objective, an optimal
-  one; every solution is still checked against the problem as you wrote it. A
-  solution relying on `int_tol` (an integer variable just off its integer
-  under a big-M coefficient) is never sought: it is returned where the search
-  lands on one, and where the objective can improve forever such a landing
-  answers `Unbounded`. A problem with no solution whose integer variables are
-  integral is answered `Infeasible` unless that happens, with presolve on or
-  off.
-* `dual_fixing` (on by default): let presolve fix an integer variable at a
-  bound that neither the objective nor any constraint gives it a reason to
-  leave. That keeps an optimal solution, not every solution: turn it off when
-  every integral solution must stay reachable, for example to enumerate the
-  solutions within an objective cutoff. A `warm_start` hint turns it off.
+* `int_tol`, `tolerances`: `int_tol` (default `1e-6`) is how far a reported
+  integer or boolean value may be from a whole number.
+  `tolerances.feasibility` (default `1e-7`) is how far a solution may lie
+  outside a constraint or variable bound, as an absolute amount. A model
+  feasible only at slightly nonintegral integer values is normally reported
+  `Infeasible`.
+* `presolve` (on by default): simplifies the problem before solving, making
+  most solves faster. Every variable is still reported, and the solution
+  returned is one of the problem as you wrote it. Turn it off only to
+  compare behavior or to rule it out when investigating a numerical problem.
+* `dual_fixing` (on by default): a presolve shortcut for integer variables.
+  It keeps an optimal solution but can rule out other solutions, including
+  equally good ones. Turn it off when every integer solution must stay
+  reachable, for example when you enumerate solutions by adding constraints
+  and solving again. A `warm_start` hint turns it off.
+
+See [`SolveOptions`] and [`Tolerances`] for accepted values and exact
+conditions.
 
 ## Changing a solved problem
 
-A `Solution` can be edited and re-solved: `add_constraint` adds a new
-constraint, `fix_var` pins a variable to a value, `unfix_var` releases a
-previous fix. Each call consumes the solution and returns a new, re-solved
-one, keeping as much earlier work as possible, in particular, the previous
-solution is used as a starting point whenever it is still valid for the
-changed problem.
+You can edit a `Solution` and solve the changed problem. `add_constraint`
+adds a constraint, `set_rhs` changes a right-hand side, and `set_obj_coeff`
+changes an objective coefficient. `fix_var` fixes a variable to a value, and
+`unfix_var` restores its original bounds.
 
-Only a `Solution` can be edited. An interrupted outcome deliberately has no
-edit methods because it has no validated assignment. A feasible-but-unproven
-`Solution` can be edited. Every edit returns another `SolveOutcome`, so a
-limited reoptimization remains explicit and safe.
+Each edit consumes the solution, even if it returns an error. Clone it first
+if you need to keep the preceding solution. The calls return a new
+`SolveOutcome`. `add_constraint` also returns the new constraint handle, and
+`unfix_var` reports whether it released a fix.
+
+Edits to LPs continue from the preceding solve, which is usually much faster
+than starting over. An infinite right-hand side on a constraint's open side
+switches it off, and a finite one switches it back on. See [`Solution`] for
+edit conditions, errors, and the settings each call uses.
+
+```rust
+use microlp::{ComparisonOp, OptimizationDirection, Problem};
+
+let mut problem = Problem::new(OptimizationDirection::Minimize);
+let cheap = problem.add_var(20.0, (0.0, 6.0));
+let dear = problem.add_var(50.0, (0.0, f64::INFINITY));
+let demand = problem.add_constraint(&[(cheap, 1.0), (dear, 1.0)], ComparisonOp::Ge, 0.0);
+let mut solution = problem.solve().unwrap().into_solution().unwrap();
+// The cost of each demand level, each solve warm from the one before.
+for level in [2.0, 4.0, 6.0, 8.0, 10.0] {
+    solution = solution.set_rhs(demand, level).unwrap().into_solution().unwrap();
+    println!("demand {level}: cost {}, price {}", solution.objective(), solution.dual(demand).unwrap());
+}
+```
+
+You can edit a `Solution` whose optimality is unproved. An interrupted
+outcome has no validated assignment to edit.
 
 ```rust
 use microlp::{
@@ -367,7 +394,7 @@ fn main() -> Result<(), Error> {
     // Requirements change after seeing the plan: a customer needs at least
     // 3 units of product 0, and product 3 is out of stock. Edits apply to
     // the problem as you originally defined it, plus the other edits.
-    let outcome =
+    let (outcome, _at_least_3) =
         solution.add_constraint(&[(units[0], 1.0)], ComparisonOp::Ge, 3.0)?;
     let solution = resume_until_answer(outcome)?
         .into_solution()
@@ -392,8 +419,10 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-An edit that makes the problem unsolvable returns `Err(Error::Infeasible)`
-from the edit call itself.
+Edits return the same errors as solving. `Error::Infeasible` means the changed
+problem has no solution. `Error::Unbounded` means its objective can improve
+forever, which can happen after `set_rhs` switches off the constraint that
+limited it, after `set_obj_coeff`, or after `unfix_var`.
 
 ## Testing
 
@@ -414,7 +443,8 @@ run, use `HEGEL_TEST_CASES=500000 cargo test --release --lib origin`, which
 takes about a minute and some 4 GB of memory.
 
 The `xhard` tier gives larger instances a 10-minute budget. It accepts clean
-interruptions and checks returned incumbents against externally certified results:
+interruptions and checks the solutions it returns against externally certified
+results:
 
 ```
 cargo test --release --test suite -- --xhard
@@ -433,9 +463,7 @@ with:
 cargo run -p microlp-benchmark --release
 ```
 
-The rival solvers set themselves up during the build: HiGHS is compiled from
-source, SCIP is downloaded prebuilt (the first build needs internet access)
-and Clarabel is pure Rust. What must already be on the machine is a C++
+The rival solvers set themselves up during the build so you must have a C++
 toolchain, CMake and libclang:
 
 * **Linux** (Debian/Ubuntu): `sudo apt install cmake build-essential libclang-dev libgfortran5`
@@ -445,9 +473,7 @@ toolchain, CMake and libclang:
   `libclang.dll` — or `pip install libclang` and point `LIBCLANG_PATH` at
   its `native` folder
 
-Runs are timed, so use an otherwise idle machine.
-A solver you cannot build
-can be left out, e.g.
+A solver you cannot build can be left out, e.g.
 ```bash
 cargo run -p microlp-benchmark --release --no-default-features --features highs,clarabel
 ```
@@ -455,3 +481,13 @@ cargo run -p microlp-benchmark --release --no-default-features --features highs,
 ## License
 
 This project is licensed under the [Apache License, Version 2.0](./LICENSE).
+
+[`Error::Infeasible`]: https://docs.rs/microlp/latest/microlp/enum.Error.html#variant.Infeasible
+[known limitations]: https://docs.rs/microlp/latest/microlp/#known-limitations
+[`stats()`]: https://docs.rs/microlp/latest/microlp/struct.Solution.html#method.stats
+[`dual(constraint)`]: https://docs.rs/microlp/latest/microlp/struct.Solution.html#method.dual
+[`resume()`]: https://docs.rs/microlp/latest/microlp/enum.SolveOutcome.html#method.resume
+[`resume_with`]: https://docs.rs/microlp/latest/microlp/enum.SolveOutcome.html#method.resume_with
+[`SolveOptions`]: https://docs.rs/microlp/latest/microlp/struct.SolveOptions.html
+[`Tolerances`]: https://docs.rs/microlp/latest/microlp/struct.Tolerances.html
+[`Solution`]: https://docs.rs/microlp/latest/microlp/struct.Solution.html
