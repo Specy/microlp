@@ -183,12 +183,10 @@ impl SosSet {
         // does not exceed it.
         let mass: f64 = nz.iter().map(|&(_, m)| m).sum();
         let mean = nz.iter().map(|&(p, m)| self.weights[p] * m).sum::<f64>() / mass;
-        let mut r = a;
-        for p in a..=b {
-            if self.weights[p] <= mean {
-                r = p;
-            }
-        }
+        let r = (a..=b)
+            .rev()
+            .find(|&p| self.weights[p] <= mean)
+            .unwrap_or(a);
         let r = match self.kind {
             SosKind::Sos1 => r.clamp(a, b - 1),
             SosKind::Sos2 => r.clamp(a + 1, b - 1),
