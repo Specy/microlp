@@ -94,7 +94,7 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
         solver,
         root_bounds,
         applied: Vec::new(),
-        open: Vec::new(),
+        open: node::OpenNodes::default(),
         diving: false,
         incumbent: None,
         node_seq: 0,
@@ -285,11 +285,7 @@ pub(crate) fn global_bound_internal(state: &MipState) -> Option<f64> {
     if !state.root_solved {
         return None;
     }
-    let open_min = state
-        .open
-        .iter()
-        .map(|n| n.lp_bound)
-        .fold(f64::INFINITY, f64::min);
+    let open_min = state.open.min_bound().unwrap_or(f64::INFINITY);
     match (&state.incumbent, state.open.is_empty()) {
         (Some(inc), true) => Some(inc.objective), // proof complete
         (Some(inc), false) => Some(open_min.min(inc.objective)),
