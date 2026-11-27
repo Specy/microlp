@@ -95,6 +95,22 @@ fn process_integral_candidate(
     }
 }
 
+/// The objective of the node LP the solver has just solved, which bounds the
+/// node's subtree. One that cannot be evaluated in `f64`, its terms (costs
+/// times values) or their sum overflowing, is an `InternalError`: it bounds
+/// nothing, and the search prunes and orders nodes by it.
+fn node_objective(state: &MipState) -> Result<f64, Error> {
+    let objective = state.solver.cur_obj_val;
+    if !objective.is_finite() {
+        return Err(Error::InternalError(
+            "the objective of a branch & bound node's LP solution cannot be evaluated in f64: \
+             its terms (costs times values) or their sum overflow"
+                .to_string(),
+        ));
+    }
+    Ok(objective)
+}
+
 /// Apply `node`'s bounds to the solver: reset each var in `applied` that the
 /// node has no entry for to its root bounds, then set every entry of the
 /// node, also one already in force, which drops any widening a previous
@@ -430,11 +446,12 @@ fn initialize_root(
         }
     }
 
+    let objective = node_objective(state)?;
     let root = Node {
         bound_changes: Vec::new(),
         basis: state.solver.snapshot_basis(),
-        lp_bound: state.solver.cur_obj_val,
-        lattice_bound: state.lattice_bound(state.solver.cur_obj_val),
+        lp_bound: objective,
+        lattice_bound: state.lattice_bound(objective),
         depth: 0,
         parent_id: 0,
         branch_var: None,
@@ -494,7 +511,7 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
         }
     }
 
-    let objective = state.solver.cur_obj_val;
+    let objective = node_objective(state)?;
     if let Some(var) = node.branch_var {
         state.pseudocosts.record(
             var,

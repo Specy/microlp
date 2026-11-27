@@ -580,7 +580,9 @@ branching); a false acceptance would be a wrong answer.
 - **Pruning** uses `cutoff(incumbent) = incumbent − max(ε, ε·|incumbent|)` with
   `ε = Tolerances::prune_epsilon` (default 1e-9), applied twice per node (`dominated`):
   against the stored parent bound *before* any LP work, and against the fresh objective
-  after.
+  after. A node LP whose objective is not finite, its terms (costs times values) or their sum
+  overflowing `f64`, bounds nothing: an `InternalError` that says so (`node_objective`, §7.9),
+  so that every bound the search prunes and orders by is finite.
 - **Objective lattice** (`ObjectiveLattice`): where every var with a nonzero cost is an
   integer var or fixed in the bounds the search starts from (presolve's fixings and an
   edit's included), the objective at a point whose integer vars are integral and whose fixed
@@ -1520,11 +1522,12 @@ limitation below). Fixing one var of the group (a reference angle) removes the s
   `(-2147483644, 2147483647)`, whose objective is `3e300` but whose terms are some `2e309`,
   and three binaries costing `1e308` each reach `(1, 1, 1)`, whose terms are finite and whose
   sum is not.
-  A candidate of the search or an LP answer there is an `InternalError` that says so, never
-  an answer whose objective is not finite:
-  `an_integral_point_whose_objective_overflows_is_an_internal_error` and
+  A node LP of the search, a candidate or an LP answer there is an `InternalError` that says
+  so, never a bound or an answer whose objective is not finite:
+  `a_node_whose_objective_overflows_is_an_internal_error` and
   `an_lp_answer_whose_objective_overflows_is_an_internal_error` (`src/tests/regressions.rs`),
-  which expect the error.
+  and `a_candidate_whose_objective_overflows_is_an_internal_error` (`src/mip/tests.rs`), which
+  expect the error.
 
 ---
 
@@ -1542,7 +1545,7 @@ limitation below). Fixing one var of the group (a reference angle) removes the s
 | A primal pivot element whose row and column computations disagree on a fresh factorization at the highest threshold | the column refined and judged (§7.7), never a pivot on the plain values: where the column's refinement converged, the element taken where the refined row agrees with it, has it genuine with the same sign, or overlaps it within their errors, `InternalError` ("through the refined row") where the row has it genuine with the other sign; else unresolved (the row above) |
 | A basis the factorization finds singular (after a pivot on an entry tiny beside its column, or loaded) | repaired: the slack of a row no pivot took replaces each dependent column (a var with both bounds finite where the factorization's choice has an infinite bound and a second factorization allows, §7.8), and the solve goes on; within a phase the change back is taboo, unless the step whose refactorization found the basis singular moved its row (§3, §7.8) |
 | Basis bookkeeping found inconsistent when a singular basis is repaired (a var basic twice, or a slack's non-basic position held by another var) | panic: a bug, never repaired |
-| A candidate's objective, or an LP answer's, that cannot be evaluated in `f64`, its terms (costs times values) or their sum overflowing | `InternalError` that says so, never an incumbent or an answer, even where the exact objective is representable (§7.9) |
+| A node LP's objective, a candidate's, or an LP answer's, that cannot be evaluated in `f64`, its terms (costs times values) or their sum overflowing | `InternalError` that says so, never a bound, an incumbent or an answer, even where the exact objective is representable (§7.9) |
 | Integral candidate failing the guard with no integer variable to branch on | `InternalError`, never force-accepted. The engine verified the point on its own rows, and with nothing to branch on every integer variable is exactly integral (one its bounds fix the engine holds on its value), where a row presolve dropped or rewrote holds as written: the failure is a reduction that did not keep the point (§5.4) |
 | Verified state unreachable (`MAX_PHASE_ROUNDS` alternations, or a vertex whose values miss its rows through every factorization of the verification's ladder, again after the solve starts over from the slack basis) | `InternalError`, never an unverified optimum |
 | Any `InternalError` of a model outside the recommended coefficient range | its message names the constraint and the variable whose coefficients span the most, those of them outside the range (§7.7) |

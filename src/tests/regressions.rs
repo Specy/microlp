@@ -1635,16 +1635,29 @@ pub(crate) mod regression_tests {
         }
     }
 
-    /// `max 1e300 x + 1e300 y` s.t. `2x + 2y <= 7` and `x - y <= 0.5`, `x`
-    /// and `y` integers over the `i32` range. The search's integral point
-    /// `(-2147483644, 2147483647)` has the objective `3e300`, but its terms,
-    /// some `2e309`, overflow `f64`, and their sum is not a number. An
-    /// `InternalError` that says so, where the guard's rejection of the point
-    /// read as a failed validation with nothing to branch on. Three binaries
-    /// costing `1e308` each reach `(1, 1, 1)`, whose terms are finite and
-    /// whose sum is not.
+    /// A node LP whose objective cannot be evaluated in `f64`, its terms
+    /// (costs times values) or their sum overflowing, bounds nothing: an
+    /// `InternalError` that says so, where the search pruned and ordered its
+    /// nodes by it.
+    /// - `max 1e300 x + 1e300 y` s.t. `2x + 2y <= 7` and `x - y <= 0.5`, `x`
+    ///   and `y` integers over the `i32` range. The root LP ends at
+    ///   `(-2147483643.5, 2147483647)`, whose objective is `3.5e300`, but its
+    ///   terms, some `2e309`, overflow `f64`, and their sum is not a number.
+    /// - Three binaries costing `1e308` each. The root LP ends at
+    ///   `(1, 1, 1)`, whose terms are finite and whose sum is not.
+    /// - `max 5e306 (-x + 7y + 2z)` s.t. `-2x + 3y + 2z >= -13.5`,
+    ///   `-3x + 2z >= 5.5` and `x - 3y - z >= 13`, integers `x` in
+    ///   `[-3, 0]`, `y` in `[-6, -5]` and `z` in `[-6, 5]`. The optimum is
+    ///   `-1.6e308` at `(0, -6, 5)`; the answer was `-1.65e308` at
+    ///   `(-2, -5, 0)`, as optimal.
+    /// - `max 5e306 (11x - 13y + 5z)` s.t. `-3x + 3y - z >= 2`,
+    ///   `x - 3y + 3z <= -6.5` and `-2y + 2z <= -1.5`, integers `x` in
+    ///   `[-1, 2]`, `y` in `[-2, 3]` and `z` in `[-5, -2]`. The root LP's
+    ///   objective is finite and a later node's is not. The optimum is
+    ///   `-5e307` at `(-1, -2, -5)`; the answer was `-6e307` at
+    ///   `(0, -1, -5)`, as optimal.
     #[test]
-    fn an_integral_point_whose_objective_overflows_is_an_internal_error() {
+    fn a_node_whose_objective_overflows_is_an_internal_error() {
         let mut terms = Problem::new(OptimizationDirection::Maximize);
         let x = terms.add_integer_var(1e300, (i32::MIN, i32::MAX));
         let y = terms.add_integer_var(1e300, (i32::MIN, i32::MAX));
@@ -1654,24 +1667,46 @@ pub(crate) mod regression_tests {
         let b: Vec<_> = (0..3).map(|_| sum.add_binary_var(1e308)).collect();
         sum.add_constraint([(b[0], 1.0), (b[1], 1.0)], ComparisonOp::Le, 2.0);
         sum.add_constraint([(b[1], 1.0), (b[2], 1.0)], ComparisonOp::Le, 2.0);
-        for (problem, presolve) in [(&terms, true), (&terms, false), (&sum, true), (&sum, false)] {
-            let options = crate::SolveOptions {
-                presolve,
-                ..crate::SolveOptions::default()
-            };
-            let got = problem.solve_with(options);
-            assert!(
-                matches!(&got, Err(crate::Error::InternalError(m))
-                    if m.contains("the objective of an integral solution cannot be evaluated \
-                        in f64: its terms (costs times values) or their sum overflow")),
-                "presolve {presolve}: {:?}",
-                got.map(|_| "solved")
-            );
+        let mut at_the_root = Problem::new(OptimizationDirection::Maximize);
+        let x = at_the_root.add_integer_var(-5e306, (-3, 0));
+        let y = at_the_root.add_integer_var(3.5e307, (-6, -5));
+        let z = at_the_root.add_integer_var(1e307, (-6, 5));
+        at_the_root.add_constraint([(x, -2.0), (y, 3.0), (z, 2.0)], ComparisonOp::Ge, -13.5);
+        at_the_root.add_constraint([(x, -3.0), (z, 2.0)], ComparisonOp::Ge, 5.5);
+        at_the_root.add_constraint([(x, 1.0), (y, -3.0), (z, -1.0)], ComparisonOp::Ge, 13.0);
+        let mut below_the_root = Problem::new(OptimizationDirection::Maximize);
+        let x = below_the_root.add_integer_var(5.5e307, (-1, 2));
+        let y = below_the_root.add_integer_var(-6.5e307, (-2, 3));
+        let z = below_the_root.add_integer_var(2.5e307, (-5, -2));
+        below_the_root.add_constraint([(x, -3.0), (y, 3.0), (z, -1.0)], ComparisonOp::Ge, 2.0);
+        below_the_root.add_constraint([(x, 1.0), (y, -3.0), (z, 3.0)], ComparisonOp::Le, -6.5);
+        below_the_root.add_constraint([(y, -2.0), (z, 2.0)], ComparisonOp::Le, -1.5);
+        let problems = [
+            ("terms", &terms),
+            ("sum", &sum),
+            ("at the root", &at_the_root),
+            ("below the root", &below_the_root),
+        ];
+        for (name, problem) in problems {
+            for presolve in [true, false] {
+                let options = crate::SolveOptions {
+                    presolve,
+                    ..crate::SolveOptions::default()
+                };
+                let got = problem.solve_with(options);
+                assert!(
+                    matches!(&got, Err(crate::Error::InternalError(m))
+                        if m.contains("the objective of a branch & bound node's LP solution \
+                            cannot be evaluated in f64: its terms (costs times values) or their \
+                            sum overflow")),
+                    "{name}, presolve {presolve}: {:?}",
+                    got.map(|outcome| outcome.solution().map(|s| s.objective()))
+                );
+            }
         }
     }
 
-    /// The LP of
-    /// [`an_integral_point_whose_objective_overflows_is_an_internal_error`]
+    /// The LP of [`a_node_whose_objective_overflows_is_an_internal_error`]
     /// over reals ends at `(-2147483643.5, 2147483647)`, whose objective is
     /// `3.5e300` but whose terms overflow `f64`, their sum not a number; the
     /// optimum of `max 1e308 x + 1e308 y` s.t. `x + y <= 15` over `[0, 10]`,

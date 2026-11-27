@@ -798,6 +798,31 @@ fn valid_candidate_completes_unbounded_classification() {
     assert_eq!(try_adopt_incumbent(&mut state), Err(Error::Unbounded));
 }
 
+/// A candidate whose objective cannot be evaluated in `f64` is an
+/// `InternalError` that says so: three binaries costing `1e308` each at
+/// `(1, 1, 1)`, whose terms are finite and whose sum is not.
+#[test]
+fn a_candidate_whose_objective_overflows_is_an_internal_error() {
+    let mut problem = Problem::new(OptimizationDirection::Maximize);
+    let b: Vec<_> = (0..3).map(|_| problem.add_binary_var(1e308)).collect();
+    problem.add_constraint([(b[0], 1.0), (b[1], 1.0)], ComparisonOp::Le, 2.0);
+    problem.add_constraint([(b[1], 1.0), (b[2], 1.0)], ComparisonOp::Le, 2.0);
+    for presolve in [true, false] {
+        let options = SolveOptions {
+            presolve,
+            ..SolveOptions::default()
+        };
+        let mut state = build_state(&problem, options).unwrap();
+        assert_eq!(state.solver.initial_solve().unwrap(), StopReason::Finished);
+        assert!(
+            matches!(try_adopt_incumbent(&mut state), Err(Error::InternalError(m))
+                if m.contains("the objective of an integral solution cannot be evaluated in \
+                    f64: its terms (costs times values) or their sum overflow")),
+            "presolve {presolve}"
+        );
+    }
+}
+
 #[test]
 fn warm_start_restores_bounds_before_unbounded_verdict() {
     let mut problem = Problem::new(OptimizationDirection::Minimize);
