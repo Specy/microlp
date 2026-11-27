@@ -13,14 +13,17 @@ Use microlp directly, or write models at a higher level with the
 
 * Pure Rust. Runs on WebAssembly.
 * Real, integer, and boolean variables.
+* Special ordered sets of type 1 and 2 ([`Problem::add_sos1_constraint`],
+  [`Problem::add_sos2_constraint`]), such as piecewise-linear functions that
+  need not be convex.
 * Time limits and MIP gap, with the possibility to edit and resume a solve.
 * Warm starts from a known solution.
 * Dual values (shadow prices) and reduced costs for linear programs.
 * Handles problems with hundreds of thousands of variables and constraints.
 
-Problems with integer or boolean variables are solved with branch & bound. A
-solve on a hard or ill-conditioned problem can still return
-[`Error::InternalError`] instead of a solution.
+Problems with integer or boolean variables, or special ordered sets, are
+solved with branch & bound. A solve on a hard or ill-conditioned problem can
+still return [`Error::InternalError`] instead of a solution.
 
 # Example
 

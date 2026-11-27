@@ -157,6 +157,36 @@ pub(crate) fn presolve(
     int_tol: f64,
     allow_dual: bool,
 ) -> Result<Presolved, Error> {
+    presolve_with_locks(
+        obj_coeffs,
+        var_mins,
+        var_maxs,
+        constraints,
+        var_domains,
+        mode,
+        feasibility,
+        int_tol,
+        allow_dual,
+        &[],
+    )
+}
+
+/// [`presolve`], with `locked` the vars something outside the rows holds in
+/// both directions, which dual fixing then leaves alone: the members of the
+/// special ordered sets, which the rows do not hold (`Work::dual_fix`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn presolve_with_locks(
+    obj_coeffs: &[f64],
+    var_mins: &[f64],
+    var_maxs: &[f64],
+    constraints: &[(CsVec, ComparisonOp, f64)],
+    var_domains: &[VarDomain],
+    mode: Mode,
+    feasibility: f64,
+    int_tol: f64,
+    allow_dual: bool,
+    locked: &[usize],
+) -> Result<Presolved, Error> {
     let started = web_time::Instant::now();
     let num_vars = obj_coeffs.len();
     let mut lo = var_mins.to_vec();
@@ -264,7 +294,7 @@ pub(crate) fn presolve(
         }
         let mut dual_changed = work.tighten_binary_coeffs(&mut rows);
         if allow_dual {
-            dual_changed |= work.dual_fix(&rows, obj_coeffs);
+            dual_changed |= work.dual_fix(&rows, obj_coeffs, locked);
         }
         rounds += 1;
         if !dual_changed || rounds >= MAX_ROUNDS {

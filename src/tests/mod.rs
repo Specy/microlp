@@ -28,3 +28,11 @@ mod duals;
 
 #[cfg(test)]
 mod warm_edits;
+
+mod sos;
+
+#[cfg(test)]
+mod sos_port;
+
+#[cfg(test)]
+mod sos_losses;

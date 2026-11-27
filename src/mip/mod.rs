@@ -16,6 +16,7 @@ pub(crate) mod node;
 mod options;
 pub(crate) mod params;
 mod search;
+pub(crate) mod sos;
 mod state;
 
 pub use options::{
@@ -35,9 +36,19 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
     // Presolve what the search solves; `state.base` stays the user's problem,
     // so post-solve edits keep composing against it. The presolved bounds
     // become the root bounds. Dual fixing can exclude a feasible point, so a
-    // warm-start hint disables it, as does `SolveOptions::dual_fixing`.
+    // warm-start hint disables it, as does `SolveOptions::dual_fixing`. It
+    // reads only the rows, which do not hold a special ordered set: an
+    // integer member nothing in the rows stops would be fixed at a nonzero
+    // bound, two in one SOS1 contradicting it. So every member is locked in
+    // both directions, and dual fixing leaves it alone; the other vars keep
+    // it, since fixing a non-member cannot break a set.
+    let set_members: Vec<usize> = problem
+        .sos
+        .iter()
+        .flat_map(|set| set.members.iter().copied())
+        .collect();
     let presolved = if options.presolve {
-        crate::presolve::reduced_model(crate::presolve::presolve(
+        crate::presolve::reduced_model(crate::presolve::presolve_with_locks(
             &problem.obj_coeffs,
             &problem.var_mins,
             &problem.var_maxs,
@@ -47,6 +58,7 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
             options.tolerances.feasibility,
             options.int_tol,
             options.dual_fixing && options.warm_start.is_none(),
+            &set_members,
         ))?
     } else {
         None
@@ -205,16 +217,19 @@ pub(crate) fn incumbent_feasible(
     int_tol: f64,
 ) -> bool {
     let feasibility = tolerances.feasibility;
-    candidate_variables_feasible(values, &base.var_domains, feasibility, int_tol, |v| {
+    let bounds = |v: usize| {
         fixed
             .get(&v)
             .map_or((base.var_mins[v], base.var_maxs[v]), |&value| {
                 (value, value)
             })
-    }) && base.constraints.iter().all(|(coeffs, op, rhs)| {
-        crate::solver::row_violation(coeffs, *op, *rhs, |v| values[v], tolerances.feasibility)
-            .is_none()
-    })
+    };
+    candidate_variables_feasible(values, &base.var_domains, feasibility, int_tol, bounds)
+        && sos::values_satisfy(&base.sos, values, feasibility, bounds)
+        && base.constraints.iter().all(|(coeffs, op, rhs)| {
+            crate::solver::row_violation(coeffs, *op, *rhs, |v| values[v], tolerances.feasibility)
+                .is_none()
+        })
 }
 
 /// After a user edit: drop the open tree, carry the incumbent as a warm-start

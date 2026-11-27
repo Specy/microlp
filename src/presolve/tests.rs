@@ -1062,3 +1062,27 @@ fn a_forcing_row_counts_its_round_off_as_room() {
         assert!(keeps(&pre, cons, xstar), "model {i}");
     }
 }
+
+/// Dual fixing leaves a locked var alone (a special ordered set's member,
+/// which the rows do not hold) and still fixes the others: with no row,
+/// every integer var that gains from rising would be fixed at its upper
+/// bound.
+#[test]
+fn dual_fixing_leaves_locked_vars_alone() {
+    let cons: Vec<(CsVec, ComparisonOp, f64)> = vec![];
+    let pre = presolve_with_locks(
+        &[-1.0, -1.0, -1.0],
+        &[0.0, 0.0, 0.0],
+        &[5.0, 5.0, 5.0],
+        &cons,
+        &[VarDomain::Integer; 3],
+        Mode::Mip,
+        1e-7,
+        1e-6,
+        true,
+        &[0, 1],
+    )
+    .unwrap();
+    assert_eq!(pre.var_mins, vec![0.0, 0.0, 5.0]);
+    assert_eq!(pre.var_maxs, vec![5.0, 5.0, 5.0]);
+}

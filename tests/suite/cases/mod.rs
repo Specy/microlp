@@ -14,6 +14,7 @@ mod milpbench;
 mod milpbench_xhard;
 mod miplib;
 mod netlib;
+mod sos;
 mod warm_restart;
 
 /// Difficulty tiers, cumulative: a tier flag on the runner selects that tier
@@ -158,6 +159,7 @@ pub fn all() -> Vec<Case> {
     miplib::register(&mut cases);
     milpbench::register(&mut cases);
     milpbench_xhard::register(&mut cases);
+    sos::register(&mut cases);
     warm_restart::register(&mut cases);
 
     // Names must be unique: they are the stable handle for --filter and repro.
