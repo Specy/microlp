@@ -4,6 +4,7 @@
 
 use super::branching;
 use super::lattice::ObjectiveLattice;
+use super::node::OpenNodes;
 use super::options::{SolveOptions, Stats, TerminationReason};
 use crate::solver::{Deadline, Solver};
 use crate::{OptimizationDirection, Problem};
@@ -26,7 +27,7 @@ pub(crate) struct MipState {
     /// Bound changes currently applied to `solver`, as a node stores them (one
     /// entry per var, sorted by var).
     pub applied: Vec<(usize, f64, f64)>,
-    pub open: super::node::OpenNodes,
+    pub open: OpenNodes,
     /// Pop policy toggle for `pop_node`: `true` while the most recently processed
     /// node pushed children (keep plunging via LIFO pop); `false` once a dive dies
     /// out with no children pushed, or once a node is requeued unsolved by an

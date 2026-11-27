@@ -182,7 +182,7 @@ fn a_deep_search_stores_one_bound_change_per_var_in_each_node() {
         run.state.open.iter().any(|node| node.depth >= 100),
         "the search should branch each var again and again"
     );
-    for node in &run.state.open {
+    for node in run.state.open.iter() {
         let changes = &node.bound_changes;
         assert!(
             changes.len() <= 2,

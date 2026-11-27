@@ -386,7 +386,7 @@ and direction that created it.
 |---|---|
 | `solver` | the ONE live LP engine |
 | `root_bounds`, `applied` | original bounds + which changes are currently applied to the solver (for diffing when switching nodes) |
-| `open: Vec<Node>` | the frontier (LIFO tail = current dive; best-bound scan on jumps) |
+| `open: OpenNodes` | the frontier: the nodes in push order (LIFO tail = current dive) and an index of them by `lp_bound`, which names the best-bound node on jumps |
 | `incumbent: Option<Incumbent>` | best integral solution: its values as computed + `objective = c·x` |
 | `node_seq`, `last_solved_id`, `diving` | warm-dive detection + node-selection mode |
 | `pseudocosts`, `stats`, `options`, `deadline`, `direction` | search intelligence and bookkeeping |
@@ -566,11 +566,12 @@ branching); a false acceptance would be a wrong answer.
 - **Plunging DFS with best-bound jumps** (`pop_node`): while the last processed node
   produced children (`diving == true`), pop LIFO — cheap warm dives, incumbents found fast.
   When a dive dies out (prune/infeasible/leaf), jump to the open node with the **lowest**
-  `lp_bound` (linear scan, first-minimum tie-break, `swap_remove`).
-- **Global dual bound** = min over open nodes' `lp_bound`, clamped by the incumbent
-  (stale nodes may carry looser bounds than a fresher incumbent). Open list empty →
-  the bound *is* the incumbent: proof complete. Valid only between nodes — a popped node's
-  subtree is otherwise unaccounted.
+  `lp_bound`, the first of them in the list (the first entry of `OpenNodes`' index, which
+  orders the bounds as `<` does and ties by position; `swap_remove`).
+- **Global dual bound** = min over open nodes' `lp_bound` (the index's first entry), clamped
+  by the incumbent (stale nodes may carry looser bounds than a fresher incumbent). Open list
+  empty → the bound *is* the incumbent: proof complete. Valid only between nodes — a popped
+  node's subtree is otherwise unaccounted.
 - **Gap** = `(incumbent − bound) / max(|incumbent|, ε)` in minimize space (sign-free — the
   formula is direction-invariant). `mip_gap > 0` may stop the search early with a feasible
   solution and `TerminationReason::MipGap`; the default `0.0` demands exact proof and adds
@@ -1621,8 +1622,9 @@ basis snapshot + a bound list of at most one entry per var. Pseudocost branching
 observed child degradation to shrink the tree while preserving the same node-state
 representation.
 
-**Known, accepted costs:** the best-bound jump and the (only when `mip_gap > 0`) bound scan
-are `O(open)` linear scans — fine at current scales, a heap if profiling ever says otherwise.
+**Known, accepted costs:** every push and pop of an open node updates the index by bound, at
+a logarithm of the list's length; the best-bound jump and the (only when `mip_gap > 0`) bound
+read then cost no pass over the list.
 Basis snapshots per node are `num_total_vars` bytes, and a dive leaves at most one open
 sibling per level, so its frontier grows linearly with its depth; basis *aging* (snapshot
 every k-th depth) is the standard next step if memory becomes a concern on deep trees.
@@ -1663,8 +1665,8 @@ dives a specific home:
 - **SOS1/SOS2.** Detection fits naturally in presolve. `Node.bound_changes` already supports
   multi-variable bound decisions, but propagation and basis bookkeeping must still obey the
   node-visit contracts above.
-- **Basis aging / node memory**, **heap-based best-bound selection**, and an anti-cycling
-  fallback remain independent engine/search-policy improvements; see §10.
+- **Basis aging / node memory** and an anti-cycling fallback remain independent
+  engine/search-policy improvements; see §10.
 
 ---
 

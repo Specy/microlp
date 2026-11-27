@@ -1,6 +1,8 @@
-//! Plain-data branch & bound tree nodes.
+//! Plain-data branch & bound tree nodes, and the list of the open ones.
 
 use crate::solver::Basis;
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 /// One open node of the search tree. Contains no solver machinery — applying
 /// `bound_changes` on top of the root bounds plus loading `basis` fully
@@ -54,6 +56,134 @@ pub(crate) fn with_var_bounds(
     }
 }
 
+/// The open nodes of a search: a list in push order, which a dive pops from
+/// the end, and an index of `(lp_bound, position)` kept in step with it, so
+/// that the lowest bound and the first node holding it are read without a
+/// pass over the list.
+///
+/// The index orders bounds as `<` does, `-0.0` with `0.0`, and ties by
+/// position: the first of the lowest bounds is the node a scan with a strict
+/// `<` picks. No bound is NaN, which `<` does not order: the search refuses
+/// a node LP whose objective is not finite (`super::search::node_objective`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OpenNodes {
+    nodes: Vec<Node>,
+    index: BTreeSet<(BoundKey, usize)>,
+}
+
+/// A node bound as the index orders it: `f64::total_cmp`, with `-0.0` read
+/// as `0.0` so that the two compare equal, as under `<`.
+#[derive(Clone, Copy, Debug)]
+struct BoundKey(f64);
+
+impl BoundKey {
+    fn of(bound: f64) -> Self {
+        BoundKey(if bound == 0.0 { 0.0 } else { bound })
+    }
+}
+
+impl PartialEq for BoundKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for BoundKey {}
+
+impl PartialOrd for BoundKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BoundKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl OpenNodes {
+    pub(crate) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, Node> {
+        self.nodes.iter()
+    }
+
+    pub(crate) fn push(&mut self, node: Node) {
+        debug_assert!(!node.lp_bound.is_nan(), "an open node's bound is NaN");
+        self.enter(node.lp_bound, self.nodes.len());
+        self.nodes.push(node);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.nodes.clear();
+        self.index.clear();
+    }
+
+    /// Remove the node at `at`, the last node taking its place, as
+    /// `Vec::swap_remove`.
+    pub(crate) fn swap_remove(&mut self, at: usize) -> Node {
+        let last = self.nodes.len() - 1;
+        self.leave(self.nodes[at].lp_bound, at);
+        if at != last {
+            let moved = self.nodes[last].lp_bound;
+            self.leave(moved, last);
+            self.enter(moved, at);
+        }
+        self.nodes.swap_remove(at)
+    }
+
+    /// Swap the nodes at `a` and `b`, as `slice::swap`.
+    pub(crate) fn swap(&mut self, a: usize, b: usize) {
+        if a == b {
+            return;
+        }
+        let (bound_a, bound_b) = (self.nodes[a].lp_bound, self.nodes[b].lp_bound);
+        self.leave(bound_a, a);
+        self.leave(bound_b, b);
+        self.enter(bound_a, b);
+        self.enter(bound_b, a);
+        self.nodes.swap(a, b);
+    }
+
+    /// The position of the first node with the lowest bound.
+    pub(crate) fn best(&self) -> Option<usize> {
+        self.index.first().map(|&(_, at)| at)
+    }
+
+    /// The lowest bound of an open node, `None` when there is none.
+    pub(crate) fn min_bound(&self) -> Option<f64> {
+        self.best().map(|at| self.nodes[at].lp_bound)
+    }
+
+    /// Index a node with `bound` at position `at`.
+    fn enter(&mut self, bound: f64, at: usize) {
+        let fresh = self.index.insert((BoundKey::of(bound), at));
+        debug_assert!(fresh, "the index held position {at} already");
+    }
+
+    /// Drop the index entry of the node with `bound` at position `at`.
+    fn leave(&mut self, bound: f64, at: usize) {
+        let held = self.index.remove(&(BoundKey::of(bound), at));
+        debug_assert!(held, "the index did not hold position {at}");
+    }
+}
+
+impl std::ops::Index<usize> for OpenNodes {
+    type Output = Node;
+
+    fn index(&self, at: usize) -> &Node {
+        &self.nodes[at]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,136 +213,6 @@ mod tests {
         );
         assert_eq!(with_var_bounds(&[], 4, 0.0, 1.0), vec![(4, 0.0, 1.0)]);
     }
-}
-
-/// The open nodes of a search: a list in push order, which a dive pops from
-/// the end, with an index of `(lp_bound, position)` kept in step with it, so
-/// that the best bound, and the first node holding it, cost a logarithm of
-/// the list's length instead of a pass over it. Both were a pass per node
-/// (the gap check, `super::global_bound_internal`, and every jump of
-/// `super::search::pop_node`): 60 to 90% of the search's time on models
-/// whose open list reaches 10^5 nodes.
-///
-/// The index orders bounds as `<` does, `-0.0` with `0.0`, and ties by
-/// position, so the first of the best bounds is the one a scan with a
-/// strict `<` would pick.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct OpenNodes {
-    nodes: Vec<Node>,
-    index: std::collections::BTreeSet<(BoundKey, usize)>,
-}
-
-/// A node bound as the index orders it: `f64::total_cmp`, with `-0.0` read
-/// as `0.0` so that the two compare equal, as under `<`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct BoundKey(f64);
-
-impl BoundKey {
-    fn of(bound: f64) -> Self {
-        BoundKey(if bound == 0.0 { 0.0 } else { bound })
-    }
-}
-
-impl Eq for BoundKey {}
-
-impl PartialOrd for BoundKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for BoundKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.total_cmp(&other.0)
-    }
-}
-
-impl OpenNodes {
-    pub(crate) fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn iter(&self) -> std::slice::Iter<'_, Node> {
-        self.nodes.iter()
-    }
-
-    pub(crate) fn push(&mut self, node: Node) {
-        self.index
-            .insert((BoundKey::of(node.lp_bound), self.nodes.len()));
-        self.nodes.push(node);
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.nodes.clear();
-        self.index.clear();
-    }
-
-    /// Remove the node at `at`, the last node taking its place, as
-    /// `Vec::swap_remove`.
-    pub(crate) fn swap_remove(&mut self, at: usize) -> Node {
-        let last = self.nodes.len() - 1;
-        self.index
-            .remove(&(BoundKey::of(self.nodes[at].lp_bound), at));
-        if at != last {
-            let moved = BoundKey::of(self.nodes[last].lp_bound);
-            self.index.remove(&(moved, last));
-            self.index.insert((moved, at));
-        }
-        self.nodes.swap_remove(at)
-    }
-
-    /// Swap the nodes at `a` and `b`, as `slice::swap`.
-    pub(crate) fn swap(&mut self, a: usize, b: usize) {
-        if a == b {
-            return;
-        }
-        let (ka, kb) = (
-            BoundKey::of(self.nodes[a].lp_bound),
-            BoundKey::of(self.nodes[b].lp_bound),
-        );
-        self.index.remove(&(ka, a));
-        self.index.remove(&(kb, b));
-        self.index.insert((ka, b));
-        self.index.insert((kb, a));
-        self.nodes.swap(a, b);
-    }
-
-    /// The position of the first node with the lowest bound.
-    pub(crate) fn best(&self) -> Option<usize> {
-        self.index.first().map(|&(_, at)| at)
-    }
-
-    /// The lowest bound of an open node, `None` when there is none.
-    pub(crate) fn min_bound(&self) -> Option<f64> {
-        self.best().map(|at| self.nodes[at].lp_bound)
-    }
-}
-
-impl std::ops::Index<usize> for OpenNodes {
-    type Output = Node;
-
-    fn index(&self, at: usize) -> &Node {
-        &self.nodes[at]
-    }
-}
-
-impl<'a> IntoIterator for &'a OpenNodes {
-    type Item = &'a Node;
-    type IntoIter = std::slice::Iter<'a, Node>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.nodes.iter()
-    }
-}
-
-#[cfg(test)]
-mod open_tests {
-    use super::*;
 
     fn node(lp_bound: f64, depth: u32) -> Node {
         Node {
@@ -228,8 +228,8 @@ mod open_tests {
         }
     }
 
-    /// What `pop_node` scanned for before the index: the first position of
-    /// the lowest bound, under a strict `<`.
+    /// The first position of the lowest bound by a scan under a strict `<`:
+    /// the node the index must name.
     fn scanned_best(open: &OpenNodes) -> Option<usize> {
         if open.is_empty() {
             return None;
