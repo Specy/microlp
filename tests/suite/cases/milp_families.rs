@@ -573,13 +573,43 @@ fn unbounded_cases(cases: &mut Vec<Case>) {
         10,
         || {
             let mut b = Builder::new(Minimize);
-            // The unbounded direction must ride the REAL var: integer bounds
-            // are i32 in the public API, so an "unbounded" integer is really
+            // The unbounded direction rides the REAL var: `add_integer_var`'s
+            // i32 bounds are finite, so an "unbounded" integer with them is
             // pinned at i32::MIN (the first version of this case expected
-            // Unbounded and got the finite -2^31 optimum instead).
+            // Unbounded and got the finite -2^31 optimum instead). The
+            // integer-ray cases below use `add_integer_var_f64`.
             let x = b.integer(0.0, 0, 10);
             let y = b.real(1.0, f64::NEG_INFINITY, f64::INFINITY);
             b.constraint(&[(x, 1.0), (y, -1.0)], Ge, -3.0); // y <= x + 3: no floor
+            Ok((b.spec, b.problem, Expected::Unbounded))
+        },
+    ));
+    cases.push(Case::solve(
+        "family/unbounded/integer-ray-max",
+        Tier::Easy,
+        10,
+        || {
+            // max x + y over integers x, y >= 0 with no upper bound:
+            // |x - y| stays within the rows along the integral ray (1, 1).
+            let mut b = Builder::new(Maximize);
+            let x = b.integer_f64(1.0, 0.0, f64::INFINITY);
+            let y = b.integer_f64(1.0, 0.0, f64::INFINITY);
+            b.constraint(&[(x, 1.0), (y, -1.0)], Le, 1.5);
+            b.constraint(&[(x, -1.0), (y, 1.0)], Le, 2.5);
+            Ok((b.spec, b.problem, Expected::Unbounded))
+        },
+    ));
+    cases.push(Case::solve(
+        "family/unbounded/integer-ray-min",
+        Tier::Easy,
+        10,
+        || {
+            // min x over a free integer x with 3x - 2y <= 4 and y in
+            // [0, 5]: x falls without limit.
+            let mut b = Builder::new(Minimize);
+            let x = b.integer_f64(1.0, f64::NEG_INFINITY, f64::INFINITY);
+            let y = b.integer(0.0, 0, 5);
+            b.constraint(&[(x, 3.0), (y, -2.0)], Le, 4.0);
             Ok((b.spec, b.problem, Expected::Unbounded))
         },
     ));

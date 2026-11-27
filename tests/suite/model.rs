@@ -65,6 +65,14 @@ impl Builder {
         v
     }
 
+    /// An integer var with `f64` bounds, which may be infinite
+    /// ([`Problem::add_integer_var_f64`]).
+    pub fn integer_f64(&mut self, obj_coeff: f64, min: f64, max: f64) -> Variable {
+        let v = self.problem.add_integer_var_f64(obj_coeff, (min, max));
+        self.push_spec(v, obj_coeff, min, max, Domain::Integer);
+        v
+    }
+
     pub fn binary(&mut self, obj_coeff: f64) -> Variable {
         let v = self.problem.add_binary_var(obj_coeff);
         self.push_spec(v, obj_coeff, 0.0, 1.0, Domain::Integer);

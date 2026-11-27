@@ -102,10 +102,40 @@ impl Problem {
     ///
     /// `obj_coeff` is the variable's objective coefficient. If it is NaN or
     /// infinite, the solve returns [`Error::InvalidOperation`]. `min` and
-    /// `max` are inclusive bounds. Use [`i32::MIN`] or [`i32::MAX`] when no
-    /// tighter integer bound is required on that side.
+    /// `max` are inclusive bounds. [`i32::MIN`] and [`i32::MAX`] are finite
+    /// bounds like any other: a problem whose objective improves along the
+    /// variable without limit has its optimum there, not
+    /// [`Error::Unbounded`]. For an integer variable with no bound on a side,
+    /// use [`Problem::add_integer_var_f64`] with an infinite bound.
     pub fn add_integer_var(&mut self, obj_coeff: f64, (min, max): (i32, i32)) -> Variable {
         self.internal_add_var(obj_coeff, (min as f64, max as f64), VarDomain::Integer)
+    }
+
+    /// Adds an integer-valued variable with `f64` bounds, which may be
+    /// infinite: [`f64::NEG_INFINITY`] or [`f64::INFINITY`] leaves that side
+    /// unbounded, so the objective improving along the variable without limit
+    /// gives [`Error::Unbounded`]. A finite bound must be a whole number;
+    /// a fractional or NaN one, or `min` at `+inf` or `max` at `-inf`, makes
+    /// the solve return [`Error::InvalidOperation`]. A finite bound of
+    /// magnitude `2^52` or more is taken as infinite, as for [`Problem::add_var`].
+    /// With `i32` bounds this is the same variable as
+    /// [`Problem::add_integer_var`] gives.
+    ///
+    /// `obj_coeff` is the variable's objective coefficient. If it is NaN or
+    /// infinite, the solve returns [`Error::InvalidOperation`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use microlp::*;
+    /// let mut problem = Problem::new(OptimizationDirection::Maximize);
+    /// let n = problem.add_integer_var_f64(1.0, (0.0, f64::INFINITY));
+    /// let y = problem.add_var(0.0, (0.0, 1.0));
+    /// problem.add_constraint(&[(n, 2.0), (y, -1.0)], ComparisonOp::Ge, 0.5);
+    /// assert!(matches!(problem.solve(), Err(Error::Unbounded)));
+    /// ```
+    pub fn add_integer_var_f64(&mut self, obj_coeff: f64, (min, max): (f64, f64)) -> Variable {
+        self.internal_add_var(obj_coeff, (min, max), VarDomain::Integer)
     }
 
     /// Returns whether the problem contains any integer or boolean variables.
@@ -462,6 +492,16 @@ impl Problem {
                 return Err(Error::InvalidOperation(format!(
                     "invalid upper bound {max} of variable {var}: expected a finite value or inf"
                 )));
+            }
+            if self.var_domains[var] == VarDomain::Integer {
+                for (side, bound) in [("lower", min), ("upper", max)] {
+                    if bound.is_finite() && bound.fract() != 0.0 {
+                        return Err(Error::InvalidOperation(format!(
+                            "invalid {side} bound {bound} of integer variable {var}: expected a \
+                             whole number or an infinite bound"
+                        )));
+                    }
+                }
             }
         }
         for (row, (coeffs, cmp_op, rhs)) in self.constraints.iter().enumerate() {
