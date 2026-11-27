@@ -262,8 +262,8 @@ pub(super) fn solve_node_lp(state: &mut MipState) -> Result<NodeLp, Error> {
 
 /// Pop policy: keep diving (DFS) while the last processed node produced children;
 /// when a dive dies out, jump to the open node with the best (lowest) bound. Ties
-/// in `lp_bound` resolve to the first (lowest-index) such node in `open` — the
-/// scan uses strict `<`, so `best` only moves for a strictly smaller bound.
+/// in `lp_bound` resolve to the first (lowest-index) such node in `open`, which
+/// the open list's index gives without a pass over it (`OpenNodes::best`).
 /// Returns the node and the index it held, which `swap_remove` refills with the
 /// last node ([`put_back`] undoes the pop).
 pub(super) fn pop_node(state: &mut MipState) -> Option<(Node, usize)> {
@@ -273,13 +273,7 @@ pub(super) fn pop_node(state: &mut MipState) -> Option<(Node, usize)> {
     let at = if state.diving {
         state.open.len() - 1
     } else {
-        let mut best = 0;
-        for (i, n) in state.open.iter().enumerate() {
-            if n.lp_bound < state.open[best].lp_bound {
-                best = i;
-            }
-        }
-        best
+        state.open.best().expect("the open list is not empty")
     };
     Some((state.open.swap_remove(at), at))
 }
