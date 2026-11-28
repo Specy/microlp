@@ -170,10 +170,13 @@ jobs:
         with:
           node-version: 20
 
+      # A pinned version: for `latest` the action asks the GitHub API without
+      # a token, and when that request is rate limited it installs v0.9.1,
+      # whose wasm-opt cannot parse what current Rust emits.
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
         with:
-          version: latest
+          version: v0.15.1
 
       # Runtime guard: build the example to wasm and actually solve an LP and a
       # MILP under Node. Each solve sets a time limit, so this exercises the
